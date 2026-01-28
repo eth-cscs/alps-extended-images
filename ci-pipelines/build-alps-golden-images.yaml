@@ -24,7 +24,7 @@ test-alps-ngc-pytorch:
   image: $PERSIST_IMAGE_NAME
   script:
     - |
-      srun --mpi=pmix -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=1 -u bash -c '
+      srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=1 -u bash -c '
         wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
         echo "[image-vet] Set-up vetnode on $(hostname)..." 
         cd /tmp
@@ -34,7 +34,7 @@ test-alps-ngc-pytorch:
         vetnode setup /tmp/config.yaml 
       '
     - |
-      srun --mpi=pmix -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=4 -u bash -c '
+      srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=4 -u bash -c '
     
         echo "[image-vet] diagnose"
         cd /tmp
@@ -43,6 +43,6 @@ test-alps-ngc-pytorch:
       '
   variables:
     SLURM_JOB_NUM_NODES: 2
-    USE_MPI: 'false'
-    EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
+    #USE_MPI: 'false'
+    #EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
 
