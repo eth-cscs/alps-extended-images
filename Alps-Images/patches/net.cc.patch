@@ -1,7 +1,7 @@
-diff --git i/src/plugin/net.cc w/src/plugin/net.cc
+diff --git a/src/plugin/net.cc b/src/plugin/net.cc
 index 808d686..95c34ce 100644
---- i/src/plugin/net.cc
-+++ w/src/plugin/net.cc
+--- a/src/plugin/net.cc
++++ b/src/plugin/net.cc
 @@ -82,8 +82,12 @@ static ncclResult_t ncclNetPluginUnload(netPluginLib_t* pluginLib) {
    if ((pluginLib->dlHandle) && ((pluginLib->ncclNetPluginRefCount) == 0)) {
      INFO(NCCL_INIT|NCCL_NET, "Unloading plugin %s", pluginLib->name);
