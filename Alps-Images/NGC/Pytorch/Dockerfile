@@ -47,25 +47,6 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# NCCL from source (+ patch), install as Debian package
-# -----------------------------------------------------------------------------
-COPY Alps-Images/patches/net.cc.patch /tmp/net.cc.patch
-ARG NCCL_VER=2.29.2-1
-RUN set -eux; \
-    curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz; \
-    tar -C /tmp -xzf /tmp/nccl.tar.gz; \
-    cd "/tmp/nccl-${NCCL_VER}"; \
-    cat /tmp/net.cc.patch; \
-    git apply --check /tmp/net.cc.patch; \
-    git apply /tmp/net.cc.patch; \
-    make -j"$(nproc)" pkg.debian.build CUDA_HOME=/usr/local/cuda; \
-    dpkg -i build/pkg/deb/*.deb; \
-    cd /; \
-    rm -rf "/tmp/nccl-${NCCL_VER}" /tmp/nccl.tar.gz /tmp/net.cc.patch; \
-    ldconfig
-
-
-# -----------------------------------------------------------------------------
 # Remove AWS EFA user-space
 # -----------------------------------------------------------------------------
 RUN set -eux; \
