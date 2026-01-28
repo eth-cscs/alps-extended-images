@@ -151,26 +151,20 @@ RUN set -eux; \
     ldconfig
 
 # -----------------------------------------------------------------------------
-# NCCL from source, install as Debian package
+# NCCL from source (+ patch), install as Debian package
 # -----------------------------------------------------------------------------
-COPY patches/net.cc.patch /tmp/net.cc.patch
+COPY Alps-Images/patches/net.cc.patch /tmp/net.cc.patch
+ARG NCCL_VER=2.29.2-1
 RUN set -eux; \
-    NCCL_VER="$(python3 -c 'import ctypes; \
-lib=ctypes.CDLL("libnccl.so.2"); v=ctypes.c_int(); \
-rc=lib.ncclGetVersion(ctypes.byref(v)); \
-assert rc==0, rc; \
-maj=v.value//10000; min=(v.value%10000)//100; pat=v.value%10; \
-print(f"{maj}.{min}.{pat}")')"; \
-    echo "Detected NCCL runtime version: ${NCCL_VER}"; \
-    cd /tmp; \
-    git clone https://github.com/NVIDIA/nccl; \
-    cd nccl; \
-    git checkout "v${NCCL_VER}-1"; \
+    curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz; \
+    tar -C /tmp -xzf /tmp/nccl.tar.gz; \
+    cd "/tmp/nccl-${NCCL_VER}"; \
     git apply --check /tmp/net.cc.patch; \
     git apply /tmp/net.cc.patch; \
     make -j"$(nproc)" pkg.debian.build CUDA_HOME=/usr/local/cuda; \
     dpkg -i build/pkg/deb/*.deb; \
-    cd /; rm -rf /tmp/nccl* \
+    cd /; \
+    rm -rf "/tmp/nccl-${NCCL_VER}" /tmp/nccl.tar.gz /tmp/net.cc.patch; \
     ldconfig
 
 # -----------------------------------------------------------------------------
@@ -182,6 +176,7 @@ RUN set -eux; \
     rm -rf /opt/hpcx/nccl_spectrum-x_plugin || true ; \
     rm -rf /opt/hpcx/sharp || true ; \
     ldconfig
+
 
 # -----------------------------------------------------------------------------
 # UCX into /opt/hpcx/ucx
@@ -254,14 +249,18 @@ RUN set -eux; \
     ldconfig
 
 # -----------------------------------------------------------------------------
-# aws-ofi-nccl + patch
+# aws-ofi-nccl + patch, install to /usr
 # -----------------------------------------------------------------------------
+COPY Alps-Images/patches/endpoint_mr_for_rdma.patch /tmp/endpoint_mr_for_rdma.patch
 ARG AWS_OFI_VER=1.18.0
 RUN set -eux; \
-    curl -fsSL "https://github.com/aws/aws-ofi-nccl/releases/download/v${AWS_OFI_VER}/aws-ofi-nccl-${AWS_OFI_VER}.tar.gz" -o /tmp/aws-ofi-nccl.tar.gz; \
-    tar -C /tmp -xzf /tmp/aws-ofi-nccl.tar.gz; \
-    cd /tmp/aws-ofi-nccl-1.18.0; \
+    git clone https://github.com/aws/aws-ofi-nccl.git /tmp/aws-ofi-nccl; \
+    cd /tmp/aws-ofi-nccl; \
+    git reset --hard f4d964adb0be307987338078b0c978c721ad117f; \
+    git apply --check /tmp/endpoint_mr_for_rdma.patch; \
+    git apply /tmp/endpoint_mr_for_rdma.patch; \
     ./autogen.sh; \
+    CPPFLAGS="" \
     ./configure \
       --prefix=/usr \
       --with-libfabric=/usr \
@@ -274,7 +273,7 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install; \
     cd /; \
-    rm -rf /tmp/aws-ofi-nccl.tar.gz; /tmp/aws-ofi-nccl-${AWS_OFI_NCCL}; \
+    rm -rf /tmp/aws-ofi-nccl; \
     ldconfig
 
 # -----------------------------------------------------------------------------
@@ -313,16 +312,15 @@ RUN set -eux; \
     rm -rf "/tmp/osu-micro-benchmarks-${OSU_VERSION}" /tmp/osu.tar.gz; \
     ldconfig
 
-# -----------------------------------------------------------------------------
-# Install missing python packages
-# -----------------------------------------------------------------------------
+
+
 RUN python -m pip install flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
 
 # -----------------------------------------------------------------------------
 # Runtime environment defaults
 # -----------------------------------------------------------------------------
 ENV CUDA_CACHE_DISABLE="1" \
-    NCCL_VERSION="${NCCL_VER}" \
+    NCCL_VERSION="2.29.2-1" \
     NCCL_NET="AWS Libfabric" \
     NCCL_CROSS_NIC="1" \
     NCCL_P2P_LEVEL="NVL" \
