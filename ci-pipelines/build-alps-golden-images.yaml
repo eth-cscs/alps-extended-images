@@ -1,0 +1,20 @@
+include:
+  - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
+
+stages:
+  - build-image
+
+
+build-alps-ngc-pytorch:
+  stage: build-image
+  extends: [.container-builder-cscs-gh200, .dynamic-image-name]
+  timeout: 6h
+  variables:
+    #SLURM_TIMELIMIT: "06:00:00"
+    DOCKERFILE: Alps-Images/Nvidia(NGC)/Pytorch/Dockerfile
+    IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
+    PERSIST_IMAGE_NAME: $IMAGE_NAME:25.12-py3
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    WATCH_FILECHANGES: $DOCKERFILE
+
