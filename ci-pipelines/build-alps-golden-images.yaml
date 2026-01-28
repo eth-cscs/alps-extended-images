@@ -45,6 +45,6 @@ test-alps-ngc-pytorch:
   variables:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 4
-    USE_MPI: 'false'
-    EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
+    #USE_MPI: 'false'
+    #EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
 
