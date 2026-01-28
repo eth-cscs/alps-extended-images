@@ -14,7 +14,7 @@ build-alps-ngc-pytorch:
   extends: [.container-builder-cscs-gh200]
   timeout: 6h
   variables:
-    DOCKERFILE: Alps-Images/NGC/Pytorch/Dockerfile
+    DOCKERFILE: Alps-Images/NGC/Pytorch/Containerfile_25.12
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
 

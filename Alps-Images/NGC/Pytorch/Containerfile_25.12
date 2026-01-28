@@ -38,7 +38,6 @@ RUN set -eux; \
         libjson-c-dev \
         libibverbs-dev \
         libsox-fmt-all \
-        # NCCL .deb build tooling
         devscripts \
         debhelper \
         fakeroot \
@@ -60,9 +59,21 @@ RUN set -eux; \
     ldconfig
 
 # -----------------------------------------------------------------------------
+# Remove HPC-X NCCL plugins
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    rm -rf /opt/hpcx/nccl_mrc_plugin || true ; \
+    rm -rf /opt/hpcx/nccl_rdma_sharp_plugin || true ; \
+    rm -rf /opt/hpcx/nccl_spectrum-x_plugin || true ; \
+    rm -rf /opt/hpcx/sharp || true ; \
+    ldconfig
+
+# -----------------------------------------------------------------------------
 # XPMEM
 # -----------------------------------------------------------------------------
-ARG xpmem_ref=0d0bad4e1d07b38d53ecc8f20786bb1328c446da
+#ARG xpmem_ref=0d0bad4e1d07b38d53ecc8f20786bb1328c446da
+# XPMEM is not released/tagged since 2016 - we use the latest commit here
+ARG xpmem_ref=3bcab55479489fdd93847fa04c58ab16e9c0b3fd
 RUN set -eux; \
     git clone https://github.com/hpc/xpmem.git; \
     cd xpmem; \
@@ -90,7 +101,7 @@ RUN set -eux; \
     ldconfig
 
 # -----------------------------------------------------------------------------
-# Slingshot headers / CXI driver headers
+# Slingshot headers / CXI driver headers / libcxi
 # -----------------------------------------------------------------------------
 ARG cassini_headers_version=release/shs-13.0.0
 RUN set -eux; \
@@ -109,9 +120,6 @@ RUN set -eux; \
     cd /; \
     rm -rf shs-cxi-driver
 
-# -----------------------------------------------------------------------------
-# libcxi
-# -----------------------------------------------------------------------------
 ARG libcxi_version=release/shs-13.0.0
 RUN set -eux; \
     git clone --depth 1 --branch "${libcxi_version}" https://github.com/HewlettPackard/shs-libcxi.git; \
@@ -127,16 +135,16 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # libfabric (CXI provider enabled) + patch
 # -----------------------------------------------------------------------------
-ARG libfabric_commit=f8262817c337d615a1acceea6cd4ecb526ce548b
+# Until https://github.com/ofiwg/libfabric/pull/11684 is merged, we apply the
+# changes in PR 11684 manually which requires a recent libfabric commit.
+ARG libfabric_commit=cedfeaa550b1d0b64e48e5b730482414409746d3
+COPY Alps-Images/patches/libfabric.fi_writemsg.patch /tmp/fi_writemsg.patch
 RUN set -eux; \
     git clone https://github.com/ofiwg/libfabric.git; \
     cd libfabric; \
     git reset --hard "${libfabric_commit}"; \
-    curl -fsSL \
-      "https://github.com/ofiwg/libfabric/compare/f8262817c337d615a1acceea6cd4ecb526ce548b...ryanhankins:fi_writemsg.patch?full_index=1" \
-      -o fi_writemsg.patch; \
-    git apply --check fi_writemsg.patch; \
-    git apply fi_writemsg.patch; \
+    git apply --check /tmp/fi_writemsg.patch; \
+    git apply /tmp/fi_writemsg.patch; \
     ./autogen.sh; \
     ./configure --prefix=/usr \
       --with-cuda=/usr/local/cuda \
@@ -147,13 +155,17 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install; \
     cd /; \
-    rm -rf libfabric; \
+    rm -rf libfabric /tmp/fi_writemsg.patch; \
     ldconfig
 
 # -----------------------------------------------------------------------------
 # NCCL from source (+ patch), install as Debian package
 # -----------------------------------------------------------------------------
-COPY Alps-Images/patches/net.cc.patch /tmp/net.cc.patch
+# According to https://github.com/NVIDIA/nccl/issues/218 we should be ok to
+# replace with newer 2.x version.
+# Until https://github.com/NVIDIA/nccl/pull/1979 is merged, we apply the
+# changes manually.
+COPY Alps-Images/patches/nccl.net.cc.patch /tmp/net.cc.patch
 ARG NCCL_VER=2.29.2-1
 RUN set -eux; \
     curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz; \
@@ -166,17 +178,6 @@ RUN set -eux; \
     cd /; \
     rm -rf "/tmp/nccl-${NCCL_VER}" /tmp/nccl.tar.gz /tmp/net.cc.patch; \
     ldconfig
-
-# -----------------------------------------------------------------------------
-# Remove HPC-X NCCL plugins
-# -----------------------------------------------------------------------------
-RUN set -eux; \
-    rm -rf /opt/hpcx/nccl_mrc_plugin || true ; \
-    rm -rf /opt/hpcx/nccl_rdma_sharp_plugin || true ; \
-    rm -rf /opt/hpcx/nccl_spectrum-x_plugin || true ; \
-    rm -rf /opt/hpcx/sharp || true ; \
-    ldconfig
-
 
 # -----------------------------------------------------------------------------
 # UCX into /opt/hpcx/ucx
@@ -226,6 +227,8 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # Open MPI 5 into /opt/hpcx/ompi
 # -----------------------------------------------------------------------------
+# OpenMPI 5 is ABI compatible with OpenMPI 4.x which was previously on the
+# image, so we should be ok.
 ARG OMPI_VER=5.0.9
 RUN set -eux; \
     HPCX=/opt/hpcx; \
@@ -251,12 +254,13 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # aws-ofi-nccl + patch, install to /usr
 # -----------------------------------------------------------------------------
-COPY Alps-Images/patches/endpoint_mr_for_rdma.patch /tmp/endpoint_mr_for_rdma.patch
-ARG AWS_OFI_VER=1.18.0
+# Until https://github.com/aws/aws-ofi-nccl/pull/1056 is merged, we apply the
+# changes manually - requires recent commit.
+COPY Alps-Images/patches/aws-ofi-nccl.endpoint_mr_for_rdma.patch /tmp/endpoint_mr_for_rdma.patch
 RUN set -eux; \
     git clone https://github.com/aws/aws-ofi-nccl.git /tmp/aws-ofi-nccl; \
     cd /tmp/aws-ofi-nccl; \
-    git reset --hard f4d964adb0be307987338078b0c978c721ad117f; \
+    git reset --hard eb9877e9cfecf725dba0794a5e0fc06f8fdf7f3f; \
     git apply --check /tmp/endpoint_mr_for_rdma.patch; \
     git apply /tmp/endpoint_mr_for_rdma.patch; \
     ./autogen.sh; \
@@ -273,7 +277,7 @@ RUN set -eux; \
     make -j"$(nproc)"; \
     make install; \
     cd /; \
-    rm -rf /tmp/aws-ofi-nccl; \
+    rm -rf /tmp/aws-ofi-nccl /tmp/endpoint_mf_for_rdma.patch; \
     ldconfig
 
 # -----------------------------------------------------------------------------
@@ -312,8 +316,9 @@ RUN set -eux; \
     rm -rf "/tmp/osu-micro-benchmarks-${OSU_VERSION}" /tmp/osu.tar.gz; \
     ldconfig
 
-
-
+# -----------------------------------------------------------------------------
+# Install missing python packages
+# -----------------------------------------------------------------------------
 RUN python -m pip install flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
 
 # -----------------------------------------------------------------------------
@@ -331,9 +336,11 @@ ENV CUDA_CACHE_DISABLE="1" \
     NCCL_NCHANNELS_PER_NET_PEER="4" \
     FI_PROVIDER="cxi" \
     FI_CXI_DEFAULT_CQ_SIZE="131072" \
-    FI_CXI_DEFAULT_TX_SIZE="32768" \
+    FI_CXI_DEFAULT_TX_SIZE="16384" \
     FI_CXI_DISABLE_HOST_REGISTER="1" \
-    FI_CXI_RX_MATCH_MODE="software" \
+    FI_CXI_RDZV_EAGER_SIZE="0" \
+    FI_CXI_RDZV_PROTO="altread" \
+    FI_CXI_RX_MATCH_MODE="hybrid" \
     FI_MR_CACHE_MONITOR="userfaultfd" \
     PMIX_MCA_psec="native" \
     OMPI_MCA_btl="^tcp,ofi,vader" \
