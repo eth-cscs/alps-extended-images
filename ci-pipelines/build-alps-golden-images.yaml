@@ -9,14 +9,14 @@ variables:
   IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
   PERSIST_IMAGE_NAME: $IMAGE_NAME:25.12-py3
 
-build-alps-ngc-pytorch:
-  stage: build
-  extends: [.container-builder-cscs-gh200]
-  timeout: 6h
-  variables:
-    DOCKERFILE: Alps-Images/NGC/Pytorch/Dockerfile
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+#build-alps-ngc-pytorch:
+#  stage: build
+#  extends: [.container-builder-cscs-gh200]
+#  timeout: 6h
+#  variables:
+#    DOCKERFILE: Alps-Images/NGC/Pytorch/Dockerfile
+#    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+#    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
 
 test-alps-ngc-pytorch:
   stage: test
