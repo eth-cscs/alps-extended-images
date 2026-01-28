@@ -23,7 +23,7 @@ test-alps-ngc-pytorch:
   extends: [.container-runner-clariden-gh200]
   image: $PERSIST_IMAGE_NAME
   script:
-    - wget -O /tmp/config.yaml https://gitlab.com/cscs-ci/recipes/-/raw/master/tests/data/vetnode/alps-vetnode-config.yaml
+    - wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
     - |
       srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=1 -u bash -c '
 
