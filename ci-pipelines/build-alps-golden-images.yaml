@@ -11,7 +11,7 @@ build-alps-ngc-pytorch:
   timeout: 6h
   variables:
     #SLURM_TIMELIMIT: "06:00:00"
-    DOCKERFILE: Alps-Images/Nvidia(NGC)/Pytorch/Dockerfile
+    DOCKERFILE: Alps-Images/NGC/Pytorch/Dockerfile
     IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
     PERSIST_IMAGE_NAME: $IMAGE_NAME:25.12-py3
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
