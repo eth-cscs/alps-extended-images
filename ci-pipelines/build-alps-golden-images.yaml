@@ -6,8 +6,8 @@ stages:
   - test
 
 variables:
-  IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch-25.12
-  PERSIST_IMAGE_NAME: $IMAGE_NAME:$CI_COMMIT_SHORT_SHA
+  IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch-25.12-test
+  PERSIST_IMAGE_NAME: $IMAGE_NAME
 
 build-alps-ngc-pytorch:
   stage: build
@@ -17,6 +17,7 @@ build-alps-ngc-pytorch:
     DOCKERFILE: Alps-Images/NGC/Pytorch/Containerfile_25.12
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: ALWAYS
 
 test-alps-ngc-pytorch:
   stage: test
@@ -36,9 +37,10 @@ test-alps-ngc-pytorch:
     - source .venv/bin/activate
     - vetnode diagnose /tmp/config.yaml
   variables:
+    USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
-    USE_MPI: NO
     SLURM_MPI_TYPE: pmix
+    SLURM_NETWORK: disable_rdzv_get
     PMIX_MCA_psec: native
     EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
