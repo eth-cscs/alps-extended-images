@@ -23,26 +23,26 @@ test-alps-ngc-pytorch:
   extends: [.container-runner-clariden-gh200]
   image: $PERSIST_IMAGE_NAME
   script:
+    - echo "[image-vet] Set-up vetnode on $(hostname)..."
     - |
-      srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=1 -u bash -c '
+      if [ "$SLURM_LOCALID" -eq 0 ]; then
         wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
-        echo "[image-vet] Set-up vetnode on $(hostname)..." 
         cd /tmp
         python -m venv --system-site-packages .venv
         source .venv/bin/activate
         pip install --no-cache-dir vetnode
-        vetnode setup /tmp/config.yaml 
-      '
-    - |
-      srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=4 -u bash -c '
-    
-        echo "[image-vet] diagnose"
-        cd /tmp
-        source .venv/bin/activate
-        vetnode diagnose /tmp/config.yaml
-      '
+        vetnode setup /tmp/config.yaml
+      else
+        echo "[image-vet] Waiting for setup on $(hostname)..."
+        sleep 30 
+      fi
+    - echo "[image-vet] diagnose"
+    - cd /tmp
+    - source .venv/bin/activate
+    - vetnode diagnose /tmp/config.yaml
   variables:
     SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 4
     #USE_MPI: 'false'
     #EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
 
