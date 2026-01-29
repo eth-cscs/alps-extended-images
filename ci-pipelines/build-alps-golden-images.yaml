@@ -22,11 +22,22 @@ test-alps-ngc-pytorch:
   stage: test
   extends: [.container-runner-clariden-gh200]
   image: $PERSIST_IMAGE_NAME
-  script: |
-    alltoall_perf -b 32 -e 4M -f 2 -g 1
+  script:
+    - alltoall_perf -b 32 -e 4M -f 2 -g 1
+    - |
+      wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
+      cd /tmp
+      python -m venv --system-site-packages .venv
+      source .venv/bin/activate
+      pip install --no-cache-dir vetnode
+      vetnode setup /tmp/config.yaml
+    - echo "[image-vet] diagnose"
+    - cd /tmp
+    - source .venv/bin/activate
+    - vetnode diagnose /tmp/config.yaml
   variables:
     SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 4
+    SLURM_NTASKS: 8
     USE_MPI: NO
     SLURM_MPI_TYPE: pmix
     PMIX_MCA_psec: native
