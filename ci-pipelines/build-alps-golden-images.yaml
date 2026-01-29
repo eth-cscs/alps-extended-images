@@ -24,7 +24,7 @@ test-alps-ngc-pytorch:
   image: $PERSIST_IMAGE_NAME
   script: |
     wget -O /tmp/config.yaml https://gitlab.com/cscs-ci/recipes/-/raw/master/tests/data/vetnode/alps-vetnode-config.yaml
-    srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=1 -u bash -c '
+    srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=1 --mpi=pmix -u bash -c '
 
         echo "[image-vet] Set-up vetnode on $(hostname)..." 
         cd /tmp
@@ -33,7 +33,7 @@ test-alps-ngc-pytorch:
         pip install --no-cache-dir vetnode
         vetnode setup /tmp/config.yaml 
       '
-    srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=4 -u bash -c '
+    srun -N ${SLURM_JOB_NUM_NODES} --tasks-per-node=4 --mpi=pmix -u bash -c '
     
         echo "[image-vet] diagnose"
         cd /tmp
