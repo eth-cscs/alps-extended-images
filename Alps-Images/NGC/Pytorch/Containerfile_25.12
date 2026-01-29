@@ -79,7 +79,6 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # XPMEM
 # -----------------------------------------------------------------------------
-#ARG xpmem_ref=0d0bad4e1d07b38d53ecc8f20786bb1328c446da
 # XPMEM is not released/tagged since 2016 - we use the latest commit here
 ARG xpmem_ref=3bcab55479489fdd93847fa04c58ab16e9c0b3fd
 RUN set -eux; \
@@ -186,10 +185,6 @@ RUN set -eux; \
     cd /; \
     rm -rf "/tmp/nccl-${NCCL_VER}" /tmp/nccl.tar.gz /tmp/net.cc.patch; \
     ldconfig
-
-RUN set -eux; \
-   HPCX=/opt/hpcx; \
-   rm -rf "${HPCX}/ucc"
 
 # -----------------------------------------------------------------------------
 # Open MPI 5 into /opt/hpcx/ompi
