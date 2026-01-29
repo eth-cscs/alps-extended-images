@@ -138,7 +138,7 @@ RUN set -eux; \
 # Until https://github.com/ofiwg/libfabric/pull/11684 is merged, we apply the
 # changes in PR 11684 manually which requires a recent libfabric commit.
 ARG libfabric_commit=f8262817c337d615a1acceea6cd4ecb526ce548b
-COPY libfabric/fi_writemsg.patch /tmp/fi_writemsg.patch
+COPY Alps-Images/patches/libfabric.fi_writemsg.patch /tmp/fi_writemsg.patch
 RUN set -eux; \
     git clone https://github.com/ofiwg/libfabric.git; \
     cd libfabric; \
@@ -165,7 +165,7 @@ RUN set -eux; \
 # replace with newer 2.x version.
 # Until https://github.com/NVIDIA/nccl/pull/1979 is merged, we apply the
 # changes manually.
-COPY nccl/net.cc.patch /tmp/net.cc.patch
+COPY Alps-Images/patches/nccl.net.cc.patch /tmp/net.cc.patch
 ARG NCCL_VER=2.29.2-1
 RUN set -eux; \
     curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz; \
@@ -256,7 +256,7 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 # Until https://github.com/aws/aws-ofi-nccl/pull/1056 is merged, we apply the
 # changes manually - requires recent commit.
-COPY aws-ofi-nccl/endpoint_mr_for_rdma.patch /tmp/endpoint_mr_for_rdma.patch
+COPY Alps-Images/patches/aws-ofi-nccl.endpoint_mr_for_rdma.patch /tmp/endpoint_mr_for_rdma.patch
 RUN set -eux; \
     git clone https://github.com/aws/aws-ofi-nccl.git /tmp/aws-ofi-nccl; \
     cd /tmp/aws-ofi-nccl; \
