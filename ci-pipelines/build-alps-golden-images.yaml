@@ -6,7 +6,7 @@ stages:
   - test
 
 variables:
-  IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch-25.12-test
+  IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch-25.12
   PERSIST_IMAGE_NAME: $IMAGE_NAME
 
 build-alps-ngc-pytorch:
