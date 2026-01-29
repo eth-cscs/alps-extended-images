@@ -203,7 +203,6 @@ RUN set -eux; \
       --prefix="${HPCX}/ompi" \
       --with-ofi=/usr \
       --without-ucx \
-      --enable-oshmem \
       --with-cuda="${CUDA}" \
       --with-cuda-libdir="${CUDA}/lib64/stubs"; \
     make -j"$(nproc)"; \
