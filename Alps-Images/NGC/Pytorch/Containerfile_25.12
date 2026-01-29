@@ -69,6 +69,14 @@ RUN set -eux; \
     ldconfig
 
 # -----------------------------------------------------------------------------
+# Remove UCX and UCC
+# -----------------------------------------------------------------------------
+RUN set -eux; \
+    rm -rf /opt/hpcx/ucx || true ; \
+    rm -rf /opt/hpcx/ucc || true ; \
+    ldconfig
+
+# -----------------------------------------------------------------------------
 # XPMEM
 # -----------------------------------------------------------------------------
 #ARG xpmem_ref=0d0bad4e1d07b38d53ecc8f20786bb1328c446da
@@ -184,51 +192,6 @@ RUN set -eux; \
    rm -rf "${HPCX}/ucc"
 
 # -----------------------------------------------------------------------------
-# UCX into /opt/hpcx/ucx
-# -----------------------------------------------------------------------------
-ARG UCX_VERSION=1.19.1
-RUN set -eux; \
-    HPCX=/opt/hpcx; \
-    CUDA=/usr/local/cuda; \
-    rm -rf "${HPCX}/ucx"; \
-    curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" -o /tmp/ucx.tar.gz; \
-    tar -C /tmp -xzf /tmp/ucx.tar.gz; \
-    cd "/tmp/ucx-${UCX_VERSION}"; \
-    mkdir build; \
-    cd build; \
-    ../configure \
-      --prefix="${HPCX}/ucx" \
-      --with-cuda="${CUDA}" \
-      --with-gdrcopy=/usr/local \
-      --enable-mt \
-      --enable-devel-headers; \
-    make -j"$(nproc)"; \
-    make install; \
-    cd /; \
-    rm -rf "/tmp/ucx-${UCX_VERSION}" /tmp/ucx.tar.gz
-
-## -----------------------------------------------------------------------------
-## UCC into /opt/hpcx/ucc
-## -----------------------------------------------------------------------------
-#ARG UCC_VERSION=1.6.0
-#RUN set -eux; \
-#    HPCX=/opt/hpcx; \
-#    CUDA=/usr/local/cuda; \
-#    rm -rf "${HPCX}/ucc"; \
-#    git clone --depth 1 --branch "v${UCC_VERSION}" https://github.com/openucx/ucc.git /tmp/ucc; \
-#    cd /tmp/ucc; \
-#    ./autogen.sh; \
-#    ./configure \
-#      --prefix="${HPCX}/ucc" \
-#      --with-ucx="${HPCX}/ucx" \
-#      --with-cuda="${CUDA}" \
-#      --with-nccl; \
-#    make -j"$(nproc)"; \
-#    make install; \
-#    cd /; \
-#    rm -rf /tmp/ucc
-
-# -----------------------------------------------------------------------------
 # Open MPI 5 into /opt/hpcx/ompi
 # -----------------------------------------------------------------------------
 # OpenMPI 5 is ABI compatible with OpenMPI 4.x which was previously on the
@@ -244,8 +207,7 @@ RUN set -eux; \
     ./configure \
       --prefix="${HPCX}/ompi" \
       --with-ofi=/usr \
-      --with-ucx="${HPCX}/ucx" \
-      #--with-ucc="${HPCX}/ucc" \
+      --without-ucx \
       --enable-oshmem \
       --with-cuda="${CUDA}" \
       --with-cuda-libdir="${CUDA}/lib64/stubs"; \
