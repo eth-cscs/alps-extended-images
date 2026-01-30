@@ -35,7 +35,7 @@ build-alps-images:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: always
+    CSCS_REBUILD_POLICY: if-not-exists
     DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
     DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
     PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG"
@@ -56,4 +56,3 @@ test-alps-images:
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
     PMIX_MCA_psec: native
-    EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
