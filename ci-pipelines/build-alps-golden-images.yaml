@@ -26,17 +26,23 @@ test-alps-ngc-pytorch:
   image: $PERSIST_IMAGE_NAME
   script:
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
+    - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
-      wget -O /workspace/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
-      cd /workspace
-      python -m venv --system-site-packages .venv-${SLURM_LOCALID}
-      source .venv-${SLURM_LOCALID}/bin/activate
-      pip install --no-cache-dir vetnode
-      vetnode setup /workspace/config.yaml
+      if [ "$SLURM_LOCALID" -eq 0 ]; then
+        wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
+        cd /tmp
+        python -m venv --system-site-packages .venv
+        source .venv/bin/activate
+        pip install --no-cache-dir vetnode
+        vetnode setup /tmp/config.yaml
+      else
+        echo "[image-vet] Waiting for setup on $(hostname)..."
+        sleep 30
+      fi
     - echo "[image-vet] diagnose"
-    - cd /workspace
-    - source .venv-${SLURM_LOCALID}/bin/activate
-    - vetnode diagnose /workspace/config.yaml
+    - cd /tmp
+    - source .venv/bin/activate
+    - vetnode diagnose /tmp/config.yaml
   variables:
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
