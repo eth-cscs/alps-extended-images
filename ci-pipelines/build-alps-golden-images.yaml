@@ -3,18 +3,19 @@ include:
 
 stages: [build, test]
 
+variables:
+  IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
+
 .alps_images_matrix: &alps_images_matrix
-  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
+  - NAME: alps-ngc-pytorch
     TAG: 25.12-py3
     BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
     REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
-    PERSIST_IMAGE_NAME: "$IMAGE_NAME:$TAG"
 
-  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-nemo
+  - NAME: alps-ngc-nemo
     TAG: 25.11.01
     BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
     REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/ncclnet_plugin /opt/hpcx/sharp"
-    PERSIST_IMAGE_NAME: "$IMAGE_NAME:$TAG"
 
 build-alps-images:
   stage: build
@@ -25,16 +26,17 @@ build-alps-images:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
     CSCS_REBUILD_POLICY: always
+    DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
     DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
+    PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG"
 
 test-alps-images:
   stage: test
   extends: [.container-runner-clariden-gh200]
   parallel:
     matrix: *alps_images_matrix
-  image: "$PERSIST_IMAGE_NAME"
+  image: "$IMAGE_PREFIX/$NAME:$TAG"
   script:
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
   variables:
