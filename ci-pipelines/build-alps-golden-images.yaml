@@ -3,12 +3,6 @@ include:
 
 stages: [build, test]
 
-variables:
-  CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-  CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-  CSCS_REBUILD_POLICY: always
-  DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
-
 .alps_images_matrix: &alps_images_matrix
   - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
     TAG: 25.12-py3
@@ -29,6 +23,10 @@ build-alps-images:
   parallel:
     matrix: *alps_images_matrix
   variables:
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
+    CSCS_REBUILD_POLICY: always
     DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
 
 test-alps-images:
