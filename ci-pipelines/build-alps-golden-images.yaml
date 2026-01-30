@@ -17,7 +17,8 @@ build-alps-ngc-pytorch:
     DOCKERFILE: Alps-Images/NGC/Pytorch/Containerfile_25.12
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: ALWAYS
+    #CSCS_REBUILD_POLICY: ALWAYS
+    CSCS_REBUILD_POLICY: if-not-exists
 
 test-alps-ngc-pytorch:
   stage: test
@@ -28,13 +29,13 @@ test-alps-ngc-pytorch:
     - |
       wget -O /workspace/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
       cd /workspace
-      python -m venv --system-site-packages .venv
-      source .venv/bin/activate
+      python -m venv --system-site-packages .venv-${SLURM_LOCALID}
+      source .venv-${SLURM_LOCALID}/bin/activate
       pip install --no-cache-dir vetnode
       vetnode setup /workspace/config.yaml
     - echo "[image-vet] diagnose"
     - cd /workspace
-    - source .venv/bin/activate
+    - source .venv-${SLURM_LOCALID}/bin/activate
     - vetnode diagnose /workspace/config.yaml
   variables:
     USE_MPI: NO
