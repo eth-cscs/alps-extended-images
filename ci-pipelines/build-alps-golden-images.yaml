@@ -35,7 +35,7 @@ build-alps-images:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: if-not-exists
+    CSCS_REBUILD_POLICY: always
     DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
     DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
     PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG"
