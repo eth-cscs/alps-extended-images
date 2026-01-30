@@ -10,15 +10,13 @@ variables:
   DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
 
 .alps_images_matrix: &alps_images_matrix
-  - NAME: pytorch-25.12
-    IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
+  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
     TAG: 25.12-py3
     BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
     REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
     PERSIST_IMAGE_NAME: "$IMAGE_NAME:$TAG"
 
-  - NAME: nemo-25.11.01
-    IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-nemo
+  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-nemo
     TAG: 25.11.01
     BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
     REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/ncclnet_plugin /opt/hpcx/sharp"
@@ -36,7 +34,6 @@ build-alps-images:
 test-alps-images:
   stage: test
   extends: [.container-runner-clariden-gh200]
-  needs: ["build-alps-images"]
   parallel:
     matrix: *alps_images_matrix
   image: "$PERSIST_IMAGE_NAME"
