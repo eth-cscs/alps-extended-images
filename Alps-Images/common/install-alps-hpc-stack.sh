@@ -161,11 +161,16 @@ build_ucc() {
     git clone --depth 1 --branch "v${UCC_VERSION}" https://github.com/openucx/ucc.git /tmp/ucc
     pushd /tmp/ucc
     ./autogen.sh
+
+    local gencode_sm90='-gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90'
+    local gencode_sm90a='-gencode arch=compute_90a,code=sm_90a -gencode arch=compute_90a,code=compute_90a'
+    local gencode="${gencode_sm90} ${gencode_sm90a}"
+
     ./configure \
         --prefix="${hpcx}/ucc" \
         --with-ucx="${hpcx}/ucx" \
         --with-cuda="${cuda}" \
-        --with-nvcc-gencode="90" \
+        --with-nvcc-gencode="${gencode}" \
         --with-nccl
     make -j"$(nproc)"
     make install
