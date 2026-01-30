@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG REMOVE_HPCX_DIRS=""
+
+ARG XPMEM_REF=3bcab55479489fdd93847fa04c58ab16e9c0b3fd
+ARG GDRCOPY_VER=2.5.1
+
+ARG CASSINI_HEADERS_VERSION=release/shs-13.0.0
+ARG CXI_DRIVER_VERSION=release/shs-13.0.0
+ARG LIBCXI_VERSION=release/shs-13.0.0
+
+ARG LIBFABRIC_COMMIT=f8262817c337d615a1acceea6cd4ecb526ce548b
+ARG LIBFABRIC_PATCH="libfabric/fi_writemsg.f826281.patch"
+
+ARG NCCL_VER=2.29.2-1
+ARG NCCL_PATCH="nccl/net.cc.2.29.2-1.patch"
+
+ARG UCX_VERSION=1.19.1
+ARG UCC_VERSION=1.6.0
+ARG OMPI_VER=5.0.9
+
+ARG AWS_OFI_NCCL_COMMIT=eb9877e9cfecf725dba0794a5e0fc06f8fdf7f3f
+ARG AWS_OFI_NCCL_PATCH="aws-ofi-nccl/endpoint_mr.eb9877e.patch"
+
+ARG NCCL_TESTS_VER=2.17.8
+ARG OSU_VERSION=7.5.2
+
+ARG PIP_PACKAGES="flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]"
+
+COPY Alps-Images/patches/ /opt/alps/patches/
+COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
+
+RUN chmod +x /opt/alps/install-alps-hpc-stack.sh && \
+    /opt/alps/install-alps-hpc-stack.sh
+
+ENV CUDA_CACHE_DISABLE="1" \
+    NCCL_VERSION="${NCCL_VER}" \
+    NCCL_NET="AWS Libfabric" \
+    NCCL_CROSS_NIC="1" \
+    NCCL_P2P_LEVEL="NVL" \
+    NCCL_NET_GDR_LEVEL="PHB" \
+    NCCL_NET_GDR_C2C="1" \
+    NCCL_NET_GDR_READ="1" \
+    NCCL_PROTO="^LL128" \
+    NCCL_NCHANNELS_PER_NET_PEER="4" \
+    FI_PROVIDER="cxi" \
+    FI_CXI_DEFAULT_CQ_SIZE="131072" \
+    FI_CXI_DEFAULT_TX_SIZE="16384" \
+    FI_CXI_DISABLE_HOST_REGISTER="1" \
+    FI_CXI_RDZV_EAGER_SIZE="0" \
+    FI_CXI_RDZV_PROTO="altread" \
+    FI_CXI_RX_MATCH_MODE="hybrid" \
+    FI_MR_CACHE_MONITOR="userfaultfd" \
+    PMIX_MCA_psec="native" \
+    OMPI_MCA_btl="^tcp,ofi,vader" \
+    OMPI_MCA_pml="cm" \
+    OMPI_MCA_mtl="ofi" \
+    OMPI_MCA_opal_common_ofi_provider_include="cxi"

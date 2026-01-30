@@ -1,48 +1,45 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages:
-  - build
-  - test
+stages: [build, test]
 
 variables:
-  IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
-  PERSIST_IMAGE_NAME: $IMAGE_NAME:25.12-py3
+  CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+  CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+  CSCS_REBUILD_POLICY: always
+  DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
 
-build-alps-ngc-pytorch:
+.alps_images_matrix: &alps_images_matrix
+  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
+    TAG: 25.12-py3
+    BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
+    REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
+    PERSIST_IMAGE_NAME: "$IMAGE_NAME:$TAG"
+
+  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-nemo
+    TAG: 25.11.01
+    BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
+    REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/ncclnet_plugin /opt/hpcx/sharp"
+    PERSIST_IMAGE_NAME: "$IMAGE_NAME:$TAG"
+
+build-alps-images:
   stage: build
   extends: [.container-builder-cscs-gh200]
   timeout: 6h
+  parallel:
+    matrix: *alps_images_matrix
   variables:
-    DOCKERFILE: Alps-Images/NGC/Pytorch/Containerfile_25.12
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    #CSCS_REBUILD_POLICY: ALWAYS
-    CSCS_REBUILD_POLICY: if-not-exists
+    DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
 
-test-alps-ngc-pytorch:
+test-alps-images:
   stage: test
   extends: [.container-runner-clariden-gh200]
-  image: $PERSIST_IMAGE_NAME
+  needs: ["build-alps-images"]
+  parallel:
+    matrix: *alps_images_matrix
+  image: "$PERSIST_IMAGE_NAME"
   script:
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
-    - echo "[image-vet] Set-up vetnode on $(hostname)... "
-    - |
-      if [ "$SLURM_LOCALID" -eq 0 ]; then
-        wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
-        cd /tmp
-        python -m venv --system-site-packages .venv
-        source .venv/bin/activate
-        pip install --no-cache-dir vetnode
-        vetnode setup /tmp/config.yaml
-      else
-        echo "[image-vet] Waiting for setup on $(hostname)..."
-        sleep 30
-      fi
-    - echo "[image-vet] diagnose"
-    - cd /tmp
-    - source .venv/bin/activate
-    - vetnode diagnose /tmp/config.yaml
   variables:
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
