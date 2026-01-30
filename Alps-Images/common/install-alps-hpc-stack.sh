@@ -3,8 +3,6 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
-#CUDA_PATH="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
-
 die() {
     echo "ERROR: $*" >&2
     exit 1
@@ -55,6 +53,29 @@ apply_patch_if_set() {
     git apply --whitespace=nowarn "$patch"
 }
 
+detect_cuda_dir() {
+    if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}" ]]; then
+        echo "${CUDA_HOME}"
+        return 0
+    fi
+    if [[ -n "${CUDA_PATH:-}" && -d "${CUDA_PATH}" ]]; then
+        echo "${CUDA_PATH}"
+        return 0
+    fi
+    if command -v nvcc >/dev/null 2>&1; then
+        # nvcc is typically in <CUDA_DIR>/bin/nvcc
+        local nvcc_path
+        nvcc_path="$(command -v nvcc)"
+        echo "$(cd "$(dirname "$nvcc_path")/.." && pwd)"
+        return 0
+    fi
+    if [[ -d /usr/local/cuda ]]; then
+        echo /usr/local/cuda
+        return 0
+    fi
+    return 1
+}
+
 build_xpmem() {
     local ref="${XPMEM_REF}"
     git clone https://github.com/hpc/xpmem.git /tmp/xpmem
@@ -73,16 +94,14 @@ build_gdrcopy() {
     local ver="${GDRCOPY_VER}"
     git clone --depth 1 --branch "v${ver}" https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy
     pushd /tmp/gdrcopy
-    local cuda_path
-    cuda_path="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
-    make CC=gcc CUDA="${cuda_path}" lib -j"$(nproc)"
+    make CC=gcc CUDA="${CUDA_DIR}" lib -j"$(nproc)"
     make lib_install
     popd
     rm -rf /tmp/gdrcopy
     ldconfig
 }
 
-install_cxi_bits() {
+build_cxi_bits() {
     git clone --depth 1 --branch "${CASSINI_HEADERS_VERSION}" https://github.com/HewlettPackard/shs-cassini-headers.git /tmp/shs-cassini-headers
     cp -r /tmp/shs-cassini-headers/include/* /usr/include/
     cp -r /tmp/shs-cassini-headers/share/* /usr/share/
@@ -95,7 +114,7 @@ install_cxi_bits() {
     git clone --depth 1 --branch "${LIBCXI_VERSION}" https://github.com/HewlettPackard/shs-libcxi.git /tmp/shs-libcxi
     pushd /tmp/shs-libcxi
     ./autogen.sh
-    ./configure --prefix=/usr --with-cuda=/usr/local/cuda
+    ./configure --prefix=/usr --with-cuda="${CUDA_DIR}"
     make -j"$(nproc)"
     make install
     popd
@@ -110,7 +129,7 @@ build_libfabric() {
     apply_patch_if_set "${LIBFABRIC_PATCH}"
     ./autogen.sh
     ./configure --prefix=/usr \
-        --with-cuda=/usr/local/cuda \
+        --with-cuda="${CUDA_DIR}" \
         --enable-cuda-dlopen \
         --enable-gdrcopy-dlopen \
         --enable-xpmem=/usr \
@@ -127,7 +146,7 @@ build_nccl_deb() {
     tar -C /tmp -xzf /tmp/nccl.tar.gz
     pushd "/tmp/nccl-${NCCL_VER}"
     apply_patch_if_set "${NCCL_PATCH}"
-    make -j"$(nproc)" pkg.debian.build CUDA_HOME=/usr/local/cuda
+    make -j"$(nproc)" pkg.debian.build CUDA_HOME="${CUDA_DIR}"
     dpkg -i build/pkg/deb/*.deb
     popd
     rm -rf "/tmp/nccl-${NCCL_VER}" /tmp/nccl.tar.gz
@@ -136,7 +155,6 @@ build_nccl_deb() {
 
 build_ucx() {
     local hpcx=/opt/hpcx
-    local cuda=/usr/local/cuda
     rm -rf "${hpcx}/ucx"
     curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" -o /tmp/ucx.tar.gz
     tar -C /tmp -xzf /tmp/ucx.tar.gz
@@ -144,7 +162,7 @@ build_ucx() {
     mkdir -p build && cd build
     ../configure \
         --prefix="${hpcx}/ucx" \
-        --with-cuda="${cuda}" \
+        --with-cuda="${CUDA_DIR}" \
         --with-gdrcopy=/usr/local \
         --enable-mt \
         --enable-devel-headers
@@ -156,7 +174,6 @@ build_ucx() {
 
 build_ucc() {
     local hpcx=/opt/hpcx
-    local cuda=/usr/local/cuda
     rm -rf "${hpcx}/ucc"
     git clone --depth 1 --branch "v${UCC_VERSION}" https://github.com/openucx/ucc.git /tmp/ucc
     pushd /tmp/ucc
@@ -169,7 +186,7 @@ build_ucc() {
     ./configure \
         --prefix="${hpcx}/ucc" \
         --with-ucx="${hpcx}/ucx" \
-        --with-cuda="${cuda}" \
+        --with-cuda="${CUDA_DIR}" \
         --with-nvcc-gencode="${gencode}" \
         --with-nccl
     make -j"$(nproc)"
@@ -180,7 +197,6 @@ build_ucc() {
 
 build_ompi5() {
     local hpcx=/opt/hpcx
-    local cuda=/usr/local/cuda
     rm -rf "${hpcx}/ompi"
     curl -fsSL "https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-${OMPI_VER}.tar.gz" -o /tmp/ompi.tar.gz
     tar -C /tmp -xzf /tmp/ompi.tar.gz
@@ -191,8 +207,8 @@ build_ompi5() {
         --with-ucx="${hpcx}/ucx" \
         --with-ucc="${hpcx}/ucc" \
         --enable-oshmem \
-        --with-cuda="${cuda}" \
-        --with-cuda-libdir="${cuda}/lib64/stubs"
+        --with-cuda="${CUDA_DIR}" \
+        --with-cuda-libdir="${CUDA_DIR}/lib64/stubs"
     make -j"$(nproc)"
     make install
     popd
@@ -209,7 +225,7 @@ build_aws_ofi_nccl() {
     CPPFLAGS="" ./configure \
         --prefix=/usr \
         --with-libfabric=/usr \
-        --with-cuda=/usr/local/cuda \
+        --with-cuda="${CUDA_DIR}" \
         --with-mpi=/opt/hpcx/ompi \
         --with-hwloc=/opt/hpcx/ompi
 
@@ -227,7 +243,7 @@ build_aws_ofi_nccl() {
 build_nccl_tests() {
     git clone --depth 1 --branch "v${NCCL_TESTS_VER}" https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests
     pushd /tmp/nccl-tests
-    MPI=1 MPI_HOME=/opt/hpcx/ompi CUDA_HOME=/usr/local/cuda make -j"$(nproc)"
+    MPI=1 MPI_HOME=/opt/hpcx/ompi CUDA_HOME="${CUDA_DIR}" make -j"$(nproc)"
     install -d /usr/local/bin
     find build -maxdepth 1 -type f -executable -name '*_perf' -print -exec install -m 0755 {} /usr/local/bin/ \;
     popd
@@ -243,8 +259,8 @@ build_osu() {
     ./configure \
         --prefix=/usr/local \
         --enable-cuda \
-        --with-cuda-include=/usr/local/cuda/include \
-        --with-cuda-libpath=/usr/local/cuda/lib64
+        --with-cuda-include="${CUDA_DIR}/include" \
+        --with-cuda-libpath="${CUDA_DIR}/lib64"
     make -j"$(nproc)"
     make install
     popd
@@ -257,12 +273,19 @@ install_python_pkgs() {
 }
 
 main() {
+    CUDA_DIR="$(detect_cuda_dir)" || die "Could not determine CUDA directory..."
+    export CUDA_DIR
+    export CUDA_HOME="${CUDA_HOME:-$CUDA_DIR}"
+    export CUDA_PATH="${CUDA_PATH:-$CUDA_DIR}"
+
     apt_install_build_deps
+
     remove_efa
     remove_hpcx_plugins
+
     build_xpmem
     build_gdrcopy
-    install_cxi_bits
+    build_cxi_bits
     build_libfabric
     build_nccl_deb
     build_ucx
@@ -271,6 +294,7 @@ main() {
     build_aws_ofi_nccl
     build_nccl_tests
     build_osu
+
     install_python_pkgs
 }
 
