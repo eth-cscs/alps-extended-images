@@ -10,13 +10,15 @@ variables:
   DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
 
 .alps_images_matrix: &alps_images_matrix
-  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
+  - NAME: pytorch-25.12
+    IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
     TAG: 25.12-py3
     BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
     REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
     PERSIST_IMAGE_NAME: "$IMAGE_NAME:$TAG"
 
-  - IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-nemo
+  - NAME: nemo-25.11.01
+    IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-nemo
     TAG: 25.11.01
     BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
     REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/ncclnet_plugin /opt/hpcx/sharp"
