@@ -102,11 +102,11 @@ build-alps-app-images:
       skopeo copy "docker://$SRC" "docker://$DST"
 
 publish-base-images:
-  extends: [.container-runner-lightweight-aarch64, .publish-images-template]
+  extends: [.container-runner-lightweight-gh200, .publish-images-template]
   parallel:
     matrix: *alps_base_images_matrix
 
 publish-app-images:
-  extends: [.container-runner-lightweight-aarch64, .publish-images-template]
+  extends: [.container-runner-lightweight-gh200, .publish-images-template]
   parallel:
     matrix: *alps_app_images_matrix
