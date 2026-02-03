@@ -1,0 +1,14 @@
+FROM jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:25.12-py3-alps1
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
+ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
+
+RUN set -eux; \
+    git clone "${MEGATRON_REPO}" /opt/megatron; \
+    cd /opt/megatron; \
+    git checkout -q "${MEGATRON_COMMIT}"; \
+    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"
+
+WORKDIR /opt/megatron

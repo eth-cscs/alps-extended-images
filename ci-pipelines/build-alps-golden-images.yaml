@@ -1,48 +1,112 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages:
-  #- build
-  - test
+stages: [build-base, test-base, build-apps, publish]
 
 variables:
-  IMAGE_NAME: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/alps-ngc-pytorch
-  PERSIST_IMAGE_NAME: $IMAGE_NAME:25.12-py3
+  IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
 
-#build-alps-ngc-pytorch:
-#  stage: build
-#  extends: [.container-builder-cscs-gh200]
-#  timeout: 6h
-#  variables:
-#    DOCKERFILE: Alps-Images/NGC/Pytorch/Dockerfile
-#    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-#    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+# Note:
+# Keep the matrices small to avoid "job name too long" issues
+# Use rules to add additonal variables
 
-test-alps-ngc-pytorch:
-  stage: test
-  extends: [.container-runner-clariden-gh200]
-  image: $PERSIST_IMAGE_NAME
-  script:
-    - echo "[image-vet] Set-up vetnode on $(hostname)... "
-    - |
-      if [ "$SLURM_LOCALID" -eq 0 ]; then
-        wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
-        cd /tmp
-        python -m venv --system-site-packages .venv
-        source .venv/bin/activate
-        pip install --no-cache-dir vetnode
-        vetnode setup /tmp/config.yaml
-      else
-        echo "[image-vet] Waiting for setup on $(hostname)..."
-        sleep 30 
-      fi
-    - echo "[image-vet] diagnose"
-    - cd /tmp
-    - source .venv/bin/activate
-    - vetnode diagnose /tmp/config.yaml
+# ----------------------------
+# Base images
+# ----------------------------
+.alps_base_images_matrix: &alps_base_images_matrix
+  - PROFILE: pytorch-25.12
+    NAME: ngc-pytorch
+    TAG: 25.12-py3-alps1
+
+  - PROFILE: nemo-25.11.01
+    NAME: ngc-nemo
+    TAG: 25.11.01-alps1
+
+# ----------------------------
+# App images
+# ----------------------------
+.alps_app_images_matrix: &alps_app_images_matrix
+  - NAME: apertus-1p5
+    TAG: alps1
+    DOCKERFILE: Alps-Images/apps/apertus-1p5/Containerfile
+
+
+build-alps-images:
+  stage: build-base
+  extends: [.container-builder-cscs-gh200]
+  timeout: 6h
+  parallel:
+    matrix: *alps_base_images_matrix
+  rules:
+    - if: '$PROFILE == "pytorch-25.12"'
+      variables:
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
+        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
+    - if: '$PROFILE == "nemo-25.11.01"'
+      variables:
+        BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
+        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/ncclnet_plugin /opt/hpcx/sharp"
   variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 4
-    #USE_MPI: 'false'
-    #EDF_APPEND: 'annotations.com.hooks.cxi.enabled = "false"'
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: always
+    DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
+    DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
+    PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
 
+test-alps-images:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200]
+  parallel:
+    matrix: *alps_base_images_matrix
+  image: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+  script:
+    - alltoall_perf -b 32 -e 4M -f 2 -g 1
+  variables:
+    USE_MPI: NO
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 8
+    SLURM_MPI_TYPE: pmix
+    SLURM_NETWORK: disable_rdzv_get
+    PMIX_MCA_psec: native
+
+build-alps-app-images:
+  stage: build-apps
+  extends: [.container-builder-cscs-gh200]
+  timeout: 2h
+  parallel:
+    matrix: *alps_app_images_matrix
+  variables:
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: always
+    PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+    DOCKERFILE: $DOCKERFILE
+
+.publish-images-template:
+  stage: publish
+  # Use an image that has skopeo
+  image: quay.io/skopeo/stable:latest
+  rules:
+    # publish only on default branch
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+    - when: never
+  script:
+    - |
+      set -euxo pipefail
+      SRC="$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+      DST="$IMAGE_PREFIX/$NAME:$TAG"
+      echo "Promoting $SRC -> $DST"
+      skopeo login --username "$JFROG_USER" --password "$JFROG_KEY" "$IMAGE_REGISTRY"
+      skopeo copy "docker://$SRC" "docker://$DST"
+
+publish-base-images:
+  extends: [.container-runner-lightweight-gh200, .publish-images-template]
+  parallel:
+    matrix: *alps_base_images_matrix
+
+publish-app-images:
+  extends: [.container-runner-lightweight-gh200, .publish-images-template]
+  parallel:
+    matrix: *alps_app_images_matrix
