@@ -95,6 +95,7 @@ build-alps-app-images:
   script:
     - |
       set -euxo pipefail
+      IMAGE_REGISTRY="${IMAGE_PREFIX%%/*}"   # -> jfrog.svc.cscs.ch
       SRC="$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
       DST="$IMAGE_PREFIX/$NAME:$TAG"
       echo "Promoting $SRC -> $DST"
