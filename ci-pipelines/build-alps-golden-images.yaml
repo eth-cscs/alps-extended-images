@@ -66,7 +66,7 @@ test-alps-images:
     # NVSHMEM
     - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
     # OSU
-    - /usr/local/libexec/osu-micro-benchmarks/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
+    - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
   variables:
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
