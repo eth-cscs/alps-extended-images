@@ -274,33 +274,66 @@ build_nvshmem() {
     ## Ensure pip tooling + build deps for wheel are present
     #python -m pip install --no-cache-dir -U pip wheel setuptools "Cython>=0.29.24" "numpy>=1.26"
 
+    NVSHMEM_BUILD_EXAMPLES=0 \
+    NVSHMEM_BUILD_TESTS=1 \
+    NVSHMEM_DEBUG=0 \
+    NVSHMEM_DEVEL=0 \
+    NVSHMEM_DEFAULT_PMI2=0 \
+    NVSHMEM_DEFAULT_PMIX=1 \
+    NVSHMEM_DISABLE_COLL_POLL=1 \
+    NVSHMEM_ENABLE_ALL_DEVICE_INLINING=0 \
+    NVSHMEM_GPU_COLL_USE_LDST=0 \
+    NVSHMEM_LIBFABRIC_SUPPORT=1 \
+    NVSHMEM_MPI_SUPPORT=1 \
+    NVSHMEM_MPI_IS_OMPI=1 \
+    NVSHMEM_NVTX=1 \
+    NVSHMEM_PMIX_SUPPORT=1 \
+    NVSHMEM_SHMEM_SUPPORT=1 \
+    NVSHMEM_TEST_STATIC_LIB=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_TRACE=0 \
+    NVSHMEM_USE_DLMALLOC=0 \
+    NVSHMEM_USE_NCCL=1 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    NVSHMEM_VERBOSE=0 \
+    NVSHMEM_DEFAULT_UCX=0 \
+    NVSHMEM_UCX_SUPPORT=1 \
+    NVSHMEM_IBGDA_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT_GPUMEM_ONLY=0 \
+    NVSHMEM_IBDEVX_SUPPORT=0 \
+    NVSHMEM_IBRC_SUPPORT=0 \
+    LIBFABRIC_HOME=/usr \
+    NCCL_HOME=/usr \
+    GDRCOPY_HOME=/usr/local \
+    MPI_HOME=/opt/hpcx/ompi \
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
-        -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}" \
-        -DNVSHMEM_BUILD_EXAMPLES=OFF \
-        -DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF \
-        -DNVSHMEM_BUILD_TXZ_PACKAGE=OFF \
-        -DNVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo ON || echo OFF)" \
-        -DNVSHMEM_BUILD_PYTHON_LIB="$([[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]] && echo ON || echo OFF)" \
-        -DNVSHMEM_MPI_SUPPORT=ON \
-        -DNVSHMEM_MPI_IS_OMPI=1 \
-        -DMPI_HOME=/opt/hpcx/ompi \
-        -DNVSHMEM_UCX_SUPPORT=ON \
-        -DUCX_HOME=/opt/hpcx/ucx \
-        -DNVSHMEM_USE_NCCL=ON \
-        -DNCCL_HOME=/usr \
-        -DNVSHMEM_USE_GDRCOPY=ON \
-        -DGDRCOPY_HOME=/usr/local \
-        -DNVSHMEM_LIBFABRIC_SUPPORT=ON \
-        -DLIBFABRIC_HOME=/usr \
-        -DNVSHMEM_DEBUG=0 \
-        -DNVSHMEM_DEVEL=0 \
-        -DNVSHMEM_DEFAULT_PMI2=0 \
-        -DNVSHMEM_DEFAULT_PMIX=1 \
-        -DNVSHMEM_PMI2_SUPPORT=1 \
-        -DNVSHMEM_PMIX_SUPPORT=1 \
-        -DNVSHMEM_NVTX=1
+        -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
+
+        #-DNVSHMEM_BUILD_EXAMPLES=OFF \
+        #-DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF \
+        #-DNVSHMEM_BUILD_TXZ_PACKAGE=OFF \
+        #-DNVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo ON || echo OFF)" \
+        #-DNVSHMEM_BUILD_PYTHON_LIB="$([[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]] && echo ON || echo OFF)" \
+        #-DNVSHMEM_MPI_SUPPORT=ON \
+        #-DNVSHMEM_MPI_IS_OMPI=1 \
+        #-DMPI_HOME=/opt/hpcx/ompi \
+        #-DNVSHMEM_UCX_SUPPORT=ON \
+        #-DUCX_HOME=/opt/hpcx/ucx \
+        #-DNVSHMEM_USE_NCCL=ON \
+        #-DNCCL_HOME=/usr \
+        #-DNVSHMEM_USE_GDRCOPY=ON \
+        #-DGDRCOPY_HOME=/usr/local \
+        #-DNVSHMEM_LIBFABRIC_SUPPORT=ON \
+        #-DLIBFABRIC_HOME=/usr \
+        #-DNVSHMEM_DEBUG=0 \
+        #-DNVSHMEM_DEVEL=0 \
+        #-DNVSHMEM_DEFAULT_PMI2=0 \
+        #-DNVSHMEM_DEFAULT_PMIX=1 \
+        #-DNVSHMEM_PMI2_SUPPORT=1 \
+        #-DNVSHMEM_PMIX_SUPPORT=1 \
+        #-DNVSHMEM_NVTX=1
 
     cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
     cmake --install "${NVSHMEM_BUILDDIR}"
