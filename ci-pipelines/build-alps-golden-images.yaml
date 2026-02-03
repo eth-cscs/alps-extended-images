@@ -16,11 +16,11 @@ variables:
 .alps_base_images_matrix: &alps_base_images_matrix
   - PROFILE: pytorch-25.12
     NAME: ngc-pytorch
-    TAG: 25.12-py3-alps1
+    TAG: 25.12-py3-alps2
 
   - PROFILE: nemo-25.11.01
     NAME: ngc-nemo
-    TAG: 25.11.01-alps1
+    TAG: 25.11.01-alps2
 
 # ----------------------------
 # App images
