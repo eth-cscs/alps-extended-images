@@ -61,7 +61,12 @@ test-alps-images:
     matrix: *alps_base_images_matrix
   image: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
   script:
+    # NCCL
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
+    # NVSHMEM
+    - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
+    # OSU
+    - /usr/local/libexec/osu-micro-benchmarks/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
   variables:
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
