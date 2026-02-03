@@ -336,8 +336,15 @@ EOF
             python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
-            python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r "${req}"
+            
+            #python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r "${req}"
+            # Install nvshmem4py deps *except* the pip-provided NVSHMEM runtime (nvidia-nvshmem-cuXX).
+            # Avoid upgrades unless needed.
+            python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r <(
+                grep -Ev '^\s*(nvidia[-_])?nvshmem(-cu[0-9]+)?\s*([=<>!~].*)?\s*$' "${req}"
+            )
             #python -m pip install cuda-core[cu${cuda_major}] cuda-bindings cuda-pathfinder nvidia-mathdx nvidia-libmathdx-cu${cuda_major}
+
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
         fi
     fi
