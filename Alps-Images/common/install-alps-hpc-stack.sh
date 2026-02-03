@@ -334,7 +334,10 @@ EOF
             [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
 
             python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
-            python -m pip install cuda-core[cu${cuda_major}] cuda-bindings cuda-pathfinder nvidia-mathdx nvidia-libmathdx-cu${cuda_major}
+            req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
+            [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
+            python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r "${req}"
+            #python -m pip install cuda-core[cu${cuda_major}] cuda-bindings cuda-pathfinder nvidia-mathdx nvidia-libmathdx-cu${cuda_major}
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
         fi
     fi
