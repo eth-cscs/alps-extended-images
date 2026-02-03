@@ -263,8 +263,10 @@ build_nvshmem() {
 
     # Fetch source tarball
     local url tarball
-    url="https://github.com/NVIDIA/nvshmem/archive/refs/tags/v${NVSHMEM_VERSION}.tar.gz"
+    #url="https://github.com/NVIDIA/nvshmem/archive/refs/tags/v${NVSHMEM_VERSION}.tar.gz"
+    url="https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VERSION}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VERSION}.tar.gz"
     tarball="/tmp/nvshmem-${NVSHMEM_VERSION}.tar.gz"
+    echo "[nvshmem4py] fetching from ${url}"
     curl -fsSL "${url}" -o "${tarball}"
     tar -C "${NVSHMEM_SRC_DIR}" -xzf "${tarball}" --strip-components=1
     rm -f "${tarball}"
