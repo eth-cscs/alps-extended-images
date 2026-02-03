@@ -293,7 +293,14 @@ build_nvshmem() {
         -DNVSHMEM_USE_GDRCOPY=ON \
         -DGDRCOPY_HOME=/usr/local \
         -DNVSHMEM_LIBFABRIC_SUPPORT=ON \
-        -DLIBFABRIC_HOME=/usr
+        -DLIBFABRIC_HOME=/usr \
+        -DNVSHMEM_DEBUG=0 \
+        -DNVSHMEM_DEVEL=0 \
+        -DNVSHMEM_DEFAULT_PMI2=0 \
+        -DNVSHMEM_DEFAULT_PMIX=1 \
+        -DNVSHMEM_PMI2_SUPPORT=1 \
+        -DNVSHMEM_PMIX_SUPPORT=1 \
+        -DNVSHMEM_NVTX=1
 
     cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
     cmake --install "${NVSHMEM_BUILDDIR}"
