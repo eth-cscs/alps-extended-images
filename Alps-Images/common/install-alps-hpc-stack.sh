@@ -259,17 +259,20 @@ build_nvshmem() {
     rm -rf /usr/lib/*/nvshmem || true
 
     rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
-    mkdir -p "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
+    #mkdir -p "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
+    mkdir -p "${NVSHMEM_BUILDDIR}"
 
-    # Fetch source tarball
-    local url tarball
-    #url="https://github.com/NVIDIA/nvshmem/archive/refs/tags/v${NVSHMEM_VER}.tar.gz"
-    url="https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VER}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VER}.tar.gz"
-    tarball="/tmp/nvshmem-${NVSHMEM_VER}.tar.gz"
-    echo "[nvshmem4py] fetching from ${url}"
-    curl -fsSL "${url}" -o "${tarball}"
-    tar -C "${NVSHMEM_SRC_DIR}" -xzf "${tarball}" --strip-components=1
-    rm -f "${tarball}"
+    ## Fetch source tarball
+    #local url tarball
+    ##url="https://github.com/NVIDIA/nvshmem/archive/refs/tags/v${NVSHMEM_VER}.tar.gz"
+    #url="https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VER}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VER}.tar.gz"
+    #tarball="/tmp/nvshmem-${NVSHMEM_VER}.tar.gz"
+    #echo "[nvshmem4py] fetching from ${url}"
+    #curl -fsSL "${url}" -o "${tarball}"
+    #tar -C "${NVSHMEM_SRC_DIR}" -xzf "${tarball}" --strip-components=1
+    #rm -f "${tarball}"
+
+    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git ${NVSHMEM_SRC_DIR}
 
     ## Ensure pip tooling + build deps for wheel are present
     #python -m pip install --no-cache-dir -U pip wheel setuptools "Cython>=0.29.24" "numpy>=1.26"
