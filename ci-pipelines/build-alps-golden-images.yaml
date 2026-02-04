@@ -75,6 +75,43 @@ test-alps-images:
     SLURM_NETWORK: disable_rdzv_get
     PMIX_MCA_psec: native
 
+test-alps-images-vetnode:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200]
+  parallel:
+    matrix: *alps_base_images_matrix
+  image: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+  script:
+    - echo "[image-vet] Set-up vetnode on $(hostname)... "
+    - |
+      if [ "$SLURM_LOCALID" -eq 0 ]; then
+        wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
+        cd /tmp
+        python -m venv --system-site-packages .venv
+        source .venv/bin/activate
+        p install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
+        vetnode setup /tmp/config.yaml
+        touch /tmp/setup-done-${SLURM_JOB_ID}
+      else
+        echo "[image-vet] Waiting for setup on $(hostname)..."
+        timeout=60
+        while [ ! -f "/tmp/setup-done-${SLURM_JOB_ID}" ] && [ $timeout -gt 0 ]; do
+            sleep 1
+            ((timeout--))
+        done
+      fi
+    - echo "[image-vet] diagnose"
+    - cd /tmp
+    - source .venv/bin/activate
+    - vetnode diagnose /tmp/config.yaml
+  variables:
+    USE_MPI: NO
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 4
+    SLURM_MPI_TYPE: pmix
+    SLURM_NETWORK: disable_rdzv_get
+    PMIX_MCA_psec: native
+
 build-alps-app-images:
   stage: build-apps
   extends: [.container-builder-cscs-gh200]
