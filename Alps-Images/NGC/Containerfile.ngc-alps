@@ -27,7 +27,7 @@ ARG OMPI_VER=5.0.9
 ARG AWS_OFI_NCCL_COMMIT=eb9877e9cfecf725dba0794a5e0fc06f8fdf7f3f
 ARG AWS_OFI_NCCL_PATCH="aws-ofi-nccl/endpoint_mr.eb9877e.patch"
 
-ARG NVSHMEM_VERSION=3.5.19-1
+ARG NVSHMEM_VER=3.5.19-1
 
 ARG NCCL_TESTS_VER=2.17.8
 ARG OSU_VERSION=7.5.2
@@ -63,6 +63,7 @@ ENV CUDA_CACHE_DISABLE="1" \
     OMPI_MCA_pml="cm" \
     OMPI_MCA_mtl="ofi" \
     OMPI_MCA_opal_common_ofi_provider_include="cxi" \
+    NVSHMEM_VERSION="${NVSHMEM_VER}" \
     NVSHMEM_REMOTE_TRANSPORT="libfabric" \
     NVSHMEM_LIBFABRIC_PROVIDER="cxi" \
     NVSHMEM_DISABLE_CUDA_VMM="1"
