@@ -259,23 +259,10 @@ build_nvshmem() {
     rm -rf /usr/lib/*/nvshmem || true
 
     rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
-    #mkdir -p "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
     mkdir -p "${NVSHMEM_BUILDDIR}"
 
-    ## Fetch source tarball
-    #local url tarball
-    ##url="https://github.com/NVIDIA/nvshmem/archive/refs/tags/v${NVSHMEM_VER}.tar.gz"
-    #url="https://developer.download.nvidia.com/compute/redist/nvshmem/${NVSHMEM_VER}/source/nvshmem_src_cuda12-all-all-${NVSHMEM_VER}.tar.gz"
-    #tarball="/tmp/nvshmem-${NVSHMEM_VER}.tar.gz"
-    #echo "[nvshmem4py] fetching from ${url}"
-    #curl -fsSL "${url}" -o "${tarball}"
-    #tar -C "${NVSHMEM_SRC_DIR}" -xzf "${tarball}" --strip-components=1
-    #rm -f "${tarball}"
-
+    # Clone repo
     git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git ${NVSHMEM_SRC_DIR}
-
-    ## Ensure pip tooling + build deps for wheel are present
-    #python -m pip install --no-cache-dir -U pip wheel setuptools "Cython>=0.29.24" "numpy>=1.26"
 
     NVSHMEM_BUILD_EXAMPLES=0 \
     NVSHMEM_BUILD_TESTS=1 \
@@ -314,30 +301,6 @@ build_nvshmem() {
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
-
-        #-DNVSHMEM_BUILD_EXAMPLES=OFF \
-        #-DNVSHMEM_BUILD_HYDRA_LAUNCHER=OFF \
-        #-DNVSHMEM_BUILD_TXZ_PACKAGE=OFF \
-        #-DNVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo ON || echo OFF)" \
-        #-DNVSHMEM_BUILD_PYTHON_LIB="$([[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]] && echo ON || echo OFF)" \
-        #-DNVSHMEM_MPI_SUPPORT=ON \
-        #-DNVSHMEM_MPI_IS_OMPI=1 \
-        #-DMPI_HOME=/opt/hpcx/ompi \
-        #-DNVSHMEM_UCX_SUPPORT=ON \
-        #-DUCX_HOME=/opt/hpcx/ucx \
-        #-DNVSHMEM_USE_NCCL=ON \
-        #-DNCCL_HOME=/usr \
-        #-DNVSHMEM_USE_GDRCOPY=ON \
-        #-DGDRCOPY_HOME=/usr/local \
-        #-DNVSHMEM_LIBFABRIC_SUPPORT=ON \
-        #-DLIBFABRIC_HOME=/usr \
-        #-DNVSHMEM_DEBUG=0 \
-        #-DNVSHMEM_DEVEL=0 \
-        #-DNVSHMEM_DEFAULT_PMI2=0 \
-        #-DNVSHMEM_DEFAULT_PMIX=1 \
-        #-DNVSHMEM_PMI2_SUPPORT=1 \
-        #-DNVSHMEM_PMIX_SUPPORT=1 \
-        #-DNVSHMEM_NVTX=1
 
     cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
     cmake --install "${NVSHMEM_BUILDDIR}"
@@ -381,13 +344,11 @@ EOF
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
             
-            #python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r "${req}"
             # Install nvshmem4py deps *except* the pip-provided NVSHMEM runtime (nvidia-nvshmem-cuXX).
             # Avoid upgrades unless needed.
             python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r <(
                 grep -Ev '^\s*(nvidia[-_])?nvshmem(-cu[0-9]+)?\s*([=<>!~].*)?\s*$' "${req}"
             )
-            #python -m pip install cuda-core[cu${cuda_major}] cuda-bindings cuda-pathfinder nvidia-mathdx nvidia-libmathdx-cu${cuda_major}
 
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
         fi
