@@ -306,6 +306,7 @@ build_nvshmem() {
     NCCL_HOME=/usr \
     GDRCOPY_HOME=/usr/local \
     MPI_HOME=/opt/hpcx/ompi \
+    PMIX_HOME=/opt/hpcx/ompi \
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
