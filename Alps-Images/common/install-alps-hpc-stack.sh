@@ -230,6 +230,7 @@ build_aws_ofi_nccl() {
         --with-hwloc=/opt/hpcx/ompi
 
     # critical fix: remove /usr/include being injected as -isystem
+    echo "filtering Makefiles"
     grep -R --line-number --fixed-string " -isystem /usr/include" . || true
     find . -name 'Makefile' -o -name 'Makefile.in' | xargs sed -i 's| -isystem /usr/include||g'
 
