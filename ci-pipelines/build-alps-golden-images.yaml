@@ -16,11 +16,11 @@ variables:
 .alps_base_images_matrix: &alps_base_images_matrix
   - PROFILE: pytorch-25.12
     NAME: ngc-pytorch
-    TAG: 25.12-py3-alps1
+    TAG: 25.12-py3-alps2
 
   - PROFILE: nemo-25.11.01
     NAME: ngc-nemo
-    TAG: 25.11.01-alps1
+    TAG: 25.11.01-alps2
 
 # ----------------------------
 # App images
@@ -61,7 +61,12 @@ test-alps-images:
     matrix: *alps_base_images_matrix
   image: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
   script:
+    # NCCL
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
+    # NVSHMEM
+    - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
+    # OSU
+    - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
   variables:
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2

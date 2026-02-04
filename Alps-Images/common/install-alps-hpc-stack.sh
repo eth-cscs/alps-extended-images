@@ -240,6 +240,123 @@ build_aws_ofi_nccl() {
     ldconfig
 }
 
+build_nvshmem() {
+    : "${NVSHMEM_PREFIX:=/opt/nvshmem}"
+    : "${NVSHMEM_BUILDDIR:=/tmp/nvshmem-build}"
+    : "${NVSHMEM_SRC_DIR:=/tmp/nvshmem-src}"
+    : "${NVSHMEM_CUDA_ARCH:=90}"
+    : "${NVSHMEM_ENABLE_PYTHON:=1}"
+    : "${NVSHMEM_ENABLE_TESTS:=1}"
+
+    # Remove preinstalled NVSHMEM
+    apt-get update
+    apt-get purge -y 'libnvshmem*-cuda-*' 'nvshmem*' || true
+    apt-get autoremove -y || true
+
+    # Remove CUDA symlinks/copies that can shadow our install
+    rm -f "${CUDA_DIR}/lib64/libnvshmem"*".so"* || true
+    rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*".so"* || true
+    rm -rf /usr/lib/*/nvshmem || true
+
+    rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
+    mkdir -p "${NVSHMEM_BUILDDIR}"
+
+    # Clone repo
+    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git ${NVSHMEM_SRC_DIR}
+
+    NVSHMEM_BUILD_EXAMPLES=0 \
+    NVSHMEM_BUILD_TESTS=1 \
+    NVSHMEM_DEBUG=0 \
+    NVSHMEM_DEVEL=0 \
+    NVSHMEM_DEFAULT_PMI2=0 \
+    NVSHMEM_DEFAULT_PMIX=1 \
+    NVSHMEM_DISABLE_COLL_POLL=1 \
+    NVSHMEM_ENABLE_ALL_DEVICE_INLINING=0 \
+    NVSHMEM_GPU_COLL_USE_LDST=0 \
+    NVSHMEM_LIBFABRIC_SUPPORT=1 \
+    NVSHMEM_MPI_SUPPORT=1 \
+    NVSHMEM_MPI_IS_OMPI=1 \
+    NVSHMEM_NVTX=1 \
+    NVSHMEM_PMIX_SUPPORT=1 \
+    NVSHMEM_SHMEM_SUPPORT=1 \
+    NVSHMEM_TEST_STATIC_LIB=0 \
+    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
+    NVSHMEM_TRACE=0 \
+    NVSHMEM_USE_DLMALLOC=0 \
+    NVSHMEM_USE_NCCL=1 \
+    NVSHMEM_USE_GDRCOPY=1 \
+    NVSHMEM_VERBOSE=0 \
+    NVSHMEM_DEFAULT_UCX=0 \
+    NVSHMEM_UCX_SUPPORT=1 \
+    NVSHMEM_IBGDA_SUPPORT=0 \
+    NVSHMEM_IBGDA_SUPPORT_GPUMEM_ONLY=0 \
+    NVSHMEM_IBDEVX_SUPPORT=0 \
+    NVSHMEM_IBRC_SUPPORT=0 \
+    LIBFABRIC_HOME=/usr \
+    NCCL_HOME=/usr \
+    GDRCOPY_HOME=/usr/local \
+    MPI_HOME=/opt/hpcx/ompi \
+    PMIX_HOME=/opt/hpcx/ompi \
+    cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
+        -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
+
+    cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
+    cmake --install "${NVSHMEM_BUILDDIR}"
+
+    # Ensure loader finds our NVSHMEM without LD_LIBRARY_PATH
+    cat > /etc/ld.so.conf.d/99-nvshmem.conf <<EOF
+${NVSHMEM_PREFIX}/lib
+${NVSHMEM_PREFIX}/lib64
+EOF
+    ldconfig
+
+    # pip install wheel (build installs/copies wheels into prefix but does not install into python)
+    if [[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]]; then
+        if python -c 'import nvshmem.core as _' >/dev/null 2>&1; then
+            echo "[nvshmem4py] already importable; skipping wheel install"
+        else
+            local cp_tag mach cuda_major best
+            cp_tag="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
+            mach="$(python -c 'import platform; print(platform.machine())')"
+            cuda_major="$("${CUDA_DIR}/bin/nvcc" --version | awk '/release [0-9]+/ {for(i=1;i<=NF;i++) if($i=="release"){gsub(",","",$(i+1)); split($(i+1),a,"."); print a[1]; exit}}')"
+
+            # Prefer the most specific wheel: linux_<arch> > manylinux
+            # Search both build/dist and install tree dist locations
+            best="$(
+              find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
+                   -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
+              | grep -E "${cp_tag}-${cp_tag}-linux_${mach}\.whl$" \
+              | sort -V | tail -n1 || true
+            )"
+            if [[ -z "${best}" ]]; then
+              best="$(
+                find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
+                     -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
+                | grep -E "${cp_tag}-${cp_tag}-.*manylinux.*_${mach}\.whl$" \
+                | sort -V | tail -n1 || true
+              )"
+            fi
+            [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
+
+            python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
+            req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
+            [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
+            
+            # Install nvshmem4py deps *except* the pip-provided NVSHMEM runtime (nvidia-nvshmem-cuXX).
+            # Avoid upgrades unless needed.
+            python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r <(
+                grep -Ev '^\s*(nvidia[-_])?nvshmem(-cu[0-9]+)?\s*([=<>!~].*)?\s*$' "${req}"
+            )
+
+            python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
+        fi
+    fi
+
+    rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
+}
+
 build_nccl_tests() {
     git clone --depth 1 --branch "v${NCCL_TESTS_VER}" https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests
     pushd /tmp/nccl-tests
@@ -292,6 +409,8 @@ main() {
     build_ucc
     build_ompi5
     build_aws_ofi_nccl
+    build_nvshmem
+
     build_nccl_tests
     build_osu
 
