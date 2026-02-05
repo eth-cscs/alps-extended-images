@@ -89,7 +89,7 @@ test-alps-images-vetnode:
         cd /tmp
         python -m venv --system-site-packages .venv
         source .venv/bin/activate
-        p install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
+        pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
         vetnode setup /tmp/config.yaml
         touch /tmp/setup-done-${SLURM_JOB_ID}
       else
