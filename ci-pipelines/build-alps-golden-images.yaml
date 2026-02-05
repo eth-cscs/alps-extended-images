@@ -106,7 +106,7 @@ test-alps-images-vetnode:
     - vetnode diagnose /tmp/config.yaml
   variables:
     USE_MPI: NO
-    SLURM_JOB_NUM_NODES: 2
+    SLURM_JOB_NUM_NODES: 8
     SLURM_NTASKS: 4
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
