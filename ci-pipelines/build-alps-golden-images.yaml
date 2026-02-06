@@ -14,6 +14,10 @@ variables:
 # Base images
 # ----------------------------
 .alps_base_images_matrix: &alps_base_images_matrix
+  - PROFILE: pytorch-26.01
+    NAME: ngc-pytorch
+    TAG: 26.01-py3-alps2
+  
   - PROFILE: pytorch-25.12
     NAME: ngc-pytorch
     TAG: 25.12-py3-alps2
@@ -42,6 +46,10 @@ build-alps-images:
       variables:
         BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
         REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
+    - if: '$PROFILE == "pytorch-26.01"'
+      variables:
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:26.01-py3
+        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
     - if: '$PROFILE == "nemo-25.11.01"'
       variables:
         BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
