@@ -49,7 +49,7 @@ build-alps-images:
     - if: '$PROFILE == "pytorch-26.01"'
       variables:
         BASE_IMAGE: nvcr.io/nvidia/pytorch:26.01-py3
-        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
+        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
     - if: '$PROFILE == "nemo-25.11.01"'
       variables:
         BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
