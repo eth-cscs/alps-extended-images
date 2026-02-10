@@ -1,14 +1,22 @@
-FROM jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:25.12-py3-alps1
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
-ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
+#ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
+#ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
+ARG MEGATRON_REPO="https://github.com/boeschf/Megatron-LM.git"
+ARG MEGATRON_COMMIT="669c4e8ffcc100cb3cfda3bf577b24dbb5541dd4"
 
 RUN set -eux; \
     git clone "${MEGATRON_REPO}" /opt/megatron; \
     cd /opt/megatron; \
     git checkout -q "${MEGATRON_COMMIT}"; \
-    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"
+    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"; \
+    python3 setup.py build_ext --inplace;
+
+# Tests shipped with the image
+COPY Alps-Images/apps/apertus-1p5/tests/ /opt/tests/apertus-1p5/
+RUN chmod -R a+rX /opt/tests/apertus-1p5
 
 WORKDIR /opt/megatron

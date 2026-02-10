@@ -1,73 +1,254 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [build-base, test-base, build-apps, publish]
+stages: [build-base, test-base, build-apps, test-apps, publish]
 
+# ----------------------------
+# Global variables
+# ----------------------------
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
-
-# Note:
-# Keep the matrices small to avoid "job name too long" issues
-# Use rules to add additonal variables
+  ALPS_REV: alps2
 
 # ----------------------------
-# Base images
+# Image matrix anchors
 # ----------------------------
+# NOTE: Keep the matrices small to avoid "job name too long" issues
+
 .alps_base_images_matrix: &alps_base_images_matrix
-  - PROFILE: pytorch-26.01
-    NAME: ngc-pytorch
-    TAG: 26.01-py3-alps2
-  
-  - PROFILE: pytorch-25.12
-    NAME: ngc-pytorch
-    TAG: 25.12-py3-alps2
+  - NGC_NAME: pytorch
+    NGC_TAG: 26.01-py3
+  - NGC_NAME: pytorch
+    NGC_TAG: 25.12-py3
+  - NGC_NAME: nemo
+    NGC_TAG: 25.11.01
 
-  - PROFILE: nemo-25.11.01
-    NAME: ngc-nemo
-    TAG: 25.11.01-alps2
-
-# ----------------------------
-# App images
-# ----------------------------
 .alps_app_images_matrix: &alps_app_images_matrix
   - NAME: apertus-1p5
-    TAG: alps1
-    DOCKERFILE: Alps-Images/apps/apertus-1p5/Containerfile
+  - NAME: apertus-2
 
+# ----------------------------
+# Dependency mapping for matrix jobs as anchors
+# ----------------------------
+# These are required to achieve unambiguous mapping between two matrix jobs
+# when explicitly defining "needs:" in the downstream job, as GitLab does not
+# support automatic mapping based on the matrix values.
 
-build-alps-images:
+.base_needs_map: &base_needs_map
+  parallel:
+    matrix:
+      - NGC_NAME: ['$[[ matrix.NGC_NAME ]]']
+        NGC_TAG: ['$[[ matrix.NGC_TAG ]]']
+
+.app_needs_map: &app_needs_map
+  parallel:
+    matrix:
+      - NAME: ['$[[ matrix.NAME ]]']
+
+# ----------------------------
+# Skopeo: manipulate images in the registry
+# ----------------------------
+.skopeo-template:
+  image: quay.io/skopeo/stable:latest
+  before_script:
+    - source ci-pipelines/helpers/skopeo.sh
+    - skopeo_login
+
+# ----------------------------
+# Slurm: set pertinent env variables
+# ----------------------------
+.slurm-template:
+  variables:
+    USE_MPI: NO
+    SLURM_MPI_TYPE: pmix
+    SLURM_NETWORK: disable_rdzv_get
+    PMIX_MCA_psec: native
+
+# ----------------------------
+# Meta job: determines image name
+# ----------------------------
+# Creates content hash and determines if build is needed based on changes in
+# relevant files. Passes necessary variables to the builder job via artifacts.
+
+build-base-meta:
   stage: build-base
-  extends: [.container-builder-cscs-gh200]
-  timeout: 6h
+  extends: [.container-runner-lightweight-gh200, .skopeo-template]
   parallel:
     matrix: *alps_base_images_matrix
-  rules:
-    - if: '$PROFILE == "pytorch-25.12"'
-      variables:
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.12-py3
-        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_mrc_plugin /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
-    - if: '$PROFILE == "pytorch-26.01"'
-      variables:
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:26.01-py3
-        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/nccl_spectrum-x_plugin /opt/hpcx/sharp"
-    - if: '$PROFILE == "nemo-25.11.01"'
-      variables:
-        BASE_IMAGE: nvcr.io/nvidia/nemo:25.11.01
-        REMOVE_HPCX_DIRS: "/opt/hpcx/hcoll /opt/hpcx/nccl_rdma_sharp_plugin /opt/hpcx/ncclnet_plugin /opt/hpcx/sharp"
+  script:
+    - source ci-pipelines/helpers/meta.sh
+    - |
+      set -euo pipefail
+
+      # Generate content-hash based image references and additional container build variables
+      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(base_refs "$NGC_NAME" "$NGC_TAG")
+      REMOVE_HPCX_DIRS="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
+
+      # Check if the canonical image already exists in the registry to determine if a build is needed
+      if img_exists "$CANON_IMAGE_REF"; then BUILD_NEEDED=0; else BUILD_NEEDED=1; fi
+
+      # Export variables to a file for the builder job
+      cat > build.env <<EOF
+      DOCKERFILE=$DOCKERFILE
+      CANON_IMAGE_REF=$CANON_IMAGE_REF
+      TEST_IMAGE_REF=$TEST_IMAGE_REF
+      STABLE_IMAGE_REF=$STABLE_IMAGE_REF
+      BUILD_NEEDED=$BUILD_NEEDED
+      BASE_IMAGE=$BASE_IMAGE_REF
+      REMOVE_HPCX_DIRS=$REMOVE_HPCX_DIRS
+      EOF
+
+      # For debugging: print the generated variables
+      echo "Generated build variables:"
+      cat build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+
+build-apps-meta:
+  stage: build-apps
+  extends: [.container-runner-lightweight-gh200, .skopeo-template]
+  parallel:
+    matrix: *alps_app_images_matrix
+  script:
+    - source ci-pipelines/helpers/meta.sh
+    - |
+      set -euo pipefail
+
+      # Generate content-hash based image references and additional container build variables
+      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$NAME")
+
+      # Check if the canonical image already exists in the registry to determine if a build is needed
+      if img_exists "$CANON_IMAGE_REF"; then BUILD_NEEDED=0; else BUILD_NEEDED=1; fi
+
+      # Export variables to a file for the builder job
+      cat > build_apps.env <<EOF
+      DOCKERFILE=$DOCKERFILE
+      CANON_IMAGE_REF=$CANON_IMAGE_REF
+      TEST_IMAGE_REF=$TEST_IMAGE_REF
+      STABLE_IMAGE_REF=$STABLE_IMAGE_REF
+      BUILD_NEEDED=$BUILD_NEEDED
+      BASE_IMAGE=$BASE_IMAGE_REF
+      EOF
+
+      # For debugging: print the generated variables
+      echo "Generated build variables:"
+      cat build_apps.env
+  artifacts:
+    reports:
+      dotenv: build_apps.env
+
+# ----------------------------
+# Build images
+# ----------------------------
+# The build jobs read the variables generated in the meta jobs and build the
+# images accordingly. BASE_IMAGE and REMOVE_HPCX_DIRS are passed as build args
+# to the image builder.
+
+.build-images-template:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: always
-    DOCKERFILE: Alps-Images/NGC/Containerfile.ngc-alps
-    DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
-    PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+  before_script:
+    - |
+      set -euo pipefail
+      if [[ "${BUILD_NEEDED}" != "1" ]]; then
+        echo "BUILD_NEEDED=$BUILD_NEEDED -> skipping build"
+        exit 0
+      fi
+      export PERSIST_IMAGE_NAME="$CANON_IMAGE_REF"
+      echo "Building: $PERSIST_IMAGE_NAME"
+  timeout: 6h
 
-test-alps-images:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200]
+build-base-images:
+  stage: build-base
+  extends: [.container-builder-cscs-gh200, .build-images-template]
   parallel:
     matrix: *alps_base_images_matrix
-  image: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+  needs:
+    - job: build-base-meta
+      artifacts: true
+      <<: *base_needs_map
+  variables:
+    DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
+
+build-app-images:
+  stage: build-apps
+  extends: [.container-builder-cscs-gh200, .build-images-template]
+  parallel:
+    matrix: *alps_app_images_matrix
+  needs:
+    - job: build-apps-meta
+      artifacts: true
+      <<: *app_needs_map
+  variables:
+    DOCKER_BUILD_ARGS: '["BASE_IMAGE"]'
+
+# ----------------------------
+# Re-tag images with commit SHA for testing
+# ----------------------------
+# The commit SHA is known at configuration time of the pipeline unlike the
+# content hash, which becomes known only at runtime of the pipeline. Thus, we
+# cannot use the content hash directly in the test stage to pull the image, but
+# we can copy the image to a new tag with the commit SHA for the test stage.
+
+.tag-images-template:
+  extends: [.container-runner-lightweight-gh200, .skopeo-template]
+  variables:
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+  script:
+    - |
+      set -euo pipefail
+      copy_if_needed "$CANON_IMAGE_REF" "$TEST_IMAGE_REF"
+
+tag-base-images-for-ci:
+  stage: build-base
+  extends: [.tag-images-template]
+  parallel:
+    matrix: *alps_base_images_matrix
+  needs:
+    - job: build-base-meta
+      artifacts: true
+      <<: *base_needs_map
+    - job: build-base-images
+      <<: *base_needs_map
+
+tag-app-images-for-ci:
+  stage: build-apps
+  extends: [.tag-images-template]
+  parallel:
+    matrix: *alps_app_images_matrix
+  needs:
+    - job: build-apps-meta
+      artifacts: true
+      <<: *app_needs_map
+    - job: build-app-images
+      <<: *app_needs_map
+
+# ----------------------------
+# Run tests on the images
+# ----------------------------
+# The test jobs use the test tags created in the previous step. They run a set of
+# sanity checks to verify the functionality of the images.
+# Current tets for the baase images:
+# - NCCL alltoall_perf
+# - NVSHMEM alltoall_latency
+# - OSU alltoall
+# - vetnode diagnose
+#   - basic cuda kernel launch
+#   - NCCL low-level tests for intra-node, inter-node and full-topology scenarios
+#   - NCCL through PyTorch
+# Current tests for the app images:
+# - Apertus 1.5: Megatron pretraining script
+# - Apertus 2: pplx garden benchmark
+
+test-base-images:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  parallel:
+    matrix: *alps_base_images_matrix
+  image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     # NCCL
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
@@ -76,19 +257,15 @@ test-alps-images:
     # OSU
     - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
   variables:
-    USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
-    SLURM_MPI_TYPE: pmix
-    SLURM_NETWORK: disable_rdzv_get
-    PMIX_MCA_psec: native
 
-test-alps-images-vetnode:
+test-base-images-vetnode:
   stage: test-base
-  extends: [.container-runner-clariden-gh200]
+  extends: [.container-runner-clariden-gh200, .slurm-template]
   parallel:
     matrix: *alps_base_images_matrix
-  image: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
@@ -113,51 +290,95 @@ test-alps-images-vetnode:
     - source .venv/bin/activate
     - vetnode diagnose /tmp/config.yaml
   variables:
-    USE_MPI: NO
     SLURM_JOB_NUM_NODES: 4
     SLURM_NTASKS: 16
-    SLURM_MPI_TYPE: pmix
-    SLURM_NETWORK: disable_rdzv_get
-    PMIX_MCA_psec: native
 
-build-alps-app-images:
-  stage: build-apps
-  extends: [.container-builder-cscs-gh200]
+test-apertus-1p5:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
   timeout: 2h
-  parallel:
-    matrix: *alps_app_images_matrix
+  image: "$IMAGE_PREFIX/apertus-1p5:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-1p5/megatron_pretrain.sh
   variables:
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: always
-    PERSIST_IMAGE_NAME: "$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
-    DOCKERFILE: $DOCKERFILE
+    CI_FAST: "1"
+    TP_CI: "1"
+    PP_CI: "1"
+    USE_MPI: NO
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 8
 
-.publish-images-template:
+test-apertus-2:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 2h
+  image: "$IMAGE_PREFIX/apertus-2:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-2/pplx-garden-benchmark.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 2
+
+# ----------------------------
+# Publish
+# ----------------------------
+# Upload the images to the registry with stable tags under certain conditions:
+# - All tests must have executed and passed (enforced by the "needs:"
+#   dependency on the test jobs in the publish-gate job)
+# - The commit must be on the default branch (enforced in the script with a
+#   check on CI_COMMIT_BRANCH)
+# - The stable tag must not already exist with different content (enforced by
+#   promote_check_strict)
+
+publish-gate:
   stage: publish
-  # Use an image that has skopeo
-  image: quay.io/skopeo/stable:latest
-  rules:
-    # publish only on default branch
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: on_success
-    - when: never
+  extends: [.container-runner-lightweight-gh200, .skopeo-template]
+  # make sure to keep the "needs" up to date when adding new test jobs
+  needs:
+    - test-base-images
+    - test-base-images-vetnode
+    - test-apertus-1p5
+    - test-apertus-2
+  script:
+    - echo "Publish gate passed (tests completed)"
+
+.publish-template:
+  stage: publish
+  extends: [.container-runner-lightweight-gh200, .skopeo-template]
   script:
     - |
-      set -euxo pipefail
-      IMAGE_REGISTRY="${IMAGE_PREFIX%%/*}"   # -> jfrog.svc.cscs.ch
-      SRC="$IMAGE_PREFIX/$NAME:$TAG-$CI_COMMIT_SHORT_SHA"
-      DST="$IMAGE_PREFIX/$NAME:$TAG"
-      echo "Promoting $SRC -> $DST"
-      skopeo login --username "$JFROG_USER" --password "$JFROG_KEY" "$IMAGE_REGISTRY"
-      skopeo copy "docker://$SRC" "docker://$DST"
+      set -euo pipefail
+      echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+
+      # CAUTION: The following operation overrides the stable images!
+      # Only uncomment for special circumstances
+      #skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
+
+      # Always run strict check (fails if stable exists but differs)
+      promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+      # Only promote on default branch
+      if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+        promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+      else
+        echo "Dry-run only (not default branch): promotion not executed."
+      fi
 
 publish-base-images:
-  extends: [.container-runner-lightweight-gh200, .publish-images-template]
+  extends: [.publish-template]
   parallel:
     matrix: *alps_base_images_matrix
+  needs:
+    - job: publish-gate
+    - job: build-base-meta
+      artifacts: true
+      <<: *base_needs_map
 
 publish-app-images:
-  extends: [.container-runner-lightweight-gh200, .publish-images-template]
+  extends: [.publish-template]
   parallel:
     matrix: *alps_app_images_matrix
+  needs:
+    - job: publish-gate
+    - job: build-apps-meta
+      artifacts: true
+      <<: *app_needs_map

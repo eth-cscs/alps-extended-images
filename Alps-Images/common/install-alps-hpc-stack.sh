@@ -221,8 +221,19 @@ build_aws_ofi_nccl() {
     pushd /tmp/aws-ofi-nccl
     git reset --hard "${AWS_OFI_NCCL_COMMIT}"
     apply_patch_if_set "${AWS_OFI_NCCL_PATCH}"
+
+    unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
+    export CPPFLAGS="${CPPFLAGS:-}"
+    export CFLAGS="${CFLAGS:-}"
+    export CXXFLAGS="${CXXFLAGS:-}"
+    CPPFLAGS="$(echo "$CPPFLAGS" | sed 's| -isystem /usr/include||g')"
+    CFLAGS="$(echo "$CFLAGS" | sed 's| -isystem /usr/include||g')"
+    CXXFLAGS="$(echo "$CXXFLAGS" | sed 's| -isystem /usr/include||g')"
+    export CPPFLAGS CFLAGS CXXFLAGS
+
     ./autogen.sh
-    CPPFLAGS="" ./configure \
+
+    ./configure \
         --prefix=/usr \
         --with-libfabric=/usr \
         --with-cuda="${CUDA_DIR}" \
@@ -230,9 +241,10 @@ build_aws_ofi_nccl() {
         --with-hwloc=/opt/hpcx/ompi
 
     # critical fix: remove /usr/include being injected as -isystem
-    echo "filtering Makefiles"
-    grep -R --line-number --fixed-string " -isystem /usr/include" . || true
-    find . -name 'Makefile' -o -name 'Makefile.in' | xargs sed -i 's| -isystem /usr/include||g'
+    find . \( \
+        -name 'Makefile' -o -name 'Makefile.in' -o -name 'Makefile.am' -o -name '*.mk' -o -name 'config.status' -o -name 'libtool' \
+    \) -type f -print0 \
+    | xargs -0 -r sed -i 's| -isystem /usr/include||g'
 
     make -j"$(nproc)"
     make install
