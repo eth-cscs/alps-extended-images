@@ -37,35 +37,26 @@ ARG PIP_PACKAGES="flask-restful einops sentencepiece transformers tiktoken wandb
 COPY Alps-Images/patches/ /opt/alps/patches/
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
 
-RUN chmod +x /opt/alps/install-alps-hpc-stack.sh && \
+RUN set -eux; \
+    chmod +x /opt/alps/install-alps-hpc-stack.sh; \
     /opt/alps/install-alps-hpc-stack.sh
 
-ENV CUDA_CACHE_DISABLE="1" \
+COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
+
+RUN set -eux; \
+    chmod 0644 /opt/alps/env/alps-runtime.env; \
+    printf '%s\n' 'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
+        > /etc/profile.d/99-alps-env.sh
+
+COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
+COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
+COPY Alps-Images/common/alps-runtime-warning.py /opt/alps/env/alps-runtime-warning.py
+COPY Alps-Images/common/install-alps-runtime-warnings.sh /opt/alps/env/install-alps-runtime-warnings.sh
+
+RUN set -eux; \
+    chmod +x /opt/alps/env/install-alps-runtime-warnings.sh; \
+    /opt/alps/env/install-alps-runtime-warnings.sh
+
+ENV \
     NCCL_VERSION="${NCCL_VER}" \
-    NCCL_NET="AWS Libfabric" \
-    NCCL_CROSS_NIC="1" \
-    NCCL_P2P_LEVEL="NVL" \
-    NCCL_NET_GDR_LEVEL="PHB" \
-    NCCL_NET_GDR_C2C="1" \
-    NCCL_NET_GDR_READ="1" \
-    NCCL_PROTO="^LL128" \
-    NCCL_NCHANNELS_PER_NET_PEER="4" \
-    FI_PROVIDER="cxi" \
-    FI_CXI_DEFAULT_CQ_SIZE="131072" \
-    FI_CXI_DEFAULT_TX_SIZE="16384" \
-    FI_CXI_DISABLE_HOST_REGISTER="1" \
-    FI_CXI_RDZV_EAGER_SIZE="0" \
-    FI_CXI_RDZV_PROTO="alt_read" \
-    FI_CXI_RDZV_GET_MIN="0" \
-    FI_CXI_RDZV_THRESHOLD="0" \
-    FI_CXI_RX_MATCH_MODE="hybrid" \
-    FI_MR_CACHE_MONITOR="userfaultfd" \
-    PMIX_MCA_psec="native" \
-    OMPI_MCA_btl="^tcp,ofi,vader" \
-    OMPI_MCA_pml="cm" \
-    OMPI_MCA_mtl="ofi" \
-    OMPI_MCA_opal_common_ofi_provider_include="cxi" \
-    NVSHMEM_VERSION="${NVSHMEM_VER}" \
-    NVSHMEM_REMOTE_TRANSPORT="libfabric" \
-    NVSHMEM_LIBFABRIC_PROVIDER="cxi" \
-    NVSHMEM_DISABLE_CUDA_VMM="1"
+    NVSHMEM_VERSION="${NVSHMEM_VER}"

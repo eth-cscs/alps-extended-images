@@ -82,13 +82,13 @@ base_refs() {
 
   local profile_file="Alps-Images/NGC/${ngc_name}-${ngc_tag}.env"
   local dockerfile="Alps-Images/NGC/Containerfile.ngc-alps"
-  local install_sh="Alps-Images/common/install-alps-hpc-stack.sh"
+  local common_dir="Alps-Images/common"
   local patches_dir="Alps-Images/patches"
 
-  [[ -f "$profile_file" ]]  || { echo "ERROR: missing $profile_file" >&2; return 1; }
-  [[ -f "$dockerfile" ]]    || { echo "ERROR: missing $dockerfile" >&2; return 1; }
-  [[ -f "$install_sh" ]]    || { echo "ERROR: missing $install_sh" >&2; return 1; }
-  [[ -d "$patches_dir" ]]   || { echo "ERROR: missing $patches_dir" >&2; return 1; }
+  [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
+  [[ -f "$dockerfile" ]]   || { echo "ERROR: missing $dockerfile" >&2; return 1; }
+  [[ -d "$common_dir" ]]   || { echo "ERROR: missing $common_dir" >&2; return 1; }
+  [[ -d "$patches_dir" ]]  || { echo "ERROR: missing $patches_dir" >&2; return 1; }
 
   # Load REMOVE_HPCX_DIRS from profile file
   # shellcheck disable=SC1090
@@ -100,7 +100,7 @@ base_refs() {
   local base_image_ref="nvcr.io/nvidia/${ngc_name}:${ngc_tag}"
 
   # Compute canonical tag from hashed content
-  local hash_paths="$dockerfile $install_sh $patches_dir $profile_file"
+  local hash_paths="$dockerfile $common_dir $patches_dir $profile_file"
   local name="ngc-${ngc_name}"
   local tag="${ngc_tag}-${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag")"

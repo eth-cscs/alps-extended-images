@@ -232,6 +232,7 @@ tag-app-images-for-ci:
 # The test jobs use the test tags created in the previous step. They run a set of
 # sanity checks to verify the functionality of the images.
 # Current tets for the baase images:
+# - Ensure environment variables are set correctly
 # - NCCL alltoall_perf
 # - NVSHMEM alltoall_latency
 # - OSU alltoall
@@ -243,7 +244,33 @@ tag-app-images-for-ci:
 # - Apertus 1.5: Megatron pretraining script
 # - Apertus 2: pplx garden benchmark
 
-test-base-images:
+test-base-images-env:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  parallel:
+    matrix: *alps_base_images_matrix
+  image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - |
+      set -euo pipefail
+
+      # Check that the relevant environment variables are set correctly in the image
+      test "${FI_PROVIDER:-}" = "cxi"
+      test "${FI_CXI_RDZV_PROTO:-}" = "alt_read"
+      test "${NCCL_NET:-}" = "AWS Libfabric"
+      test "${NCCL_PROTO:-}" = "^LL128"
+      test "${NVSHMEM_REMOTE_TRANSPORT:-}" = "libfabric"
+      test "${NVSHMEM_LIBFABRIC_PROVIDER:-}" = "cxi"
+
+      # Check that the environment variables are exported with the correct semantics
+      test "${NCCL_VERSION:-}" = "dummy"
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+    # Set dummy value for environment variables to test that it will be overridden by the image's entrypoint or environment setup scripts
+    NCCL_VERSION: dummy
+
+test-base-images-collectives:
   stage: test-base
   extends: [.container-runner-clariden-gh200, .slurm-template]
   parallel:
@@ -335,7 +362,8 @@ publish-gate:
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
   # make sure to keep the "needs" up to date when adding new test jobs
   needs:
-    - test-base-images
+    - test-base-images-env
+    - test-base-images-collectives
     - test-base-images-vetnode
     - test-apertus-1p5
     - test-apertus-2
