@@ -8,7 +8,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 # ----------------------------
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
-  ALPS_REV: alps2
+  ALPS_REV: alps3-dev
 
 # ----------------------------
 # Image matrix anchors
@@ -84,16 +84,12 @@ build-base-meta:
       read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(base_refs "$NGC_NAME" "$NGC_TAG")
       REMOVE_HPCX_DIRS="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
 
-      # Check if the canonical image already exists in the registry to determine if a build is needed
-      if img_exists "$CANON_IMAGE_REF"; then BUILD_NEEDED=0; else BUILD_NEEDED=1; fi
-
       # Export variables to a file for the builder job
       cat > build.env <<EOF
       DOCKERFILE=$DOCKERFILE
       CANON_IMAGE_REF=$CANON_IMAGE_REF
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
-      BUILD_NEEDED=$BUILD_NEEDED
       BASE_IMAGE=$BASE_IMAGE_REF
       REMOVE_HPCX_DIRS=$REMOVE_HPCX_DIRS
       EOF
@@ -118,16 +114,12 @@ build-apps-meta:
       # Generate content-hash based image references and additional container build variables
       read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$NAME")
 
-      # Check if the canonical image already exists in the registry to determine if a build is needed
-      if img_exists "$CANON_IMAGE_REF"; then BUILD_NEEDED=0; else BUILD_NEEDED=1; fi
-
       # Export variables to a file for the builder job
       cat > build_apps.env <<EOF
       DOCKERFILE=$DOCKERFILE
       CANON_IMAGE_REF=$CANON_IMAGE_REF
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
-      BUILD_NEEDED=$BUILD_NEEDED
       BASE_IMAGE=$BASE_IMAGE_REF
       EOF
 
@@ -149,13 +141,11 @@ build-apps-meta:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: if-not-exists
+    CSCS_BUILD_CACHE: $CSCS_REGISTRY_PATH/build_cache
   before_script:
     - |
       set -euo pipefail
-      if [[ "${BUILD_NEEDED}" != "1" ]]; then
-        echo "BUILD_NEEDED=$BUILD_NEEDED -> skipping build"
-        exit 0
-      fi
       export PERSIST_IMAGE_NAME="$CANON_IMAGE_REF"
       echo "Building: $PERSIST_IMAGE_NAME"
   timeout: 6h
@@ -378,17 +368,25 @@ publish-gate:
       set -euo pipefail
       echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
 
-      # CAUTION: The following operation overrides the stable images!
-      # Only uncomment for special circumstances
-      #skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-
-      # Always run strict check (fails if stable exists but differs)
-      promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
-      # Only promote on default branch
-      if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
-        promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+      if [[ "${ALPS_REV}" =~ -dev$ ]]; then
+        # For dev versions, we allow non-strict promotion (overwrites stable
+        # tag regardless of content) but only on the default branch
+        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
+          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+        else
+          echo "Dry-run only (dev version detected and not default branch): promotion not executed."
+        fi
       else
-        echo "Dry-run only (not default branch): promotion not executed."
+        # Always run strict check (fails if stable exists but differs)
+        promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+        # Only promote on default branch
+        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+        else
+          echo "Dry-run only (not default branch): promotion not executed."
+        fi
       fi
 
 publish-base-images:

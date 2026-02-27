@@ -96,8 +96,9 @@ base_refs() {
   : "${REMOVE_HPCX_DIRS:?REMOVE_HPCX_DIRS must be set in ${profile_file}}"
   REMOVE_HPCX_DIRS_B64="$(printf '%s' "$REMOVE_HPCX_DIRS" | base64 -w0)"
 
-  # BASE_IMAGE points to the NGC image we build on top of
-  local base_image_ref="nvcr.io/nvidia/${ngc_name}:${ngc_tag}"
+  # BASE IMAGE points to NGC image via remote proxy (jfrog) (speed up downloads
+  # in CI and avoid hitting NGC rate limits)
+  local base_image_ref=" jfrog.svc.cscs.ch/nvcr/nvidia/${ngc_name}:${ngc_tag}"
 
   # Compute canonical tag from hashed content
   local hash_paths="$dockerfile $common_dir $patches_dir $profile_file"
