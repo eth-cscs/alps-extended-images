@@ -136,6 +136,9 @@ build_libfabric() {
         --enable-cxi
     make -j"$(nproc)"
     make install
+    mkdir -p /opt/alps/env
+    printf 'export LIBFABRIC_VERSION=%q\n' "$(fi_info --version | head -n 1 | awk '{ print $2; }')" >> /opt/alps/env/alps-versions.env
+    printf 'export LIBFABRIC_COMMIT=%q\n' "${LIBFABRIC_COMMIT}" >> /opt/alps/env/alps-versions.env
     popd
     rm -rf /tmp/libfabric
     ldconfig
@@ -148,6 +151,8 @@ build_nccl_deb() {
     apply_patch_if_set "${NCCL_PATCH}"
     make -j"$(nproc)" pkg.debian.build CUDA_HOME="${CUDA_DIR}"
     dpkg -i build/pkg/deb/*.deb
+    mkdir -p /opt/alps/env
+    printf 'export NCCL_VERSION=%q\n' "${NCCL_VER}" >> /opt/alps/env/alps-versions.env
     # Produces: ext-profiler/inspector/libnccl-profiler-inspector.so
     pushd ext-profiler/inspector
     make -j"$(nproc)" CUDA_HOME="${CUDA_DIR}"
@@ -173,6 +178,8 @@ build_ucx() {
         --enable-devel-headers
     make -j"$(nproc)"
     make install
+    mkdir -p /opt/alps/env
+    printf 'export UCX_VERSION=%q\n' "${UCX_VERSION}" >> /opt/alps/env/alps-versions.env
     popd
     rm -rf "/tmp/ucx-${UCX_VERSION}" /tmp/ucx.tar.gz
 }
@@ -196,6 +203,8 @@ build_ucc() {
         --with-nccl
     make -j"$(nproc)"
     make install
+    mkdir -p /opt/alps/env
+    printf 'export UCC_VERSION=%q\n' "${UCC_VERSION}" >> /opt/alps/env/alps-versions.env
     popd
     rm -rf /tmp/ucc
 }
@@ -216,6 +225,8 @@ build_ompi5() {
         --with-cuda-libdir="${CUDA_DIR}/lib64/stubs"
     make -j"$(nproc)"
     make install
+    mkdir -p /opt/alps/env
+    printf 'export OMPI_VERSION=%q\n' "${OMPI_VER}" >> /opt/alps/env/alps-versions.env
     popd
     rm -rf "/tmp/openmpi-${OMPI_VER}" /tmp/ompi.tar.gz
     ldconfig
@@ -253,6 +264,11 @@ build_aws_ofi_nccl() {
 
     make -j"$(nproc)"
     make install
+
+    mkdir -p /opt/alps/env
+    printf 'export AWS_OFI_NCCL_VERSION=%q\n' "$(./m4/get_version.sh)" >> /opt/alps/env/alps-versions.env
+    printf 'export AWS_OFI_NCCL_COMMIT=%q\n' "${AWS_OFI_NCCL_COMMIT}" >> /opt/alps/env/alps-versions.env
+
     popd
     rm -rf /tmp/aws-ofi-nccl
     ldconfig
@@ -328,6 +344,10 @@ build_nvshmem() {
 ${NVSHMEM_PREFIX}/lib
 ${NVSHMEM_PREFIX}/lib64
 EOF
+
+    mkdir -p /opt/alps/env
+    printf 'export NVSHMEM_VERSION=%q\n' "${NVSHMEM_VER}" >> /opt/alps/env/alps-versions.env
+
     ldconfig
 
     # pip install wheel (build installs/copies wheels into prefix but does not install into python)

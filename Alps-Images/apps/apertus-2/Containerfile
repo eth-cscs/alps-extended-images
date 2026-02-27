@@ -3,6 +3,18 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
 # System deps
 RUN set -eux; \
     apt-get update; \
@@ -63,6 +75,36 @@ RUN set -eux; \
     cp -a /tmp/pplx_garden/benchmarks /opt/pplx-garden/benchmarks; \
     cp -a /tmp/pplx_garden/tests /opt/pplx-garden/tests; \
     rm -rf /tmp/pplx_garden
+
+# Install DeepEP
+ARG DEEPEP_REPO=https://github.com/boeschf/DeepEP.git
+ARG DEEPEP_COMMIT=ea669122295c9a8f47ed13f69e408fb745dc7bca
+RUN set -eux; \
+    git clone --depth 1 "${DEEPEP_REPO}" /tmp/DeepEP; \
+    pushd /tmp/DeepEP; \
+    git fetch --depth 1 origin "${DEEPEP_COMMIT}"; \
+    git checkout -q "${DEEPEP_COMMIT}"; \
+    NVSHMEM_DIR=/opt/nvshmem \
+    DISABLE_SM90_FEATURES=0 \
+    TORCH_CUDA_ARCH_LIST="9.0" \
+    DISABLE_AGGRESSIVE_PTX_INSTRS=0 \
+        python setup.py install; \
+    popd; \
+    # Vendor benchmark code into the image
+    rm -rf /opt/DeepEP; \
+    mkdir /opt/DeepEP; \
+    cp -a /tmp/DeepEP/tests /opt/DeepEP/tests; \
+    rm -rf /tmp/DeepEP
+
+# Install quack-kernels
+ARG QUACK_REPO=https://github.com/Dao-AILab/quack.git
+ARG QUACK_TAG=v0.2.10
+RUN set -eux; \
+    git clone --depth 1 --branch "${QUACK_TAG}" "${QUACK_REPO}" /tmp/quack; \
+    pushd /tmp/quack; \
+    python -m pip install --upgrade-strategy only-if-needed '.[cu13]'; \
+    popd; \
+    rm -rf /tmp/quack
 
 # Tests shipped with the image
 COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/

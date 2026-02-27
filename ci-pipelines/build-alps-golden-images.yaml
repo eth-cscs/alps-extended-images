@@ -92,6 +92,10 @@ build-base-meta:
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
       REMOVE_HPCX_DIRS=$REMOVE_HPCX_DIRS
+      OCI_SOURCE="${CI_PROJECT_URL}"
+      OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
+      OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
       EOF
 
       # For debugging: print the generated variables
@@ -121,6 +125,10 @@ build-apps-meta:
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
+      OCI_SOURCE="${CI_PROJECT_URL}"
+      OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
+      OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
       EOF
 
       # For debugging: print the generated variables
@@ -160,7 +168,14 @@ build-base-images:
       artifacts: true
       <<: *base_needs_map
   variables:
-    DOCKER_BUILD_ARGS: '["BASE_IMAGE", "REMOVE_HPCX_DIRS"]'
+    DOCKER_BUILD_ARGS: '[
+      "BASE_IMAGE",
+      "REMOVE_HPCX_DIRS",
+      "OCI_SOURCE",
+      "OCI_REVISION",
+      "OCI_CREATED",
+      "CSCS_ALPS_GIT_COMMIT_SHORT"
+    ]'
 
 build-app-images:
   stage: build-apps
@@ -172,7 +187,13 @@ build-app-images:
       artifacts: true
       <<: *app_needs_map
   variables:
-    DOCKER_BUILD_ARGS: '["BASE_IMAGE"]'
+    DOCKER_BUILD_ARGS: '[
+      "BASE_IMAGE",
+      "OCI_SOURCE",
+      "OCI_REVISION",
+      "OCI_CREATED",
+      "CSCS_ALPS_GIT_COMMIT_SHORT"
+    ]'
 
 # ----------------------------
 # Re-tag images with commit SHA for testing
@@ -325,7 +346,7 @@ test-apertus-1p5:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
 
-test-apertus-2:
+test-apertus-2-pplx-garden:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
   timeout: 2h
@@ -335,6 +356,17 @@ test-apertus-2:
   variables:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 2
+
+test-apertus-2-DeepEP:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 2h
+  image: "$IMAGE_PREFIX/apertus-2:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-2/deep-ep-benchmark.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
 
 # ----------------------------
 # Publish
@@ -356,7 +388,8 @@ publish-gate:
     - test-base-images-collectives
     - test-base-images-vetnode
     - test-apertus-1p5
-    - test-apertus-2
+    - test-apertus-2-pplx-garden
+    - test-apertus-2-DeepEP
   script:
     - echo "Publish gate passed (tests completed)"
 
