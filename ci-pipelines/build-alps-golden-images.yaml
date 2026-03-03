@@ -8,7 +8,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 # ----------------------------
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
-  ALPS_REV: alps3
+  ALPS_REV: alps4-dev
 
 # ----------------------------
 # Image matrix anchors
