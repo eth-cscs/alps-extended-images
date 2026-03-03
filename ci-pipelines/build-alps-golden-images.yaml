@@ -308,7 +308,7 @@ test-base-images-vetnode:
     - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
       if [ "$SLURM_LOCALID" -eq 0 ]; then
-        wget -O /tmp/config.yaml https://raw.githubusercontent.com/theely/vetnode/refs/heads/main/examples/image-vet/config.yaml
+        wget -O /tmp/config.yaml https://raw.githubusercontent.com/eth-cscs/vetnode/refs/heads/main/examples/image-vet/config.yaml
         cd /tmp
         python -m venv --system-site-packages .venv
         source .venv/bin/activate
