@@ -16,16 +16,18 @@ variables:
 # NOTE: Keep the matrices small to avoid "job name too long" issues
 
 .alps_base_images_matrix: &alps_base_images_matrix
-  - NGC_NAME: pytorch
-    NGC_TAG: 26.01-py3
-  - NGC_NAME: pytorch
-    NGC_TAG: 25.12-py3
-  - NGC_NAME: nemo
-    NGC_TAG: 25.11.01
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "26.01-py3"
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "25.12-py3"
+  - NGC_NAME: "nemo"
+    NGC_TAG: "25.11.01"
+  - NGC_NAME: "physicsnemo"
+    NGC_TAG: "25.11"
 
 .alps_app_images_matrix: &alps_app_images_matrix
-  - NAME: apertus-1p5
-  - NAME: apertus-2
+  - NAME: "apertus-1p5"
+  - NAME: "apertus-2"
 
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
@@ -87,6 +89,7 @@ build-base-meta:
       # Export variables to a file for the builder job
       cat > build.env <<EOF
       DOCKERFILE=$DOCKERFILE
+      NGC_VARIANT_DIR=${NGC_NAME}-${NGC_TAG}
       CANON_IMAGE_REF=$CANON_IMAGE_REF
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
@@ -170,6 +173,7 @@ build-base-images:
   variables:
     DOCKER_BUILD_ARGS: '[
       "BASE_IMAGE",
+      "NGC_VARIANT_DIR",
       "REMOVE_HPCX_DIRS",
       "OCI_SOURCE",
       "OCI_REVISION",

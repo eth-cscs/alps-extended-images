@@ -80,11 +80,13 @@ base_refs() {
   : "${ALPS_REV:?ALPS_REV must be set}"
   : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
 
-  local profile_file="Alps-Images/NGC/${ngc_name}-${ngc_tag}.env"
+  local image_dir="Alps-Images/NGC/${ngc_name}-${ngc_tag}"
+  local profile_file="${image_dir}/profile.env"
   local dockerfile="Alps-Images/NGC/Containerfile.ngc-alps"
   local common_dir="Alps-Images/common"
   local patches_dir="Alps-Images/patches"
 
+  [[ -d "$image_dir" ]]    || { echo "ERROR: missing $image_dir" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
   [[ -f "$dockerfile" ]]   || { echo "ERROR: missing $dockerfile" >&2; return 1; }
   [[ -d "$common_dir" ]]   || { echo "ERROR: missing $common_dir" >&2; return 1; }
@@ -96,12 +98,18 @@ base_refs() {
   : "${REMOVE_HPCX_DIRS:?REMOVE_HPCX_DIRS must be set in ${profile_file}}"
   REMOVE_HPCX_DIRS_B64="$(printf '%s' "$REMOVE_HPCX_DIRS" | base64 -w0)"
 
+  # Some nvcr images have a different repo structure, e.g. physicsnemo:
+  # nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
+  # but most are like nvcr.io/nvidia/pytorch:25.12-py3, so we need to handle both cases.
+  # Load NVCR_PREFIX from profile file, default to "nvidia" if not set.
+  NVCR_PREFIX="${NVCR_PREFIX:-nvidia}"
+
   # BASE IMAGE points to NGC image via remote proxy (jfrog) (speed up downloads
   # in CI and avoid hitting NGC rate limits)
-  local base_image_ref=" jfrog.svc.cscs.ch/nvcr/nvidia/${ngc_name}:${ngc_tag}"
+  local base_image_ref="jfrog.svc.cscs.ch/nvcr/${NVCR_PREFIX}/${ngc_name}:${ngc_tag}"
 
   # Compute canonical tag from hashed content
-  local hash_paths="$dockerfile $common_dir $patches_dir $profile_file"
+  local hash_paths="$dockerfile $common_dir $patches_dir $image_dir"
   local name="ngc-${ngc_name}"
   local tag="${ngc_tag}-${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag")"
