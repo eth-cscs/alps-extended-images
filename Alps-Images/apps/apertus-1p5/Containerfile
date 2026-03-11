@@ -15,16 +15,13 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
-#ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
-#ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
-ARG MEGATRON_REPO="https://github.com/boeschf/Megatron-LM.git"
-ARG MEGATRON_COMMIT="669c4e8ffcc100cb3cfda3bf577b24dbb5541dd4"
+ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
+ARG MEGATRON_COMMIT="multimodality/main"
 
 RUN set -eux; \
     git clone "${MEGATRON_REPO}" /opt/megatron; \
     cd /opt/megatron; \
     git checkout -q "${MEGATRON_COMMIT}"; \
-    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"; \
     python3 setup.py build_ext --inplace;
 
 # Tests shipped with the image
