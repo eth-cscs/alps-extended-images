@@ -3,6 +3,7 @@ include:
 
 stages: [build-base, test-base, build-apps, test-apps, publish]
 
+
 # ----------------------------
 # Global variables
 # ----------------------------
