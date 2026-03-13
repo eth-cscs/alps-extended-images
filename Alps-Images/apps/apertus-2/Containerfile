@@ -57,7 +57,7 @@ RUN set -eux; \
 
 # Install patched pplx-garden
 ARG PPLX_GARDEN_REPO=https://github.com/boeschf/pplx_garden_cxi.git
-ARG PPLX_GARDEN_COMMIT=52663e208c30f32f532248dec63b3f4cb4dc664a
+ARG PPLX_GARDEN_COMMIT=77587943df26f7e63fbe4d096a7cb93236b40312
 RUN set -eux; \
     python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install --no-cache-dir build; \
     rm -rf /tmp/pplx_garden; \
