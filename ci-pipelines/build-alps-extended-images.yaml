@@ -346,6 +346,7 @@ test-apertus-1p5:
     CI_FAST: "1"
     TP_CI: "1"
     PP_CI: "1"
+    CHECKPOINT_STEPS_CI: "2"
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
