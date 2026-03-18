@@ -32,6 +32,6 @@ COPY Alps-Images/apps/apertus-1p5/tests/ /opt/tests/apertus-1p5/
 RUN chmod -R a+rX /opt/tests/apertus-1p5
 
 RUN set -eux; \
-    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-cache-dir nvidia-ml-py==13.590.48
+    python -m pip install --no-cache-dir nvidia-ml-py==13.590.48
 
 WORKDIR /opt/megatron
