@@ -7,7 +7,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 # Global variables
 # ----------------------------
 variables:
-  IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
+  IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps4-dev
 
 # ----------------------------
@@ -150,8 +150,8 @@ build-apps-meta:
 
 .build-images-template:
   variables:
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CUSTOM_REGISTRY_USERNAME: $GITHUB_ACTOR
+    CUSTOM_REGISTRY_PASSWORD: $GITHUB_TOKEN
     CSCS_REBUILD_POLICY: if-not-exists
     CSCS_BUILD_CACHE: $CSCS_REGISTRY_PATH/build_cache
   before_script:
@@ -210,8 +210,8 @@ build-app-images:
 .tag-images-template:
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
   variables:
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CUSTOM_REGISTRY_USERNAME: $GITHUB_ACTOR
+    CUSTOM_REGISTRY_PASSWORD: $GITHUB_TOKEN
   script:
     - |
       set -euo pipefail

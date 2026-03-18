@@ -3,10 +3,10 @@ set -euo pipefail
 
 skopeo_login() {
   : "${IMAGE_PREFIX:?IMAGE_PREFIX must be set}"
-  : "${JFROG_USER:?JFROG_USER must be set}"
-  : "${JFROG_KEY:?JFROG_KEY must be set}"
+  : "${GITHUB_ACTOR:?GITHUB_ACTOR must be set}"
+  : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
   local reg="${IMAGE_PREFIX%%/*}"
-  skopeo login --username "${JFROG_USER}" --password "${JFROG_KEY}" "${reg}" >/dev/null
+  skopeo login --username "${GITHUB_ACTOR}" --password "${GITHUB_TOKEN}" "${reg}" >/dev/null
 }
 
 # prints digest or empty string if missing/unreachable
