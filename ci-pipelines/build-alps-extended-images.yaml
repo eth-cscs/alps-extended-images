@@ -7,7 +7,8 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 # Global variables
 # ----------------------------
 variables:
-  IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
+  IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
+  GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps4-dev
 
 # ----------------------------
@@ -150,8 +151,8 @@ build-apps-meta:
 
 .build-images-template:
   variables:
-    CUSTOM_REGISTRY_USERNAME: $GITHUB_ACTOR
-    CUSTOM_REGISTRY_PASSWORD: $GITHUB_TOKEN
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
     CSCS_REBUILD_POLICY: if-not-exists
     CSCS_BUILD_CACHE: $CSCS_REGISTRY_PATH/build_cache
   before_script:
@@ -210,8 +211,8 @@ build-app-images:
 .tag-images-template:
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
   variables:
-    CUSTOM_REGISTRY_USERNAME: $GITHUB_ACTOR
-    CUSTOM_REGISTRY_PASSWORD: $GITHUB_TOKEN
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
   script:
     - |
       set -euo pipefail
@@ -403,14 +404,17 @@ publish-gate:
   script:
     - |
       set -euo pipefail
-      echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+      skopeo_login_ghcr
+      GHCR_STABLE_IMAGE_REF="${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}"
+      echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
 
       if [[ "${ALPS_REV}" =~ -dev$ ]]; then
         # For dev versions, we allow non-strict promotion (overwrites stable
         # tag regardless of content) but only on the default branch
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+          skopeo copy "$(_ref_url "$STABLE_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         else
           echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         fi
@@ -420,7 +424,8 @@ publish-gate:
         # Only promote on default branch
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
-          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+          skopeo copy "$(_ref_url "$STABLE_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         else
           echo "Dry-run only (not default branch): promotion not executed."
         fi
