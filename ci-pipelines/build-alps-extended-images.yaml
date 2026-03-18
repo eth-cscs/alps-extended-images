@@ -411,15 +411,15 @@ publish-gate:
       if [[ "${ALPS_REV}" =~ -dev$ ]]; then
         # For dev versions, we allow non-strict promotion (overwrites stable
         # tag regardless of content) but only on the default branch
-        #if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           echo "copy to: $STABLE_IMAGE_REF"
           skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
           echo "copy to: $GHCR_STABLE_IMAGE_REF"
           skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$STABLE_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
           echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
-        #else
-        #  echo "Dry-run only (dev version detected and not default branch): promotion not executed."
-        #fi
+        else
+          echo "Dry-run only (dev version detected and not default branch): promotion not executed."
+        fi
       else
         # Always run strict check (fails if stable exists but differs)
         promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
