@@ -6,6 +6,7 @@ skopeo_login() {
   : "${JFROG_USER:?JFROG_USER must be set}"
   : "${JFROG_KEY:?JFROG_KEY must be set}"
   local reg="${IMAGE_PREFIX%%/*}"
+  echo "login to: ${reg} with user: ${JFROG_USER}"
   skopeo login --username "${JFROG_USER}" --password "${JFROG_KEY}" "${reg}" >/dev/null
 }
 
@@ -14,6 +15,7 @@ skopeo_login_ghcr() {
   : "${GITHUB_ACTOR:?GITHUB_ACTOR must be set}"
   : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
   local reg="${GHCR_IMAGE_PREFIX%%/*}"
+  echo "login to: ${reg} with user: ${GITHUB_ACTOR}"
   skopeo login --username "${GITHUB_ACTOR}" --password "${GITHUB_TOKEN}" "${reg}" >/dev/null
 }
 
