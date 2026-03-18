@@ -15,9 +15,6 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
-RUN set -eux; \
-    python -m pip install --no-cache-dir --force-reinstall nvidia-ml-py==13.590.48
-
 #ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
 #ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
 ARG MEGATRON_REPO="https://github.com/boeschf/Megatron-LM.git"
@@ -33,5 +30,8 @@ RUN set -eux; \
 # Tests shipped with the image
 COPY Alps-Images/apps/apertus-1p5/tests/ /opt/tests/apertus-1p5/
 RUN chmod -R a+rX /opt/tests/apertus-1p5
+
+RUN set -eux; \
+    python -m pip install --no-cache-dir --force-reinstall nvidia-ml-py==13.590.48
 
 WORKDIR /opt/megatron
