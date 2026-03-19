@@ -25,7 +25,8 @@ Each variant corresponds to an NGC container extended with the Alps HPC stack:
 | `pytorch-25.12-py3` | `nvcr.io/nvidia/pytorch:25.12-py3` | GPU-accelerated PyTorch workloads |
 | `pytorch-26.01-py3` | `nvcr.io/nvidia/pytorch:26.01-py3` | GPU-accelerated PyTorch workloads |
 | `nemo-25.11.01` | `nvcr.io/nvidia/nemo:25.11.01` | Speech & language model training |
-| `physicsnemo-25.11` | `nvcr.io/nvidia/physicsnemo:25.11` | Physics-informed neural networks |
+| `physicsnemo-25.11` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks |
+| `physicsnemo-26.03` | `nvcr.io/nvidia/physicsnemo/physicsnemo:26.03` | Physics-informed neural networks |
 
 ### Application Images
 
