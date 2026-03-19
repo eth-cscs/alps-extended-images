@@ -31,7 +31,4 @@ RUN set -eux; \
 COPY Alps-Images/apps/apertus-1p5/tests/ /opt/tests/apertus-1p5/
 RUN chmod -R a+rX /opt/tests/apertus-1p5
 
-RUN set -eux; \
-    python -m pip install --no-cache-dir --force-reinstall nvidia-ml-py==13.590.48
-
 WORKDIR /opt/megatron
