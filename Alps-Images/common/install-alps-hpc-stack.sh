@@ -9,6 +9,19 @@ die() {
 }
 
 apt_install_build_deps() {
+
+    # Use JFrog Artifactory as an APT proxy/cache for Ubuntu packages, to speed
+    # up installs and reduce load on Ubuntu mirrors.
+    sed -i \
+        -e 's|http://archive.ubuntu.com/ubuntu|https://jfrog.svc.cscs.ch/artifactory/ubuntu|' \
+        -e 's|http://security.ubuntu.com/ubuntu|https://jfrog.svc.cscs.ch/artifactory/ubuntu|' \
+        -e 's|http://ports.ubuntu.com/ubuntu-ports|https://jfrog.svc.cscs.ch/artifactory/ubuntu-ports|' \
+        /etc/apt/sources.list.d/ubuntu.sources
+    printf '%s\n%s' "Acquire::http::AllowRedirect "true";" "Acquire::http::Pipeline-Depth "0";" \
+        > /etc/apt/apt.conf.d/99-jfrog-proxy
+    apt -o "Acquire::https::Verify-Peer=false" update
+    apt -o "Acquire::https::Verify-Peer=false" install ca-certificates
+
     apt-get update
     apt-get install -y --no-install-recommends \
         build-essential ca-certificates pkg-config automake autoconf libtool cmake \
@@ -19,6 +32,10 @@ apt_install_build_deps() {
         libsox-fmt-all \
         devscripts debhelper fakeroot dh-make
     rm -rf /var/lib/apt/lists/*
+}
+
+proxied_pip_install() {
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple "$@"
 }
 
 remove_efa() {
@@ -378,13 +395,13 @@ EOF
             fi
             [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
 
-            python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
+            proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
             
             # Install nvshmem4py deps *except* the pip-provided NVSHMEM runtime (nvidia-nvshmem-cuXX).
             # Avoid upgrades unless needed.
-            python -m pip install --no-cache-dir --upgrade-strategy only-if-needed -r <(
+            proxied_pip_install --no-cache-dir --upgrade-strategy only-if-needed -r <(
                 grep -Ev '^\s*(nvidia[-_])?nvshmem(-cu[0-9]+)?\s*([=<>!~].*)?\s*$' "${req}"
             )
 
@@ -424,7 +441,7 @@ build_osu() {
 }
 
 install_python_pkgs() {
-    python -m pip install ${PIP_PACKAGES}
+    proxied_pip_install ${PIP_PACKAGES}
 }
 
 main() {
