@@ -44,7 +44,7 @@ ARG NVSHMEM_VER=3.4.5-0
 ARG NCCL_TESTS_VER=2.17.8
 ARG OSU_VERSION=7.5.2
 
-ARG PIP_PACKAGES="flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf] cuda-pathfinder==1.3.4"
+ARG PIP_PACKAGES="flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf] cuda-pathfinder"
 
 COPY Alps-Images/patches/ /opt/alps/patches/
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
@@ -53,23 +53,23 @@ RUN set -eux; \
     chmod +x /opt/alps/install-alps-hpc-stack.sh; \
     /opt/alps/install-alps-hpc-stack.sh
 
-COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
+#COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
+#
+#RUN set -eux; \
+#    chmod 0644 /opt/alps/env/alps-runtime.env; \
+#    printf '%s\n' \
+#      'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
+#      'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
+#      > /etc/profile.d/99-alps-env.sh
 
-RUN set -eux; \
-    chmod 0644 /opt/alps/env/alps-runtime.env; \
-    printf '%s\n' \
-      'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
-      'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
-      > /etc/profile.d/99-alps-env.sh
+#COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
+#COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
+#COPY Alps-Images/common/alps-runtime-warning.py /opt/alps/env/alps-runtime-warning.py
+#COPY Alps-Images/common/install-alps-runtime-warnings.sh /opt/alps/env/install-alps-runtime-warnings.sh
 
-COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
-COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
-COPY Alps-Images/common/alps-runtime-warning.py /opt/alps/env/alps-runtime-warning.py
-COPY Alps-Images/common/install-alps-runtime-warnings.sh /opt/alps/env/install-alps-runtime-warnings.sh
-
-RUN set -eux; \
-    chmod +x /opt/alps/env/install-alps-runtime-warnings.sh; \
-    /opt/alps/env/install-alps-runtime-warnings.sh
+#RUN set -eux; \
+#    chmod +x /opt/alps/env/install-alps-runtime-warnings.sh; \
+#    /opt/alps/env/install-alps-runtime-warnings.sh
 
 # Optional image-specific fixes (late hooks)
 ARG NGC_VARIANT_DIR=""

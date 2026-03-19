@@ -65,6 +65,36 @@ variables:
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
     PMIX_MCA_psec: native
+    CUDA_CACHE_DISABLE: "1"
+    NCCL_NET: "AWS Libfabric"
+    NCCL_SOCKET_IFNAME: "hsn"
+    NCCL_CROSS_NIC: "1"
+    NCCL_P2P_LEVEL: "NVL"
+    NCCL_NET_GDR_LEVEL: "PHB"
+    NCCL_NET_GDR_C2C: "1"
+    NCCL_NET_GDR_READ: "1"
+    NCCL_PROTO: "^LL128"
+    NCCL_NCHANNELS_PER_NET_PEER: "4"
+    FI_PROVIDER: "cxi"
+    FI_CXI_DEFAULT_CQ_SIZE: "131072"
+    FI_CXI_DEFAULT_TX_SIZE: "16384"
+    FI_CXI_DISABLE_HOST_REGISTER: "1"
+    FI_CXI_RDZV_PROTO: "alt_read"
+    FI_CXI_RDZV_EAGER_SIZE: "0"
+    FI_CXI_RDZV_GET_MIN: "0"
+    FI_CXI_RDZV_THRESHOLD: "0"
+    FI_CXI_RX_MATCH_MODE: "hybrid"
+    FI_MR_CACHE_MONITOR: "userfaultfd"
+    FI_MR_CACHE_MAX_SIZE: "-1"
+    FI_MR_CACHE_MAX_COUNT: "524288"
+    FI_CXI_SAFE_DEVMEM_COPY_THRESHOLD: "16777216"
+    OMPI_MCA_btl: "^tcp,uct,usnic"
+    OMPI_MCA_pml: "cm"
+    OMPI_MCA_mtl: "ofi"
+    OMPI_MCA_opal_common_ofi_provider_include: "cxi"
+    NVSHMEM_REMOTE_TRANSPORT: "libfabric"
+    NVSHMEM_LIBFABRIC_PROVIDER: "cxi"
+    NVSHMEM_DISABLE_CUDA_VMM: "1"
 
 # ----------------------------
 # Meta job: determines image name

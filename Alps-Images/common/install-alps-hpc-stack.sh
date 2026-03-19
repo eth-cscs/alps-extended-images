@@ -463,7 +463,7 @@ main() {
     build_nccl_tests
     build_osu
 
-    install_python_pkgs
+    #install_python_pkgs
 }
 
 main "$@"
