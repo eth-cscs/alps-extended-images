@@ -16,10 +16,15 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 RUN set -eux; \
+    echo "Pip constraints are: $(python -m pip config get global.constraints || echo 'None')"; \
+    echo "Pip constraints env var is: ${PIP_CONSTRAINTS:-None}"
+
+RUN set -eux; \
     python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple \
         --no-cache-dir \
         --progress-bar off \
-        flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
+        wandb nvidia-modelopt[hf]
+        #flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
 
 #ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
 #ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
