@@ -55,12 +55,12 @@ RUN set -eux; \
 
 COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
 
-#RUN set -eux; \
-#    chmod 0644 /opt/alps/env/alps-runtime.env; \
-#    printf '%s\n' \
-#      'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
-#      'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
-#      > /etc/profile.d/99-alps-env.sh
+RUN set -eux; \
+    chmod 0644 /opt/alps/env/alps-runtime.env; \
+    printf '%s\n' \
+      'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
+      'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
+      > /etc/profile.d/99-alps-env.sh
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
