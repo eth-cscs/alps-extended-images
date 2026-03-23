@@ -159,6 +159,8 @@ RUN set -eux; \
     export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
     export MAX_JOBS="$(nproc)"; \
     export NVTE_BUILD_THREADS_PER_JOB=4; \
+    export CPATH="/usr/local/cuda/include/cccl:/usr/local/cuda/targets/sbsa-linux/include/cccl:${CPATH:-}"; \
+    export CPLUS_INCLUDE_PATH="/usr/local/cuda/include/cccl:/usr/local/cuda/targets/sbsa-linux/include/cccl:${CPLUS_INCLUDE_PATH:-}"; \
     python -m pip install -v --no-build-isolation .; \
     rm -rf /tmp/TransformerEngine
 
