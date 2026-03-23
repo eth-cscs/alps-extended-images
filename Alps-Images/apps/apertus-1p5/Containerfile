@@ -23,8 +23,8 @@ RUN set -eux; \
     python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple \
         --no-cache-dir \
         --progress-bar off \
-        wandb nvidia-modelopt[hf]
-        #flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
+        nvidia-modelopt[hf]
+        #wandb flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
 
 #ARG MEGATRON_REPO="https://github.com/swiss-ai/Megatron-LM.git"
 #ARG MEGATRON_COMMIT="08c9941f1f761b0758918744713176285a20b0e7" # merge-250908
