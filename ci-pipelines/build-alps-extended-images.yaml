@@ -415,9 +415,7 @@ publish-gate:
           echo "copy to: $STABLE_IMAGE_REF"
           skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
           echo "copy to: $GHCR_STABLE_IMAGE_REF"
-    - skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
-    - | 
-        echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
+          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         # else
         #  echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         # fi
@@ -433,6 +431,7 @@ publish-gate:
           echo "Dry-run only (not default branch): promotion not executed."
         fi
       fi
+    - skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
 
 publish-base-images:
   extends: [.publish-template]
