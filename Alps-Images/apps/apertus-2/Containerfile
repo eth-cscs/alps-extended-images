@@ -145,8 +145,8 @@ RUN set -eux; \
     export NVTE_CUDA_ARCHS="90"; \
     export NVTE_ENABLE_NVSHMEM=1; \
     export NVSHMEM_HOME="${NVSHMEM_HOME}"; \
-    export NVTE_WITH_CUBLASMP=1; \
-    export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
+    #export NVTE_WITH_CUBLASMP=1; \
+    #export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
     export MAX_JOBS="$(nproc)"; \
     export NVTE_BUILD_THREADS_PER_JOB=4; \
     python -m pip install -v --no-build-isolation .; \
