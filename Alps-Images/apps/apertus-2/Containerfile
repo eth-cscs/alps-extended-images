@@ -129,7 +129,7 @@ RUN set -eux; \
 # Install Transformer Engine
 ARG TE_VERSION=v2.12
 ARG NVSHMEM_HOME=/opt/nvshmem
-ARG CUBLASMP_HOME=/opt/cublasmp
+ARG CUBLASMP_HOME=/usr
 RUN set -eux; \
     python -m pip install --upgrade pip; \
     python -m pip install --no-cache-dir \
@@ -156,7 +156,7 @@ RUN set -eux; \
     export NVTE_ENABLE_NVSHMEM=1; \
     export NVSHMEM_HOME="${NVSHMEM_HOME}"; \
     export NVTE_WITH_CUBLASMP=1; \
-    #export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
+    export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
     export MAX_JOBS="$(nproc)"; \
     export NVTE_BUILD_THREADS_PER_JOB=4; \
     python -m pip install -v --no-build-isolation .; \
