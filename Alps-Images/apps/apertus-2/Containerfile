@@ -65,7 +65,7 @@ RUN set -eux; \
 ARG PPLX_GARDEN_REPO=https://github.com/pinxuezhao/pplx_garden_cxi.git
 ARG PPLX_GARDEN_COMMIT=3ce62f9993b6e4abdcda8dac3b87a944ea221f4f
 RUN set -eux; \
-    python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install --no-cache-dir build; \
+    python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-cache-dir build; \
     rm -rf /tmp/pplx_garden; \
     git clone --depth 1 "${PPLX_GARDEN_REPO}" /tmp/pplx_garden; \
     pushd /tmp/pplx_garden; \
@@ -73,7 +73,7 @@ RUN set -eux; \
     git checkout -q "${PPLX_GARDEN_COMMIT}"; \
     export TORCH_CMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"; \
     python3 -m build --wheel; \
-    python3 -m pip install --no-cache-dir dist/*.whl; \
+    python3 -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-cache-dir dist/*.whl; \
     popd; \
     # Vendor benchmark code into the image
     rm -rf /opt/pplx-garden; \
@@ -108,7 +108,7 @@ ARG QUACK_TAG=v0.2.10
 RUN set -eux; \
     git clone --depth 1 --branch "${QUACK_TAG}" "${QUACK_REPO}" /tmp/quack; \
     pushd /tmp/quack; \
-    python -m pip install --upgrade-strategy only-if-needed '.[cu13]'; \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --upgrade-strategy only-if-needed '.[cu13]'; \
     popd; \
     rm -rf /tmp/quack
 
@@ -117,13 +117,11 @@ COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/
 RUN chmod -R a+rX /opt/tests/apertus-2
 
 # Install Transformer Engine
-
 ARG TE_VERSION=v2.12
 ARG NVSHMEM_HOME=/opt/nvshmem
 ARG CUBLASMP_HOME=/opt/cublasmp
-
 RUN set -euxo pipefail; \
-    python -m pip install --no-cache-dir \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-cache-dir \
         'setuptools>=61' \
         wheel \
         'cmake>=3.21' \
@@ -160,5 +158,57 @@ PY
     export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
     export MAX_JOBS="$(nproc)"; \
     export NVTE_BUILD_THREADS_PER_JOB=4; \
-    python -m pip install -v --no-build-isolation .; \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple -v --no-build-isolation .; \
     rm -rf /tmp/TransformerEngine
+
+# Add FA3 Hopper as a separate install for Megatron.
+ARG FLASH_ATTN3_REF=main
+RUN set -euxo pipefail; \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-cache-dir packaging ninja einops; \
+    git clone --recursive https://github.com/Dao-AILab/flash-attention.git /tmp/flash-attention; \
+    cd /tmp/flash-attention; \
+    git checkout "${FLASH_ATTN3_REF}"; \
+    git submodule update --init --recursive; \
+    cd hopper; \
+    export MAX_JOBS="$(nproc)"; \
+    export FAHOPPER_FORCE_CXX11_ABI=TRUE; \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-build-isolation .; \
+    python - <<'PY' \
+import importlib.util, pathlib, site, sys
+
+sp = pathlib.Path(site.getsitepackages()[0])
+
+# If FA3 is already importable directly, leave it alone.
+has_fa3 = importlib.util.find_spec("flash_attn_3") is not None
+has_hopper = importlib.util.find_spec("flashattn_hopper") is not None
+
+# Megatron often looks for flash_attn_3.flash_attn_interface first.
+# If only flashattn_hopper is present, create a thin shim package.
+if (not has_fa3) and has_hopper:
+    pkg = sp / "flash_attn_3"
+    pkg.mkdir(parents=True, exist_ok=True)
+    (pkg / "__init__.py").write_text(
+        "from .flash_attn_interface import *\n", encoding="utf-8"
+    )
+    (pkg / "flash_attn_interface.py").write_text(
+        "from flashattn_hopper.flash_attn_interface import *\n", encoding="utf-8"
+    )
+
+# Sanity checks
+mods = []
+for name in [
+    "flash_attn",
+    "flashattn_hopper",
+    "flash_attn_3",
+]:
+    mods.append((name, importlib.util.find_spec(name) is not None))
+print("module availability:", mods)
+
+try:
+    import flash_attn_3.flash_attn_interface as fa3
+    print("flash-attn v3 import OK:", hasattr(fa3, "_flash_attn_forward"))
+except Exception as e:
+    print("flash-attn v3 import failed:", repr(e))
+    sys.exit(1)
+PY
+    rm -rf /tmp/flash-attention
