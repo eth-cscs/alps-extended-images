@@ -180,8 +180,9 @@ RUN set -eux; \
     python -m pip install -v --no-build-isolation .; \
     rm -rf /tmp/TransformerEngine
 
-# Add FA3 Hopper as a separate install for Megatron.
+# Add FA3 Hopper as a separate install (for Megatron)
 ARG FLASH_ATTN3_REF=main
+ARG FA3_JOBS=2
 RUN set -eux; \
     python -m pip install --upgrade pip setuptools wheel; \
     python -m pip install --no-cache-dir packaging ninja einops; \
@@ -190,9 +191,14 @@ RUN set -eux; \
     git checkout "${FLASH_ATTN3_REF}"; \
     git submodule update --init --recursive; \
     cd hopper; \
-    export MAX_JOBS=16; \
-    export FAHOPPER_FORCE_CXX11_ABI=TRUE; \
-    python -m pip install --no-build-isolation .; \
+    export FLASH_ATTENTION_FORCE_BUILD=TRUE; \
+    export FLASH_ATTENTION_DISABLE_SM80=TRUE; \
+    export MAX_JOBS="${FA3_JOBS}"; \
+    export CMAKE_BUILD_PARALLEL_LEVEL="${FA3_JOBS}"; \
+    export NINJA_NUM_JOBS="${FA3_JOBS}"; \
+    export FLASH_ATTENTION_FORCE_CXX11_ABI=TRUE; \
+    python setup.py build_ext --verbose --parallel "${FA3_JOBS}" bdist_wheel; \
+    python -m pip install --no-cache-dir dist/*.whl; \
     python_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
     mkdir -p "${python_site}/flash_attn_3"; \
     printf '%s\n' 'from .flash_attn_interface import *' > "${python_site}/flash_attn_3/__init__.py"; \
