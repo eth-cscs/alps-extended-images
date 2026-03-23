@@ -44,8 +44,6 @@ ARG NVSHMEM_VER=3.4.5-0
 ARG NCCL_TESTS_VER=2.17.8
 ARG OSU_VERSION=7.5.2
 
-ARG PIP_PACKAGES="flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf] cuda-pathfinder==1.3.4"
-
 COPY Alps-Images/patches/ /opt/alps/patches/
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
 
