@@ -116,6 +116,16 @@ RUN set -eux; \
 COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/
 RUN chmod -R a+rX /opt/tests/apertus-2
 
+# Install cuBLASMp
+RUN set -eux; \
+    wget https://developer.download.nvidia.com/compute/cublasmp/0.8.0/local_installers/cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb; \
+    dpkg -i cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb; \
+    cp /var/cublasmp-local-repo-ubuntu2404-0.8.0/cublasmp-*-keyring.gpg /usr/share/keyrings/; \
+    apt-get update; \
+    apt-get -y install cublasmp; \
+    apt-get -y install cublasmp-cuda-13; \
+    rm -cf cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb
+
 # Install Transformer Engine
 ARG TE_VERSION=v2.12
 ARG NVSHMEM_HOME=/opt/nvshmem
@@ -145,7 +155,7 @@ RUN set -eux; \
     export NVTE_CUDA_ARCHS="90"; \
     export NVTE_ENABLE_NVSHMEM=1; \
     export NVSHMEM_HOME="${NVSHMEM_HOME}"; \
-    #export NVTE_WITH_CUBLASMP=1; \
+    export NVTE_WITH_CUBLASMP=1; \
     #export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
     export MAX_JOBS="$(nproc)"; \
     export NVTE_BUILD_THREADS_PER_JOB=4; \

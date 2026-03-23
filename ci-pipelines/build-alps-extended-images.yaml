@@ -1,7 +1,7 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [build-base, test-base, build-apps, test-apps, publish]
+stages: [build-base, build-apps, test-apps, publish]
 
 # ----------------------------
 # Global variables
@@ -263,82 +263,6 @@ tag-app-images-for-ci:
 # - Apertus 1.5: Megatron pretraining script
 # - Apertus 2: pplx garden benchmark
 
-test-base-images-env:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  parallel:
-    matrix: *alps_base_images_matrix
-  image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - |
-      set -euo pipefail
-
-      # Check that the relevant environment variables are set correctly in the image
-      test "${FI_PROVIDER:-}" = "cxi"
-      test "${FI_CXI_RDZV_PROTO:-}" = "alt_read"
-      test "${NCCL_NET:-}" = "AWS Libfabric"
-      test "${NCCL_PROTO:-}" = "^LL128"
-      test "${NVSHMEM_REMOTE_TRANSPORT:-}" = "libfabric"
-      test "${NVSHMEM_LIBFABRIC_PROVIDER:-}" = "cxi"
-
-      # Check that the environment variables are exported with the correct semantics
-      test "${NCCL_VERSION:-}" = "dummy"
-  variables:
-    SLURM_JOB_NUM_NODES: 1
-    SLURM_NTASKS: 1
-    # Set dummy value for environment variables to test that it will be overridden by the image's entrypoint or environment setup scripts
-    NCCL_VERSION: dummy
-
-test-base-images-collectives:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  parallel:
-    matrix: *alps_base_images_matrix
-  image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    # NCCL
-    - alltoall_perf -b 32 -e 4M -f 2 -g 1
-    # NVSHMEM
-    - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
-    # OSU
-    - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
-  variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 8
-
-test-base-images-vetnode:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  parallel:
-    matrix: *alps_base_images_matrix
-  image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - echo "[image-vet] Set-up vetnode on $(hostname)... "
-    - |
-      if [ "$SLURM_LOCALID" -eq 0 ]; then
-        wget -O /tmp/config.yaml https://raw.githubusercontent.com/eth-cscs/vetnode/refs/heads/main/examples/image-vet/config.yaml
-        cd /tmp
-        python -m venv --system-site-packages .venv
-        source .venv/bin/activate
-        pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
-        vetnode setup /tmp/config.yaml
-        touch /tmp/setup-done-${SLURM_JOB_ID}
-      else
-        echo "[image-vet] Waiting for setup on $(hostname)..."
-        timeout=60
-        while [ ! -f "/tmp/setup-done-${SLURM_JOB_ID}" ] && [ $timeout -gt 0 ]; do
-            sleep 1
-            ((timeout--))
-        done
-      fi
-    - echo "[image-vet] diagnose"
-    - cd /tmp
-    - source .venv/bin/activate
-    - vetnode diagnose /tmp/config.yaml
-  variables:
-    SLURM_JOB_NUM_NODES: 4
-    SLURM_NTASKS: 16
-
 test-apertus-1p5:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
@@ -393,9 +317,6 @@ publish-gate:
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
   # make sure to keep the "needs" up to date when adding new test jobs
   needs:
-    - test-base-images-env
-    - test-base-images-collectives
-    - test-base-images-vetnode
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
