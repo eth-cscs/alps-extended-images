@@ -124,7 +124,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get -y install cublasmp; \
     apt-get -y install cublasmp-cuda-13; \
-    rm -cf cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb
+    rm -f cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb
 
 # Install Transformer Engine
 ARG TE_VERSION=v2.12
