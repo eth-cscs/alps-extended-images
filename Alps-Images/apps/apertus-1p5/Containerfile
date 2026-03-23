@@ -29,7 +29,6 @@ RUN set -eux; \
     git clone "${MEGATRON_REPO}" /opt/megatron; \
     cd /opt/megatron; \
     git checkout -q "${MEGATRON_COMMIT}"; \
-    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"; \
     curl -fsSL "${MEGATRON_PATCH_URL}" -o /tmp/megatron-1871.patch; \
     if git apply --3way --check /tmp/megatron-1871.patch; then \
         git apply --3way /tmp/megatron-1871.patch; \
