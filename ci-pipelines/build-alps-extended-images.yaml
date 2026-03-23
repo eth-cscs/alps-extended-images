@@ -403,35 +403,33 @@ publish-gate:
   stage: publish
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
   script:
-    - |
-      set -euo pipefail
-      GHCR_STABLE_IMAGE_REF="${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}"
-      echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
-
-      if [[ "${ALPS_REV}" =~ -dev$ ]]; then
+    - set -euo pipefail
+    - GHCR_STABLE_IMAGE_REF="${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}"
+    - echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
+    - if [[ "${ALPS_REV}" =~ -dev$ ]]; then
         # For dev versions, we allow non-strict promotion (overwrites stable
         # tag regardless of content) but only on the default branch
         # if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
-          echo "copy to: $STABLE_IMAGE_REF"
-          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-          echo "copy to: $GHCR_STABLE_IMAGE_REF"
-          skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
-          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
+        - echo "copy to: $STABLE_IMAGE_REF"
+        - skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
+        - echo "copy to: $GHCR_STABLE_IMAGE_REF"
+        - skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+        - echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         # else
         #  echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         # fi
-      else
+      - else
         # Always run strict check (fails if stable exists but differs)
-        promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+        - promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
         # Only promote on default branch
-        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
-          promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
-          skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
-          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
-        else
-          echo "Dry-run only (not default branch): promotion not executed."
-        fi
-      fi
+        - if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          - promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+          - skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          - echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
+        - else
+          - echo "Dry-run only (not default branch): promotion not executed."
+        - fi
+      - fi
 
 publish-base-images:
   extends: [.publish-template]
