@@ -125,11 +125,27 @@ RUN chmod -R a+rX /opt/tests/apertus-2
 #    apt-get -y install cublasmp; \
 #    apt-get -y install cublasmp-cuda-13; \
 #    rm -f cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb
+ARG CUBLASMP_URL=https://developer.download.nvidia.com/compute/cublasmp/redist/libcublasmp/linux-sbsa/libcublasmp-linux-sbsa-0.7.0.125_cuda13-archive.tar.xz
+
+RUN set -eux; \
+    mkdir -p /opt/cublasmp /tmp/cublasmp-extract; \
+    curl -fsSL "${CUBLASMP_URL}" -o /tmp/libcublasmp.tar.xz; \
+    tar -xf /tmp/libcublasmp.tar.xz -C /tmp/cublasmp-extract; \
+    cublasmp_root="$(find /tmp/cublasmp-extract -mindepth 1 -maxdepth 1 -type d | head -n 1)"; \
+    test -n "${cublasmp_root}"; \
+    cp -a "${cublasmp_root}/include" /opt/cublasmp/; \
+    cp -a "${cublasmp_root}/lib" /opt/cublasmp/; \
+    test -e /opt/cublasmp/lib/libcublasmp.so || \
+      ln -sf "$(find /opt/cublasmp/lib -maxdepth 1 -name 'libcublasmp.so.*' | head -n 1)" /opt/cublasmp/lib/libcublasmp.so; \
+    echo /opt/cublasmp/lib > /etc/ld.so.conf.d/cublasmp.conf; \
+    ldconfig; \
+    test -f /opt/cublasmp/lib/libcublasmp.so; \
+    rm -rf /tmp/cublasmp-extract /tmp/libcublasmp.tar.xz
 
 # Install Transformer Engine
 ARG TE_VERSION=v2.12
 ARG NVSHMEM_HOME=/opt/nvshmem
-ARG CUBLASMP_HOME=/usr
+ARG CUBLASMP_HOME=/opt/cublasmp
 RUN set -eux; \
     python -m pip install --upgrade pip; \
     python -m pip install --no-cache-dir \
@@ -155,7 +171,7 @@ RUN set -eux; \
     export NVTE_CUDA_ARCHS="90"; \
     export NVTE_ENABLE_NVSHMEM=1; \
     export NVSHMEM_HOME="${NVSHMEM_HOME}"; \
-    export NVTE_WITH_CUBLASMP=0; \
+    export NVTE_WITH_CUBLASMP=1; \
     export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
     export MAX_JOBS="$(nproc)"; \
     export NVTE_BUILD_THREADS_PER_JOB=4; \
@@ -174,7 +190,7 @@ RUN set -eux; \
     git checkout "${FLASH_ATTN3_REF}"; \
     git submodule update --init --recursive; \
     cd hopper; \
-    export MAX_JOBS="$(nproc)"; \
+    export MAX_JOBS=16; \
     export FAHOPPER_FORCE_CXX11_ABI=TRUE; \
     python -m pip install --no-build-isolation .; \
     python_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
