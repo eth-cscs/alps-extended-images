@@ -67,9 +67,9 @@ COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warni
 COPY Alps-Images/common/alps-runtime-warning.py /opt/alps/env/alps-runtime-warning.py
 COPY Alps-Images/common/install-alps-runtime-warnings.sh /opt/alps/env/install-alps-runtime-warnings.sh
 
-#RUN set -eux; \
-#    chmod +x /opt/alps/env/install-alps-runtime-warnings.sh; \
-#    /opt/alps/env/install-alps-runtime-warnings.sh
+RUN set -eux; \
+    chmod +x /opt/alps/env/install-alps-runtime-warnings.sh; \
+    /opt/alps/env/install-alps-runtime-warnings.sh
 
 # Optional image-specific fixes (late hooks)
 ARG NGC_VARIANT_DIR=""
