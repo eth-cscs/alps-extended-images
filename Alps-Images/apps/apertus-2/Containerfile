@@ -15,6 +15,12 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
+RUN set -eux; \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple \
+        --no-cache-dir \
+        --progress-bar off \
+        transformers
+
 # System deps
 RUN set -eux; \
     apt-get update; \
@@ -109,3 +115,50 @@ RUN set -eux; \
 # Tests shipped with the image
 COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/
 RUN chmod -R a+rX /opt/tests/apertus-2
+
+# Install Transformer Engine
+
+ARG TE_VERSION=v2.12
+ARG NVSHMEM_HOME=/opt/nvshmem
+ARG CUBLASMP_HOME=/opt/cublasmp
+
+RUN set -euxo pipefail; \
+    python -m pip install --no-cache-dir \
+        'setuptools>=61' \
+        wheel \
+        'cmake>=3.21' \
+        ninja \
+        'pybind11[global]' \
+        packaging \
+        pydantic \
+        importlib-metadata; \
+    git clone --branch "${TE_VERSION}" --recursive https://github.com/NVIDIA/TransformerEngine.git /tmp/TransformerEngine; \
+    cd /tmp/TransformerEngine; \
+    python - <<'PY'
+from pathlib import Path
+
+# Patch 1: add missing include to nvshmem_waitkernel.cu
+cu = Path("transformer_engine/common/nvshmem_api/nvshmem_waitkernel.cu")
+txt = cu.read_text(encoding="utf-8")
+old = '#include "../util/logging.h"'
+new = '#include "../util/logging.h"\n#include "../util/cuda_driver.h"'
+if old in txt and new not in txt:
+    cu.write_text(txt.replace(old, new), encoding="utf-8")
+
+# Patch 2: add missing include dir to nvshmem_api/CMakeLists.txt
+cm = Path("transformer_engine/common/nvshmem_api/CMakeLists.txt")
+txt = cm.read_text(encoding="utf-8")
+inc = 'target_include_directories(nvshmemapi PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../include")'
+if inc not in txt:
+    cm.write_text(txt.rstrip() + "\n" + inc + "\n", encoding="utf-8")
+PY
+    export NVTE_FRAMEWORK=pytorch; \
+    export NVTE_CUDA_ARCHS="90"; \
+    export NVTE_ENABLE_NVSHMEM=1; \
+    export NVSHMEM_HOME="${NVSHMEM_HOME}"; \
+    export NVTE_WITH_CUBLASMP=1; \
+    export CUBLASMP_HOME="${CUBLASMP_HOME}"; \
+    export MAX_JOBS="$(nproc)"; \
+    export NVTE_BUILD_THREADS_PER_JOB=4; \
+    python -m pip install -v --no-build-isolation .; \
+    rm -rf /tmp/TransformerEngine
