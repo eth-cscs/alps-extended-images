@@ -23,6 +23,7 @@ RUN set -eux; \
     python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple \
         --no-cache-dir \
         --progress-bar off \
+        --update-strategy only-if-needed \
         nvidia-modelopt[hf]
         #wandb flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
 
