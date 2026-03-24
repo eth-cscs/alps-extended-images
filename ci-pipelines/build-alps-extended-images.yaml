@@ -1,7 +1,7 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [build-base, test-base, build-apps, test-apps, publish]
+stages: [debug, build-base, test-base, build-apps, test-apps, publish]
 
 # ----------------------------
 # Global variables
@@ -10,6 +10,25 @@ variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps4-dev
+
+
+debug-publish:
+  stage: debug
+  extends: [.container-builder-cscs-gh200]
+  image: quay.io/skopeo/stable:latest
+  variables:
+    KUBERNETES_MEMORY_REQUEST: 128Gi
+    KUBERNETES_MEMORY_LIMIT: 128Gi
+    STABLE_IMAGE_REF:
+
+  script:
+    - |
+      source ci-pipelines/helpers/skopeo.sh
+      skopeo_login
+      skopeo_login_ghcr
+      set -euo pipefail
+      skopeo copy docker://jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:26.01-py3-alps4-dev-c83875ebc60f1d56 docker://ghcr.io/eth-cscs/alps-extended-images/ngc-pytorch:26.01-py3-alps4-dev
+
 
 # ----------------------------
 # Image matrix anchors
@@ -401,8 +420,11 @@ publish-gate:
 
 .publish-template:
   stage: publish
-  extends: [.container-runner-clariden-gh200, .slurm-template]
+  extends: [.container-builder-cscs-gh200]
   image: quay.io/skopeo/stable:latest
+  variables:
+    KUBERNETES_MEMORY_REQUEST: 128Gi
+    KUBERNETES_MEMORY_LIMIT: 128Gi
   script:
     - |
       source ci-pipelines/helpers/skopeo.sh
