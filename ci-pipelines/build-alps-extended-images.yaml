@@ -17,6 +17,8 @@ variables:
 
 .alps_base_images_matrix: &alps_base_images_matrix
   - NGC_NAME: "pytorch"
+    NGC_TAG: "26.02-py3"
+  - NGC_NAME: "pytorch"
     NGC_TAG: "26.01-py3"
   - NGC_NAME: "pytorch"
     NGC_TAG: "25.12-py3"
