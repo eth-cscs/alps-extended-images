@@ -402,7 +402,8 @@ test-apertus-2-DeepEP:
 #   check on CI_COMMIT_BRANCH)
 # - The stable tag must not already exist with different content (enforced by
 #   promote_check_strict)
-
+# Note: Skopeo copy requires a larger memory limit.
+#       Therfore we are using the container-builder-cscs-gh200 worker that comes with the skopeo tool kit.
 publish-gate:
   stage: publish
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
@@ -420,7 +421,6 @@ publish-gate:
 .publish-template:
   stage: publish
   extends: [.container-builder-cscs-gh200]
-  image: quay.io/skopeo/stable:latest
   variables:
     KUBERNETES_MEMORY_REQUEST: 128Gi
     KUBERNETES_MEMORY_LIMIT: 128Gi
