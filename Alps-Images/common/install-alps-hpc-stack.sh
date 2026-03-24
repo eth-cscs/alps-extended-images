@@ -440,10 +440,6 @@ build_osu() {
     ldconfig
 }
 
-install_python_pkgs() {
-    proxied_pip_install ${PIP_PACKAGES}
-}
-
 main() {
     CUDA_DIR="$(detect_cuda_dir)" || die "Could not determine CUDA directory..."
     export CUDA_DIR
@@ -468,8 +464,6 @@ main() {
 
     build_nccl_tests
     build_osu
-
-    install_python_pkgs
 }
 
 main "$@"
