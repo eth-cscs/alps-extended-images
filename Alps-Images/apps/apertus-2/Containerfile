@@ -182,7 +182,7 @@ RUN set -eux; \
 
 # Add FA3 Hopper as a separate install (for Megatron)
 ARG FLASH_ATTN3_REF=main
-ARG FA3_JOBS=16
+ARG FA3_JOBS=32
 RUN set -eux; \
     python -m pip install --upgrade pip setuptools wheel; \
     python -m pip install --no-cache-dir packaging ninja einops; \
@@ -200,8 +200,9 @@ RUN set -eux; \
     python setup.py build_ext --verbose --parallel "${FA3_JOBS}" bdist_wheel; \
     python -m pip install --no-cache-dir dist/*.whl; \
     python_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    python -c 'import flash_attn_interface; print("top-level FA3 import OK")'; \
     mkdir -p "${python_site}/flash_attn_3"; \
     printf '%s\n' 'from .flash_attn_interface import *' > "${python_site}/flash_attn_3/__init__.py"; \
-    printf '%s\n' 'from flashattn_hopper.flash_attn_interface import *' > "${python_site}/flash_attn_3/flash_attn_interface.py"; \
-    python -c 'import flash_attn_3.flash_attn_interface as m; print("flash-attn v3 import OK:", hasattr(m, "_flash_attn_forward"))'; \
+    printf '%s\n' 'from flash_attn_interface import *' > "${python_site}/flash_attn_3/flash_attn_interface.py"; \
+    python -c 'import flash_attn_3.flash_attn_interface as m; print("flash-attn v3 import OK:", hasattr(m, "flash_attn_func"))'; \
     rm -rf /tmp/flash-attention
