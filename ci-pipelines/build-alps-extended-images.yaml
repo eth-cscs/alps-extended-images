@@ -1,7 +1,7 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [debug, build-base, test-base, build-apps, test-apps, publish]
+stages: [build-base, test-base, build-apps, test-apps, publish]
 
 # ----------------------------
 # Global variables
@@ -10,23 +10,6 @@ variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps4-dev
-
-
-debug-publish:
-  stage: debug
-  extends: [.container-builder-cscs-gh200]
-  variables:
-    KUBERNETES_MEMORY_REQUEST: 128Gi
-    KUBERNETES_MEMORY_LIMIT: 128Gi
-    STABLE_IMAGE_REF:
-
-  script:
-    - |
-      source ci-pipelines/helpers/skopeo.sh
-      skopeo_login
-      skopeo_login_ghcr
-      set -euo pipefail
-      skopeo copy docker://jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:26.01-py3-alps4-dev-c83875ebc60f1d56 docker://ghcr.io/eth-cscs/alps-extended-images/ngc-pytorch:26.01-py3-alps4-dev
 
 
 # ----------------------------
@@ -438,8 +421,8 @@ publish-gate:
         # tag regardless of content) but only on the default branch
         # if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           echo "copy to: $STABLE_IMAGE_REF"
-          #skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-          skopeo copy  "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
+          skopeo copy  "$(_ref_url "$STABLE_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
           echo "copy to: $GHCR_STABLE_IMAGE_REF"
           echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         # else
@@ -451,7 +434,8 @@ publish-gate:
         # Only promote on default branch
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           promote_strict "$CANON_IMAGE_REF" "$GHCR_STABLE_IMAGE_REF"
-          skopeo copy --dest-creds "${GITHUB_ACTOR}:${GITHUB_TOKEN}" "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
+          skopeo copy "$(_ref_url "$STABLE_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
           echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         else
           echo "Dry-run only (not default branch): promotion not executed."
