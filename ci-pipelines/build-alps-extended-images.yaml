@@ -401,7 +401,7 @@ publish-gate:
 
 .publish-template:
   stage: publish
-  extends: [.container-runner-clariden-gh200, .skopeo-template]
+  extends: [.container-runner-clariden-gh200, .skopeo-template, .slurm-template]
   script:
     - |
       set -euo pipefail
