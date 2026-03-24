@@ -379,6 +379,22 @@ test-apertus-2-DeepEP:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
+test-apertus-2-moe:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 2h
+  image: "$IMAGE_PREFIX/apertus-2:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-2/megatron-moe-pretrain.sh
+  variables:
+    CI_FAST: "1"
+    TP_CI: "1"
+    PP_CI: "1"
+    CHECKPOINT_STEPS_CI: "2"
+    USE_MPI: NO
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 8
+
 # ----------------------------
 # Publish
 # ----------------------------
@@ -401,6 +417,7 @@ publish-gate:
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
+    - test-apertus-2-moe
   script:
     - echo "Publish gate passed (tests completed)"
 

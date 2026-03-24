@@ -112,21 +112,8 @@ RUN set -eux; \
     popd; \
     rm -rf /tmp/quack
 
-# Tests shipped with the image
-COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/
-RUN chmod -R a+rX /opt/tests/apertus-2
-
-## Install cuBLASMp
-#RUN set -eux; \
-#    wget https://developer.download.nvidia.com/compute/cublasmp/0.8.0/local_installers/cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb; \
-#    dpkg -i cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb; \
-#    cp /var/cublasmp-local-repo-ubuntu2404-0.8.0/cublasmp-*-keyring.gpg /usr/share/keyrings/; \
-#    apt-get update; \
-#    apt-get -y install cublasmp; \
-#    apt-get -y install cublasmp-cuda-13; \
-#    rm -f cublasmp-local-repo-ubuntu2404-0.8.0_0.8.0-1_arm64.deb
+# Install cuBLASMp
 ARG CUBLASMP_URL=https://developer.download.nvidia.com/compute/cublasmp/redist/libcublasmp/linux-sbsa/libcublasmp-linux-sbsa-0.7.0.125_cuda13-archive.tar.xz
-
 RUN set -eux; \
     mkdir -p /opt/cublasmp /tmp/cublasmp-extract; \
     curl -fsSL "${CUBLASMP_URL}" -o /tmp/libcublasmp.tar.xz; \
@@ -180,7 +167,7 @@ RUN set -eux; \
     python -m pip install -v --no-build-isolation .; \
     rm -rf /tmp/TransformerEngine
 
-# Add FA3 Hopper as a separate install (for Megatron)
+# Add Flash Attention 3 (for Hopper)
 ARG FLASH_ATTN3_REF=main
 ARG FA3_JOBS=16
 RUN set -eux; \
@@ -206,3 +193,28 @@ RUN set -eux; \
     printf '%s\n' 'from flash_attn_interface import *' > "${python_site}/flash_attn_3/flash_attn_interface.py"; \
     python -c 'import flash_attn_3.flash_attn_interface as m; print("flash-attn v3 import OK:", hasattr(m, "flash_attn_func"))'; \
     rm -rf /tmp/flash-attention
+
+ARG MEGATRON_REPO="https://github.com/NVIDIA/Megatron-LM.git"
+ARG MEGATRON_COMMIT="9e2810417315a7ee93b41d4e234454abd3c16af5"
+ARG MEGATRON_PATCH_URL="https://patch-diff.githubusercontent.com/raw/NVIDIA/Megatron-LM/pull/1871.patch"
+
+RUN set -eux; \
+    git clone "${MEGATRON_REPO}" /opt/megatron; \
+    cd /opt/megatron; \
+    git checkout -q "${MEGATRON_COMMIT}"; \
+    test "$(git rev-parse HEAD)" = "${MEGATRON_COMMIT}"; \
+    curl -fsSL "${MEGATRON_PATCH_URL}" -o /tmp/megatron-1871.patch; \
+    if git apply --3way --check /tmp/megatron-1871.patch; then \
+        git apply --3way /tmp/megatron-1871.patch; \
+    elif git apply --reverse --check /tmp/megatron-1871.patch; then \
+        echo "Patch already applied, skipping."; \
+    else \
+        echo "Patch does not apply cleanly."; \
+        exit 1; \
+    fi; \
+    rm -f /tmp/megatron-1871.patch; \
+    python3 setup.py build_ext --inplace;
+
+# Tests shipped with the image
+COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/
+RUN chmod -R a+rX /opt/tests/apertus-2
