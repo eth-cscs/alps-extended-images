@@ -401,9 +401,13 @@ publish-gate:
 
 .publish-template:
   stage: publish
-  extends: [.container-runner-clariden-gh200, .skopeo-template, .slurm-template]
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  image: quay.io/skopeo/stable:latest
   script:
     - |
+      source ci-pipelines/helpers/skopeo.sh
+      skopeo_login
+      skopeo_login_ghcr
       set -euo pipefail
       GHCR_STABLE_IMAGE_REF="${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}"
       echo "Publish check: $CANON_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
