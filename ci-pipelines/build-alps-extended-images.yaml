@@ -15,7 +15,6 @@ variables:
 debug-publish:
   stage: debug
   extends: [.container-builder-cscs-gh200]
-  image: quay.io/skopeo/stable:latest
   variables:
     KUBERNETES_MEMORY_REQUEST: 128Gi
     KUBERNETES_MEMORY_LIMIT: 128Gi
