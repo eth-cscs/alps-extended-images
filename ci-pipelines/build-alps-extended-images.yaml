@@ -19,9 +19,13 @@ variables:
 
 .alps_base_images_matrix: &alps_base_images_matrix
   - NGC_NAME: "pytorch"
+    NGC_TAG: "26.02-py3"
+  - NGC_NAME: "pytorch"
     NGC_TAG: "26.01-py3"
   - NGC_NAME: "pytorch"
     NGC_TAG: "25.12-py3"
+  - NGC_NAME: "nemo"
+    NGC_TAG: "26.02"
   - NGC_NAME: "nemo"
     NGC_TAG: "25.11.01"
   - NGC_NAME: "physicsnemo"
@@ -159,6 +163,8 @@ build-apps-meta:
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
     CSCS_REBUILD_POLICY: if-not-exists
     CSCS_BUILD_CACHE: $CSCS_REGISTRY_PATH/build_cache
+    KUBERNETES_MEMORY_REQUEST: '128Gi'
+    KUBERNETES_MEMORY_LIMIT: '128Gi'
   before_script:
     - |
       set -euo pipefail
@@ -351,6 +357,7 @@ test-apertus-1p5:
     CI_FAST: "1"
     TP_CI: "1"
     PP_CI: "1"
+    CHECKPOINT_STEPS_CI: "2"
     USE_MPI: NO
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8

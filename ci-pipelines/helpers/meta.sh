@@ -79,6 +79,7 @@ base_refs() {
 
   : "${ALPS_REV:?ALPS_REV must be set}"
   : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
+  : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local image_dir="Alps-Images/NGC/${ngc_name}-${ngc_tag}"
   local profile_file="${image_dir}/profile.env"
@@ -112,7 +113,7 @@ base_refs() {
   local hash_paths="$dockerfile $common_dir $patches_dir $image_dir"
   local name="ngc-${ngc_name}"
   local tag="${ngc_tag}-${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag")"
+  local h="$(content_hash "$hash_paths" "name tag CSCS_CI_ORIG_CLONE_URL CI_COMMIT_SHORT_SHA")"
   local canon_tag="$(canon_tag_for "$tag" "$h")"
 
   local canon_ref="$(img_ref "$name" "$canon_tag")"
@@ -131,6 +132,7 @@ app_refs() {
 
   : "${ALPS_REV:?ALPS_REV must be set}"
   : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
+  : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local app_dir="Alps-Images/apps/${name}"
   local dockerfile="${app_dir}/Containerfile"
@@ -157,7 +159,7 @@ app_refs() {
   # Compute canonical tag from hashed content
   local hash_paths="$dockerfile $profile_file $test_dir"
   local tag="${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag base_canon_ref")"
+  local h="$(content_hash "$hash_paths" "name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL CI_COMMIT_SHORT_SHA")"
   local canon_tag="$(canon_tag_for "$tag" "$h")"
   local canon_ref="$(img_ref "$name" "$canon_tag")"
   local test_ref="$(img_ref "$name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
