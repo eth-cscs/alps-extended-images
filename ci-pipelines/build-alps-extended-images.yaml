@@ -433,9 +433,8 @@ publish-gate:
         promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
         # Only promote on default branch
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
           promote_strict "$CANON_IMAGE_REF" "$GHCR_STABLE_IMAGE_REF"
-          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-          skopeo copy "$(_ref_url "$STABLE_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
           echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         else
           echo "Dry-run only (not default branch): promotion not executed."
