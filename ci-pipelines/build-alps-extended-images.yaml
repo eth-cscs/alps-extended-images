@@ -8,7 +8,9 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 # ----------------------------
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
+  GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps4-dev
+
 
 # ----------------------------
 # Image matrix anchors
@@ -59,6 +61,7 @@ variables:
   before_script:
     - source ci-pipelines/helpers/skopeo.sh
     - skopeo_login
+    - skopeo_login_ghcr
 
 # ----------------------------
 # Slurm: set pertinent env variables
@@ -99,10 +102,11 @@ build-base-meta:
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
       REMOVE_HPCX_DIRS=$REMOVE_HPCX_DIRS
-      OCI_SOURCE="${CI_PROJECT_URL}"
+      OCI_SOURCE="${CSCS_CI_ORIG_CLONE_URL}"
       OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
       OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
       CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
+      GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
 
       # For debugging: print the generated variables
@@ -132,10 +136,11 @@ build-apps-meta:
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
-      OCI_SOURCE="${CI_PROJECT_URL}"
+      OCI_SOURCE="${CSCS_CI_ORIG_CLONE_URL}"
       OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
       OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
       CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
+      GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
 
       # For debugging: print the generated variables
@@ -405,7 +410,8 @@ test-apertus-2-moe:
 #   check on CI_COMMIT_BRANCH)
 # - The stable tag must not already exist with different content (enforced by
 #   promote_check_strict)
-
+# Note: Skopeo copy requires a larger memory limit.
+#       Therfore we are using the container-builder-cscs-gh200 worker that comes with the skopeo tool kit.
 publish-gate:
   stage: publish
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
@@ -423,28 +429,40 @@ publish-gate:
 
 .publish-template:
   stage: publish
-  extends: [.container-runner-lightweight-gh200, .skopeo-template]
+  extends: [.container-builder-cscs-gh200]
+  variables:
+    KUBERNETES_MEMORY_REQUEST: 128Gi
+    KUBERNETES_MEMORY_LIMIT: 128Gi
   script:
     - |
+      source ci-pipelines/helpers/skopeo.sh
+      skopeo_login
+      skopeo_login_ghcr
       set -euo pipefail
-      echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+
+      echo "Starting promotion process for $CANON_IMAGE_REF"
 
       if [[ "${ALPS_REV}" =~ -dev$ ]]; then
         # For dev versions, we allow non-strict promotion (overwrites stable
         # tag regardless of content) but only on the default branch
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          echo "copy to: $STABLE_IMAGE_REF"
           skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+          echo "copy to: $GHCR_STABLE_IMAGE_REF"
+          skopeo copy  "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         else
           echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         fi
       else
         # Always run strict check (fails if stable exists but differs)
+        echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
         promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
         # Only promote on default branch
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
-          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+          promote_strict "$CANON_IMAGE_REF" "$GHCR_STABLE_IMAGE_REF"
+          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
         else
           echo "Dry-run only (not default branch): promotion not executed."
         fi
