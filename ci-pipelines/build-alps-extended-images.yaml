@@ -112,6 +112,9 @@ build-base-meta:
       # For debugging: print the generated variables
       echo "Generated build variables:"
       cat build.env
+
+      echo "CI_COMMIT_SHORT_SHA    = ${CI_COMMIT_SHORT_SHA}"
+      echo "CSCS_CI_ORIG_CLONE_URL = ${CSCS_CI_ORIG_CLONE_URL}"
   artifacts:
     reports:
       dotenv: build.env
