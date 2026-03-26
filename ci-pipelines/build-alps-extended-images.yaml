@@ -102,10 +102,10 @@ build-base-meta:
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
       REMOVE_HPCX_DIRS=$REMOVE_HPCX_DIRS
-      OCI_SOURCE="${CSCS_CI_ORIG_CLONE_URL}"
-      OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
-      OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-      CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
+      OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
+      OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
+      OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
 
@@ -136,10 +136,10 @@ build-apps-meta:
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
-      OCI_SOURCE="${CSCS_CI_ORIG_CLONE_URL}"
-      OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
-      OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-      CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
+      OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
+      OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
+      OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
 
@@ -437,6 +437,8 @@ publish-gate:
         else
           echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         fi
+        echo "copy to: $GHCR_STABLE_IMAGE_REF"
+        skopeo copy  "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
       else
         # Always run strict check (fails if stable exists but differs)
         echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
