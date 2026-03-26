@@ -105,6 +105,7 @@ build-base-meta:
       OCI_SOURCE="${CSCS_CI_ORIG_CLONE_URL}"
       OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
       OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      OCI_DESCRIPTION="This image extends ${NGC_NAME}:${NGC_TAG} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
       CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
@@ -139,6 +140,7 @@ build-apps-meta:
       OCI_SOURCE="${CSCS_CI_ORIG_CLONE_URL}"
       OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}"
       OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      OCI_DESCRIPTION="This image extends ${NGC_NAME}:${NGC_TAG} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
       CSCS_ALPS_GIT_COMMIT_SHORT="${CI_COMMIT_SHORT_SHA}"
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
@@ -189,6 +191,7 @@ build-base-images:
       "OCI_SOURCE",
       "OCI_REVISION",
       "OCI_CREATED",
+      "OCI_DESCRIPTION",
       "CSCS_ALPS_GIT_COMMIT_SHORT"
     ]'
 
@@ -207,6 +210,7 @@ build-app-images:
       "OCI_SOURCE",
       "OCI_REVISION",
       "OCI_CREATED",
+      "OCI_DESCRIPTION",
       "CSCS_ALPS_GIT_COMMIT_SHORT"
     ]'
 
