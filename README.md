@@ -26,6 +26,7 @@ Each variant corresponds to an NGC container extended with the Alps HPC stack:
 | `nemo-25.11.01`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
 | `nemo-26.02`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
 | `physicsnemo-25.11` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
+| `physicsnemo-26.03` | `nvcr.io/nvidia/physicsnemo/physicsnemo:26.03` | Physics-informed neural networks  |
 
 ### Application Images
 

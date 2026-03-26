@@ -29,6 +29,8 @@ variables:
   - NGC_NAME: "nemo"
     NGC_TAG: "25.11.01"
   - NGC_NAME: "physicsnemo"
+    NGC_TAG: "26.03"
+  - NGC_NAME: "physicsnemo"
     NGC_TAG: "25.11"
 
 .alps_app_images_matrix: &alps_app_images_matrix
