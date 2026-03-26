@@ -1,4 +1,4 @@
-[![build-images](https://img.shields.io/gitlab/pipeline-status/cscs-ci%2Fci-testing%2Fwebhook-ci%2Fmirrors%2F4655938191952498%2F3557919080247023?gitlab_url=https%3A%2F%2Fgitlab.com&branch=main&style=flat&label=build-images)](https://gitlab.com/cscs-ci/ci-testing/webhook-ci/mirrors/4655938191952498/3557919080247023/-/pipelines?ref=main)
+[![build-images](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fgitlab.com%2Fapi%2Fv4%2Fprojects%2Fcscs-ci%252Fci-testing%252Fwebhook-ci%252Fmirrors%252F4655938191952498%252F3557919080247023%2Fpipelines%3Fref%3Dmain%26source%3Dapi%26per_page%3D1&query=%24%5B0%5D.status&label=build-images&style=flat&logo=gitlab)](https://gitlab.com/cscs-ci/ci-testing/webhook-ci/mirrors/4655938191952498/3557919080247023/-/pipelines?ref=main&source=api&scope=all)
 
 # Alps Extended Images
 
