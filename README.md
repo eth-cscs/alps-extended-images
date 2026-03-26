@@ -1,3 +1,5 @@
+[![build-images](https://img.shields.io/gitlab/pipeline-status/cscs-ci%2Fci-testing%2Fwebhook-ci%2Fmirrors%2F4655938191952498%2F3557919080247023?gitlab_url=https%3A%2F%2Fgitlab.com&branch=main&style=flat&label=build-images)](https://gitlab.com/cscs-ci/ci-testing/webhook-ci/mirrors/4655938191952498/3557919080247023/-/pipelines?ref=main)
+
 # Alps Extended Images
 
 Container images that extend NVIDIA NGC base images with a fully-optimized HPC networking stack tailored for the [Alps supercomputer](https://www.cscs.ch/computers/alps) at [CSCS](https://www.cscs.ch). The images replace the bundled HPC-X components in NGC containers with libraries compiled specifically for the Slingshot CXI interconnect, enabling efficient GPU-accelerated collective communication across the Alps fabric.
