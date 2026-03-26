@@ -1,5 +1,4 @@
-![build-images](https://img.shields.io/github/check-runs/eth-cscs/alps-extended-images/main?nameFilter=cscs%2Fbuild-images&style=plastic)
-
+[![build-images](https://img.shields.io/gitlab/pipeline-status/cscs-ci%2Fci-testing%2Fwebhook-ci%2Fmirrors%2F4655938191952498%2F3557919080247023?gitlab_url=https%3A%2F%2Fgitlab.com&branch=main&style=flat&label=build-images)](https://gitlab.com/cscs-ci/ci-testing/webhook-ci/mirrors/4655938191952498/3557919080247023/-/pipelines?ref=main)
 
 # Alps Extended Images
 
