@@ -1,3 +1,5 @@
+![build-images](https://img.shields.io/github/check-runs/eth-cscs/alps-extended-images/main?nameFilter=cscs%2Fbuild-images&logo=github)
+
 # Alps Extended Images
 
 Container images that extend NVIDIA NGC base images with a fully-optimized HPC networking stack tailored for the [Alps supercomputer](https://www.cscs.ch/computers/alps) at [CSCS](https://www.cscs.ch). The images replace the bundled HPC-X components in NGC containers with libraries compiled specifically for the Slingshot CXI interconnect, enabling efficient GPU-accelerated collective communication across the Alps fabric.
