@@ -187,11 +187,10 @@ RUN set -eux; \
     python setup.py build_ext --verbose --parallel "${FA3_JOBS}" bdist_wheel; \
     python -m pip install --no-cache-dir dist/*.whl; \
     python_site="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
-    python -c 'import flash_attn_interface; print("top-level FA3 import OK")'; \
     mkdir -p "${python_site}/flash_attn_3"; \
+    cp /tmp/flash-attention/hopper/flash_attn_interface.py "${python_site}/flash_attn_3/flash_attn_interface.py"; \
     printf '%s\n' 'from .flash_attn_interface import *' > "${python_site}/flash_attn_3/__init__.py"; \
-    printf '%s\n' 'from flash_attn_interface import *' > "${python_site}/flash_attn_3/flash_attn_interface.py"; \
-    python -c 'import flash_attn_3.flash_attn_interface as m; print("flash-attn v3 import OK:", hasattr(m, "flash_attn_func"))'; \
+    python -c 'import flash_attn_3.flash_attn_interface as m; print("has _flash_attn_forward:", hasattr(m, "_flash_attn_forward"))'; \
     rm -rf /tmp/flash-attention
 
 ARG MEGATRON_REPO="https://github.com/NVIDIA/Megatron-LM.git"
