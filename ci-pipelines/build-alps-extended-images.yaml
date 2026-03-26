@@ -161,7 +161,7 @@ build-apps-meta:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: always
+    CSCS_REBUILD_POLICY: if-not-exists
     CSCS_BUILD_CACHE: $CSCS_REGISTRY_PATH/build_cache
     KUBERNETES_MEMORY_REQUEST: '128Gi'
     KUBERNETES_MEMORY_LIMIT: '128Gi'
@@ -437,8 +437,6 @@ publish-gate:
         else
           echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         fi
-        echo "copy to: $GHCR_STABLE_IMAGE_REF"
-        skopeo copy  "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
       else
         # Always run strict check (fails if stable exists but differs)
         echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
