@@ -1,4 +1,4 @@
-![build-images](https://img.shields.io/github/check-runs/eth-cscs/alps-extended-images/main?nameFilter=cscs%2Fbuild-images&logo=github)
+![build-images](https://img.shields.io/github/status/s/eth-cscs/alps-extended-images/main/cscs%2Fbuild-images?logo=github)
 
 # Alps Extended Images
 
