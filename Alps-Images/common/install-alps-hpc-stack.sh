@@ -53,6 +53,7 @@ remove_hpcx_plugins() {
     if [[ -n "${REMOVE_HPCX_DIRS:-}" ]]; then
         while IFS= read -r d; do
             [[ -z "$d" ]] && continue
+            echo "Removing HPCX plugin dir: $d"
             rm -rf "$d" || true
         done < <(printf "%s\n" ${REMOVE_HPCX_DIRS})
         ldconfig

@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
@@ -6,11 +8,13 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG OCI_SOURCE="unknown"
 ARG OCI_REVISION="unknown"
 ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
 ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
 
 LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       org.opencontainers.image.revision="${OCI_REVISION}" \
       org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
       com.cscs.alps.git.repo="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
