@@ -1,18 +1,16 @@
+[![build-images](https://gitlab.com/cscs-ci/ci-testing/webhook-ci/mirrors/4655938191952498/3557919080247023/badges/main/pipeline.svg?ignore_skipped=true&key_text=build-images&key_width=90)](https://gitlab.com/cscs-ci/ci-testing/webhook-ci/mirrors/4655938191952498/3557919080247023/-/pipelines?ref=main)
+
 # Alps Extended Images
 
 Container images that extend NVIDIA NGC base images with a fully-optimized HPC networking stack tailored for the [Alps supercomputer](https://www.cscs.ch/computers/alps) at [CSCS](https://www.cscs.ch). The images replace the bundled HPC-X components in NGC containers with libraries compiled specifically for the Slingshot CXI interconnect, enabling efficient GPU-accelerated collective communication across the Alps fabric.
 
 Image pipeline managed via: https://cicd-ext-mw.cscs.ch
 
----
-
 ## Overview
 
 NVIDIA NGC images ship with generic HPC libraries that are not optimized for the Slingshot network fabric used on Alps. This project rebuilds the full HPC networking stack — libfabric, NCCL, NVSHMEM, UCX, UCC, OpenMPI, and their transitive dependencies — against the CXI provider and installs the result on top of each supported NGC base image.
 
 The resulting images are validated on multi-node Slurm allocations (clariden-gh200) before being promoted to stable registries.
-
----
 
 ## Image Variants
 
@@ -22,10 +20,12 @@ Each variant corresponds to an NGC container extended with the Alps HPC stack:
 
 | Variant | NGC Base | Use Case |
 |---------|----------|----------|
-| `pytorch-25.12-py3` | `nvcr.io/nvidia/pytorch:25.12-py3` | GPU-accelerated PyTorch workloads |
-| `pytorch-26.01-py3` | `nvcr.io/nvidia/pytorch:26.01-py3` | GPU-accelerated PyTorch workloads |
-| `nemo-25.11.01` | `nvcr.io/nvidia/nemo:25.11.01` | Speech & language model training |
-| `physicsnemo-25.11` | `nvcr.io/nvidia/physicsnemo:25.11` | Physics-informed neural networks |
+| `pytorch-25.12-py3` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.01-py3` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.02-py3` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
+| `nemo-25.11.01`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
+| `nemo-26.02`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
+| `physicsnemo-25.11` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
 
 ### Application Images
 
@@ -34,9 +34,7 @@ Application images are built on top of the NGC base images and include additiona
 | Image | Base | Description |
 |-------|------|-------------|
 | `apertus-1p5` | `pytorch-26.01-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2` | `pytorch-26.01-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
-
----
+| `apertus-2`   | `pytorch-26.01-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 
 ## HPC Stack Components
 
@@ -60,8 +58,6 @@ All components are compiled with CUDA support (auto-detected) and architecture-s
 
 Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained under `patches/`.
 
----
-
 ## Runtime Environment
 
 `common/alps-runtime.env` configures the runtime environment for Slingshot-based collective communication:
@@ -71,9 +67,6 @@ Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained 
 - **NVSHMEM**: libfabric remote transport over the Cassini provider, CUDA VMM disabled
 - **OpenMPI / PMIX**: security modules, byte transfer layer restricted to supported backends
 - **CUDA**: JIT cache disabled for shared-filesystem compatibility
-
----
-
 
 ## CI/CD Pipeline
 
@@ -92,8 +85,6 @@ The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs fiv
 5. **publish** — promotes all tested images to stable registries; overwrites are blocked on existing stable tags
 
 **Image tagging strategy:** each image name encodes a SHA256 hash of its source files, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds.
-
----
 
 ## Acknowledgements
 
