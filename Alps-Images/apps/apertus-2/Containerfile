@@ -194,7 +194,7 @@ RUN set -eux; \
     rm -rf /tmp/flash-attention
 
 ARG MEGATRON_REPO="https://github.com/NVIDIA/Megatron-LM.git"
-ARG MEGATRON_COMMIT="9e2810417315a7ee93b41d4e234454abd3c16af5"
+ARG MEGATRON_COMMIT="287d2f47c3ee724fc5dfda6e798e17156da1f33f"
 ARG MEGATRON_PATCH_URL="https://patch-diff.githubusercontent.com/raw/NVIDIA/Megatron-LM/pull/1871.patch"
 
 RUN set -eux; \
@@ -213,6 +213,15 @@ RUN set -eux; \
     fi; \
     rm -f /tmp/megatron-1871.patch; \
     python3 setup.py build_ext --inplace;
+
+ARG EMERGING_OPTIMIZERS_REPO="https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git"
+ARG EMERGING_OPTIMIZERS_COMMIT="8d12ddf22e5a7092ae2c21ea5eceaf70eb7f79b3"
+
+RUN set -eux; \
+    git clone "${EMERGING_OPTIMIZERS_REPO}" /opt/emerging_optimizers; \
+    cd /opt/emerging_optimizers; \
+    git checkout -q "${EMERGING_OPTIMIZERS_COMMIT}"; \
+    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple --no-cache-dir .;
 
 # Tests shipped with the image
 COPY Alps-Images/apps/apertus-2/tests/ /opt/tests/apertus-2/
