@@ -92,6 +92,7 @@ build-base-meta:
       # Generate content-hash based image references and additional container build variables
       read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(base_refs "$NGC_NAME" "$NGC_TAG")
       REMOVE_HPCX_DIRS="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
+      IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
 
       # Export variables to a file for the builder job
       cat > build.env <<EOF
@@ -105,7 +106,7 @@ build-base-meta:
       OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
       OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
       OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      OCI_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
+      OCI_DESCRIPTION=$IMAGE_DESCRIPTION
       CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
@@ -129,6 +130,7 @@ build-apps-meta:
 
       # Generate content-hash based image references and additional container build variables
       read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$NAME")
+      IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
 
       # Export variables to a file for the builder job
       cat > build_apps.env <<EOF
@@ -140,7 +142,7 @@ build-apps-meta:
       OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
       OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
       OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      OCI_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
+      OCI_DESCRIPTION=$IMAGE_DESCRIPTION
       CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
