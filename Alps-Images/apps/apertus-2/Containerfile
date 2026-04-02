@@ -148,8 +148,10 @@ RUN set -eux; \
         packaging \
         pydantic \
         importlib-metadata; \
-    git clone --branch "${TE_VERSION}" --recursive https://github.com/NVIDIA/TransformerEngine.git /tmp/TransformerEngine; \
+    #git clone --branch "${TE_VERSION}" --recursive https://github.com/NVIDIA/TransformerEngine.git /tmp/TransformerEngine; \
+    git clone --recursive https://github.com/NouamaneTazi/TransformerEngine.git /tmp/TransformerEngine; \
     cd /tmp/TransformerEngine; \
+    git checkout -q "c86c65878631f424838cd3be0ec7336665344ccf"; \
     grep -q 'cuda_driver.h' transformer_engine/common/nvshmem_api/nvshmem_waitkernel.cu || \
       sed -i '/#include "..\/util\/logging.h"/a #include "..\/util\/cuda_driver.h"' \
         transformer_engine/common/nvshmem_api/nvshmem_waitkernel.cu; \
@@ -197,8 +199,10 @@ RUN set -eux; \
     python -c 'import flash_attn_3.flash_attn_interface as m; print("has _flash_attn_forward:", hasattr(m, "_flash_attn_forward"))'; \
     rm -rf /tmp/flash-attention
 
-ARG MEGATRON_REPO="https://github.com/NVIDIA/Megatron-LM.git"
-ARG MEGATRON_COMMIT="287d2f47c3ee724fc5dfda6e798e17156da1f33f"
+ARG MEGATRON_REPO="https://github.com/NouamaneTazi/Megatron-LM.git"
+ARG MEGATRON_COMMIT="413924458f5c025623d470d6e9b3791fc3022f79"
+#ARG MEGATRON_REPO="https://github.com/NVIDIA/Megatron-LM.git"
+#ARG MEGATRON_COMMIT="287d2f47c3ee724fc5dfda6e798e17156da1f33f"
 ARG MEGATRON_PATCH_URL="https://patch-diff.githubusercontent.com/raw/NVIDIA/Megatron-LM/pull/1871.patch"
 
 RUN set -eux; \
