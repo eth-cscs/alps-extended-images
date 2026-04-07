@@ -328,11 +328,13 @@ test-base-images-vetnode:
   script:
     - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
+      config=$(realpath ci-pipelines/vetnode-config.yaml)
+      cd /tmp
       if [ "$SLURM_LOCALID" -eq 0 ]; then
         python -m venv --system-site-packages .venv
         source .venv/bin/activate
         pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
-        vetnode setup ./ci-pipelines/build-alps-extended-images.yaml
+        vetnode setup "$config"
         touch /tmp/setup-done-${SLURM_JOB_ID}
       else
         echo "[image-vet] Waiting for setup on $(hostname)..."
@@ -344,7 +346,7 @@ test-base-images-vetnode:
       fi
     - echo "[image-vet] diagnose"
     - source .venv/bin/activate
-    - vetnode diagnose ./ci-pipelines/build-alps-extended-images.yaml
+    - vetnode diagnose "$config"
   variables:
     SLURM_JOB_NUM_NODES: 4
     SLURM_NTASKS: 16
