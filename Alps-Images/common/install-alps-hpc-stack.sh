@@ -171,8 +171,7 @@ build_nccl_deb() {
     mkdir -p /opt/alps/env
     printf 'export NCCL_VERSION=%q\n' "${NCCL_VER}" >> /opt/alps/env/alps-versions.env
     # Produces: ext-profiler/inspector/libnccl-profiler-inspector.so
-    #pushd plugins/profiler/inspector
-    pushd ext-profiler/inspector
+    pushd plugins/profiler/inspector
     make -j"$(nproc)" CUDA_HOME="${CUDA_DIR}"
     install -D -m 0644 libnccl-profiler-inspector.so /usr/local/lib/libnccl-profiler-inspector.so
     popd
