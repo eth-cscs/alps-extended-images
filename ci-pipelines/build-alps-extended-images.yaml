@@ -328,7 +328,7 @@ test-base-images-vetnode:
   script:
     - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
-      config=$(realpath ci-pipelines/vetnode-config.yaml)
+      config=$(realpath ci-pipelines/helpers/vetnode-config.yaml)
       cd /tmp
       if [ "$SLURM_LOCALID" -eq 0 ]; then
         python -m venv --system-site-packages .venv
