@@ -329,12 +329,10 @@ test-base-images-vetnode:
     - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
       if [ "$SLURM_LOCALID" -eq 0 ]; then
-        wget -O /tmp/config.yaml https://raw.githubusercontent.com/eth-cscs/vetnode/refs/heads/main/examples/image-vet/config.yaml
-        cd /tmp
         python -m venv --system-site-packages .venv
         source .venv/bin/activate
         pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
-        vetnode setup /tmp/config.yaml
+        vetnode setup ./ci-pipelines/build-alps-extended-images.yaml
         touch /tmp/setup-done-${SLURM_JOB_ID}
       else
         echo "[image-vet] Waiting for setup on $(hostname)..."
@@ -345,12 +343,12 @@ test-base-images-vetnode:
         done
       fi
     - echo "[image-vet] diagnose"
-    - cd /tmp
     - source .venv/bin/activate
-    - vetnode diagnose /tmp/config.yaml
+    - vetnode diagnose ./ci-pipelines/build-alps-extended-images.yaml
   variables:
     SLURM_JOB_NUM_NODES: 4
     SLURM_NTASKS: 16
+    GIT_STRATEGY: fetch
 
 test-apertus-1p5:
   stage: test-apps
