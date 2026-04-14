@@ -115,12 +115,12 @@ ARG RMM_TAG=v26.04.00
 RUN set -eux; \
     git clone --depth 1 --branch "${RMM_TAG}" "${RMM_REPO}" /tmp/rmm; \
     pushd /tmp/rmm; \
-    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/rmm; \
+    cmake -S ./cpp -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/opt/rmm; \
     cmake --build build -j$(nproc); \
     cmake --install build; \
     python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple rapids-build-backend; \
-    python -m pip wheel --no-deps --no-cache-dir ./python/librmm; \
-    python -m pip install --find-links. -e ./python/rmm; \
+    python -m pip wheel ./python/librmm; \
+    CMAKE_PREFIX_PATH=/opt/rmm/lib/cmake/ python -m pip install --find-links=. python/rmm; \
     popd; \
     rm -rf /tmp/rmm
 
