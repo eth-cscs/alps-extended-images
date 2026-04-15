@@ -33,8 +33,8 @@ Application images are built on top of the NGC base images and include additiona
 
 | Image | Base | Description |
 |-------|------|-------------|
-| `apertus-1p5` | `pytorch-26.01-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2`   | `pytorch-26.01-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `apertus-1p5` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
+| `apertus-2`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 
 ## HPC Stack Components
 

@@ -9,7 +9,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
-  ALPS_REV: alps4-dev
+  ALPS_REV: alps4
 
 
 # ----------------------------
