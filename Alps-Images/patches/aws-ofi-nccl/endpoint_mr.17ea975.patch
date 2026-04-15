@@ -1,4 +1,4 @@
-From 9e56d680d7fa8eb231dff1d217a44918410e7321 Mon Sep 17 00:00:00 2001
+From e1024f6f71cca33bf5c41ab56f088209cee3070d Mon Sep 17 00:00:00 2001
 From: Ryan Hankins <ryan.hankins@hpe.com>
 Date: Mon, 6 Apr 2026 17:16:01 -0500
 Subject: [PATCH 1/5] rdma: split mr[] into mr_data[], mr_ctrl_owned[],
@@ -31,15 +31,15 @@ so every code path uses the same fid_mr as before.
 
 Signed-off-by: Ryan Hankins <ryan.hankins@hpe.com>
 ---
- include/nccl_ofi_rdma.h | 38 ++++++++++++++++++----
+ include/nccl_ofi_rdma.h | 37 +++++++++++++++++++---
  src/nccl_ofi_rdma.cpp   | 70 ++++++++++++++++++++++++++---------------
- 2 files changed, 76 insertions(+), 32 deletions(-)
+ 2 files changed, 76 insertions(+), 31 deletions(-)
 
 diff --git a/include/nccl_ofi_rdma.h b/include/nccl_ofi_rdma.h
-index e1d60ba6c14c64960886ffd85e955685e8a81439..8d91de9cb9decb4e4f072af0a318d9dd98164beb 100644
+index 70896fa0f..6136f1fa4 100644
 --- a/include/nccl_ofi_rdma.h
 +++ b/include/nccl_ofi_rdma.h
-@@ -131,26 +131,52 @@ class nccl_net_ofi_rdma_mr_handle_t : public nccl_net_ofi_mr_handle_t {
+@@ -131,25 +131,52 @@ class nccl_net_ofi_rdma_mr_handle_t : public nccl_net_ofi_mr_handle_t {
  public:
  	/**
  	 * @brief 	Default constructor
@@ -66,7 +66,6 @@ index e1d60ba6c14c64960886ffd85e955685e8a81439..8d91de9cb9decb4e4f072af0a318d9dd
 +		  num_ctrl_rails(num_ctrl_rails_arg),
  		  base_addr(0)
  	{
--		mr.resize(num_rails);
 +		mr_data.resize(num_rails);
 +		mr_ctrl.resize(num_ctrl_rails, nullptr);
  	}
@@ -90,8 +89,8 @@ index e1d60ba6c14c64960886ffd85e955685e8a81439..8d91de9cb9decb4e4f072af0a318d9dd
 +	 * In non-endpoint-MR mode this vector remains empty; mr_ctrl[] aliases mr_data[]. */
 +	std::vector<ofi_mr_ptr> mr_ctrl_owned;
  
--	/* Array of size `num_rails' */
--	std::vector<ofi_mr_ptr> mr;
+-	/* Array of size `num_rails', indexed by rail_id */
+-	std::array<ofi_mr_ptr, MAX_NUM_RAILS> mr;
 +	/* Non-owning view into either mr_ctrl_owned[] (FI_MR_ENDPOINT) or mr_data[]
 +	 * (non-endpoint-MR).  Always populated after reg_mr_on_device() returns. */
 +	std::vector<struct fid_mr *> mr_ctrl;
@@ -99,7 +98,7 @@ index e1d60ba6c14c64960886ffd85e955685e8a81439..8d91de9cb9decb4e4f072af0a318d9dd
  	/* Base address of the registered memory region for offset calculation */
  	uintptr_t base_addr;
 diff --git a/src/nccl_ofi_rdma.cpp b/src/nccl_ofi_rdma.cpp
-index 95efb9af74f571705b8ee784d6fe6ca3744e5a8c..421949b97e00f2520c44f4d7df1ea8ec988ebff0 100644
+index f08d5d1df..0fcdfc025 100644
 --- a/src/nccl_ofi_rdma.cpp
 +++ b/src/nccl_ofi_rdma.cpp
 @@ -2560,8 +2560,16 @@ int nccl_net_ofi_rdma_domain_t::reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
@@ -291,7 +290,7 @@ index 95efb9af74f571705b8ee784d6fe6ca3744e5a8c..421949b97e00f2520c44f4d7df1ea8ec
  	uint64_t flags = 0;
  	return rma_write_impl(this, src, size, desc, dest, mr_key, flags, base_req);
 
-From 9c805bd75dba6ccc7b8e2ebfd2e321dacf5963f3 Mon Sep 17 00:00:00 2001
+From 671d0584aadeecb92cabd3b9bc5c0002d231f571 Mon Sep 17 00:00:00 2001
 From: Ryan Hankins <ryan.hankins@hpe.com>
 Date: Mon, 6 Apr 2026 17:19:16 -0500
 Subject: [PATCH 2/5] rdma: thread endpoint pointer through reg_mr chain
@@ -319,10 +318,10 @@ Signed-off-by: Ryan Hankins <ryan.hankins@hpe.com>
  2 files changed, 28 insertions(+), 26 deletions(-)
 
 diff --git a/include/nccl_ofi_rdma.h b/include/nccl_ofi_rdma.h
-index 8d91de9cb9decb4e4f072af0a318d9dd98164beb..26d07eec4859e2dd9c600ddd64618f6c64acc350 100644
+index 6136f1fa4..87d93a3c2 100644
 --- a/include/nccl_ofi_rdma.h
 +++ b/include/nccl_ofi_rdma.h
-@@ -841,6 +841,7 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
+@@ -840,6 +840,7 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
  	 */
  	int reg_mr(nccl_ofi_mr_ckey_ref ckey,
  		   int type,
@@ -330,7 +329,7 @@ index 8d91de9cb9decb4e4f072af0a318d9dd98164beb..26d07eec4859e2dd9c600ddd64618f6c
  		   nccl_net_ofi_rdma_mr_handle_t **mhandle);
  
  	/**
-@@ -896,11 +897,13 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
+@@ -895,11 +896,13 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
  	 */
  	int reg_internal_mr(void *data,
  			    size_t size, int type,
@@ -344,7 +343,7 @@ index 8d91de9cb9decb4e4f072af0a318d9dd98164beb..26d07eec4859e2dd9c600ddd64618f6c
  				nccl_net_ofi_rdma_mr_handle_t **mhandle);
  #endif
  	/**
-@@ -959,6 +962,7 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
+@@ -958,6 +961,7 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
  private:
  	int reg_mr_on_device(nccl_ofi_mr_ckey_ref ckey,
  			     int type,
@@ -353,7 +352,7 @@ index 8d91de9cb9decb4e4f072af0a318d9dd98164beb..26d07eec4859e2dd9c600ddd64618f6c
  
  	/**
 diff --git a/src/nccl_ofi_rdma.cpp b/src/nccl_ofi_rdma.cpp
-index 421949b97e00f2520c44f4d7df1ea8ec988ebff0..bb96439c7b6e8cd3b0c3c82468ce74427561de58 100644
+index 0fcdfc025..d7b5ddf86 100644
 --- a/src/nccl_ofi_rdma.cpp
 +++ b/src/nccl_ofi_rdma.cpp
 @@ -2551,6 +2551,7 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
@@ -513,7 +512,7 @@ index 421949b97e00f2520c44f4d7df1ea8ec988ebff0..bb96439c7b6e8cd3b0c3c82468ce7442
  		NCCL_OFI_WARN("Could not register memory for control mailbox for dev %d", dev_id);
  		ret = -ENOMEM;
 
-From e22d6a9027a9797195350f8efae06c236d57aa49 Mon Sep 17 00:00:00 2001
+From a0a75fb9d977bec0ad9e9fa38e6fa1f5b06985a9 Mon Sep 17 00:00:00 2001
 From: Ryan Hankins <ryan.hankins@hpe.com>
 Date: Mon, 6 Apr 2026 17:21:07 -0500
 Subject: [PATCH 3/5] rdma: implement FI_MR_ENDPOINT bind/enable in
@@ -547,10 +546,10 @@ Signed-off-by: Ryan Hankins <ryan.hankins@hpe.com>
  2 files changed, 97 insertions(+), 17 deletions(-)
 
 diff --git a/include/nccl_ofi_rdma.h b/include/nccl_ofi_rdma.h
-index 26d07eec4859e2dd9c600ddd64618f6c64acc350..fb4f89b199a4e90c69fa724fde2631d5f9ad3ef9 100644
+index 87d93a3c2..2e82fa76f 100644
 --- a/include/nccl_ofi_rdma.h
 +++ b/include/nccl_ofi_rdma.h
-@@ -965,6 +965,29 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
+@@ -964,6 +964,29 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
  			     nccl_net_ofi_rdma_ep_t *ep,
  			     nccl_net_ofi_rdma_mr_handle_t **mhandle);
  
@@ -581,7 +580,7 @@ index 26d07eec4859e2dd9c600ddd64618f6c64acc350..fb4f89b199a4e90c69fa724fde2631d5
  	 * @brief	Deregister memory region without acquiring memory region cache lock
  	 *
 diff --git a/src/nccl_ofi_rdma.cpp b/src/nccl_ofi_rdma.cpp
-index bb96439c7b6e8cd3b0c3c82468ce74427561de58..eea7139daf3f6ad33ec644e7cb9ead16ef09756b 100644
+index d7b5ddf86..73d38db88 100644
 --- a/src/nccl_ofi_rdma.cpp
 +++ b/src/nccl_ofi_rdma.cpp
 @@ -2549,6 +2549,29 @@ int nccl_net_ofi_rdma_domain_t::dereg_mr_no_lock(nccl_net_ofi_rdma_mr_handle_t *
@@ -691,7 +690,7 @@ index bb96439c7b6e8cd3b0c3c82468ce74427561de58..eea7139daf3f6ad33ec644e7cb9ead16
  	}
  
  	/* Store base address of registered memory region for offset calculations.
-@@ -6814,7 +6876,7 @@ static void get_hints(struct fi_info *hints)
+@@ -6811,7 +6873,7 @@ static void get_hints(struct fi_info *hints)
  	hints->ep_attr->type = FI_EP_RDM;
  
  	hints->domain_attr->mr_mode = FI_MR_LOCAL | FI_MR_HMEM | FI_MR_VIRT_ADDR |
@@ -700,7 +699,7 @@ index bb96439c7b6e8cd3b0c3c82468ce74427561de58..eea7139daf3f6ad33ec644e7cb9ead16
  	hints->domain_attr->mr_key_size = (size_t) ofi_nccl_mr_key_size();
  	hints->domain_attr->threading = FI_THREAD_COMPLETION;
  
-@@ -7001,11 +7063,6 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
+@@ -6998,11 +7060,6 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
  		return ret;
  	}
  
@@ -713,7 +712,7 @@ index bb96439c7b6e8cd3b0c3c82468ce74427561de58..eea7139daf3f6ad33ec644e7cb9ead16
  		NCCL_OFI_WARN("Invalid value for EAGER_MAX_SIZE");
  		return -ENOTSUP;
 
-From 62c245f6dd6f559aef0a1eb2d1e9043ad3db11e7 Mon Sep 17 00:00:00 2001
+From 741b8df4bbc5010997887fee38483f3e47f2bec6 Mon Sep 17 00:00:00 2001
 From: Ryan Hankins <ryan.hankins@hpe.com>
 Date: Mon, 6 Apr 2026 16:52:06 -0500
 Subject: [PATCH 4/5] rdma: move flush buffer lifecycle to endpoint scope
@@ -748,10 +747,10 @@ Signed-off-by: Ryan Hankins <ryan.hankins@hpe.com>
  2 files changed, 229 insertions(+), 113 deletions(-)
 
 diff --git a/include/nccl_ofi_rdma.h b/include/nccl_ofi_rdma.h
-index fb4f89b199a4e90c69fa724fde2631d5f9ad3ef9..175c6a1b39496a2b699850b42b20ce262b24f73d 100644
+index 2e82fa76f..09ac410aa 100644
 --- a/include/nccl_ofi_rdma.h
 +++ b/include/nccl_ofi_rdma.h
-@@ -917,6 +917,34 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
+@@ -916,6 +916,34 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
  	 */
  	int dereg_mr(nccl_net_ofi_rdma_mr_handle_t *mr_handle);
  
@@ -784,9 +783,9 @@ index fb4f89b199a4e90c69fa724fde2631d5f9ad3ef9..175c6a1b39496a2b699850b42b20ce26
 +				     nccl_net_ofi_rdma_ep_t *bind_ep);
 +
  	uint16_t num_rails;
- 	std::vector<nccl_net_ofi_rdma_domain_rail_t> domain_rails;
+ 	std::array<nccl_net_ofi_rdma_domain_rail_t, MAX_NUM_RAILS> domain_rails;
  
-@@ -938,19 +966,6 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
+@@ -937,19 +965,6 @@ class nccl_net_ofi_rdma_domain_t : public nccl_net_ofi_domain_t {
  
  	int cleanup_resources() override;
  
@@ -806,7 +805,7 @@ index fb4f89b199a4e90c69fa724fde2631d5f9ad3ef9..175c6a1b39496a2b699850b42b20ce26
  	/**
  	 * @brief	Deregister flush buffer if flush buffer was registered. Deallocate flush buffer.
  	 *
-@@ -1324,6 +1339,20 @@ class nccl_net_ofi_rdma_ep_t : public nccl_net_ofi_ep_t {
+@@ -1337,6 +1352,20 @@ class nccl_net_ofi_rdma_ep_t : public nccl_net_ofi_ep_t {
  	nccl_ofi_freelist *eager_rx_buff_fl = nullptr;
  	/* Free list of rx buffer requests */
  	nccl_ofi_freelist *rx_buff_reqs_fl = nullptr;
@@ -828,7 +827,7 @@ index fb4f89b199a4e90c69fa724fde2631d5f9ad3ef9..175c6a1b39496a2b699850b42b20ce26
  	size_t ctrl_rx_buff_size;
  	/* Size of eager rx buffers.  Will be -1 if eager is entirely
 diff --git a/src/nccl_ofi_rdma.cpp b/src/nccl_ofi_rdma.cpp
-index eea7139daf3f6ad33ec644e7cb9ead16ef09756b..ca0d95627d995a8e035bfd78943c719d1c7a55f6 100644
+index 73d38db88..3dcca1e83 100644
 --- a/src/nccl_ofi_rdma.cpp
 +++ b/src/nccl_ofi_rdma.cpp
 @@ -3075,7 +3075,6 @@ int nccl_net_ofi_rdma_recv_comm::recv(int n, void **buffers,
@@ -1253,7 +1252,7 @@ index eea7139daf3f6ad33ec644e7cb9ead16ef09756b..ca0d95627d995a8e035bfd78943c719d
  	}
  
  	err_code = nccl_net_ofi_mutex_destroy(&this->pending_reqs_lock);
-@@ -6600,11 +6665,33 @@ nccl_net_ofi_rdma_domain_t::nccl_net_ofi_rdma_domain_t(nccl_net_ofi_rdma_device_
+@@ -6597,11 +6662,33 @@ nccl_net_ofi_rdma_domain_t::nccl_net_ofi_rdma_domain_t(nccl_net_ofi_rdma_device_
  
  	/*
  	 * Setup flush resources.
@@ -1289,7 +1288,7 @@ index eea7139daf3f6ad33ec644e7cb9ead16ef09756b..ca0d95627d995a8e035bfd78943c719d
  
  nccl_net_ofi_domain_t *nccl_net_ofi_rdma_device_t::create_domain(unsigned int domain_key)
 
-From 39936e542e8ae91e2ee639472092eb965fed148a Mon Sep 17 00:00:00 2001
+From 9af5eec8f2eae81bc6b2b547f1079b2ab4982de9 Mon Sep 17 00:00:00 2001
 From: Ryan Hankins <ryan.hankins@hpe.com>
 Date: Mon, 6 Apr 2026 17:30:24 -0500
 Subject: [PATCH 5/5] rdma: freelist ep context, is_ctrl rail flag,
@@ -1321,10 +1320,10 @@ Signed-off-by: Ryan Hankins <ryan.hankins@hpe.com>
  2 files changed, 63 insertions(+), 8 deletions(-)
 
 diff --git a/include/nccl_ofi_rdma.h b/include/nccl_ofi_rdma.h
-index 175c6a1b39496a2b699850b42b20ce262b24f73d..a8dbbf553162e0e2e1f001db1d851c0e275aee6a 100644
+index 09ac410aa..65c5e80b5 100644
 --- a/include/nccl_ofi_rdma.h
 +++ b/include/nccl_ofi_rdma.h
-@@ -714,6 +714,10 @@ class nccl_net_ofi_rdma_recv_comm : public nccl_net_ofi_recv_comm {
+@@ -715,6 +715,10 @@ class nccl_net_ofi_rdma_recv_comm : public nccl_net_ofi_recv_comm {
  	/* Free list to track host flush buffers, for sending flush messages */
  	nccl_ofi_freelist *flush_buff_fl;
  
@@ -1335,7 +1334,7 @@ index 175c6a1b39496a2b699850b42b20ce262b24f73d..a8dbbf553162e0e2e1f001db1d851c0e
  #if HAVE_NVTX_TRACING
  	nvtxDomainHandle_t nvtx_domain[NCCL_OFI_N_NVTX_DOMAIN_PER_COMM];
  #endif
-@@ -1088,6 +1092,9 @@ class nccl_net_ofi_rdma_ep_rail_t {
+@@ -1087,6 +1091,9 @@ class nccl_net_ofi_rdma_ep_rail_t {
  	/* Mutex for rx buffer operations */
  	pthread_mutex_t rx_buff_mutex;
  
@@ -1345,7 +1344,7 @@ index 175c6a1b39496a2b699850b42b20ce262b24f73d..a8dbbf553162e0e2e1f001db1d851c0e
  	/* Allocate a receive buffer request for this rail (eager or ctrl) */
  	nccl_net_ofi_rdma_req* (*rx_buff_req_alloc)(nccl_net_ofi_rdma_ep_t *ep,
  						      nccl_net_ofi_rdma_ep_rail_t *rail);
-@@ -1339,6 +1346,9 @@ class nccl_net_ofi_rdma_ep_t : public nccl_net_ofi_ep_t {
+@@ -1352,6 +1359,9 @@ class nccl_net_ofi_rdma_ep_t : public nccl_net_ofi_ep_t {
  	nccl_ofi_freelist *eager_rx_buff_fl = nullptr;
  	/* Free list of rx buffer requests */
  	nccl_ofi_freelist *rx_buff_reqs_fl = nullptr;
@@ -1356,7 +1355,7 @@ index 175c6a1b39496a2b699850b42b20ce262b24f73d..a8dbbf553162e0e2e1f001db1d851c0e
  	 * In FI_MR_ENDPOINT mode this is a per-endpoint registration bound to
  	 * the endpoint's own flush_buff allocation; otherwise it aliases the
 diff --git a/src/nccl_ofi_rdma.cpp b/src/nccl_ofi_rdma.cpp
-index ca0d95627d995a8e035bfd78943c719d1c7a55f6..e6fbd6f931425117c6bded3a8c800b1f8dd9e518 100644
+index 3dcca1e83..52311daa8 100644
 --- a/src/nccl_ofi_rdma.cpp
 +++ b/src/nccl_ofi_rdma.cpp
 @@ -2802,6 +2802,17 @@ typedef struct {
