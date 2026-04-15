@@ -442,6 +442,15 @@ build_osu() {
     ldconfig
 }
 
+clean_up() {
+    apt-get remove --purge -y  \
+        rdma-corebuild-essential pkg-config automake autoconf, libtool cmake \
+        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev libibverbs-dev \
+        fakeroot dh-make
+
+    apt-get autoremove -y
+}
+
 main() {
     CUDA_DIR="$(detect_cuda_dir)" || die "Could not determine CUDA directory..."
     export CUDA_DIR
@@ -466,6 +475,8 @@ main() {
 
     build_nccl_tests
     build_osu
+
+    clean_up
 }
 
 main "$@"
