@@ -444,7 +444,7 @@ build_osu() {
 
 clean_up() {
     apt-get remove --purge -y  \
-        rdma-corebuild-essential pkg-config automake autoconf, libtool cmake \
+        rdma-core build-essential pkg-config automake autoconf libtool cmake \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev libibverbs-dev \
         fakeroot dh-make
 
