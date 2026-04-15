@@ -312,6 +312,8 @@ test-base-images-collectives:
   script:
     # NCCL
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
+    # NCCL send/recv via RDMA protocol
+    - FI_CXI_ENABLE_WRITEDATA=1 OFI_NCCL_PROTOCOL=RDMA sendrecv_perf -b 32 -e 4M -f 2 -g 1
     # NVSHMEM
     - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
     # OSU
