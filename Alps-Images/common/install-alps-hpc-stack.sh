@@ -449,7 +449,7 @@ clean_up() {
     apt-mark hold cuda-crt-13-1 cuda-nvcc-13-1
     printf 'Removing build packages...\n'
     apt-get remove --purge -y  \
-        build-essential pkg-config automake autoconf libtool cmake \
+        pkg-config automake autoconf libtool cmake \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev libnuma-dev libsensors-dev libcurl4-openssl-dev libibverbs-dev \
         fakeroot dh-make
     printf 'Running autoremove...\n'
