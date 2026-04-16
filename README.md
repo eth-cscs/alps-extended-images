@@ -20,12 +20,12 @@ Each variant corresponds to an NGC container extended with the Alps HPC stack:
 
 | Variant | NGC Base | Use Case |
 |---------|----------|----------|
-| `pytorch-25.12-py3` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
-| `pytorch-26.01-py3` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
-| `pytorch-26.02-py3` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
-| `nemo-25.11.01`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
-| `nemo-26.02`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
-| `physicsnemo-25.11` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
+| `pytorch-25.12-py3-alps4` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.01-py3-alps4` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.02-py3-alps4` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
+| `nemo-25.11.01-alps4`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
+| `nemo-26.02-alps4`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
+| `physicsnemo-25.11-alps4` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
 
 ### Application Images
 
@@ -33,8 +33,8 @@ Application images are built on top of the NGC base images and include additiona
 
 | Image | Base | Description |
 |-------|------|-------------|
-| `apertus-1p5` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `apertus-1p5-alps4` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
+| `apertus-2-alps4`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 
 ## HPC Stack Components
 
@@ -42,16 +42,16 @@ The `common/install-alps-hpc-stack.sh` script builds and installs the following 
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
-| libfabric (CXI provider) | commit `102872c` | High-speed network fabric abstraction for Slingshot |
-| NCCL | 2.29.3-1 | NVIDIA collective communications (allreduce, alltoall, …) |
-| aws-ofi-nccl | custom | Routes NCCL traffic over libfabric/OFI |
-| NVSHMEM | 3.4.5-0 | GPU symmetric heap memory for peer-to-peer transfers |
-| UCX | 1.19.1 | Unified Communication X transport layer |
-| UCC | 1.6.0 | Unified Collective Communications abstraction |
-| OpenMPI | 5.0.9 | MPI implementation linked against OFI and UCX |
+| libfabric (CXI provider) | 2.5.0 | High-speed network fabric abstraction for Slingshot |
+| NCCL | 2.28.7-1 | NVIDIA collective communications (allreduce, alltoall, …) |
+| aws-ofi-nccl | 1.17.3 | Routes NCCL traffic over libfabric/OFI |
+| NVSHMEM | 3.6.5-0 | GPU symmetric heap memory for peer-to-peer transfers |
+| UCX | 1.20.0 | Unified Communication X transport layer |
+| UCC | 1.7.0 | Unified Collective Communications abstraction |
+| OpenMPI | 5.0.10 | MPI implementation linked against OFI and UCX |
 | GDRCopy | 2.5.1 | GPU Direct RDMA copy utilities |
 | XPMEM | — | Cross-process memory regions for intra-node GPU sharing |
-| NCCL Tests | — | Collective benchmark suite |
+| NCCL Tests | 2.18.2 | Collective benchmark suite |
 | OSU Micro-benchmarks | 7.5.2 | Point-to-point latency and bandwidth measurements |
 
 All components are compiled with CUDA support (auto-detected) and architecture-specific flags for NVIDIA Hopper (SM90/SM90a).
