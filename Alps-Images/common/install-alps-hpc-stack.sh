@@ -445,8 +445,8 @@ build_osu() {
 clean_up() {
     
     printf 'Pacakages cleanup...\n'
-    printf 'Marking packages to hold\n'
-    apt-mark hold cuda-crt-13-1 cuda-nvcc-13-1
+    #printf 'Marking packages to hold\n'
+    #apt-mark hold cuda-crt-13-1 cuda-nvcc-13-1
     printf 'Removing build packages...\n'
     apt-get remove --purge -y  \
         pkg-config automake autoconf libtool cmake \
