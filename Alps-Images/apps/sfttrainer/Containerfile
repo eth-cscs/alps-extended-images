@@ -31,4 +31,4 @@ RUN set -eux; \
       python3-venv
 # Python deps 
 COPY Alps-Images/apps/sfttrainer/requirements.txt /tmp/requirements.txt
-RUN pip install -r /tmp/requirements.txt
+RUN python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple -r /tmp/requirements.txt
