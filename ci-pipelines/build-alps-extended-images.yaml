@@ -34,6 +34,7 @@ variables:
 .alps_app_images_matrix: &alps_app_images_matrix
   - NAME: "apertus-1p5"
   - NAME: "apertus-2"
+  - NAME: "sfttrainer"
 
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
