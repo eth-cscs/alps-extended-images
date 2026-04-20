@@ -301,24 +301,74 @@ build_nvshmem() {
     : "${NVSHMEM_ENABLE_PYTHON:=1}"
     : "${NVSHMEM_ENABLE_TESTS:=1}"
 
+    patch_nvshmem4py() {
+        local pyroot="${NVSHMEM_SRC_DIR}/nvshmem4py"
+        local build_tests=0
+        [[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && build_tests=1
+
+        # 1) Prevent pip build/runtime deps from pulling a packaged NVSHMEM
+        #    that would conflict with the source-built install in this container.
+        sed -i \
+            '/^[[:space:]]*cuda-toolkit\[cudart,nvcc,curand,cccl,nvvm\]==13\.\*[[:space:]]*$/d' \
+            "${pyroot}/requirements_build.txt"
+
+        sed -i \
+            '/^[[:space:]]*nvidia-nvshmem-cu12[[:space:]]*$/d' \
+            "${pyroot}/requirements_cuda12.txt"
+
+        sed -i \
+            '/^[[:space:]]*nvidia-nvshmem-cu13[[:space:]]*$/d' \
+            "${pyroot}/requirements_cuda13.txt"
+
+        # 2) Silence setuptools package-discovery warnings from namespace-style dirs.
+        #    Make the package tree explicit and switch discovery to namespace-aware.
+        mkdir -p \
+            "${pyroot}/nvshmem/core/interop" \
+            "${pyroot}/nvshmem/bindings/_internal" \
+            "${pyroot}/nvshmem/bindings/device/cute"
+
+        touch \
+            "${pyroot}/nvshmem/core/interop/__init__.py" \
+            "${pyroot}/nvshmem/bindings/_internal/__init__.py" \
+            "${pyroot}/nvshmem/bindings/device/cute/__init__.py"
+
+        sed -i \
+            's/from setuptools import setup, Extension, find_packages/from setuptools import setup, Extension, find_namespace_packages/' \
+            "${pyroot}/setup.py"
+
+        sed -i \
+            's/packages=find_packages(include=\["nvshmem", "nvshmem\.\*"\])/packages=find_namespace_packages(include=["nvshmem", "nvshmem.*"])/' \
+            "${pyroot}/setup.py"
+
+        # Optional sanity output so logs show the patch landed.
+        grep -nE 'find_(namespace_)?packages|nvidia-nvshmem|cuda-toolkit\[cudart,nvcc,curand,cccl,nvvm\]' \
+            "${pyroot}/setup.py" \
+            "${pyroot}/requirements_build.txt" \
+            "${pyroot}/requirements_cuda12.txt" \
+            "${pyroot}/requirements_cuda13.txt" || true
+    }
+
     # Remove preinstalled NVSHMEM
     apt-get update
     apt-get purge -y 'libnvshmem*-cuda-*' 'nvshmem*' || true
     apt-get autoremove -y || true
 
     # Remove CUDA symlinks/copies that can shadow our install
-    rm -f "${CUDA_DIR}/lib64/libnvshmem"*".so"* || true
-    rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*".so"* || true
+    rm -f "${CUDA_DIR}/lib64/libnvshmem"*.so* || true
+    rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*.so* || true
     rm -rf /usr/lib/*/nvshmem || true
 
     rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
     mkdir -p "${NVSHMEM_BUILDDIR}"
 
     # Clone repo
-    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git ${NVSHMEM_SRC_DIR}
+    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git "${NVSHMEM_SRC_DIR}"
+
+    # Apply local nvshmem4py patches before configure/build
+    patch_nvshmem4py
 
     NVSHMEM_BUILD_EXAMPLES=0 \
-    NVSHMEM_BUILD_TESTS=1 \
+    NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
     NVSHMEM_DEBUG=0 \
     NVSHMEM_DEVEL=0 \
     NVSHMEM_DEFAULT_PMI2=0 \
@@ -369,42 +419,55 @@ EOF
 
     ldconfig
 
-    # pip install wheel (build installs/copies wheels into prefix but does not install into python)
+    # Build installs/copies wheels into the tree, but does not install into python.
     if [[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]]; then
         if python -c 'import nvshmem.core as _' >/dev/null 2>&1; then
             echo "[nvshmem4py] already importable; skipping wheel install"
         else
-            local cp_tag mach cuda_major best
+            local cp_tag mach cuda_major best req
+
             cp_tag="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
             mach="$(python -c 'import platform; print(platform.machine())')"
-            cuda_major="$("${CUDA_DIR}/bin/nvcc" --version | awk '/release [0-9]+/ {for(i=1;i<=NF;i++) if($i=="release"){gsub(",","",$(i+1)); split($(i+1),a,"."); print a[1]; exit}}')"
+            cuda_major="$("${CUDA_DIR}/bin/nvcc" --version | awk '
+                /release [0-9]+/ {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "release") {
+                            gsub(",", "", $(i+1))
+                            split($(i+1), a, ".")
+                            print a[1]
+                            exit
+                        }
+                    }
+                }'
+            )"
 
             # Prefer the most specific wheel: linux_<arch> > manylinux
-            # Search both build/dist and install tree dist locations
             best="$(
-              find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
-                   -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
-              | grep -E "${cp_tag}-${cp_tag}-linux_${mach}\.whl$" \
-              | sort -V | tail -n1 || true
-            )"
-            if [[ -z "${best}" ]]; then
-              best="$(
                 find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
-                     -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
-                | grep -E "${cp_tag}-${cp_tag}-.*manylinux.*_${mach}\.whl$" \
+                    -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
+                | grep -E "${cp_tag}-${cp_tag}-linux_${mach}\.whl$" \
                 | sort -V | tail -n1 || true
-              )"
+            )"
+
+            if [[ -z "${best}" ]]; then
+                best="$(
+                    find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
+                        -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
+                    | grep -E "${cp_tag}-${cp_tag}-.*manylinux.*_${mach}\.whl$" \
+                    | sort -V | tail -n1 || true
+                )"
             fi
+
             [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
 
             proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
+
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
-            
-            # Install nvshmem4py deps *except* the pip-provided NVSHMEM runtime (nvidia-nvshmem-cuXX).
-            # Avoid upgrades unless needed.
+
+            # Install nvshmem4py deps except any pip-provided NVSHMEM runtime package.
             proxied_pip_install --no-cache-dir --upgrade-strategy only-if-needed -r <(
-                grep -Ev '^\s*(nvidia[-_])?nvshmem(-cu[0-9]+)?\s*([=<>!~].*)?\s*$' "${req}"
+                grep -Ev '^[[:space:]]*(nvidia[-_])?nvshmem(-cu[0-9]+)?[[:space:]]*([=<>!~].*)?$' "${req}"
             )
 
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
