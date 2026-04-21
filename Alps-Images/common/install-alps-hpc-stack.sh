@@ -443,10 +443,9 @@ build_osu() {
 }
 
 clean_up() {
-    
     printf 'Pacakages cleanup...\n'
-    #printf 'Marking packages to hold\n'
-    #apt-mark hold cuda-crt-13-1 cuda-nvcc-13-1
+    printf 'Marking packages to hold\n'
+    apt-mark hold libibverbs-dev
     printf 'Removing build packages...\n'
     apt-get remove --purge -y  \
         pkg-config automake autoconf libtool cmake \
@@ -454,7 +453,8 @@ clean_up() {
         fakeroot dh-make
     printf 'Running autoremove...\n'
     apt-get autoremove -y
-        
+    printf 'unhold packages\n'
+    apt-mark unhold libibverbs-dev
 }
 
 main() {
