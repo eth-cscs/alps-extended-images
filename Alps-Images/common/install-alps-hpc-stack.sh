@@ -303,8 +303,7 @@ build_nvshmem() {
 
     patch_nvshmem4py() {
         local pyroot="${NVSHMEM_SRC_DIR}/nvshmem4py"
-        local build_tests=0
-        [[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && build_tests=1
+        local gen_pyproject="${pyroot}/scripts/generate_pyproject_toml.py"
 
         # 1) Prevent pip build/runtime deps from pulling a packaged NVSHMEM
         #    that would conflict with the source-built install in this container.
@@ -320,8 +319,8 @@ build_nvshmem() {
             '/^[[:space:]]*nvidia-nvshmem-cu13[[:space:]]*$/d' \
             "${pyroot}/requirements_cuda13.txt"
 
-        # 2) Silence setuptools package-discovery warnings from namespace-style dirs.
-        #    Make the package tree explicit and switch discovery to namespace-aware.
+        # 2) Make the package tree explicit so setuptools stops warning about
+        #    importable directories that are absent from the generated package list.
         mkdir -p \
             "${pyroot}/nvshmem/core/interop" \
             "${pyroot}/nvshmem/bindings/_internal" \
@@ -332,20 +331,76 @@ build_nvshmem() {
             "${pyroot}/nvshmem/bindings/_internal/__init__.py" \
             "${pyroot}/nvshmem/bindings/device/cute/__init__.py"
 
-        sed -i \
-            's/from setuptools import setup, Extension, find_packages/from setuptools import setup, Extension, find_namespace_packages/' \
-            "${pyroot}/setup.py"
+        # 3) Patch the pyproject generator, because buildWheel.cmake regenerates
+        #    pyproject.toml from this script during wheel builds.
+        GEN_PYPROJECT="${gen_pyproject}" python - <<'PY'
+from pathlib import Path
+import os
+import re
+import sys
 
-        sed -i \
-            's/packages=find_packages(include=\["nvshmem", "nvshmem\.\*"\])/packages=find_namespace_packages(include=["nvshmem", "nvshmem.*"])/' \
-            "${pyroot}/setup.py"
+p = Path(os.environ["GEN_PYPROJECT"])
+s = p.read_text(encoding="utf-8")
 
-        # Optional sanity output so logs show the patch landed.
-        grep -nE 'find_(namespace_)?packages|nvidia-nvshmem|cuda-toolkit\[cudart,nvcc,curand,cccl,nvvm\]' \
-            "${pyroot}/setup.py" \
-            "${pyroot}/requirements_build.txt" \
-            "${pyroot}/requirements_cuda12.txt" \
-            "${pyroot}/requirements_cuda13.txt" || true
+# Replace the explicit package list in the embedded pyproject template.
+old = re.compile(
+    r'(\[tool\.setuptools\]\s*packages\s*=\s*\[\s*'
+    r'"nvshmem",\s*'
+    r'"nvshmem\.bindings",\s*'
+    r'"nvshmem\.bindings\.device",\s*'
+    r'"nvshmem\.bindings\.device\.numba",\s*'
+    r'"nvshmem\.core",\s*'
+    r'"nvshmem\.core\.device",\s*'
+    r'"nvshmem\.core\.device\.numba",\s*'
+    r'"nvshmem\.core\.device\.cute"\s*'
+    r'\])',
+    re.DOTALL,
+)
+
+new = '''[tool.setuptools]
+packages = [
+ "nvshmem",
+ "nvshmem.bindings",
+ "nvshmem.bindings._internal",
+ "nvshmem.bindings.device",
+ "nvshmem.bindings.device.numba",
+ "nvshmem.bindings.device.cute",
+ "nvshmem.core",
+ "nvshmem.core.interop",
+ "nvshmem.core.device",
+ "nvshmem.core.device.numba",
+ "nvshmem.core.device.cute"
+]'''
+
+s2, n = old.subn(new, s, count=1)
+if n != 1:
+    raise SystemExit("patch_nvshmem4py: failed to patch package list in generate_pyproject_toml.py")
+
+p.write_text(s2, encoding="utf-8")
+PY
+
+        # 4) Silence the stale MANIFEST warning for a file that is not present.
+        sed -i \
+            '/^[[:space:]]*include[[:space:]]\+requirements_cuda11\.txt[[:space:]]*$/d' \
+            "${pyroot}/MANIFEST.in"
+
+        # 5) Optional sanity output so logs show the patch landed.
+        echo "[nvshmem4py] patched requirements_build.txt:"
+        grep -n 'cuda-toolkit\[cudart,nvcc,curand,cccl,nvvm\]==13\.\*' \
+            "${pyroot}/requirements_build.txt" || true
+
+        echo "[nvshmem4py] patched requirements_cuda12.txt:"
+        grep -n 'nvidia-nvshmem-cu12' "${pyroot}/requirements_cuda12.txt" || true
+
+        echo "[nvshmem4py] patched requirements_cuda13.txt:"
+        grep -n 'nvidia-nvshmem-cu13' "${pyroot}/requirements_cuda13.txt" || true
+
+        echo "[nvshmem4py] patched package list in generate_pyproject_toml.py:"
+        grep -nE 'nvshmem\.bindings\._internal|nvshmem\.bindings\.device\.cute|nvshmem\.core\.interop' \
+            "${gen_pyproject}"
+
+        echo "[nvshmem4py] patched MANIFEST.in:"
+        grep -n 'requirements_cuda11\.txt' "${pyroot}/MANIFEST.in" || true
     }
 
     # Remove preinstalled NVSHMEM
