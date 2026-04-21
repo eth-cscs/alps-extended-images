@@ -301,108 +301,6 @@ build_nvshmem() {
     : "${NVSHMEM_ENABLE_PYTHON:=1}"
     : "${NVSHMEM_ENABLE_TESTS:=1}"
 
-    patch_nvshmem4py() {
-        local pyroot="${NVSHMEM_SRC_DIR}/nvshmem4py"
-        local gen_pyproject="${pyroot}/scripts/generate_pyproject_toml.py"
-
-        # 1) Prevent pip build/runtime deps from pulling a packaged NVSHMEM
-        #    that would conflict with the source-built install in this container.
-        sed -i \
-            '/^[[:space:]]*cuda-toolkit\[cudart,nvcc,curand,cccl,nvvm\]==13\.\*[[:space:]]*$/d' \
-            "${pyroot}/requirements_build.txt"
-
-        sed -i \
-            '/^[[:space:]]*nvidia-nvshmem-cu12[[:space:]]*$/d' \
-            "${pyroot}/requirements_cuda12.txt"
-
-        sed -i \
-            '/^[[:space:]]*nvidia-nvshmem-cu13[[:space:]]*$/d' \
-            "${pyroot}/requirements_cuda13.txt"
-
-        # 2) Make the package tree explicit so setuptools stops warning about
-        #    importable directories that are absent from the generated package list.
-        mkdir -p \
-            "${pyroot}/nvshmem/core/interop" \
-            "${pyroot}/nvshmem/bindings/_internal" \
-            "${pyroot}/nvshmem/bindings/device/cute"
-
-        touch \
-            "${pyroot}/nvshmem/core/interop/__init__.py" \
-            "${pyroot}/nvshmem/bindings/_internal/__init__.py" \
-            "${pyroot}/nvshmem/bindings/device/cute/__init__.py"
-
-        # 3) Patch the pyproject generator, because buildWheel.cmake regenerates
-        #    pyproject.toml from this script during wheel builds.
-        GEN_PYPROJECT="${gen_pyproject}" python - <<'PY'
-from pathlib import Path
-import os
-import re
-import sys
-
-p = Path(os.environ["GEN_PYPROJECT"])
-s = p.read_text(encoding="utf-8")
-
-# Replace the explicit package list in the embedded pyproject template.
-old = re.compile(
-    r'(\[tool\.setuptools\]\s*packages\s*=\s*\[\s*'
-    r'"nvshmem",\s*'
-    r'"nvshmem\.bindings",\s*'
-    r'"nvshmem\.bindings\.device",\s*'
-    r'"nvshmem\.bindings\.device\.numba",\s*'
-    r'"nvshmem\.core",\s*'
-    r'"nvshmem\.core\.device",\s*'
-    r'"nvshmem\.core\.device\.numba",\s*'
-    r'"nvshmem\.core\.device\.cute"\s*'
-    r'\])',
-    re.DOTALL,
-)
-
-new = '''[tool.setuptools]
-packages = [
- "nvshmem",
- "nvshmem.bindings",
- "nvshmem.bindings._internal",
- "nvshmem.bindings.device",
- "nvshmem.bindings.device.numba",
- "nvshmem.bindings.device.cute",
- "nvshmem.core",
- "nvshmem.core.interop",
- "nvshmem.core.device",
- "nvshmem.core.device.numba",
- "nvshmem.core.device.cute"
-]'''
-
-s2, n = old.subn(new, s, count=1)
-if n != 1:
-    raise SystemExit("patch_nvshmem4py: failed to patch package list in generate_pyproject_toml.py")
-
-p.write_text(s2, encoding="utf-8")
-PY
-
-        # 4) Silence the stale MANIFEST warning for a file that is not present.
-        sed -i \
-            '/^[[:space:]]*include[[:space:]]\+requirements_cuda11\.txt[[:space:]]*$/d' \
-            "${pyroot}/MANIFEST.in"
-
-        # 5) Optional sanity output so logs show the patch landed.
-        echo "[nvshmem4py] patched requirements_build.txt:"
-        grep -n 'cuda-toolkit\[cudart,nvcc,curand,cccl,nvvm\]==13\.\*' \
-            "${pyroot}/requirements_build.txt" || true
-
-        echo "[nvshmem4py] patched requirements_cuda12.txt:"
-        grep -n 'nvidia-nvshmem-cu12' "${pyroot}/requirements_cuda12.txt" || true
-
-        echo "[nvshmem4py] patched requirements_cuda13.txt:"
-        grep -n 'nvidia-nvshmem-cu13' "${pyroot}/requirements_cuda13.txt" || true
-
-        echo "[nvshmem4py] patched package list in generate_pyproject_toml.py:"
-        grep -nE 'nvshmem\.bindings\._internal|nvshmem\.bindings\.device\.cute|nvshmem\.core\.interop' \
-            "${gen_pyproject}"
-
-        echo "[nvshmem4py] patched MANIFEST.in:"
-        grep -n 'requirements_cuda11\.txt' "${pyroot}/MANIFEST.in" || true
-    }
-
     # Remove preinstalled NVSHMEM
     apt-get update
     apt-get purge -y 'libnvshmem*-cuda-*' 'nvshmem*' || true
@@ -419,8 +317,10 @@ PY
     # Clone repo
     git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git "${NVSHMEM_SRC_DIR}"
 
-    # Apply local nvshmem4py patches before configure/build
-    patch_nvshmem4py
+    # Apply local nvshmem4py patch set
+    pushd "${NVSHMEM_SRC_DIR}" >/dev/null
+    apply_patch_if_set "${NVSHMEM_PATCH}"
+    popd >/dev/null
 
     NVSHMEM_BUILD_EXAMPLES=0 \
     NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
@@ -480,6 +380,7 @@ EOF
             echo "[nvshmem4py] already importable; skipping wheel install"
         else
             local cp_tag mach cuda_major best req
+            local constraint_file
 
             cp_tag="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
             mach="$(python -c 'import platform; print(platform.machine())')"
@@ -517,31 +418,21 @@ EOF
 
             proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
 
-            # Install nvshmem4py deps except any pip-provided NVSHMEM runtime package.
-            # If cuda-pathfinder is already installed and already satisfies the upstream
-            # requirement, pin it to the installed version for this install.
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
 
-            local req_filtered constraint_file
-            req_filtered="$(mktemp)"
             constraint_file="$(mktemp)"
 
-            # Filter out the pip NVSHMEM runtime package from upstream requirements.
-            grep -Ev '^[[:space:]]*(nvidia[-_])?nvshmem(-cu[0-9]+)?[[:space:]]*([=<>!~].*)?$' "${req}" > "${req_filtered}"
-
-            # If cuda-pathfinder is already installed, and its installed version satisfies
-            # the requirement in req_filtered, pin it exactly via a constraints file.
-            REQ_FILE="${req_filtered}" CONSTRAINT_FILE="${constraint_file}" python - <<'PY'
+            # If cuda-pathfinder is already installed and satisfies the upstream
+            # requirement, pin it to the installed version for this install.
+            REQ_FILE="${req}" CONSTRAINT_FILE="${constraint_file}" python - <<'PY'
 import os
 import re
-import sys
 from importlib.metadata import version, PackageNotFoundError
 
 try:
     from packaging.requirements import Requirement
 except Exception:
-    # If packaging is unavailable, skip pinning rather than failing the build.
     raise SystemExit(0)
 
 req_file = os.environ["REQ_FILE"]
@@ -578,8 +469,6 @@ for candidate in ("cuda-pathfinder", "cuda.pathfinder", "cuda_pathfinder"):
 if installed is None:
     raise SystemExit(0)
 
-# Only pin if the installed version already satisfies the upstream spec.
-# Otherwise let pip upgrade it normally.
 if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed, prereleases=True):
     with open(constraint_file, "w", encoding="utf-8") as out:
         out.write(f"cuda-pathfinder=={installed}\n")
@@ -587,12 +476,12 @@ if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed
 PY
 
             if [[ -s "${constraint_file}" ]]; then
-                proxied_pip_install --no-cache-dir -c "${constraint_file}" -r "${req_filtered}"
+                proxied_pip_install --no-cache-dir -c "${constraint_file}" -r "${req}"
             else
-                proxied_pip_install --no-cache-dir -r "${req_filtered}"
+                proxied_pip_install --no-cache-dir -r "${req}"
             fi
 
-            rm -f "${req_filtered}" "${constraint_file}"
+            rm -f "${constraint_file}"
 
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
         fi
