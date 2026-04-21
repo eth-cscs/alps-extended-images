@@ -462,13 +462,82 @@ EOF
 
             proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
 
+            # Install nvshmem4py deps except any pip-provided NVSHMEM runtime package.
+            # If cuda-pathfinder is already installed and already satisfies the upstream
+            # requirement, pin it to the installed version for this install.
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
 
-            # Install nvshmem4py deps except any pip-provided NVSHMEM runtime package.
-            proxied_pip_install --no-cache-dir --upgrade-strategy only-if-needed -r <(
-                grep -Ev '^[[:space:]]*(nvidia[-_])?nvshmem(-cu[0-9]+)?[[:space:]]*([=<>!~].*)?$' "${req}"
-            )
+            local req_filtered constraint_file
+            req_filtered="$(mktemp)"
+            constraint_file="$(mktemp)"
+
+            # Filter out the pip NVSHMEM runtime package from upstream requirements.
+            grep -Ev '^[[:space:]]*(nvidia[-_])?nvshmem(-cu[0-9]+)?[[:space:]]*([=<>!~].*)?$' "${req}" > "${req_filtered}"
+
+            # If cuda-pathfinder is already installed, and its installed version satisfies
+            # the requirement in req_filtered, pin it exactly via a constraints file.
+            REQ_FILE="${req_filtered}" CONSTRAINT_FILE="${constraint_file}" python - <<'PY'
+import os
+import re
+import sys
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    # If packaging is unavailable, skip pinning rather than failing the build.
+    raise SystemExit(0)
+
+req_file = os.environ["REQ_FILE"]
+constraint_file = os.environ["CONSTRAINT_FILE"]
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+pathfinder_req = None
+with open(req_file, "r", encoding="utf-8") as f:
+    for raw in f:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            req = Requirement(line)
+        except Exception:
+            continue
+        if norm(req.name) == "cuda-pathfinder":
+            pathfinder_req = req
+            break
+
+if pathfinder_req is None:
+    raise SystemExit(0)
+
+installed = None
+for candidate in ("cuda-pathfinder", "cuda.pathfinder", "cuda_pathfinder"):
+    try:
+        installed = version(candidate)
+        break
+    except PackageNotFoundError:
+        pass
+
+if installed is None:
+    raise SystemExit(0)
+
+# Only pin if the installed version already satisfies the upstream spec.
+# Otherwise let pip upgrade it normally.
+if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed, prereleases=True):
+    with open(constraint_file, "w", encoding="utf-8") as out:
+        out.write(f"cuda-pathfinder=={installed}\n")
+    print(f"[nvshmem4py] pinning cuda-pathfinder to installed version: {installed}")
+PY
+
+            if [[ -s "${constraint_file}" ]]; then
+                proxied_pip_install --no-cache-dir -c "${constraint_file}" -r "${req_filtered}"
+            else
+                proxied_pip_install --no-cache-dir -r "${req_filtered}"
+            fi
+
+            rm -f "${req_filtered}" "${constraint_file}"
 
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
         fi
