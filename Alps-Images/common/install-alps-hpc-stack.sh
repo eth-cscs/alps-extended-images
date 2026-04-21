@@ -449,7 +449,7 @@ clean_up() {
     printf 'Removing build packages...\n'
     apt-get remove --purge -y  \
         pkg-config automake autoconf libtool cmake \
-        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev libnuma-dev libsensors-dev libcurl4-openssl-dev \
+        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnuma-dev libsensors-dev libcurl4-openssl-dev \
         fakeroot dh-make
     printf 'Running autoremove...\n'
     apt-get autoremove -y
