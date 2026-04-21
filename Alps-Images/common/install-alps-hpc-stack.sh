@@ -28,7 +28,7 @@ apt_install_build_deps() {
         bc gdb strace wget curl git bzip2 python3 gfortran \
         rdma-core numactl \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev \
-        libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev libibverbs-dev \
+        libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev \
         libsox-fmt-all \
         devscripts debhelper fakeroot dh-make
     rm -rf /var/lib/apt/lists/*
@@ -442,6 +442,21 @@ build_osu() {
     ldconfig
 }
 
+clean_up() {
+    printf 'Pacakages cleanup...\n'
+    printf 'Marking packages to hold\n'
+    apt-mark hold libibverbs-dev
+    printf 'Removing build packages...\n'
+    apt-get remove --purge -y  \
+        pkg-config automake autoconf libtool cmake \
+        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnuma-dev libsensors-dev libcurl4-openssl-dev \
+        fakeroot dh-make
+    printf 'Running autoremove...\n'
+    apt-get autoremove -y
+    printf 'unhold packages\n'
+    apt-mark unhold libibverbs-dev
+}
+
 main() {
     CUDA_DIR="$(detect_cuda_dir)" || die "Could not determine CUDA directory..."
     export CUDA_DIR
@@ -466,6 +481,8 @@ main() {
 
     build_nccl_tests
     build_osu
+
+    clean_up
 }
 
 main "$@"
