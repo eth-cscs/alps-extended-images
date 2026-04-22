@@ -28,7 +28,7 @@ apt_install_build_deps() {
         bc gdb strace wget curl git bzip2 python3 gfortran \
         rdma-core numactl \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev \
-        libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev libibverbs-dev \
+        libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev \
         libsox-fmt-all \
         devscripts debhelper fakeroot dh-make
     rm -rf /var/lib/apt/lists/*
@@ -306,18 +306,23 @@ build_nvshmem() {
     apt-get autoremove -y || true
 
     # Remove CUDA symlinks/copies that can shadow our install
-    rm -f "${CUDA_DIR}/lib64/libnvshmem"*".so"* || true
-    rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*".so"* || true
+    rm -f "${CUDA_DIR}/lib64/libnvshmem"*.so* || true
+    rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*.so* || true
     rm -rf /usr/lib/*/nvshmem || true
 
     rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
     mkdir -p "${NVSHMEM_BUILDDIR}"
 
     # Clone repo
-    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git ${NVSHMEM_SRC_DIR}
+    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git "${NVSHMEM_SRC_DIR}"
+
+    # Apply local nvshmem4py patch set
+    pushd "${NVSHMEM_SRC_DIR}" >/dev/null
+    apply_patch_if_set "${NVSHMEM_PATCH}"
+    popd >/dev/null
 
     NVSHMEM_BUILD_EXAMPLES=0 \
-    NVSHMEM_BUILD_TESTS=1 \
+    NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
     NVSHMEM_DEBUG=0 \
     NVSHMEM_DEVEL=0 \
     NVSHMEM_DEFAULT_PMI2=0 \
@@ -368,43 +373,114 @@ EOF
 
     ldconfig
 
-    # pip install wheel (build installs/copies wheels into prefix but does not install into python)
+    # Build installs/copies wheels into the tree, but does not install into python.
     if [[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]]; then
         if python -c 'import nvshmem.core as _' >/dev/null 2>&1; then
             echo "[nvshmem4py] already importable; skipping wheel install"
         else
-            local cp_tag mach cuda_major best
+            local cp_tag mach cuda_major best req
+            local constraint_file
+
             cp_tag="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
             mach="$(python -c 'import platform; print(platform.machine())')"
-            cuda_major="$("${CUDA_DIR}/bin/nvcc" --version | awk '/release [0-9]+/ {for(i=1;i<=NF;i++) if($i=="release"){gsub(",","",$(i+1)); split($(i+1),a,"."); print a[1]; exit}}')"
+            cuda_major="$("${CUDA_DIR}/bin/nvcc" --version | awk '
+                /release [0-9]+/ {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "release") {
+                            gsub(",", "", $(i+1))
+                            split($(i+1), a, ".")
+                            print a[1]
+                            exit
+                        }
+                    }
+                }'
+            )"
 
             # Prefer the most specific wheel: linux_<arch> > manylinux
-            # Search both build/dist and install tree dist locations
             best="$(
-              find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
-                   -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
-              | grep -E "${cp_tag}-${cp_tag}-linux_${mach}\.whl$" \
-              | sort -V | tail -n1 || true
-            )"
-            if [[ -z "${best}" ]]; then
-              best="$(
                 find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
-                     -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
-                | grep -E "${cp_tag}-${cp_tag}-.*manylinux.*_${mach}\.whl$" \
+                    -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
+                | grep -E "${cp_tag}-${cp_tag}-linux_${mach}\.whl$" \
                 | sort -V | tail -n1 || true
-              )"
+            )"
+
+            if [[ -z "${best}" ]]; then
+                best="$(
+                    find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
+                        -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
+                    | grep -E "${cp_tag}-${cp_tag}-.*manylinux.*_${mach}\.whl$" \
+                    | sort -V | tail -n1 || true
+                )"
             fi
+
             [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
 
             proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
+
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
-            
-            # Install nvshmem4py deps *except* the pip-provided NVSHMEM runtime (nvidia-nvshmem-cuXX).
-            # Avoid upgrades unless needed.
-            proxied_pip_install --no-cache-dir --upgrade-strategy only-if-needed -r <(
-                grep -Ev '^\s*(nvidia[-_])?nvshmem(-cu[0-9]+)?\s*([=<>!~].*)?\s*$' "${req}"
-            )
+
+            constraint_file="$(mktemp)"
+
+            # If cuda-pathfinder is already installed and satisfies the upstream
+            # requirement, pin it to the installed version for this install.
+            REQ_FILE="${req}" CONSTRAINT_FILE="${constraint_file}" python - <<'PY'
+import os
+import re
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    raise SystemExit(0)
+
+req_file = os.environ["REQ_FILE"]
+constraint_file = os.environ["CONSTRAINT_FILE"]
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+pathfinder_req = None
+with open(req_file, "r", encoding="utf-8") as f:
+    for raw in f:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            req = Requirement(line)
+        except Exception:
+            continue
+        if norm(req.name) == "cuda-pathfinder":
+            pathfinder_req = req
+            break
+
+if pathfinder_req is None:
+    raise SystemExit(0)
+
+installed = None
+for candidate in ("cuda-pathfinder", "cuda.pathfinder", "cuda_pathfinder"):
+    try:
+        installed = version(candidate)
+        break
+    except PackageNotFoundError:
+        pass
+
+if installed is None:
+    raise SystemExit(0)
+
+if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed, prereleases=True):
+    with open(constraint_file, "w", encoding="utf-8") as out:
+        out.write(f"cuda-pathfinder=={installed}\n")
+    print(f"[nvshmem4py] pinning cuda-pathfinder to installed version: {installed}")
+PY
+
+            if [[ -s "${constraint_file}" ]]; then
+                proxied_pip_install --no-cache-dir -c "${constraint_file}" -r "${req}"
+            else
+                proxied_pip_install --no-cache-dir -r "${req}"
+            fi
+
+            rm -f "${constraint_file}"
 
             python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
         fi
@@ -441,6 +517,21 @@ build_osu() {
     ldconfig
 }
 
+clean_up() {
+    printf 'Pacakages cleanup...\n'
+    printf 'Marking packages to hold\n'
+    apt-mark hold libibverbs-dev
+    printf 'Removing build packages...\n'
+    apt-get remove --purge -y  \
+        pkg-config automake autoconf libtool cmake \
+        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnuma-dev libsensors-dev libcurl4-openssl-dev \
+        fakeroot dh-make
+    printf 'Running autoremove...\n'
+    apt-get autoremove -y
+    printf 'unhold packages\n'
+    apt-mark unhold libibverbs-dev
+}
+
 main() {
     CUDA_DIR="$(detect_cuda_dir)" || die "Could not determine CUDA directory..."
     export CUDA_DIR
@@ -465,6 +556,8 @@ main() {
 
     build_nccl_tests
     build_osu
+
+    clean_up
 }
 
 main "$@"
