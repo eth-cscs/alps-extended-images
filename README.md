@@ -20,12 +20,12 @@ Each variant corresponds to an NGC container extended with the Alps HPC stack:
 
 | Variant | NGC Base | Use Case |
 |---------|----------|----------|
-| `pytorch-25.12-py3-alps4` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
-| `pytorch-26.01-py3-alps4` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
-| `pytorch-26.02-py3-alps4` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
-| `nemo-25.11.01-alps4`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
-| `nemo-26.02-alps4`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
-| `physicsnemo-25.11-alps4` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
+| `pytorch-25.12-py3-alps5` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.01-py3-alps5` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.02-py3-alps5` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
+| `nemo-25.11.01-alps5`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
+| `nemo-26.02-alps5`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
+| `physicsnemo-25.11-alps5` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
 
 ### Application Images
 
@@ -33,8 +33,8 @@ Application images are built on top of the NGC base images and include additiona
 
 | Image | Base | Description |
 |-------|------|-------------|
-| `apertus-1p5-alps4` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2-alps4`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `apertus-1p5-alps5` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
+| `apertus-2-alps5`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 
 ## HPC Stack Components
 
@@ -42,9 +42,9 @@ The `common/install-alps-hpc-stack.sh` script builds and installs the following 
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
-| libfabric (CXI provider) | 2.5.0 | High-speed network fabric abstraction for Slingshot |
-| NCCL | 2.28.7-1 | NVIDIA collective communications (allreduce, alltoall, …) |
-| aws-ofi-nccl | 1.17.3 | Routes NCCL traffic over libfabric/OFI |
+| libfabric (CXI provider) | 2.5.1 | High-speed network fabric abstraction for Slingshot |
+| NCCL | 2.30.3-1 | NVIDIA collective communications (allreduce, alltoall, …) |
+| aws-ofi-nccl | commit `17ea975` | Routes NCCL traffic over libfabric/OFI |
 | NVSHMEM | 3.6.5-0 | GPU symmetric heap memory for peer-to-peer transfers |
 | UCX | 1.20.0 | Unified Communication X transport layer |
 | UCC | 1.7.0 | Unified Collective Communications abstraction |
