@@ -61,8 +61,8 @@ RUN set -eux; \
     rustup component list --installed
 
 # Install patched pplx-garden
-ARG PPLX_GARDEN_REPO=https://github.com/pinxuezhao/pplx_garden_cxi.git
-ARG PPLX_GARDEN_COMMIT=3ce62f9993b6e4abdcda8dac3b87a944ea221f4f
+ARG PPLX_GARDEN_REPO=https://github.com/boeschf/pplx_garden_cxi.git
+ARG PPLX_GARDEN_COMMIT=7035135706cb2783213e5f44c735ba4cbce05d40
 RUN set -eux; \
     python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install --no-cache-dir build; \
     rm -rf /tmp/pplx_garden; \
