@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+
+# Special thanks to Eduard Durech for his work on the original VeRL image for Alps.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+# Install dependencies for VeRL from pypi, including vLLM and SGLang.
+
+RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu131
+RUN pip install sglang
+RUN pip install flash-attn --no-build-isolation
+
+
+# Install dependencies for VeRL from source, including flashinfer, flash-attention, torch_memory_saver, XIELU
+
+ENV SRC_DIR=/workspace/src \
+    WHL_DIR=/workspace/src/wheels
+
+WORKDIR ${SRC_DIR}
+
+RUN git clone https://github.com/flashinfer-ai/flashinfer.git ;\
+    cd flashinfer ;\
+    git checkout 50319b2e59e94e4e4b6f175e11184a677e0053b2 ;\
+    git submodule update --init --recursive ;\
+    MAX_JOBS=32 python -m flashinfer.aot 2>&1 | tee ./build_aot.log ;\
+    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
+RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/flashinfer*.whl
+
+RUN git clone https://github.com/nickjbrowning/XIELU.git ;\
+    cd XIELU ;\
+    git submodule update --init --recursive ;\
+    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
+RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
+
+
+
+RUN rm -rf ${SRC_DIR}
+RUN rm -rf ${WHL_DIR}
+
+WORKDIR /workspace
+
+RUN git clone https://github.com/verl-project/verl
+RUN cd verl && pip install --no-deps -e .
