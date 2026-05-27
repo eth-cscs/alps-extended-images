@@ -50,11 +50,9 @@ RUN git clone https://github.com/nickjbrowning/XIELU.git ;\
 RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
 
 
+WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
-RUN rm -rf ${WHL_DIR}
-
-WORKDIR /workspace
 
 RUN git clone https://github.com/verl-project/verl
 RUN cd verl && pip install --no-deps -e .
