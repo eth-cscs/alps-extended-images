@@ -24,8 +24,9 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
 # Install dependencies for VeRL from pypi, including vLLM and SGLang.
 
 RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu131
-RUN pip install sglang
+RUN pip install sglang[all]
 RUN pip install flash-attn --no-build-isolation
+RUN pip install -U "ray[data,train,tune,serve]"
 
 
 # Install dependencies for VeRL from source, including flashinfer, flash-attention, torch_memory_saver, XIELU
@@ -55,4 +56,4 @@ WORKDIR /workspace
 RUN rm -rf ${SRC_DIR}
 
 RUN git clone https://github.com/verl-project/verl
-RUN cd verl && pip install --no-deps -e .
+RUN cd verl && pip install --no-deps -e ".[sglang]"
