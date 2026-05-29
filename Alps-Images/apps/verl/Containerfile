@@ -35,19 +35,12 @@ ENV SRC_DIR=/workspace/src \
 
 WORKDIR ${SRC_DIR}
 
-#RUN git clone https://github.com/flashinfer-ai/flashinfer.git ;\
-#    cd flashinfer ;\
-#    git checkout 50319b2e59e94e4e4b6f175e11184a677e0053b2 ;\
-#    git submodule update --init --recursive ;\
-#    MAX_JOBS=32 python -m flashinfer.aot 2>&1 | tee ./build_aot.log ;\
-#    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
-#RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/flashinfer*.whl
 
-RUN git clone https://github.com/nickjbrowning/XIELU.git ;\
-    cd XIELU ;\
-    git submodule update --init --recursive ;\
-    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
-RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
+#RUN git clone https://github.com/nickjbrowning/XIELU.git ;\
+#    cd XIELU ;\
+#    git submodule update --init --recursive ;\
+#    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
+#RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
 
 
 WORKDIR /workspace
@@ -58,4 +51,5 @@ RUN git clone https://github.com/verl-project/verl
 RUN cd verl && pip install --no-deps -e ".[sglang]"
 
 RUN pip install -U "ray[data,train,tune,serve]"
-RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6 
+RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
+RUN pip uninstall kernels -y --break-system-packages 
