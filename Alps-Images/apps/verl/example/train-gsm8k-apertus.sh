@@ -8,11 +8,10 @@
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5-dev-3c816d5334982789"
 
-export MODEL_NAME="Qwen2.5-3B-Instruct"
-export MODEL_REPO="Qwen"
+export MODEL_NAME="Apertus-8B-Instruct-2509"
+export MODEL_REPO="swiss-ai"
 
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
-
 
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
@@ -42,6 +41,8 @@ data:
   train_batch_size: 256
   max_prompt_length: 512
   max_response_length: 1024
+  apply_chat_template_kwargs:
+    enable_thinking: true
 
 actor_rollout_ref:
   model:
@@ -52,8 +53,8 @@ actor_rollout_ref:
   actor:
     strategy: fsdp
     rollout_n: 8
-    ppo_mini_batch_size: 64
-    ppo_micro_batch_size_per_gpu: 4
+    ppo_mini_batch_size: 32
+    ppo_micro_batch_size_per_gpu: 2
     use_torch_compile: false
     optim:
       lr: 1.0e-6
@@ -64,7 +65,7 @@ actor_rollout_ref:
     n_gpus_per_node: 4
     temperature: 1.0
     n: 8
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 2
     gpu_memory_utilization: 0.5
     log_prob_micro_batch_size_per_gpu: 4
 
@@ -104,10 +105,16 @@ distillation:
 EOF
 
 cat > "gsm8k_reward.py" <<- EOF
+# gsm8k_reward.py
 import re
 from typing import Optional
 
+
 def extract_model_answer(response: str) -> Optional[str]:
+    """
+    Pull the content of the last <answer>...</answer> block.
+    Returns None if the model did not produce the expected format.
+    """
     matches = re.findall(r"<answer>(.*?)</answer>", response, re.DOTALL)
     if not matches:
         return None
@@ -118,6 +125,7 @@ def extract_model_answer(response: str) -> Optional[str]:
     except ValueError:
         return raw
 
+
 def compute_reward(
     data_source,
     solution_str,
@@ -125,23 +133,47 @@ def compute_reward(
     extra_info=None,
     **kwargs,
 ) -> float:
+    """
+    Reward function for GSM8K with Apertus (or any model using <answer> tags).
+
+    Reward breakdown:
+      +1.0  correct answer inside <answer> tags
+      +0.1  correct format (<answer> tag present) even if answer wrong
+       0.0  no <answer> tag at all
+
+    Thinking format (deliberation) is not required for format reward —
+    this avoids penalising the model early in training before it learns
+    to produce reasoning chains.
+    """
     model_ans = extract_model_answer(solution_str)
-    has_think  = "<think>"  in solution_str and "</think>"  in solution_str
+
+    # Format reward: model produced an <answer> tag
     has_answer = "<answer>" in solution_str and "</answer>" in solution_str
-    format_reward  = 0.1 if (has_think and has_answer) else 0.0
-    outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
+    format_reward = 0.1 if has_answer else 0.0
+
+    # Outcome reward: answer is correct
+    outcome_reward = 1.0 if (
+        model_ans is not None and model_ans == str(ground_truth)
+    ) else 0.0
+
     return outcome_reward + format_reward
 EOF
 
 cat > "prepare_gsm8k.py" <<- EOF
-import re, os, datasets, pandas as pd
+import re
+import os
+import datasets
+import pandas as pd
 from pathlib import Path
 
 SYSTEM_PROMPT = """You are a precise math solver.
-Think step by step inside <think>...</think> tags, then give your final answer
-as a single number inside <answer>...</answer> tags."""
+Solve the problem step by step, then give your final answer as a single number inside <answer>...</answer> tags.
+
+Example:
+<answer>42</answer>"""
 
 def extract_ground_truth(solution: str) -> str:
+    """Pull the number after #### from a GSM8K solution string."""
     match = re.search(r"####\s*([\d,\-\.]+)", solution)
     return match.group(1).replace(",", "").strip() if match else ""
 
@@ -152,28 +184,38 @@ def make_prompt(question: str) -> list:
     ]
 
 def prepare(split: str, output_path: str):
-    raw_path = os.path.join(os.environ["TRAINING_HOME"], "data/gsm8k_raw")
+    training_home = os.environ.get("TRAINING_HOME", ".")
+    raw_path = os.path.join(training_home, "data/gsm8k_raw")
+
     if os.path.exists(raw_path):
+        print(f"Loading {split} from local cache: {raw_path}")
         ds = datasets.load_from_disk(raw_path)[split]
     else:
+        print(f"Downloading {split} from HuggingFace...")
         ds = datasets.load_dataset("openai/gsm8k", "main", split=split)
+
     rows = []
+    skipped = 0
     for item in ds:
         gt = extract_ground_truth(item["answer"])
         if not gt:
+            skipped += 1
             continue
         rows.append({
             "prompt": make_prompt(item["question"]),
             "data_source": "gsm8k",
             "reward_model": {"ground_truth": gt},
         })
+
     df = pd.DataFrame(rows)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(output_path, index=False)
-    print(f"[{split}] Saved {len(df)} rows -> {output_path}")
+    print(f"[{split}] Saved {len(df)} rows → {output_path} (skipped {skipped})")
 
-prepare("train", os.path.join(os.environ["TRAINING_HOME"], "data/gsm8k/train.parquet"))
-prepare("test",  os.path.join(os.environ["TRAINING_HOME"], "data/gsm8k/test.parquet"))
+if __name__ == "__main__":
+    training_home = os.environ.get("TRAINING_HOME", ".")
+    prepare("train", os.path.join(training_home, "data/gsm8k/train.parquet"))
+    prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
 EOF
 
 # Download model (skip if already present)
@@ -221,9 +263,13 @@ sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
 
 
-export FLASHINFER_CACHE_DIR=/tmp/flashinfer_cache_${SLURM_JOB_ID}
-export FLASHINFER_JIT_CACHE_DIR=/tmp/flashinfer_cache_${SLURM_JOB_ID}
-mkdir -p $FLASHINFER_CACHE_DIR
+# Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
+export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+export TRITON_HOME="/tmp/triton_home_${SLURM_JOB_ID}_${SLURM_PROCID}"
+export FLASHINFER_CACHE_DIR="/tmp/flashinfer_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+export FLASHINFER_JIT_CACHE_DIR="/tmp/flashinfer_jit_${SLURM_JOB_ID}_${SLURM_PROCID}"
+export TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+mkdir -p $TRITON_CACHE_DIR $TRITON_HOME $FLASHINFER_CACHE_DIR $FLASHINFER_JIT_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR
 
 # Also disable CUDA graphs in SGLang to avoid the capture issue
 export SGLANG_DISABLE_CUDA_GRAPH=1
