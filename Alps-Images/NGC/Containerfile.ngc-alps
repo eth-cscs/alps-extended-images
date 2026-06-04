@@ -21,6 +21,8 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
 
 ARG REMOVE_HPCX_DIRS=""
 
+ARG BOOST_VER=1.91.0
+
 ARG XPMEM_REF=3bcab55479489fdd93847fa04c58ab16e9c0b3fd
 ARG GDRCOPY_VER=2.5.1
 

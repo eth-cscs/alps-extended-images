@@ -94,6 +94,26 @@ detect_cuda_dir() {
     return 1
 }
 
+build_boost() {
+    wget https://archives.boost.io/release/${BOOST_VER}/source/boost_${BOOST_VER//./_}.tar.bz2 -O /tmp/boost.tar.bz2
+    tar -xjf /tmp/boost.tar.bz2 -C /tmp
+    pushd "/tmp/boost_${BOOST_VER//./_}"
+    ./boostrap.sh
+    ./b2 \
+        --with-headers \
+        --with-program_options \
+        --layout=system \
+        toolset=gcc \
+        variant=release \
+        link=shared \
+        threading=multi \
+        runtime-link=shared \
+        install -j"$(nproc)"
+    popd
+    rm -rf "/tmp/boost_${BOOST_VER//./_}" /tmp/boost.tar.bz2
+    ldconfig
+}
+
 build_xpmem() {
     local ref="${XPMEM_REF}"
     git clone https://github.com/hpc/xpmem.git /tmp/xpmem
@@ -543,6 +563,7 @@ main() {
     remove_efa
     remove_hpcx_plugins
 
+    build_boost
     build_xpmem
     build_gdrcopy
     build_cxi_bits
