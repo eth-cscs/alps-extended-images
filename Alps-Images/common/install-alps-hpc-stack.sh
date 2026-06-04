@@ -98,7 +98,7 @@ build_boost() {
     wget https://archives.boost.io/release/${BOOST_VER}/source/boost_${BOOST_VER//./_}.tar.bz2 -O /tmp/boost.tar.bz2
     tar -xjf /tmp/boost.tar.bz2 -C /tmp
     pushd "/tmp/boost_${BOOST_VER//./_}"
-    ./boostrap.sh
+    ./bootstrap.sh
     ./b2 \
         --with-headers \
         --with-program_options \
