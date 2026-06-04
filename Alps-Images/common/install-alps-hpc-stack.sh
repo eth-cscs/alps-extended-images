@@ -30,7 +30,6 @@ apt_install_build_deps() {
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnl-3-dev \
         libnuma-dev libsensors-dev libcurl4-openssl-dev libjson-c-dev \
         libsox-fmt-all \
-        libboost-all-dev \
         devscripts debhelper fakeroot dh-make
     rm -rf /var/lib/apt/lists/*
 }
