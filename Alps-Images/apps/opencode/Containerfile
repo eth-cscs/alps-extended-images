@@ -1,0 +1,144 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+ARG OPENCODE_REF=dev
+
+# System deps
+RUN set -euxo pipefail; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        unzip \
+        xz-utils \
+        pkg-config \
+        clang \
+        libclang-dev \
+        python3 \
+        python3-dev \
+        python3-venv \
+        build-essential \
+        xclip \
+        xsel; \
+    rm -rf /var/lib/apt/lists/*
+
+# Manually link libibverbs.so
+RUN set -eux; \
+    arch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    libdir="/usr/lib/${arch}"; \
+    if [[ ! -e "${libdir}/libibverbs.so" && -e "${libdir}/libibverbs.so.1" ]]; then \
+        ln -sf "${libdir}/libibverbs.so.1" "${libdir}/libibverbs.so"; \
+        ldconfig; \
+    fi
+
+# Rust toolchain (via rustup) installed under /opt
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    CARGO_HOME=/opt/rust/cargo \
+    PATH=/opt/rust/cargo/bin:$PATH \
+    RUSTUP_DISABLE_SELF_UPDATE=1
+
+RUN set -eux; \
+    mkdir -p "${RUSTUP_HOME}" "${CARGO_HOME}"; \
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y \
+      --no-modify-path \
+      --default-toolchain 1.91.0 \
+      --component llvm-tools-preview; \
+    rustc --version; \
+    cargo --version; \
+    rustup component list --installed
+
+# Install patched pplx-garden
+ARG PPLX_GARDEN_REPO=https://github.com/pinxuezhao/pplx_garden_cxi.git
+ARG PPLX_GARDEN_COMMIT=3ce62f9993b6e4abdcda8dac3b87a944ea221f4f
+RUN set -eux; \
+    python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install --no-cache-dir build; \
+    rm -rf /tmp/pplx_garden; \
+    git clone --depth 1 "${PPLX_GARDEN_REPO}" /tmp/pplx_garden; \
+    pushd /tmp/pplx_garden; \
+    git fetch --depth 1 origin "${PPLX_GARDEN_COMMIT}"; \
+    git checkout -q "${PPLX_GARDEN_COMMIT}"; \
+    export TORCH_CMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"; \
+    python3 -m build --wheel; \
+    python3 -m pip install --no-cache-dir dist/*.whl; \
+    popd; \
+    # Vendor benchmark code into the image
+    rm -rf /opt/pplx-garden; \
+    mkdir /opt/pplx-garden; \
+    cp -a /tmp/pplx_garden/benchmarks /opt/pplx-garden/benchmarks; \
+    cp -a /tmp/pplx_garden/tests /opt/pplx-garden/tests; \
+    rm -rf /tmp/pplx_garden
+
+# Install DeepEP
+ARG DEEPEP_REPO=https://github.com/boeschf/DeepEP.git
+ARG DEEPEP_COMMIT=ea669122295c9a8f47ed13f69e408fb745dc7bca
+RUN set -eux; \
+    git clone --depth 1 "${DEEPEP_REPO}" /tmp/DeepEP; \
+    pushd /tmp/DeepEP; \
+    git fetch --depth 1 origin "${DEEPEP_COMMIT}"; \
+    git checkout -q "${DEEPEP_COMMIT}"; \
+    NVSHMEM_DIR=/opt/nvshmem \
+    DISABLE_SM90_FEATURES=0 \
+    TORCH_CUDA_ARCH_LIST="9.0" \
+    DISABLE_AGGRESSIVE_PTX_INSTRS=0 \
+        python setup.py install; \
+    popd; \
+    # Vendor benchmark code into the image
+    rm -rf /opt/DeepEP; \
+    mkdir /opt/DeepEP; \
+    cp -a /tmp/DeepEP/tests /opt/DeepEP/tests; \
+    rm -rf /tmp/DeepEP
+
+# Install quack-kernels
+ARG QUACK_REPO=https://github.com/Dao-AILab/quack.git
+ARG QUACK_TAG=v0.2.10
+RUN set -eux; \
+    git clone --depth 1 --branch "${QUACK_TAG}" "${QUACK_REPO}" /tmp/quack; \
+    pushd /tmp/quack; \
+    python -m pip install --upgrade-strategy only-if-needed '.[cu13]'; \
+    popd; \
+    rm -rf /tmp/quack
+
+RUN set -euxo pipefail; \
+    curl -fsSL https://bun.com/install | bash; \
+    /root/.bun/bin/bun upgrade --canary; \
+    install -Dm0755 /root/.bun/bin/bun /usr/local/bin/bun
+
+ENV HOME=/config/home \
+    XDG_CONFIG_HOME=/config/xdg \
+    XDG_DATA_HOME=/data \
+    XDG_CACHE_HOME=/data/cache \
+    XDG_STATE_HOME=/data/state
+
+WORKDIR /opt/opencode-src
+
+RUN set -euxo pipefail; \
+    git clone --depth=1 --branch "${OPENCODE_REF}" https://github.com/anomalyco/opencode.git .; \
+    bun install
+
+COPY Alps-Images/apps/opencode/opencode-launch /usr/local/bin/opencode-launch
+
+RUN set -euxo pipefail; \
+    chmod 0755 /usr/local/bin/opencode-launch
+
+WORKDIR /workspace
+
+CMD ["opencode-launch"]

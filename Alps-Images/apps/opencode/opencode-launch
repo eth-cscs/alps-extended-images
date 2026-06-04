@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME:-/config/home}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-/config/xdg}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-/data}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/data/cache}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-/data/state}"
+
+mkdir -p \
+  "${HOME}" \
+  "${XDG_CONFIG_HOME}" \
+  "${XDG_DATA_HOME}" \
+  "${XDG_CACHE_HOME}" \
+  "${XDG_STATE_HOME}"
+
+cd /opt/opencode-src
+
+exec bun dev /workspace "$@"
