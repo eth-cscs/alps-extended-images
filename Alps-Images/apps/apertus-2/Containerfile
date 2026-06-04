@@ -33,6 +33,7 @@ RUN set -eux; \
       python3-venv \
       libibverbs-dev \
       libnuma-dev \
+      libboost-all-dev \
     ; \
     rm -rf /var/lib/apt/lists/*
 
