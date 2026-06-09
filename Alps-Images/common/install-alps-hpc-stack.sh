@@ -94,6 +94,26 @@ detect_cuda_dir() {
     return 1
 }
 
+build_boost() {
+    wget https://archives.boost.io/release/${BOOST_VER}/source/boost_${BOOST_VER//./_}.tar.bz2 -O /tmp/boost.tar.bz2
+    tar -xjf /tmp/boost.tar.bz2 -C /tmp
+    pushd "/tmp/boost_${BOOST_VER//./_}"
+    ./bootstrap.sh
+    ./b2 \
+        --with-headers \
+        --with-program_options \
+        --layout=system \
+        toolset=gcc \
+        variant=release \
+        link=shared \
+        threading=multi \
+        runtime-link=shared \
+        install -j"$(nproc)"
+    popd
+    rm -rf "/tmp/boost_${BOOST_VER//./_}" /tmp/boost.tar.bz2
+    ldconfig
+}
+
 build_xpmem() {
     local ref="${XPMEM_REF}"
     git clone https://github.com/hpc/xpmem.git /tmp/xpmem
@@ -172,8 +192,7 @@ build_nccl_deb() {
     mkdir -p /opt/alps/env
     printf 'export NCCL_VERSION=%q\n' "${NCCL_VER}" >> /opt/alps/env/alps-versions.env
     # Produces: ext-profiler/inspector/libnccl-profiler-inspector.so
-    #pushd plugins/profiler/inspector
-    pushd ext-profiler/inspector
+    pushd plugins/profiler/inspector
     make -j"$(nproc)" CUDA_HOME="${CUDA_DIR}"
     install -D -m 0644 libnccl-profiler-inspector.so /usr/local/lib/libnccl-profiler-inspector.so
     popd
@@ -525,7 +544,7 @@ clean_up() {
     printf 'Removing build packages...\n'
     apt-get remove --purge -y  \
         pkg-config automake autoconf libtool cmake \
-        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libnuma-dev libsensors-dev libcurl4-openssl-dev \
+        libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libsensors-dev libcurl4-openssl-dev \
         fakeroot dh-make
     printf 'Running autoremove...\n'
     apt-get autoremove -y
@@ -544,6 +563,7 @@ main() {
     remove_efa
     remove_hpcx_plugins
 
+    build_boost
     build_xpmem
     build_gdrcopy
     build_cxi_bits
