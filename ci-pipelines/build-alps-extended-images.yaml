@@ -311,16 +311,14 @@ test-base-images-collectives:
     matrix: *alps_base_images_matrix
   image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
-    ## NCCL
-    #- alltoall_perf -b 32 -e 4M -f 2 -g 1
-    ## NCCL send/recv via RDMA protocol
-    #- FI_CXI_ENABLE_WRITEDATA=1 OFI_NCCL_PROTOCOL=RDMA sendrecv_perf -b 32 -e 4M -f 2 -g 1
-    ## NVSHMEM
-    #- /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
-    ## OSU
-    #- /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
-    # For now, we are skipping the actual collective tests as they require a node image with SHS 13.1.0.
-    - echo "Collective tests are currently skipped as they require SHS 13.1.0, which is not yet available in the base image."
+    # NCCL
+    - alltoall_perf -b 32 -e 4M -f 2 -g 1
+    # NCCL send/recv via RDMA protocol
+    - FI_CXI_ENABLE_WRITEDATA=1 OFI_NCCL_PROTOCOL=RDMA sendrecv_perf -b 32 -e 4M -f 2 -g 1
+    # NVSHMEM
+    - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
+    # OSU
+    - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
   variables:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
@@ -332,29 +330,27 @@ test-base-images-vetnode:
     matrix: *alps_base_images_matrix
   image: "$IMAGE_PREFIX/ngc-${NGC_NAME}:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
-    #- echo "[image-vet] Set-up vetnode on $(hostname)... "
-    #- |
-    #  config=$(realpath ci-pipelines/helpers/vetnode-config.yaml)
-    #  cd /tmp
-    #  if [ "$SLURM_LOCALID" -eq 0 ]; then
-    #    python -m venv --system-site-packages .venv
-    #    source .venv/bin/activate
-    #    pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
-    #    vetnode setup "$config"
-    #    touch /tmp/setup-done-${SLURM_JOB_ID}
-    #  else
-    #    echo "[image-vet] Waiting for setup on $(hostname)..."
-    #    timeout=60
-    #    while [ ! -f "/tmp/setup-done-${SLURM_JOB_ID}" ] && [ $timeout -gt 0 ]; do
-    #        sleep 1
-    #        ((timeout--))
-    #    done
-    #  fi
-    #- echo "[image-vet] diagnose"
-    #- source .venv/bin/activate
-    #- vetnode diagnose "$config"
-    # For now, we are skipping the actual vetnode tests as they require a node image with SHS 13.1.0.
-    - echo "Vetnode tests are currently skipped as they require SHS 13.1.0, which is not yet available in the base image."
+    - echo "[image-vet] Set-up vetnode on $(hostname)... "
+    - |
+      config=$(realpath ci-pipelines/helpers/vetnode-config.yaml)
+      cd /tmp
+      if [ "$SLURM_LOCALID" -eq 0 ]; then
+        python -m venv --system-site-packages .venv
+        source .venv/bin/activate
+        pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
+        vetnode setup "$config"
+        touch /tmp/setup-done-${SLURM_JOB_ID}
+      else
+        echo "[image-vet] Waiting for setup on $(hostname)..."
+        timeout=60
+        while [ ! -f "/tmp/setup-done-${SLURM_JOB_ID}" ] && [ $timeout -gt 0 ]; do
+            sleep 1
+            ((timeout--))
+        done
+      fi
+    - echo "[image-vet] diagnose"
+    - source .venv/bin/activate
+    - vetnode diagnose "$config"
   variables:
     SLURM_JOB_NUM_NODES: 4
     SLURM_NTASKS: 16
