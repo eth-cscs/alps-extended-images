@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -8,8 +8,7 @@
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5-dev-3c816d5334982789"
 
-#export MODEL_NAME="Apertus-70B-Instruct-2509"
-export MODEL_NAME="Apertus-8B-Instruct-2509"
+export MODEL_NAME="Apertus-70B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
 export PROJECT_NAME="test_async_grpo_gsm8k"
@@ -45,7 +44,7 @@ data:
   train_files: ${TRAINING_HOME}/data/gsm8k/train.parquet
   val_files:   ${TRAINING_HOME}/data/gsm8k/test.parquet
   train_batch_size: 128
-  max_prompt_length: 512
+  max_prompt_length: 1024
   max_response_length: 2048
   apply_chat_template_kwargs:
     enable_thinking: true
@@ -55,45 +54,37 @@ actor_rollout_ref:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
     override_config:
       attn_implementation: flash_attention_2
-    enable_gradient_checkpointing: true
     use_shm: false
 
   actor:
     strategy: fsdp
     rollout_n: 8
     ppo_mini_batch_size: 32
-    ppo_micro_batch_size_per_gpu: 1
-    use_dynamic_bsz: true
+    ppo_micro_batch_size_per_gpu: 2
     use_torch_compile: false
     optim:
       lr: 5.0e-7
     fsdp_config:
-      param_offload: false
-      grad_offload: false
       model_dtype: bfloat16
 
   rollout:
     name: sglang
     mode: async
     load_format: dummy   # skip disk load; weights come from NCCL sync
-    nnodes: 2
+    nnodes: 4
     n_gpus_per_node: 4
     temperature: 1.0
     n: 8
     tensor_model_parallel_size: 4
-    gpu_memory_utilization: 0.85
-    log_prob_micro_batch_size_per_gpu: 1
-    free_cache_engine: false     # disables HTTP weight sync
-        # disables CUDA graphs, avoids FlashInfer JIT and reduces pressure on Lustre filesystem
-    # Only needed with hybrid, we should move to standalone async rollout for better scaling and less overhead
-    enforce_eager: true          
+    gpu_memory_utilization: 0.95
+    log_prob_micro_batch_size_per_gpu: 4   
     engine_kwargs:
       sglang:
-        disable_piecewise_cuda_graph: true 
+        disable_piecewise_cuda_graph: true #Check if this setting is needed.
 
   ref:
     fsdp_config:
-      param_offload: true
+      param_offload: true #to reduce GPU memory usage.
       model_dtype: bfloat16
 
 algorithm:
@@ -114,7 +105,8 @@ trainer:
   total_epochs: 1
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
-  nnodes: 2
+  nnodes: 4
+  #nnodes: ${SLURM_JOB_NUM_NODES,1}
   n_gpus_per_node: 4
   save_freq: 50
   default_local_dir: ${CHECKPOINT_HOME}
@@ -276,28 +268,23 @@ sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
 
 
-git remote add pr_origin https://github.com/theely/verl.git
+git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
 git fetch pr_origin Full-async-SGLang-weight-broadcasting
-git checkout pr_origin/Full-async-SGLang-weight-broadcasting -- \
-    verl/trainer/main_ppo_sync.py \
-    verl/workers/engine_workers.py \
-    verl/workers/rollout/sglang_rollout/sglang_rollout.py \
-    verl/workers/rollout/sglang_rollout/async_sglang_server.py \
-    verl/workers/rollout/sglang_rollout/http_server_engine.py
+
+BASE=$(git merge-base HEAD pr_origin/Full-async-SGLang-weight-broadcasting)
+git diff --name-only $BASE pr_origin/Full-async-SGLang-weight-broadcasting \
+  | xargs git checkout pr_origin/Full-async-SGLang-weight-broadcasting --
 
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
-export TRITON_CACHE_DIR="/tmp/triton_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
-export TRITON_HOME="/tmp/triton_home_${SLURM_JOB_ID}_${SLURM_PROCID}"
-export FLASHINFER_CACHE_DIR="/tmp/flashinfer_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
-export FLASHINFER_JIT_CACHE_DIR="/tmp/flashinfer_jit_${SLURM_JOB_ID}_${SLURM_PROCID}"
-export TORCHINDUCTOR_CACHE_DIR="/tmp/inductor_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
-mkdir -p $TRITON_CACHE_DIR $TRITON_HOME $FLASHINFER_CACHE_DIR $FLASHINFER_JIT_CACHE_DIR $TORCHINDUCTOR_CACHE_DIR
+export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
+mkdir -p $FLASHINFER_WORKSPACE_BASE
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
 python3 -c "
 import os
 import flashinfer
+from flashinfer.prefill import get_batch_prefill_module
 " 2>/dev/null || true
 
 # Also disable CUDA graphs in SGLang to avoid the capture issue
