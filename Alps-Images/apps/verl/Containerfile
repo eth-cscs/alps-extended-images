@@ -23,7 +23,9 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
 
 # Install dependencies for VeRL from pypi, including vLLM and SGLang.
 
-RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu131
+#Note: disable vllm installation for now, as it causes issues. To re-enable consider using the ngc vllm base image.
+#RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu131
+
 RUN pip install sglang[all]
 RUN pip install flash-attn --no-build-isolation
 

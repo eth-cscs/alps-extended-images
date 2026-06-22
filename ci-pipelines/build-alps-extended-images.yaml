@@ -398,6 +398,15 @@ test-apertus-2-DeepEP:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
+test-app-images-vetnode:
+  stage: test-apps
+  extends: [test-base-images-vetnode]
+  timeout: 2h
+  parallel:
+    matrix: *alps_app_images_matrix
+  image: "$IMAGE_PREFIX/${NAME}:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+
+
 # ----------------------------
 # Publish
 # ----------------------------
@@ -421,6 +430,7 @@ publish-gate:
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
+    - test-app-images-vetnode
   script:
     - echo "Publish gate passed (tests completed)"
 
