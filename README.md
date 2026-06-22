@@ -43,11 +43,11 @@ The `common/install-alps-hpc-stack.sh` script builds and installs the following 
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | libfabric (CXI provider) | 2.5.1 | High-speed network fabric abstraction for Slingshot |
-| NCCL | 2.30.4-1 | NVIDIA collective communications (allreduce, alltoall, …) |
-| aws-ofi-nccl | commit `d28863c` | Routes NCCL traffic over libfabric/OFI |
+| NCCL | 2.30.7-1 | NVIDIA collective communications (allreduce, alltoall, …) |
+| aws-ofi-nccl | commit `423a007` | Routes NCCL traffic over libfabric/OFI |
 | NVSHMEM | 3.6.5-0 | GPU symmetric heap memory for peer-to-peer transfers |
-| UCX | 1.20.0 | Unified Communication X transport layer |
-| UCC | 1.7.0 | Unified Collective Communications abstraction |
+| UCX | 1.20.1 | Unified Communication X transport layer |
+| UCC | 1.8.0 | Unified Collective Communications abstraction |
 | OpenMPI | 5.0.10 | MPI implementation linked against OFI and UCX |
 | GDRCopy | 2.5.1 | GPU Direct RDMA copy utilities |
 | XPMEM | — | Cross-process memory regions for intra-node GPU sharing |
