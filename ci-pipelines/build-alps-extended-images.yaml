@@ -341,7 +341,9 @@ test-base-images-vetnode:
       if [ "$SLURM_LOCALID" -eq 0 ]; then
         python -m venv --system-site-packages "$venv"
         source "$venv/bin/activate"
-        pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
+        pip install --no-cache-dir --force-reinstall \
+          --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" \
+          "vetnode @ git+https://github.com/boeschf/vetnode.git@8e221cc7c8831cc35abd4e54cdc438fe8ed5ceea"
         vetnode setup "$config"
         touch "$done_file"
       else
