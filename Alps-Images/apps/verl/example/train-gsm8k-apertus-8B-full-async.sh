@@ -26,6 +26,7 @@ image = "${VERL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users"]
 workdir = "/workspace/verl"
 writable = true
+entrypoint = true
 [env]
 PMIX_MCA_psec = "native"
 [annotations]
@@ -321,10 +322,6 @@ export VERL_LOGGING_LEVEL=INFO
 
 #TODO: move this inside the verl image build.
 pip install cupy-cuda13x
-
-export NCCL_NET_GDR_LEVEL=0 #DMA-BUF registration causes hang when transferring large tensors.
-export NCCL_TIMEOUT=600
-export NCCL_DEBUG=WARN
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
