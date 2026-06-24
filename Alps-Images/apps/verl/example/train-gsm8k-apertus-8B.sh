@@ -144,12 +144,12 @@ def compute_reward(
     format_reward  = 0.1 if has_answer else 0.0
     outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Soft length penalty: discourage responses over 800 tokens
-    # No penalty under 800, linear penalty above up to -0.1 at 2048 tokens
+    # Soft length penalty: discourage responses over 150 tokens
+    # No penalty under 150, linear penalty above up to -0.2 at 800 tokens
     length = len(solution_str.split())
     length_penalty = 0.0
-    if length > 800:
-        length_penalty = -0.1 * min(1.0, (length - 800) / 1248)
+    if length > 150:
+        length_penalty = -0.2 * min(1.0, (length - 150) / 650)
 
     return outcome_reward + format_reward + length_penalty
 EOF
