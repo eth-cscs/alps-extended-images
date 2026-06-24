@@ -64,7 +64,7 @@ RUN set -eux; \
     printf '%s\n' \
       'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
       'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
-      > /opt/nvidia/entrypoint.d/99-alps-env.sh
+      > /etc/profile.d/99-alps-env.sh
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
