@@ -58,13 +58,13 @@ RUN set -eux; \
     /opt/alps/install-alps-hpc-stack.sh
 
 COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
+COPY Alps-Images/common/source-alps-env.sh /opt/alps/env/source-alps-env.sh
 
 RUN set -eux; \
-    chmod 0644 /opt/alps/env/alps-runtime.env; \
-    printf '%s\n' \
-      'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
-      'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
-      > /etc/profile.d/99-alps-env.sh
+    mkdir -p /opt/nvidia/entrypoint.d /etc/profile.d; \
+    chmod 0644 /opt/alps/env/alps-runtime.env /opt/alps/env/source-alps-env.sh; \
+    ln -sf /opt/alps/env/source-alps-env.sh /opt/nvidia/entrypoint.d/99-alps-env.sh; \
+    ln -sf /opt/alps/env/source-alps-env.sh /etc/profile.d/99-alps-env.sh
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
