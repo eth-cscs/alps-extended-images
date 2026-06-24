@@ -271,7 +271,9 @@ export SGLANG_DISABLE_CUDA_GRAPH=1
 
 # Alps settings: NCCL_ALGO = Ring to avoid flow control deadlock with large NCCL world size and tree broadcast.
 export NCCL_ALGO=Ring
-export NCCL_TIMEOUT=60
+export NCCL_TIMEOUT=600
+export NCCL_NET_GDR_LEVEL=0 #DMA-BUF registration causes hang when transferring large tensors.
+export NCCL_DEBUG=WARN
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0

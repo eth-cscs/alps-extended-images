@@ -8,7 +8,6 @@
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5"
 
-#export MODEL_NAME="Apertus-70B-Instruct-2509"
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
@@ -322,6 +321,10 @@ export VERL_LOGGING_LEVEL=INFO
 
 #TODO: move this inside the verl image build.
 pip install cupy-cuda13x
+
+export NCCL_NET_GDR_LEVEL=0 #DMA-BUF registration causes hang when transferring large tensors.
+export NCCL_TIMEOUT=600
+export NCCL_DEBUG=WARN
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0

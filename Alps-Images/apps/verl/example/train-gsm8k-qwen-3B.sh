@@ -12,8 +12,9 @@ export MODEL_NAME="Qwen2.5-3B-Instruct"
 export MODEL_REPO="Qwen"
 export PROJECT_NAME="scale-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Sync-on-${SLURM_JOB_NUM_NODES}-nodes"
-
+export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
+export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
 
 
 mkdir -p $TRAINING_HOME
@@ -91,7 +92,7 @@ trainer:
   nnodes: ${SLURM_JOB_NUM_NODES}
   n_gpus_per_node: 4
   save_freq: 50
-  default_local_dir: ${TRAINING_HOME}/checkpoints/grpo-gsm8k
+  default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
 ray_kwargs:
@@ -238,7 +239,9 @@ export SGLANG_DISABLE_CUDA_GRAPH=1
 
 # Alps settings: NCCL_ALGO = Ring to avoid flow control deadlock with large NCCL world size and tree broadcast.
 export NCCL_ALGO=Ring
-export NCCL_TIMEOUT=60
+export NCCL_TIMEOUT=600
+export NCCL_NET_GDR_LEVEL=0 #DMA-BUF registration causes hang when transferring large tensors.
+export NCCL_DEBUG=WARN
 
 
 if [ $SLURM_PROCID -eq 0 ]; then
