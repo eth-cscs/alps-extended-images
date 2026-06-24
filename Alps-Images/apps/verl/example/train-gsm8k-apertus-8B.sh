@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
-#SBATCH --time=8:00:00
+#SBATCH --time=5:00:00
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5"
 
@@ -12,7 +12,7 @@ export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
 export PROJECT_NAME="scale-grpo-gsm8k"
-export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-sync"
+export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Sync-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
@@ -269,8 +269,9 @@ from flashinfer.prefill import get_batch_prefill_module
 # Also disable CUDA graphs in SGLang to avoid the capture issue
 export SGLANG_DISABLE_CUDA_GRAPH=1
 
-# TODO: REMOVE THIS!!!!! Only used to debug issues with fsdp2 and NCCL on Alps.
-export NCCL_NET_PLUGIN=none
+# Alps settings: NCCL_ALGO = Ring to avoid flow control deadlock with large NCCL world size and tree broadcast.
+export NCCL_ALGO=Ring
+export NCCL_TIMEOUT=60
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
