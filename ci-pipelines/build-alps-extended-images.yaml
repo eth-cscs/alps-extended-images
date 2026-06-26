@@ -37,7 +37,8 @@ variables:
   - NAME: "apertus-2"
   - NAME: "sfttrainer"
   - NAME: "verl"
-  
+  - NAME: "opencode"
+
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
 # ----------------------------
