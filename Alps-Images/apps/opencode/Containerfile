@@ -19,7 +19,7 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
-ARG OPENCODE_REF=dev
+ARG OPENCODE_VERSION=""
 
 # System deps
 RUN set -euxo pipefail; \
@@ -121,21 +121,20 @@ RUN set -eux; \
     rm -rf /tmp/quack
 
 RUN set -euxo pipefail; \
-    curl -fsSL https://bun.com/install | bash; \
-    /root/.bun/bin/bun upgrade --canary; \
-    install -Dm0755 /root/.bun/bin/bun /usr/local/bin/bun
+    install_args=(--no-modify-path); \
+    if [[ -n "${OPENCODE_VERSION}" ]]; then \
+        install_args+=(--version "${OPENCODE_VERSION}"); \
+    fi; \
+    curl -fsSL https://opencode.ai/install | bash -s -- "${install_args[@]}"; \
+    install -Dm0755 /root/.opencode/bin/opencode /usr/local/bin/opencode; \
+    opencode --version; \
+    rm -rf /root/.opencode
 
 ENV HOME=/config/home \
     XDG_CONFIG_HOME=/config/xdg \
     XDG_DATA_HOME=/data \
     XDG_CACHE_HOME=/data/cache \
     XDG_STATE_HOME=/data/state
-
-WORKDIR /opt/opencode-src
-
-RUN set -euxo pipefail; \
-    git clone --depth=1 --branch "${OPENCODE_REF}" https://github.com/anomalyco/opencode.git .; \
-    bun install
 
 COPY Alps-Images/apps/opencode/opencode-launch /usr/local/bin/opencode-launch
 
