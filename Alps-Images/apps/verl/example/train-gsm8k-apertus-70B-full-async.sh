@@ -1,18 +1,18 @@
 #!/bin/bash
 
-#SBATCH --nodes=8
+#SBATCH --nodes=16
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
-#SBATCH --time=5:00:00
+#SBATCH --time=12:00:00
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5"
 
-export MODEL_NAME="Apertus-8B-Instruct-2509"
+export MODEL_NAME="Apertus-70B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
 export PROJECT_NAME="scale-grpo-gsm8k"
-export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Sync-on-${SLURM_JOB_NUM_NODES}-nodes"
+export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
@@ -20,6 +20,11 @@ export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLU
 
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
+
+
+
+export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
+export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
 cat > "env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -41,39 +46,68 @@ defaults:
   - override data@data: legacy_data
   - _self_
 
+# ── Required by fully_async_main ──────────────────────────────────────────────
+async_training:
+  staleness_threshold: 0.1
+  trigger_parameter_sync_step: 1   # sync every step: eliminates the lag that drives length feedback loop
+  require_batches: 2
+  partial_rollout: True
+  use_trainer_do_validate: False
+
+# Top-level rollout block — fully_async_main copies .nnodes/.n_gpus_per_node
+# into actor_rollout_ref.rollout, so keep these in sync with the rollout block below.
+rollout:
+  nnodes: ${ROLLOUT_NNODES}
+  n_gpus_per_node: 4
+  n: 8
+  total_rollout_steps: 51200   # adjust to your dataset size * desired steps
+# ──────────────────────────────────────────────────────────────────────────────
+
 data:
   train_files: ${TRAINING_HOME}/data/gsm8k/train.parquet
   val_files:   ${TRAINING_HOME}/data/gsm8k/test.parquet
-  train_batch_size: 256
+  train_batch_size: 0    # must be 0 in fully-async mode
+  gen_batch_size: 1      # must be 1 in fully-async mode
   max_prompt_length: 512
   max_response_length: 1024
   apply_chat_template_kwargs:
     enable_thinking: true
 
 actor_rollout_ref:
+  hybrid_engine: False
+
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
     override_config:
       attn_implementation: flash_attention_2
+    use_shm: false
 
   actor:
     strategy: fsdp2
     rollout_n: 8
-    ppo_mini_batch_size: 32
-    ppo_micro_batch_size_per_gpu: 2
+    ppo_mini_batch_size: 48    # must be divisible by dp_size/gcd(dp_size,rollout_n)=6; 48 = 1 sample/GPU
+    ppo_micro_batch_size_per_gpu: 1
     use_torch_compile: false
+    use_rollout_log_probs: True   # required for fully-async log prob correctness
     optim:
       lr: 1.0e-6
 
   rollout:
     name: sglang
-    nnodes: 0
+    mode: async
+    load_format: dummy
     n_gpus_per_node: 4
     temperature: 1.0
     n: 8
-    tensor_model_parallel_size: 2
-    gpu_memory_utilization: 0.5
-    log_prob_micro_batch_size_per_gpu: 4
+    tensor_model_parallel_size: 4
+    gpu_memory_utilization: 0.7   # lower than 8B to leave room for 70B weight sync buffers
+    log_prob_micro_batch_size_per_gpu: 1
+    calculate_log_probs: True     # required; log probs must come from rollout
+    checkpoint_engine:
+      backend: nccl               # weight sync via NCCL broadcast
+    engine_kwargs:
+      sglang:
+        disable_piecewise_cuda_graph: true
 
   ref:
     fsdp_config:
@@ -85,7 +119,9 @@ algorithm:
     type: adaptive
     kl_coef: 0.001
     target_kl: 0.05
-    
+    horizon: 10000
+  rollout_correction:
+    bypass_mode: True             # required for off-policy log prob correction
 
 reward:
   custom_reward_function:
@@ -96,7 +132,7 @@ trainer:
   total_epochs: 3
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
-  nnodes: ${SLURM_JOB_NUM_NODES}
+  nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 50
   default_local_dir: ${CHECKPOINT_HOME}
@@ -104,7 +140,7 @@ trainer:
 
 ray_kwargs:
   ray_init:
-    address: "auto" 
+    address: "auto"
 
 critic:
   enable: false
@@ -139,17 +175,20 @@ def extract_model_answer(response: str) -> Optional[str]:
 def compute_reward(
     data_source, solution_str, ground_truth, extra_info=None, **kwargs
 ) -> float:
+    # Truncated response (thinking opened but never closed): return 0, not a large
+    # negative, to avoid extreme GRPO advantages that cause gradient spikes.
+    if "<think>" in solution_str and "</think>" not in solution_str:
+        return 0.0
+
     model_ans = extract_model_answer(solution_str)
     has_answer = "<answer>" in solution_str and "</answer>" in solution_str
     format_reward  = 0.1 if has_answer else 0.0
     outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Soft length penalty: discourage responses over 250 words
-    # No penalty under 250, linear penalty above up to -0.2 at 1000 words
-    length = len(solution_str.split())
-    length_penalty = 0.0
-    if length > 250:
-        length_penalty = -0.2 * min(1.0, (length - 250) / 750)
+    # Smooth length penalty starting at 350 words (~455 tokens), max -0.2 at 700 words.
+    # Keeps thinking chains well below the 1024-token hard cap so truncation stays rare.
+    words = len(solution_str.split())
+    length_penalty = -0.2 * min(1.0, max(0.0, (words - 350) / 350))
 
     return outcome_reward + format_reward + length_penalty
 EOF
@@ -245,8 +284,11 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
-export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key) 
+export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
+
+export RAY_memory_usage_threshold=0.99
+
 
 
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
@@ -257,10 +299,24 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
 sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
 
-# Pre-warm FlashInfer JIT cache to avoid contention during training
+
+git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
+git fetch pr_origin Full-async-SGLang-weight-broadcasting
+
+BRANCH_COMMIT=$(git rev-parse pr_origin/Full-async-SGLang-weight-broadcasting)
+
+if [ $SLURM_PROCID -eq 0 ]; then
+    echo "=== Resetting workspace to Full-async-SGLang-weight-broadcasting @ ${BRANCH_COMMIT} ==="
+fi
+
+git reset --hard pr_origin/Full-async-SGLang-weight-broadcasting
+
+
+# Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
 mkdir -p $FLASHINFER_WORKSPACE_BASE
 
+# Pre-warm FlashInfer JIT cache to avoid contention during training
 python3 -c "
 import os
 import flashinfer
@@ -270,6 +326,18 @@ from flashinfer.prefill import get_batch_prefill_module
 # Also disable CUDA graphs in SGLang to avoid the capture issue
 export SGLANG_DISABLE_CUDA_GRAPH=1
 
+# Disable SGlang TP memory imbalance, we need this because on some nodes FSDP takes more memory.
+export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+
+export VERL_LOGGING_LEVEL=INFO
+
+#TODO: move this inside the verl image build.
+for _cupy_attempt in 1 2 3; do
+    pip install cupy-cuda13x && break
+    echo "cupy install attempt ${_cupy_attempt} failed, retrying in 10s..."
+    sleep 10
+done
+
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
     ray start --head \
@@ -278,7 +346,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
         --disable-usage-stats || true
-    
+
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -291,7 +359,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
+    HYDRA_FULL_ERROR=1 python -m verl.experimental.fully_async_policy.fully_async_main \
         --config-path ${TRAINING_HOME} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config

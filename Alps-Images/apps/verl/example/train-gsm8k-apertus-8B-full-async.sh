@@ -21,6 +21,9 @@ export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLU
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
+export  ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.5)))")
+export  TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
+
 cat > "env.toml" <<- EOF
 image = "${VERL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users"]
@@ -44,7 +47,7 @@ defaults:
 # ── Required by fully_async_main ──────────────────────────────────────────────
 async_training:
   staleness_threshold: 0.1
-  trigger_parameter_sync_step: 4
+  trigger_parameter_sync_step: 1   # sync every step: eliminates the lag that drives length feedback loop
   require_batches: 2
   partial_rollout: True
   use_trainer_do_validate: False
@@ -52,7 +55,7 @@ async_training:
 # Top-level rollout block — fully_async_main copies .nnodes/.n_gpus_per_node
 # into actor_rollout_ref.rollout, so keep these in sync with the rollout block below.
 rollout:
-  nnodes: 4
+  nnodes: ${ROLLOUT_NNODES}
   n_gpus_per_node: 4
   n: 8
   total_rollout_steps: 51200   # adjust to your dataset size * desired steps
@@ -91,7 +94,6 @@ actor_rollout_ref:
     name: sglang
     mode: async
     load_format: dummy
-    nnodes: 4
     n_gpus_per_node: 4
     temperature: 1.0
     n: 8
@@ -128,7 +130,7 @@ trainer:
   total_epochs: 3
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
-  nnodes: 4
+  nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 50
   default_local_dir: ${CHECKPOINT_HOME}
@@ -171,17 +173,20 @@ def extract_model_answer(response: str) -> Optional[str]:
 def compute_reward(
     data_source, solution_str, ground_truth, extra_info=None, **kwargs
 ) -> float:
+    # Truncated response (thinking opened but never closed): return 0, not a large
+    # negative, to avoid extreme GRPO advantages that cause gradient spikes.
+    if "<think>" in solution_str and "</think>" not in solution_str:
+        return 0.0
+
     model_ans = extract_model_answer(solution_str)
     has_answer = "<answer>" in solution_str and "</answer>" in solution_str
     format_reward  = 0.1 if has_answer else 0.0
     outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Soft length penalty: discourage responses over 150 tokens
-    # No penalty under 150, linear penalty above up to -0.2 at 800 tokens
-    length = len(solution_str.split())
-    length_penalty = 0.0
-    if length > 150:
-        length_penalty = -0.2 * min(1.0, (length - 150) / 650)
+    # Smooth length penalty starting at 350 words (~455 tokens), max -0.2 at 700 words.
+    # Keeps thinking chains well below the 1024-token hard cap so truncation stays rare.
+    words = len(solution_str.split())
+    length_penalty = -0.2 * min(1.0, max(0.0, (words - 350) / 350))
 
     return outcome_reward + format_reward + length_penalty
 EOF
@@ -296,9 +301,13 @@ sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
 git fetch pr_origin Full-async-SGLang-weight-broadcasting
 
-BASE=$(git merge-base HEAD pr_origin/Full-async-SGLang-weight-broadcasting)
-git diff --name-only $BASE pr_origin/Full-async-SGLang-weight-broadcasting \
-  | xargs git checkout pr_origin/Full-async-SGLang-weight-broadcasting --
+BRANCH_COMMIT=$(git rev-parse pr_origin/Full-async-SGLang-weight-broadcasting)
+
+if [ $SLURM_PROCID -eq 0 ]; then
+    echo "=== Resetting workspace to Full-async-SGLang-weight-broadcasting @ ${BRANCH_COMMIT} ==="
+fi
+
+git reset --hard pr_origin/Full-async-SGLang-weight-broadcasting
 
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
@@ -344,15 +353,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.5)))")
-    TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
-
     HYDRA_FULL_ERROR=1 python -m verl.experimental.fully_async_policy.fully_async_main \
         --config-path ${TRAINING_HOME} \
         --config-name grpo_gsm8k \
-        --config-dir /workspace/verl/verl/trainer/config \
-        trainer.nnodes=${TRAINING_NNODES} \
-        actor_rollout_ref.rollout.nnodes=${ROLLOUT_NNODES}
+        --config-dir /workspace/verl/verl/trainer/config
 else
     # Worker nodes join the Ray cluster
     sleep 15
