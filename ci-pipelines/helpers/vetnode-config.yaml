@@ -8,7 +8,7 @@ evals:
   expected:
     CUDA_CACHE_DISABLE: "1"
     NCCL_NET: "AWS Libfabric"
-    NCCL_CROSS_NIC: "1"
+    NCCL_CROSS_NIC: "0"
     NCCL_NET_GDR_LEVEL: "PHB"
     NCCL_PROTO: "^LL128"
     FI_PROVIDER: "cxi"
@@ -27,6 +27,17 @@ evals:
   requirements:
     - cuda-python==13.*
     - numpy
+- name: NCCL-Low-Level-Intranode
+  type: vetnode.evaluations.nccl_lib_eval.NcclLibEval
+  topology: intranode
+  scheduler: slurm
+  payload: 8 GB
+  method: allreduce
+  min_bandwidth: 250 GB/s
+  warmup:
+    payload: 8 GB
+    runs: 3
+  requirements: ["cuda-python","numpy"]
 - name: NCCL-Low-Level-Internode
   type: vetnode.evaluations.nccl_lib_eval.NcclLibEval
   topology: internode
@@ -35,8 +46,8 @@ evals:
   method: allreduce
   min_bandwidth: 15 GB/s
   warmup:
-    payload: 256 MB
-    runs: 2
+    payload: 8 GB
+    runs: 3
   requirements: ["cuda-python","numpy"]
 - name: NCCL-Low-Level-Full-Topology
   type: vetnode.evaluations.nccl_lib_eval.NcclLibEval
@@ -45,7 +56,7 @@ evals:
   method: allreduce
   min_bandwidth: 50 GB/s
   warmup:
-    payload: 2 GB
+    payload: 8 GB
     runs: 3
   requirements: ["cuda-python","numpy"]
 - name: NCCL-PyTorch
@@ -55,7 +66,7 @@ evals:
   method: allreduce
   min_bandwidth: 50 GB/s
   warmup:
-    payload: 2 GB
+    payload: 8 GB
     runs: 3
   requirements:
       - ['torch', '--index-url', 'https://download.pytorch.org/whl/cu130']
