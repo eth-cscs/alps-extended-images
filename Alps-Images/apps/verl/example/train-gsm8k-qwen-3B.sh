@@ -6,23 +6,24 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=8:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-5a817661d2b9e382"
 
 export MODEL_NAME="Qwen2.5-3B-Instruct"
 export MODEL_REPO="Qwen"
-export PROJECT_NAME="scale-grpo-gsm8k"
+export PROJECT_NAME="cscs-async-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Sync-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
+export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
 
 
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
-cat > "env.toml" <<- EOF
+cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
-mounts = ["/capstor", "/iopsstor", "/users"]
+mounts = ["/capstor", "/iopsstor", "/users","/tmp"]
 workdir = "/workspace/verl"
 writable = true
 entrypoint = true
@@ -32,7 +33,7 @@ PMIX_MCA_psec = "native"
 com.hooks.cxi.enabled = "false"
 EOF
 
-cat > "grpo_gsm8k.yaml" <<- EOF
+cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
   - ppo_trainer
   - override rollout@actor_rollout_ref.rollout: rollout
@@ -44,8 +45,8 @@ data:
   train_files: ${TRAINING_HOME}/data/gsm8k/train.parquet
   val_files:   ${TRAINING_HOME}/data/gsm8k/test.parquet
   train_batch_size: 256
-  max_prompt_length: 512
-  max_response_length: 1024
+  #max_prompt_length: 512
+  #max_response_length: 1024
 
 actor_rollout_ref:
   model:
@@ -55,26 +56,26 @@ actor_rollout_ref:
 
   actor:
     strategy: fsdp2
-    rollout_n: 8
-    ppo_mini_batch_size: 64
+    #rollout_n: 8
+    ppo_mini_batch_size: 256
     ppo_micro_batch_size_per_gpu: 4
-    use_torch_compile: false
-    optim:
-      lr: 1.0e-6
+    #use_torch_compile: false
+    #optim:
+    #  lr: 1.0e-6
 
   rollout:
     name: sglang
     nnodes: 0
     n_gpus_per_node: 4
     temperature: 1.0
-    n: 8
+    n: 16 #num of responses to generate per prompt
     tensor_model_parallel_size: 1
     gpu_memory_utilization: 0.5
     log_prob_micro_batch_size_per_gpu: 4
 
-  ref:
-    fsdp_config:
-      param_offload: true
+  #ref:
+  #  fsdp_config:
+  #    param_offload: true
 
 algorithm:
   adv_estimator: grpo
@@ -83,7 +84,7 @@ algorithm:
 
 reward:
   custom_reward_function:
-    path: ${TRAINING_HOME}/gsm8k_reward.py
+    path: ${TRAINING_CONFIG}/gsm8k_reward.py
     name: compute_reward
 
 trainer:
@@ -107,7 +108,7 @@ distillation:
   enabled: false
 EOF
 
-cat > "gsm8k_reward.py" <<- EOF
+cat > "${TRAINING_CONFIG}/gsm8k_reward.py" <<- EOF
 import re
 from typing import Optional
 
@@ -137,7 +138,7 @@ def compute_reward(
     return outcome_reward + format_reward
 EOF
 
-cat > "prepare_gsm8k.py" <<- EOF
+cat > "${TRAINING_CONFIG}/prepare_gsm8k.py" <<- EOF
 import re, os, datasets, pandas as pd
 from pathlib import Path
 
@@ -180,11 +181,14 @@ prepare("train", os.path.join(os.environ["TRAINING_HOME"], "data/gsm8k/train.par
 prepare("test",  os.path.join(os.environ["TRAINING_HOME"], "data/gsm8k/test.parquet"))
 EOF
 
+sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
+sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
+
 # Download model (skip if already present)
 if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_HOME}/env.toml" \
+        --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         hf download ${MODEL_REPO}/${MODEL_NAME} \
             --local-dir ${TRAINING_HOME}/models/${MODEL_NAME} \
@@ -197,10 +201,10 @@ fi
 if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ]; then
     echo "Preparing GSM8K dataset..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_HOME}/env.toml" \
+        --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         # Try loading from cached raw download first, otherwise fetch from HF
-        python ${TRAINING_HOME}/prepare_gsm8k.py
+        python ${TRAINING_CONFIG}/prepare_gsm8k.py
     '
 else
     echo "Dataset already present, skipping preparation."
@@ -217,13 +221,23 @@ export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
 
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
-    --environment="${TRAINING_HOME}/env.toml" \
+    --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
 # Patch flash attention NoneType bug for Qwen2 on this transformers version
 sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
 
+# Update Verl to latest commit
+git fetch --tags
+git checkout v0.8.0
+
+#TODO: move this inside the verl image build.
+for _cupy_attempt in 1 2 3; do
+    pip install cachetools && break
+    echo "cachetools install attempt ${_cupy_attempt} failed, retrying in 10s..."
+    sleep 10
+done
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
@@ -259,8 +273,8 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
-        --config-path ${TRAINING_HOME} \
+    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo_sync \
+        --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config \
         trainer.nnodes=${SLURM_JOB_NUM_NODES}

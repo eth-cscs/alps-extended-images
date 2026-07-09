@@ -6,15 +6,16 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-5a817661d2b9e382"
 
 export MODEL_NAME="Apertus-70B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
-export PROJECT_NAME="scale-grpo-gsm8k"
+export PROJECT_NAME="cscs-async-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
+export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
 
 
@@ -26,9 +27,9 @@ cd $TRAINING_HOME
 export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
-cat > "env.toml" <<- EOF
+cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
-mounts = ["/capstor", "/iopsstor", "/users"]
+mounts = ["/capstor", "/iopsstor", "/users","/tmp"]
 workdir = "/workspace/verl"
 writable = true
 entrypoint = true
@@ -38,7 +39,7 @@ PMIX_MCA_psec = "native"
 com.hooks.cxi.enabled = "false"
 EOF
 
-cat > "grpo_gsm8k.yaml" <<- EOF
+cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
   - ppo_trainer
   - override rollout@actor_rollout_ref.rollout: rollout
@@ -48,10 +49,17 @@ defaults:
 
 # ── Required by fully_async_main ──────────────────────────────────────────────
 async_training:
-  staleness_threshold: 0.1
-  trigger_parameter_sync_step: 1   # sync every step: eliminates the lag that drives length feedback loop
-  require_batches: 2
-  partial_rollout: True
+  
+  # On Policy Settings
+  # staleness_threshold: 0
+  # trigger_parameter_sync_step: 1
+  
+  # Stream Pipeline Settings
+  staleness_threshold: 0.1 
+  trigger_parameter_sync_step: 2
+
+  require_batches: 1
+  partial_rollout: False
   use_trainer_do_validate: False
 
 # Top-level rollout block — fully_async_main copies .nnodes/.n_gpus_per_node
@@ -59,8 +67,8 @@ async_training:
 rollout:
   nnodes: ${ROLLOUT_NNODES}
   n_gpus_per_node: 4
-  n: 8
-  total_rollout_steps: 51200   # adjust to your dataset size * desired steps
+  total_rollout_steps: 22419
+  test_freq: 10
 # ──────────────────────────────────────────────────────────────────────────────
 
 data:
@@ -68,10 +76,7 @@ data:
   val_files:   ${TRAINING_HOME}/data/gsm8k/test.parquet
   train_batch_size: 0    # must be 0 in fully-async mode
   gen_batch_size: 1      # must be 1 in fully-async mode
-  max_prompt_length: 512
-  max_response_length: 1024
-  apply_chat_template_kwargs:
-    enable_thinking: true
+  return_raw_chat: True
 
 actor_rollout_ref:
   hybrid_engine: False
@@ -84,13 +89,10 @@ actor_rollout_ref:
 
   actor:
     strategy: fsdp2
-    rollout_n: 8
-    ppo_mini_batch_size: 48    # must be divisible by dp_size/gcd(dp_size,rollout_n)=6; 48 = 1 sample/GPU
+    ppo_mini_batch_size: 48 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
     ppo_micro_batch_size_per_gpu: 1
-    use_torch_compile: false
     use_rollout_log_probs: True   # required for fully-async log prob correctness
-    optim:
-      lr: 1.0e-6
+    use_dynamic_bsz: True
 
   rollout:
     name: sglang
@@ -98,20 +100,15 @@ actor_rollout_ref:
     load_format: dummy
     n_gpus_per_node: 4
     temperature: 1.0
-    n: 8
+    n: 16 #num responses per prompt 
     tensor_model_parallel_size: 4
-    gpu_memory_utilization: 0.7   # lower than 8B to leave room for 70B weight sync buffers
-    log_prob_micro_batch_size_per_gpu: 1
-    calculate_log_probs: True     # required; log probs must come from rollout
+    gpu_memory_utilization: 0.75
+    log_prob_use_dynamic_bsz: True
     checkpoint_engine:
-      backend: nccl               # weight sync via NCCL broadcast
-    engine_kwargs:
-      sglang:
-        disable_piecewise_cuda_graph: true
+      backend: nccl # weight sync via NCCL broadcast
 
   ref:
-    fsdp_config:
-      param_offload: true
+    log_prob_use_dynamic_bsz: True
 
 algorithm:
   adv_estimator: grpo
@@ -121,11 +118,11 @@ algorithm:
     target_kl: 0.05
     horizon: 10000
   rollout_correction:
-    bypass_mode: True             # required for off-policy log prob correction
+    bypass_mode: True   # required for off-policy log prob correction
 
 reward:
   custom_reward_function:
-    path: ${TRAINING_HOME}/gsm8k_reward.py
+    path: ${TRAINING_CONFIG}/gsm8k_reward.py
     name: compute_reward
 
 trainer:
@@ -149,7 +146,7 @@ distillation:
   enabled: false
 EOF
 
-cat > "gsm8k_reward.py" <<- EOF
+cat > "${TRAINING_CONFIG}/gsm8k_reward.py" <<- EOF
 # gsm8k_reward.py
 import re
 import math
@@ -193,7 +190,7 @@ def compute_reward(
     return outcome_reward + format_reward + length_penalty
 EOF
 
-cat > "prepare_gsm8k.py" <<- EOF
+cat > "${TRAINING_CONFIG}/prepare_gsm8k.py" <<- EOF
 import re
 import os
 import datasets
@@ -252,11 +249,15 @@ if __name__ == "__main__":
     prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
 EOF
 
+sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
+sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
+
+
 # Download model (skip if already present)
 if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_HOME}/env.toml" \
+        --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         hf download ${MODEL_REPO}/${MODEL_NAME} \
             --local-dir ${TRAINING_HOME}/models/${MODEL_NAME} \
@@ -269,10 +270,10 @@ fi
 if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ]; then
     echo "Preparing GSM8K dataset..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_HOME}/env.toml" \
+        --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         # Try loading from cached raw download first, otherwise fetch from HF
-        python ${TRAINING_HOME}/prepare_gsm8k.py
+        python ${TRAINING_CONFIG}/prepare_gsm8k.py
     '
 else
     echo "Dataset already present, skipping preparation."
@@ -292,7 +293,7 @@ export RAY_memory_usage_threshold=0.99
 
 
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
-    --environment="${TRAINING_HOME}/env.toml" \
+    --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
 # Patch flash attention NoneType bug for Qwen2 on this transformers version
@@ -300,16 +301,10 @@ sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
 
 
+# Apply Verl fixes
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Full-async-SGLang-weight-broadcasting
-
-BRANCH_COMMIT=$(git rev-parse pr_origin/Full-async-SGLang-weight-broadcasting)
-
-if [ $SLURM_PROCID -eq 0 ]; then
-    echo "=== Resetting workspace to Full-async-SGLang-weight-broadcasting @ ${BRANCH_COMMIT} ==="
-fi
-
-git reset --hard pr_origin/Full-async-SGLang-weight-broadcasting
+git fetch pr_origin Fix-fsdp-model-loading-on-async
+git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
 
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
@@ -333,8 +328,8 @@ export VERL_LOGGING_LEVEL=INFO
 
 #TODO: move this inside the verl image build.
 for _cupy_attempt in 1 2 3; do
-    pip install cupy-cuda13x && break
-    echo "cupy install attempt ${_cupy_attempt} failed, retrying in 10s..."
+    pip install cachetools && break
+    echo "cachetools install attempt ${_cupy_attempt} failed, retrying in 10s..."
     sleep 10
 done
 
@@ -360,7 +355,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
     done
 
     HYDRA_FULL_ERROR=1 python -m verl.experimental.fully_async_policy.fully_async_main \
-        --config-path ${TRAINING_HOME} \
+        --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config
 else
