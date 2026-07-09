@@ -57,3 +57,4 @@ RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylate
 RUN pip uninstall kernels -y --break-system-packages
 
 RUN pip install cupy-cuda13x
+RUN pip install cachetools
