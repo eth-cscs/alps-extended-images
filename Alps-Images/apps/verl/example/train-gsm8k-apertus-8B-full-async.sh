@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=5:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-5a817661d2b9e382"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-8e3ed122b263df15"
 
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
@@ -321,12 +321,6 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
-#TODO: move this inside the verl image build.
-for _cupy_attempt in 1 2 3; do
-    pip install cachetools && break
-    echo "cachetools install attempt ${_cupy_attempt} failed, retrying in 10s..."
-    sleep 10
-done
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0

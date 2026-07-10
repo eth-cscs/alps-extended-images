@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=8:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-5a817661d2b9e382"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-8e3ed122b263df15"
 
 export MODEL_NAME="Qwen2.5-3B-Instruct"
 export MODEL_REPO="Qwen"
@@ -227,17 +227,6 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
 # Patch flash attention NoneType bug for Qwen2 on this transformers version
 sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
-
-# Update Verl to latest commit
-git fetch --tags
-git checkout v0.8.0
-
-#TODO: move this inside the verl image build.
-for _cupy_attempt in 1 2 3; do
-    pip install cachetools && break
-    echo "cachetools install attempt ${_cupy_attempt} failed, retrying in 10s..."
-    sleep 10
-done
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
