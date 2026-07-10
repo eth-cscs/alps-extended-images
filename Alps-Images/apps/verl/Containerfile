@@ -7,6 +7,8 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+ARG VERL_VERSION=0.8.0
+
 ARG OCI_SOURCE="unknown"
 ARG OCI_REVISION="unknown"
 ARG OCI_CREATED="unknown"
@@ -49,7 +51,7 @@ WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
 
-RUN git clone https://github.com/verl-project/verl
+RUN git clone --branch v${VERL_VERSION} --depth 1 https://github.com/verl-project/verl
 RUN cd verl && pip install --no-deps -e ".[sglang]"
 
 RUN pip install -U "ray[data,train,tune,serve]"
