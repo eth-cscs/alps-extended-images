@@ -476,9 +476,11 @@ build_nvshmem() {
     GDRCOPY_HOME=/usr/local \
     MPI_HOME=/opt/hpcx/ompi \
     PMIX_HOME=/opt/hpcx/ompi \
+    CUDAToolkit_ROOT="${CUDA_DIR}" \
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
+        -DCUDAToolkit_ROOT="${CUDA_DIR}" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
 
     cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
