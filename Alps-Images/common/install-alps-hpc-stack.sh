@@ -489,9 +489,12 @@ build_nvshmem() {
     popd >/dev/null
 
     local nvshmem_nvtx="${NVSHMEM_NVTX:-1}"
-    if [[ "${nvshmem_nvtx}" == "1" ]] && ! find "${CUDA_DIR}" -path '*/include/nvtx3/nvToolsExt.h' -print -quit | grep -q .; then
-        echo "NVTX headers not found under ${CUDA_DIR}; building NVSHMEM with NVSHMEM_NVTX=0"
-        nvshmem_nvtx=0
+    local nvshmem_nvtx_cmake="ON"
+    if [[ "${nvshmem_nvtx}" == "0" ]]; then
+        nvshmem_nvtx_cmake="OFF"
+    elif ! find "${CUDA_DIR}" -path '*/include/nvtx3/nvToolsExt.h' -print -quit | grep -q .; then
+        echo "NVTX headers not found under ${CUDA_DIR}; building NVSHMEM with NVSHMEM_NVTX=OFF"
+        nvshmem_nvtx_cmake="OFF"
     fi
 
     local mpi_home="${MPI_HOME:-/opt/hpcx/ompi}"
@@ -502,8 +505,14 @@ build_nvshmem() {
     local mpi_include_flags=""
     [[ -d "${mpi_home}/include" ]] && mpi_include_flags+=" -I${mpi_home}/include"
     [[ -d "${mpi_home}/include/openmpi" ]] && mpi_include_flags+=" -I${mpi_home}/include/openmpi"
-    export CFLAGS="${CFLAGS:-}${mpi_include_flags}"
-    export CXXFLAGS="${CXXFLAGS:-}${mpi_include_flags}"
+    local cmake_c_flags="${CFLAGS:-}${mpi_include_flags}"
+    local cmake_cxx_flags="${CXXFLAGS:-}${mpi_include_flags}"
+    local cmake_cuda_flags="${CUDAFLAGS:-}${mpi_include_flags}"
+    if [[ "${nvshmem_nvtx_cmake}" == "OFF" ]]; then
+        cmake_c_flags+=" -DNVTX_DISABLE=1"
+        cmake_cxx_flags+=" -DNVTX_DISABLE=1"
+        cmake_cuda_flags+=" -DNVTX_DISABLE=1"
+    fi
 
     NVSHMEM_BUILD_EXAMPLES=0 \
     NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
@@ -517,7 +526,7 @@ build_nvshmem() {
     NVSHMEM_LIBFABRIC_SUPPORT=1 \
     NVSHMEM_MPI_SUPPORT=1 \
     NVSHMEM_MPI_IS_OMPI=1 \
-    NVSHMEM_NVTX="${nvshmem_nvtx}" \
+    NVSHMEM_NVTX="$([[ "${nvshmem_nvtx_cmake}" == "ON" ]] && echo 1 || echo 0)" \
     NVSHMEM_PMIX_SUPPORT=1 \
     NVSHMEM_SHMEM_SUPPORT=1 \
     NVSHMEM_TEST_STATIC_LIB=0 \
@@ -544,6 +553,10 @@ build_nvshmem() {
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
+        -DCMAKE_C_FLAGS="${cmake_c_flags}" \
+        -DCMAKE_CXX_FLAGS="${cmake_cxx_flags}" \
+        -DCMAKE_CUDA_FLAGS="${cmake_cuda_flags}" \
+        -DNVSHMEM_NVTX="${nvshmem_nvtx_cmake}" \
         -DCUDAToolkit_ROOT="${CUDA_DIR}" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
 
