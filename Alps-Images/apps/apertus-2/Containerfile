@@ -229,8 +229,10 @@ RUN set -eux; \
     rm -rf /tmp/DeepGEMM
 
 # Install nv-grouped-gemm from source
-ARG NV_GROUPED_GEMM_REPO=https://github.com/fanshiqing/grouped_gemm.git
-ARG NV_GROUPED_GEMM_REF=v1.1.4.post8
+#ARG NV_GROUPED_GEMM_REPO=https://github.com/fanshiqing/grouped_gemm.git
+#ARG NV_GROUPED_GEMM_REF=v1.1.4.post8
+ARG NV_GROUPED_GEMM_REPO=https://github.com/FFGGSSJJ/grouped_gemm.git
+ARG NV_GROUPED_GEMM_REF=dev/grad_acc_fuse
 RUN set -eux; \
     python -m pip uninstall -y nv-grouped-gemm nv_grouped_gemm grouped_gemm || true; \
     rm -rf /tmp/grouped_gemm; \
