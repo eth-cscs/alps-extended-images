@@ -72,7 +72,7 @@ parse_ngc_base_image() {
 
 # Usage: base_refs NGC_NAME NGC_TAG
 # Returns a space-separated record:
-#   BASE_IMAGE_REF REOMVE_HPCX_DIRS_B64 DOCKERFILE CANON_REF TEST_REF STABLE_REF
+#   BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_REF TEST_REF STABLE_REF
 base_refs() {
   local ngc_name="${1:?ngc_name required}"   # e.g. pytorch
   local ngc_tag="${2:?ngc_tag required}"     # e.g. 25.12-py3
@@ -93,17 +93,20 @@ base_refs() {
   [[ -d "$common_dir" ]]   || { echo "ERROR: missing $common_dir" >&2; return 1; }
   [[ -d "$patches_dir" ]]  || { echo "ERROR: missing $patches_dir" >&2; return 1; }
 
-  # Load REMOVE_HPCX_DIRS from profile file
+  # Load optional NGC variant settings from profile file.
+  local REMOVE_HPCX_DIRS=""
+  local NVCR_PREFIX="nvidia"
   # shellcheck disable=SC1090
   source "$profile_file"
-  : "${REMOVE_HPCX_DIRS:?REMOVE_HPCX_DIRS must be set in ${profile_file}}"
   REMOVE_HPCX_DIRS_B64="$(printf '%s' "$REMOVE_HPCX_DIRS" | base64 -w0)"
+  # Keep the space-separated helper record parseable when the override is empty.
+  # Command substitution strips the decoded newline, yielding an empty value in CI.
+  [[ -n "$REMOVE_HPCX_DIRS_B64" ]] || REMOVE_HPCX_DIRS_B64="Cg=="
 
   # Some nvcr images have a different repo structure, e.g. physicsnemo:
   # nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
   # but most are like nvcr.io/nvidia/pytorch:25.12-py3, so we need to handle both cases.
-  # Load NVCR_PREFIX from profile file, default to "nvidia" if not set.
-  NVCR_PREFIX="${NVCR_PREFIX:-nvidia}"
+  # NVCR_PREFIX defaults to "nvidia" unless overridden by the profile file.
 
   # BASE IMAGE points to NGC image via remote proxy (jfrog) (speed up downloads
   # in CI and avoid hitting NGC rate limits)

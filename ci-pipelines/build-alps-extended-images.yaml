@@ -30,6 +30,8 @@ variables:
     NGC_TAG: "25.11.01"
   - NGC_NAME: "physicsnemo"
     NGC_TAG: "25.11"
+  - NGC_NAME: "vllm"
+    NGC_TAG: "26.06-py3"
   
 
 .alps_app_images_matrix: &alps_app_images_matrix
@@ -361,6 +363,25 @@ test-base-images-vetnode:
     SLURM_NTASKS: 16
     GIT_STRATEGY: fetch
 
+test-base-vllm-smoke:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  image: "$IMAGE_PREFIX/ngc-vllm:26.06-py3-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - |
+      set -euo pipefail
+      python - <<'PY'
+      import torch
+      import vllm
+
+      print(f"vllm={getattr(vllm, '__version__', 'unknown')}")
+      print(f"torch={torch.__version__}")
+      assert torch.cuda.is_available(), "CUDA must be available in the vLLM image"
+      PY
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
 test-apertus-1p5:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
@@ -428,6 +449,7 @@ publish-gate:
     - test-base-images-env
     - test-base-images-collectives
     - test-base-images-vetnode
+    - test-base-vllm-smoke
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP

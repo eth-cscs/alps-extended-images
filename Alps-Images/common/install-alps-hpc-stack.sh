@@ -48,6 +48,93 @@ remove_efa() {
     ldconfig
 }
 
+purge_preinstalled_network_stack() {
+    local package_patterns=(
+        '*aws-ofi-nccl*'
+        '*efa*'
+        '*hcoll*'
+        '*nccl*'
+        '*nvshmem*'
+        '*sharp*'
+        '*spectrum-x*'
+        '*ucx*'
+        '*ucc*'
+        'libfabric*'
+    )
+    local packages=() pkg pattern
+
+    while IFS= read -r pkg; do
+        for pattern in "${package_patterns[@]}"; do
+            if [[ "$pkg" == $pattern ]]; then
+                packages+=("$pkg")
+                break
+            fi
+        done
+    done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
+
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+        printf 'Purging preinstalled network-stack packages: %s\n' "${packages[*]}"
+        apt-get purge -y "${packages[@]}" || true
+        apt-get autoremove -y || true
+    fi
+
+    local dirs=(
+        /opt/amazon/aws-ofi-nccl
+        /opt/amazon/efa
+        /opt/aws-ofi-nccl
+        /opt/hpcx/hcoll
+        /opt/hpcx/nccl_mrc_plugin
+        /opt/hpcx/nccl_rdma_sharp_plugin
+        /opt/hpcx/nccl_spectrum-x_plugin
+        /opt/hpcx/ncclnet_plugin
+        /opt/hpcx/ompi
+        /opt/hpcx/sharp
+        /opt/hpcx/ucc
+        /opt/hpcx/ucx
+        /usr/local/ucx
+        /usr/local/ucc
+    )
+    local d
+    for d in "${dirs[@]}"; do
+        if [[ -e "$d" ]]; then
+            echo "Removing preinstalled network-stack path: $d"
+            rm -rf "$d" || true
+        fi
+    done
+
+    local lib_roots=(
+        /usr/local/cuda/lib64
+        /usr/local/cuda/targets/aarch64-linux/lib
+        /usr/local/cuda/targets/x86_64-linux/lib
+        /usr/local/lib
+        /usr/local/lib64
+        /usr/lib
+        /usr/lib64
+        /usr/lib/aarch64-linux-gnu
+        /usr/lib/x86_64-linux-gnu
+    )
+    local root
+    for root in "${lib_roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        find "$root" -maxdepth 1 \( -type f -o -type l \) \( \
+            -name 'libaws-ofi-nccl*' -o \
+            -name 'libfabric*' -o \
+            -name 'libhcoll*' -o \
+            -name 'libnccl*' -o \
+            -name 'libnvshmem*' -o \
+            -name 'libsharp*' -o \
+            -name 'libucc*' -o \
+            -name 'libucm*' -o \
+            -name 'libucp*' -o \
+            -name 'libucs*' -o \
+            -name 'libuct*' \
+        \) -print -delete || true
+    done
+
+    remove_efa
+    ldconfig
+}
+
 remove_hpcx_plugins() {
     # REMOVE_HPCX_DIRS can be space-separated or newline-separated
     if [[ -n "${REMOVE_HPCX_DIRS:-}" ]]; then
@@ -560,7 +647,7 @@ main() {
 
     apt_install_build_deps
 
-    remove_efa
+    purge_preinstalled_network_stack
     remove_hpcx_plugins
 
     build_boost
