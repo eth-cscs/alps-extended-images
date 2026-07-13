@@ -437,7 +437,11 @@ ensure_cuda_nvjitlink_layout() {
 
     mkdir -p "${root_lib}"
     while IFS= read -r candidate; do
-        ln -sf "${candidate}" "${root_lib}/$(basename "${candidate}")"
+        local dest="${root_lib}/$(basename "${candidate}")"
+        if [[ -e "${dest}" && "${candidate}" -ef "${dest}" ]]; then
+            continue
+        fi
+        ln -sf "${candidate}" "${dest}"
     done < <(find "${target_lib}" -maxdepth 1 -name 'libnvJitLink.so*' -print | sort -V)
 
     if [[ ! -e "${root_lib}/libnvJitLink.so" ]]; then
@@ -455,8 +459,16 @@ build_nvshmem() {
 
     # Remove preinstalled NVSHMEM
     apt-get update
-    apt-get purge -y 'libnvshmem*-cuda-*' 'nvshmem*' || true
-    apt-get autoremove -y || true
+    local nvshmem_packages=() pkg
+    while IFS= read -r pkg; do
+        case "${pkg}" in
+            libnvshmem*-cuda-*|nvshmem*) nvshmem_packages+=("${pkg}");;
+        esac
+    done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
+    if [[ "${#nvshmem_packages[@]}" -gt 0 ]]; then
+        apt-get purge -y "${nvshmem_packages[@]}" || true
+        apt-get autoremove -y || true
+    fi
 
     # Remove CUDA symlinks/copies that can shadow our install
     rm -f "${CUDA_DIR}/lib64/libnvshmem"*.so* || true
