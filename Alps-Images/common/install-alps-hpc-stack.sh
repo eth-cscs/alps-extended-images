@@ -269,7 +269,21 @@ build_libfabric() {
     ldconfig
 }
 
+ensure_debian_packaging_tools() {
+    if command -v debuild >/dev/null 2>&1; then
+        return 0
+    fi
+
+    apt-get update
+    apt-get install -y --no-install-recommends devscripts debhelper fakeroot dh-make
+    rm -rf /var/lib/apt/lists/*
+
+    command -v debuild >/dev/null 2>&1 || die "debuild not found after installing devscripts"
+}
+
 build_nccl_deb() {
+    ensure_debian_packaging_tools
+
     curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz
     tar -C /tmp -xzf /tmp/nccl.tar.gz
     pushd "/tmp/nccl-${NCCL_VER}"
