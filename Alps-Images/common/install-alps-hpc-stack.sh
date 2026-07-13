@@ -414,6 +414,37 @@ build_aws_ofi_nccl() {
     ldconfig
 }
 
+ensure_cuda_nvjitlink_layout() {
+    local root_lib="${CUDA_DIR}/lib64"
+    local target_lib=""
+    local nvjitlink=""
+    local candidate
+
+    if [[ -e "${root_lib}/libnvJitLink.so" ]]; then
+        return 0
+    fi
+
+    for candidate in "${CUDA_DIR}"/targets/*/lib "${CUDA_DIR}"/targets/*/lib64; do
+        [[ -d "${candidate}" ]] || continue
+        nvjitlink="$(find "${candidate}" -maxdepth 1 \( -name 'libnvJitLink.so' -o -name 'libnvJitLink.so.*' \) -print | sort -V | head -n1 || true)"
+        if [[ -n "${nvjitlink}" ]]; then
+            target_lib="${candidate}"
+            break
+        fi
+    done
+
+    [[ -n "${target_lib}" ]] || die "libnvJitLink not found under ${CUDA_DIR}"
+
+    mkdir -p "${root_lib}"
+    while IFS= read -r candidate; do
+        ln -sf "${candidate}" "${root_lib}/$(basename "${candidate}")"
+    done < <(find "${target_lib}" -maxdepth 1 -name 'libnvJitLink.so*' -print | sort -V)
+
+    if [[ ! -e "${root_lib}/libnvJitLink.so" ]]; then
+        ln -sf "${nvjitlink}" "${root_lib}/libnvJitLink.so"
+    fi
+}
+
 build_nvshmem() {
     : "${NVSHMEM_PREFIX:=/opt/nvshmem}"
     : "${NVSHMEM_BUILDDIR:=/tmp/nvshmem-build}"
@@ -431,6 +462,8 @@ build_nvshmem() {
     rm -f "${CUDA_DIR}/lib64/libnvshmem"*.so* || true
     rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*.so* || true
     rm -rf /usr/lib/*/nvshmem || true
+
+    ensure_cuda_nvjitlink_layout
 
     rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
     mkdir -p "${NVSHMEM_BUILDDIR}"
