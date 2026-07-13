@@ -54,4 +54,8 @@ RUN cd verl && pip install --no-deps -e ".[sglang]"
 
 RUN pip install -U "ray[data,train,tune,serve]"
 RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
-RUN pip uninstall kernels -y --break-system-packages 
+RUN pip uninstall kernels -y --break-system-packages
+
+# Tests shipped with the image
+COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
+RUN chmod -R a+rX /opt/tests/verl
