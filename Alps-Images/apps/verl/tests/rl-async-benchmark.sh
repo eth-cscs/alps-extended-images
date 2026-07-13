@@ -1,4 +1,3 @@
-
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
@@ -52,10 +51,8 @@ defaults:
 
 # ── Required by fully_async_main ──────────────────────────────────────────────
 async_training:
-  
-  # Stream Pipeline Settings
-  staleness_threshold: 0.1 
-  trigger_parameter_sync_step: 2
+  staleness_threshold: 0
+  trigger_parameter_sync_step: 1
 
   require_batches: 1
   partial_rollout: False
@@ -66,8 +63,8 @@ async_training:
 rollout:
   nnodes: ${ROLLOUT_NNODES}
   n_gpus_per_node: 4
-  total_rollout_steps: 22419
-  test_freq: 10
+  total_rollout_steps: 504  # 2 global steps: ppo_mini_batch_size=252 * 2 steps = 504
+  test_freq: 1
 # ──────────────────────────────────────────────────────────────────────────────
 
 data:
@@ -235,6 +232,10 @@ def prepare(split: str, output_path: str):
         print(f"Downloading {split} from HuggingFace...")
         ds = datasets.load_dataset("openai/gsm8k", "main", split=split)
 
+    # Use a slice large enough for 2 training steps (ppo_mini_batch_size=252 * 2 steps)
+    max_rows = 512 if split == "train" else 16
+    ds = ds.select(range(min(len(ds), max_rows)))
+
     rows = []
     skipped = 0
     for item in ds:
@@ -261,7 +262,7 @@ EOF
 
 
 
-echo "Preparing GSM8K dataset (10% subset)..."
+echo "Preparing GSM8K dataset (benchmark subset: 32 train / 16 test rows)..."
 python ${TRAINING_CONFIG}/prepare_gsm8k.py
 
 
