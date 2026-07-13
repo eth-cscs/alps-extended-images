@@ -382,6 +382,19 @@ test-base-vllm-smoke:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
+test-base-vllm-ray-nccl:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 30m
+  image: "$IMAGE_PREFIX/ngc-vllm:26.06-py3-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - bash ci-pipelines/tests/vllm/ray_nccl_smoke.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 2
+    GIT_STRATEGY: fetch
+    VLLM_RAY_NCCL_WORLD_SIZE: 8
+
 test-apertus-1p5:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
@@ -450,6 +463,7 @@ publish-gate:
     - test-base-images-collectives
     - test-base-images-vetnode
     - test-base-vllm-smoke
+    - test-base-vllm-ray-nccl
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP

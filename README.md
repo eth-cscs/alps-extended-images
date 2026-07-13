@@ -80,7 +80,7 @@ The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs fiv
    - environment variable checks (FI_PROVIDER, NCCL settings)
    - collective benchmarks (NCCL alltoall, NVSHMEM latency, OSU bandwidth)
    - hardware verification via the `vetnode` framework
-   - vLLM import/GPU smoke test for the vLLM base
+   - vLLM import/GPU smoke test and 2-node Ray/NCCL all-reduce for the vLLM base
 3. **build-apps** — builds application images on top of canonical base image refs
 4. **test-apps** — runs end-to-end workload tests:
    - `apertus-1p5`: Megatron pretraining (2 nodes, 8 GPUs)

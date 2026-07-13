@@ -390,6 +390,7 @@ build_aws_ofi_nccl() {
 
     ./configure \
         --prefix=/usr \
+        --disable-tests \
         --with-libfabric=/usr \
         --with-cuda="${CUDA_DIR}" \
         --with-mpi=/opt/hpcx/ompi \
