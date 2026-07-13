@@ -488,6 +488,23 @@ build_nvshmem() {
     apply_patch_if_set "${NVSHMEM_PATCH}"
     popd >/dev/null
 
+    local nvshmem_nvtx="${NVSHMEM_NVTX:-1}"
+    if [[ "${nvshmem_nvtx}" == "1" ]] && ! find "${CUDA_DIR}" -path '*/include/nvtx3/nvToolsExt.h' -print -quit | grep -q .; then
+        echo "NVTX headers not found under ${CUDA_DIR}; building NVSHMEM with NVSHMEM_NVTX=0"
+        nvshmem_nvtx=0
+    fi
+
+    local mpi_home="${MPI_HOME:-/opt/hpcx/ompi}"
+    if [[ -e "${mpi_home}" ]]; then
+        mpi_home="$(realpath -e "${mpi_home}")"
+    fi
+
+    local mpi_include_flags=""
+    [[ -d "${mpi_home}/include" ]] && mpi_include_flags+=" -I${mpi_home}/include"
+    [[ -d "${mpi_home}/include/openmpi" ]] && mpi_include_flags+=" -I${mpi_home}/include/openmpi"
+    export CFLAGS="${CFLAGS:-}${mpi_include_flags}"
+    export CXXFLAGS="${CXXFLAGS:-}${mpi_include_flags}"
+
     NVSHMEM_BUILD_EXAMPLES=0 \
     NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
     NVSHMEM_DEBUG=0 \
@@ -500,7 +517,7 @@ build_nvshmem() {
     NVSHMEM_LIBFABRIC_SUPPORT=1 \
     NVSHMEM_MPI_SUPPORT=1 \
     NVSHMEM_MPI_IS_OMPI=1 \
-    NVSHMEM_NVTX=1 \
+    NVSHMEM_NVTX="${nvshmem_nvtx}" \
     NVSHMEM_PMIX_SUPPORT=1 \
     NVSHMEM_SHMEM_SUPPORT=1 \
     NVSHMEM_TEST_STATIC_LIB=0 \
@@ -519,8 +536,10 @@ build_nvshmem() {
     LIBFABRIC_HOME=/usr \
     NCCL_HOME=/usr \
     GDRCOPY_HOME=/usr/local \
-    MPI_HOME=/opt/hpcx/ompi \
-    PMIX_HOME=/opt/hpcx/ompi \
+    MPI_HOME="${mpi_home}" \
+    PMIX_HOME="${mpi_home}" \
+    SHMEM_HOME="${mpi_home}" \
+    UCX_HOME=/opt/hpcx/ucx \
     CUDAToolkit_ROOT="${CUDA_DIR}" \
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
