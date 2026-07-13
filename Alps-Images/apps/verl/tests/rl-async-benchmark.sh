@@ -1,3 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
@@ -325,6 +328,13 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config
+    TRAINING_EXIT_CODE=$?
+
+    # Stop Ray cleanly so worker raylets shut down gracefully instead of
+    # flooding logs with GCS-unavailable errors after the head exits.
+    ray stop --force 2>/dev/null || true
+
+    exit $TRAINING_EXIT_CODE
 else
     # Worker nodes join the Ray cluster
     sleep 15
