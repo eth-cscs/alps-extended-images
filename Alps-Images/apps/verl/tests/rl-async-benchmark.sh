@@ -11,7 +11,7 @@ export TRAINING_HOME=/tmp/verl-pipeline-${SLURM_JOB_ID}
 export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=/tmp/checkpoints-${SLURM_JOB_ID}
 
-export  HOME=$(pwd)
+export  HOME=/workspace/verl
 
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
