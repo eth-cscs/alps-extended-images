@@ -308,7 +308,7 @@ fi
 exec "${real_podman}" "$@"
 EOF
 
-RUN chmod 0755 /usr/local/bin/podmanhj
+RUN chmod 0755 /usr/local/bin/podman
 
 WORKDIR /workspace
 
