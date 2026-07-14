@@ -58,4 +58,5 @@ RUN pip uninstall kernels -y --break-system-packages
 
 # Tests shipped with the image
 COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
-RUN chmod -R a+rX /opt/tests/verl
+RUN find /opt/tests/verl -name "*.sh" -exec chmod a+x {} \; && \
+    chmod -R a+rX /opt/tests/verl
