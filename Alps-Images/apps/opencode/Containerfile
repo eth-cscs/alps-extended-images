@@ -140,7 +140,7 @@ ENV HOME=/config/home \
     XDG_CACHE_HOME=/data/cache \
     XDG_STATE_HOME=/data/state
 
-COPY Alps-Images/apps/opencode/opencode-launch /usr/local/bin/opencode-launch
+COPY Alps-Images/apps/opencode/tests/opencode-launch /usr/local/bin/opencode-launch
 
 RUN set -euxo pipefail; \
     chmod 0755 /usr/local/bin/opencode-launch
