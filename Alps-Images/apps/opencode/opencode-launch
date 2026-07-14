@@ -7,6 +7,8 @@ export XDG_DATA_HOME="${XDG_DATA_HOME:-/data}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/data/cache}"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-/data/state}"
 
+export OPENCODE_DB="${OPENCODE_DB:-opencode-local.db}"
+
 mkdir -p \
   "${HOME}" \
   "${XDG_CONFIG_HOME}" \
@@ -14,6 +16,48 @@ mkdir -p \
   "${XDG_CACHE_HOME}" \
   "${XDG_STATE_HOME}"
 
+export PODMAN_SESSION_ID="${
+  PODMAN_SESSION_ID:-${SLURM_JOB_ID:-interactive}-${SLURM_STEP_ID:-0}
+}"
+
+export PODMAN_RUNTIME_PARENT="${PODMAN_RUNTIME_PARENT:-/run}"
+export PODMAN_STORAGE_PARENT="${PODMAN_STORAGE_PARENT:-/dev/shm}"
+
+export PODMAN_RUNTIME_DIR="${
+  PODMAN_RUNTIME_DIR:-${
+    PODMAN_RUNTIME_PARENT%/
+  }/opencode-podman-${UID}-${PODMAN_SESSION_ID}
+}"
+
+export PODMAN_STORAGE_DIR="${
+  PODMAN_STORAGE_DIR:-${
+    PODMAN_STORAGE_PARENT%/
+  }/opencode-podman-${UID}-${PODMAN_SESSION_ID}
+}"
+
+cleanup_podman() {
+  local status=$?
+
+  trap - EXIT
+  set +e
+
+  if [[ -d "${PODMAN_RUNTIME_DIR}" ||
+        -d "${PODMAN_STORAGE_DIR}" ]]; then
+    /usr/local/bin/podman system reset --force \
+      >/dev/null 2>&1 || true
+
+    rm -rf -- \
+      "${PODMAN_RUNTIME_DIR}" \
+      "${PODMAN_STORAGE_DIR}"
+  fi
+
+  exit "${status}"
+}
+
+trap cleanup_podman EXIT
+
 cd /workspace
 
-exec opencode "$@"
+# Retain this launcher process so its EXIT trap can clean ephemeral Podman
+# storage after OpenCode terminates normally.
+opencode "$@"
