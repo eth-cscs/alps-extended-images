@@ -308,7 +308,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
     ray start --head \
         --node-ip-address=$MASTER_NODE_IP \
         --port=$PORT \
-        --num-cpus=${SLURM_CPUS_PER_TASK} \
+        --num-cpus=288 \
         --num-gpus=4 \
         --disable-usage-stats || true
 
@@ -341,7 +341,7 @@ else
     ray start \
         --address="${RAY_ADDRESS}" \
         --node-ip-address=$(hostname -i) \
-        --num-cpus=${SLURM_CPUS_PER_TASK} \
+        --num-cpus=288 \
         --num-gpus=4 \
         --block || true
 fi
