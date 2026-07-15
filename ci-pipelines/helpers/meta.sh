@@ -139,6 +139,7 @@ app_refs() {
 
   local app_dir="Alps-Images/apps/${name}"
   local dockerfile="${app_dir}/Containerfile"
+  local patch_dir="${app_dir}/patches"
   local test_dir="${app_dir}/tests"
   local profile_file="${app_dir}/profile.env"
 
@@ -147,6 +148,7 @@ app_refs() {
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
   # tests dir is optional but usually present
   [[ -d "$test_dir" ]] || test_dir=""
+  [[ -d "$patch_dir" ]] || patch_dir=""
 
   # Load BASE_IMAGE from profile file
   # shellcheck disable=SC1090
@@ -160,7 +162,7 @@ app_refs() {
   read -r _base_image_ref _remove_hpcx_dirs _base_dockerfile base_canon_ref _base_test_ref _base_stable_ref < <(base_refs "$ngc_name" "$ngc_tag")
 
   # Compute canonical tag from hashed content
-  local hash_paths="$dockerfile $profile_file $test_dir"
+  local hash_paths="$dockerfile $profile_file $patch_dir $test_dir"
   local tag="${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
   local canon_tag="$(canon_tag_for "$tag" "$h")"

@@ -414,41 +414,6 @@ build_aws_ofi_nccl() {
     ldconfig
 }
 
-ensure_cuda_nvjitlink_layout() {
-    local root_lib="${CUDA_DIR}/lib64"
-    local target_lib=""
-    local nvjitlink=""
-    local candidate
-
-    if [[ -e "${root_lib}/libnvJitLink.so" ]]; then
-        return 0
-    fi
-
-    for candidate in "${CUDA_DIR}"/targets/*/lib "${CUDA_DIR}"/targets/*/lib64; do
-        [[ -d "${candidate}" ]] || continue
-        nvjitlink="$(find "${candidate}" -maxdepth 1 \( -name 'libnvJitLink.so' -o -name 'libnvJitLink.so.*' \) -print | sort -V | head -n1 || true)"
-        if [[ -n "${nvjitlink}" ]]; then
-            target_lib="${candidate}"
-            break
-        fi
-    done
-
-    [[ -n "${target_lib}" ]] || die "libnvJitLink not found under ${CUDA_DIR}"
-
-    mkdir -p "${root_lib}"
-    while IFS= read -r candidate; do
-        local dest="${root_lib}/$(basename "${candidate}")"
-        if [[ -e "${dest}" && "${candidate}" -ef "${dest}" ]]; then
-            continue
-        fi
-        ln -sf "${candidate}" "${dest}"
-    done < <(find "${target_lib}" -maxdepth 1 -name 'libnvJitLink.so*' -print | sort -V)
-
-    if [[ ! -e "${root_lib}/libnvJitLink.so" ]]; then
-        ln -sf "${nvjitlink}" "${root_lib}/libnvJitLink.so"
-    fi
-}
-
 build_nvshmem() {
     : "${NVSHMEM_PREFIX:=/opt/nvshmem}"
     : "${NVSHMEM_BUILDDIR:=/tmp/nvshmem-build}"
@@ -475,8 +440,6 @@ build_nvshmem() {
     rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*.so* || true
     rm -rf /usr/lib/*/nvshmem || true
 
-    ensure_cuda_nvjitlink_layout
-
     rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
     mkdir -p "${NVSHMEM_BUILDDIR}"
 
@@ -488,30 +451,9 @@ build_nvshmem() {
     apply_patch_if_set "${NVSHMEM_PATCH}"
     popd >/dev/null
 
-    local nvshmem_nvtx="${NVSHMEM_NVTX:-1}"
-    local nvshmem_nvtx_cmake="ON"
-    if [[ "${nvshmem_nvtx}" == "0" ]]; then
-        nvshmem_nvtx_cmake="OFF"
-    elif ! find "${CUDA_DIR}" -path '*/include/nvtx3/nvToolsExt.h' -print -quit | grep -q .; then
-        echo "NVTX headers not found under ${CUDA_DIR}; building NVSHMEM with NVSHMEM_NVTX=OFF"
-        nvshmem_nvtx_cmake="OFF"
-    fi
-
     local mpi_home="${MPI_HOME:-/opt/hpcx/ompi}"
     if [[ -e "${mpi_home}" ]]; then
         mpi_home="$(realpath -e "${mpi_home}")"
-    fi
-
-    local mpi_include_flags=""
-    [[ -d "${mpi_home}/include" ]] && mpi_include_flags+=" -I${mpi_home}/include"
-    [[ -d "${mpi_home}/include/openmpi" ]] && mpi_include_flags+=" -I${mpi_home}/include/openmpi"
-    local cmake_c_flags="${CFLAGS:-}${mpi_include_flags}"
-    local cmake_cxx_flags="${CXXFLAGS:-}${mpi_include_flags}"
-    local cmake_cuda_flags="${CUDAFLAGS:-}${mpi_include_flags}"
-    if [[ "${nvshmem_nvtx_cmake}" == "OFF" ]]; then
-        cmake_c_flags+=" -DNVTX_DISABLE=1"
-        cmake_cxx_flags+=" -DNVTX_DISABLE=1"
-        cmake_cuda_flags+=" -DNVTX_DISABLE=1"
     fi
 
     NVSHMEM_BUILD_EXAMPLES=0 \
@@ -526,7 +468,7 @@ build_nvshmem() {
     NVSHMEM_LIBFABRIC_SUPPORT=1 \
     NVSHMEM_MPI_SUPPORT=1 \
     NVSHMEM_MPI_IS_OMPI=1 \
-    NVSHMEM_NVTX="$([[ "${nvshmem_nvtx_cmake}" == "ON" ]] && echo 1 || echo 0)" \
+    NVSHMEM_NVTX=1 \
     NVSHMEM_PMIX_SUPPORT=1 \
     NVSHMEM_SHMEM_SUPPORT=1 \
     NVSHMEM_TEST_STATIC_LIB=0 \
@@ -553,10 +495,6 @@ build_nvshmem() {
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
-        -DCMAKE_C_FLAGS="${cmake_c_flags}" \
-        -DCMAKE_CXX_FLAGS="${cmake_cxx_flags}" \
-        -DCMAKE_CUDA_FLAGS="${cmake_cuda_flags}" \
-        -DNVSHMEM_NVTX="${nvshmem_nvtx_cmake}" \
         -DCUDAToolkit_ROOT="${CUDA_DIR}" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
 

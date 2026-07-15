@@ -18,15 +18,26 @@ variables:
 # NOTE: Keep the matrices small to avoid "job name too long" issues
 
 .alps_base_images_matrix: &alps_base_images_matrix
-  - NGC_NAME: "vllm"
-    NGC_TAG: "26.06-py3"
-  
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "26.02-py3"
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "26.01-py3"
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "25.12-py3"
+  - NGC_NAME: "nemo"
+    NGC_TAG: "26.02"
+  - NGC_NAME: "nemo"
+    NGC_TAG: "25.11.01"
+  - NGC_NAME: "physicsnemo"
+    NGC_TAG: "25.11"
+
 
 .alps_app_images_matrix: &alps_app_images_matrix
   - NAME: "apertus-1p5"
   - NAME: "apertus-2"
   - NAME: "sfttrainer"
   - NAME: "verl"
+  - NAME: "vllm"
   
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
@@ -351,38 +362,6 @@ test-base-images-vetnode:
     SLURM_NTASKS: 16
     GIT_STRATEGY: fetch
 
-test-base-vllm-smoke:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  image: "$IMAGE_PREFIX/ngc-vllm:26.06-py3-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - |
-      set -euo pipefail
-      python - <<'PY'
-      import torch
-      import vllm
-
-      print(f"vllm={getattr(vllm, '__version__', 'unknown')}")
-      print(f"torch={torch.__version__}")
-      assert torch.cuda.is_available(), "CUDA must be available in the vLLM image"
-      PY
-  variables:
-    SLURM_JOB_NUM_NODES: 1
-    SLURM_NTASKS: 1
-
-test-base-vllm-ray-nccl:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  timeout: 30m
-  image: "$IMAGE_PREFIX/ngc-vllm:26.06-py3-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - bash ci-pipelines/tests/vllm/ray_nccl_smoke.sh
-  variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 2
-    GIT_STRATEGY: fetch
-    VLLM_RAY_NCCL_WORLD_SIZE: 8
-
 test-apertus-1p5:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
@@ -421,6 +400,37 @@ test-apertus-2-DeepEP:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
+test-vllm-smoke:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  image: "$IMAGE_PREFIX/vllm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - |
+      set -euo pipefail
+      python - <<'PY'
+      import torch
+      import vllm
+
+      print(f"vllm={getattr(vllm, '__version__', 'unknown')}")
+      print(f"torch={torch.__version__}")
+      assert torch.cuda.is_available(), "CUDA must be available in the vLLM image"
+      PY
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
+test-vllm-ray-nccl:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 30m
+  image: "$IMAGE_PREFIX/vllm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - bash ci-pipelines/tests/vllm/ray_nccl_smoke.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 2
+    VLLM_RAY_NCCL_WORLD_SIZE: 8
+
 test-app-images-vetnode:
   stage: test-apps
   extends: [test-base-images-vetnode]
@@ -450,11 +460,11 @@ publish-gate:
     - test-base-images-env
     - test-base-images-collectives
     - test-base-images-vetnode
-    - test-base-vllm-smoke
-    - test-base-vllm-ray-nccl
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
+    - test-vllm-smoke
+    - test-vllm-ray-nccl
     - test-app-images-vetnode
   script:
     - echo "Publish gate passed (tests completed)"
