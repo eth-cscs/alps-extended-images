@@ -9,7 +9,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
-  ALPS_REV: alps6-dev
+  ALPS_REV: alps7-dev
 
 
 # ----------------------------
@@ -74,6 +74,7 @@ variables:
     USE_MPI: NO
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
+    SLURM_GPUS_PER_NODE: 4
     PMIX_MCA_psec: native
 
 # ----------------------------

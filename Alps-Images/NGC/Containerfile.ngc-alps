@@ -31,7 +31,7 @@ ARG CASSINI_HEADERS_VERSION=release/shs-13.1.0
 ARG CXI_DRIVER_VERSION=release/shs-13.1.0
 ARG LIBCXI_VERSION=release/shs-13.1.0
 
-ARG LIBFABRIC_COMMIT=5b73bf2f11ad57ff8dfbca216ceefc08eb9505ea
+ARG LIBFABRIC_COMMIT=5de2d6a2df83595bcc38531cb91bf59495559495
 ARG LIBFABRIC_PATCH=""
 
 ARG NCCL_VER=2.30.7-1
@@ -41,7 +41,7 @@ ARG UCX_VERSION=1.20.1
 ARG UCC_VERSION=1.8.0
 ARG OMPI_VER=5.0.10
 
-ARG AWS_OFI_NCCL_COMMIT=423a0073356529a93fd86191f20e27e6b7d84849
+ARG AWS_OFI_NCCL_COMMIT=a2a6d08ea98296f99596b5c18b30b8a20d74f609
 ARG AWS_OFI_NCCL_PATCH=""
 
 ARG NVSHMEM_VER=3.6.5-0
@@ -58,13 +58,13 @@ RUN set -eux; \
     /opt/alps/install-alps-hpc-stack.sh
 
 COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
+COPY Alps-Images/common/source-alps-env.sh /opt/alps/env/source-alps-env.sh
 
 RUN set -eux; \
-    chmod 0644 /opt/alps/env/alps-runtime.env; \
-    printf '%s\n' \
-      'if [ -f /opt/alps/env/alps-versions.env ]; then . /opt/alps/env/alps-versions.env; fi' \
-      'if [ -f /opt/alps/env/alps-runtime.env ]; then . /opt/alps/env/alps-runtime.env; fi' \
-      > /opt/nvidia/entrypoint.d/99-alps-env.sh
+    mkdir -p /opt/nvidia/entrypoint.d /etc/profile.d; \
+    chmod 0644 /opt/alps/env/alps-runtime.env /opt/alps/env/source-alps-env.sh; \
+    ln -sf /opt/alps/env/source-alps-env.sh /opt/nvidia/entrypoint.d/99-alps-env.sh; \
+    ln -sf /opt/alps/env/source-alps-env.sh /etc/profile.d/99-alps-env.sh
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
