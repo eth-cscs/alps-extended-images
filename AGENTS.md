@@ -8,8 +8,8 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 
 - `Alps-Images/NGC/` is the current CUDA/NGC base-image family; do not treat its assumptions as universal.
 - `Alps-Images/common/` holds shared Alps CUDA/HPC installer and runtime setup used by NGC bases.
-- `Alps-Images/apps/<app>/` holds app Containerfiles, `profile.env`, and optional tests copied into `/opt/tests/<app>/`.
-- `Alps-Images/patches/` contains upstream patches consumed by base builds and included in base hashes.
+- `Alps-Images/apps/<app>/` holds app Containerfiles, `profile.env`, optional app-local patches, and optional tests copied into `/opt/tests/<app>/`.
+- `Alps-Images/patches/` contains upstream patches consumed by base builds and included in base hashes; `Alps-Images/apps/<app>/patches/` contains app-specific source patches included in app hashes.
 - `ci-pipelines/build-alps-extended-images.yaml` is the executable pipeline source; prefer it over README prose when they disagree.
 - `ci-pipelines/helpers/meta.sh` derives image refs and hashes; `ci-pipelines/helpers/skopeo.sh` owns registry copy/promotion behavior.
 
@@ -23,7 +23,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 ## Hashing Rules
 
 - Base hashes must cover the base Containerfile, variant directory/profile/hooks, `Alps-Images/common`, `Alps-Images/patches`, and logical build inputs used by `meta.sh`.
-- App hashes must cover the app Containerfile, `profile.env`, copied tests when present, and the canonical base ref.
+- App hashes must cover the app Containerfile, `profile.env`, app-local `patches/` when present, copied tests when present, and the canonical base ref.
 - Do not add timestamps or commit SHAs to content hashes; they defeat reuse. OCI labels may still receive CI metadata.
 - Required hash inputs should fail when missing. Do not silently skip a declared Containerfile/profile/patch directory.
 - Any helper output field that can contain whitespace must be encoded or moved to dotenv; current `REMOVE_HPCX_DIRS` is base64 encoded for this reason.
@@ -34,7 +34,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - Build-stage dependency chain is `meta -> build -> retag-for-CI`; explicit `needs` can bypass stage barriers, so include every correctness dependency.
 - Matrix jobs must use matching `needs:parallel:matrix` mappings for every identity field (`NGC_NAME`/`NGC_TAG` or `NAME`) to avoid mixed dotenv artifacts.
 - Keep matrix values short because GitLab includes them in job names.
-- Current app matrix in CI is `apertus-1p5`, `apertus-2`, `sfttrainer`, and `verl`.
+- Current app matrix in CI is `apertus-1p5`, `apertus-2`, `sfttrainer`, `verl`, and `vllm`.
 - When adding or renaming tests, update `publish-gate.needs`; publishing depends on this gate, not just stage order.
 
 ## Promotion
@@ -53,6 +53,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - `install-alps-hpc-stack.sh` programmatically purges preinstalled generic network stacks before rebuilding the Alps stack; keep `REMOVE_HPCX_DIRS` only as an optional profile escape hatch for image-specific leftovers.
 - NGC variant `profile.env` is declarative and may carry optional `REMOVE_HPCX_DIRS` or `NVCR_PREFIX`; use `hooks.d/*.sh` only for deterministic late image fixes.
 - If tests must run without the repo checkout, copy them into `/opt/tests/<image>/` and include them in the app hash.
+- Prefer patch files under `Alps-Images/apps/<app>/patches/` over inline source rewrites in app Containerfiles, so compatibility changes are reviewable and hash-tracked.
 
 ## Runtime Gotchas
 
