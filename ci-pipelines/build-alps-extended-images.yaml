@@ -430,6 +430,7 @@ test-vllm-ray-nccl:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 2
     VLLM_RAY_NCCL_WORLD_SIZE: 8
+    GIT_STRATEGY: fetch
 
 test-app-images-vetnode:
   stage: test-apps
