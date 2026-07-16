@@ -142,6 +142,7 @@ app_refs() {
   local patch_dir="${app_dir}/patches"
   local test_dir="${app_dir}/tests"
   local profile_file="${app_dir}/profile.env"
+  local cleanup_script="Alps-Images/common/cleanup-apt-build-deps.sh"
 
   [[ -d "$app_dir" ]]      || { echo "ERROR: missing $app_dir" >&2; return 1; }
   [[ -f "$dockerfile" ]]   || { echo "ERROR: missing $dockerfile" >&2; return 1; }
@@ -163,6 +164,10 @@ app_refs() {
 
   # Compute canonical tag from hashed content
   local hash_paths="$dockerfile $profile_file $patch_dir $test_dir"
+  if grep -Fq "$cleanup_script" "$dockerfile"; then
+    [[ -f "$cleanup_script" ]] || { echo "ERROR: missing $cleanup_script" >&2; return 1; }
+    hash_paths="$hash_paths $cleanup_script"
+  fi
   local tag="${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
   local canon_tag="$(canon_tag_for "$tag" "$h")"

@@ -3,6 +3,9 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/cleanup-apt-build-deps.sh"
+
 die() {
     echo "ERROR: $*" >&2
     exit 1
@@ -657,18 +660,10 @@ build_osu() {
 }
 
 clean_up() {
-    printf 'Pacakages cleanup...\n'
-    printf 'Marking packages to hold\n'
-    apt-mark hold libibverbs-dev
-    printf 'Removing build packages...\n'
-    apt-get remove --purge -y  \
+    cleanup_apt_build_deps \
         pkg-config automake autoconf libtool cmake \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libsensors-dev libcurl4-openssl-dev \
         fakeroot dh-make
-    printf 'Running autoremove...\n'
-    apt-get autoremove -y
-    printf 'unhold packages\n'
-    apt-mark unhold libibverbs-dev
 }
 
 main() {
