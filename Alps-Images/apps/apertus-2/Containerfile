@@ -20,9 +20,12 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 # System deps
+COPY Alps-Images/common/apt-helpers.sh /opt/alps/apt-helpers.sh
 RUN set -eux; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    chmod +x /opt/alps/apt-helpers.sh; \
+    source /opt/alps/apt-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \

@@ -90,7 +90,7 @@ The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs fiv
    - app image vetnode coverage for all app images in the CI matrix
 5. **publish** — promotes all tested images to stable registries; overwrites are blocked on existing stable tags
 
-**Image tagging strategy:** each image name encodes a SHA256 hash of its source files, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds. App hashes include the canonical base image ref, the app `Containerfile`, `profile.env`, optional `tests/`, and optional app-local `patches/`.
+**Image tagging strategy:** each image name encodes a SHA256 hash of its source files, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds. App hashes include the canonical base image ref, the app `Containerfile`, `profile.env`, optional `tests/`, optional app-local `patches/`, and copied shared helper inputs when present.
 
 ## Manual Builds
 

@@ -36,12 +36,12 @@ ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
     CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}" \
     CCACHE_NOHASHDIR="true"
 
-COPY Alps-Images/common/cleanup-apt-build-deps.sh /opt/alps/cleanup-apt-build-deps.sh
+COPY Alps-Images/common/apt-helpers.sh /opt/alps/apt-helpers.sh
 COPY Alps-Images/apps/vllm/patches /opt/alps-vllm-patches
 
 RUN set -eux; \
-    chmod +x /opt/alps/cleanup-apt-build-deps.sh; \
-    source /opt/alps/cleanup-apt-build-deps.sh; \
+    chmod +x /opt/alps/apt-helpers.sh; \
+    source /opt/alps/apt-helpers.sh; \
     vllm_apt_build_deps=( \
       build-essential \
       cmake \
@@ -53,8 +53,8 @@ RUN set -eux; \
     ); \
     vllm_apt_install_packages=(ca-certificates "${vllm_apt_build_deps[@]}"); \
     snapshot_apt_packages /tmp/vllm-apt-before.txt; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${vllm_apt_install_packages[@]}"; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends "${vllm_apt_install_packages[@]}"; \
     rm -rf /var/lib/apt/lists/*; \
     python -m pip install --no-cache-dir --upgrade \
       build \

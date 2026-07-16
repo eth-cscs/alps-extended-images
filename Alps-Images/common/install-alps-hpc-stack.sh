@@ -1,24 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/cleanup-apt-build-deps.sh"
-
-apt_cmd() {
-    apt "$@" && return 0
-    local status=$?
-    printf 'apt failed with status %s; retrying with APT::Sandbox::User=root\n' "$status" >&2
-    apt -o APT::Sandbox::User=root "$@"
-}
-
-apt_get() {
-    apt-get "$@" && return 0
-    local status=$?
-    printf 'apt-get failed with status %s; retrying with APT::Sandbox::User=root\n' "$status" >&2
-    apt-get -o APT::Sandbox::User=root "$@"
-}
+source "${SCRIPT_DIR}/apt-helpers.sh"
 
 die() {
     echo "ERROR: $*" >&2
