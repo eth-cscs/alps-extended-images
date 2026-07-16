@@ -36,31 +36,33 @@ ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
     CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}" \
     CCACHE_NOHASHDIR="true"
 
+COPY Alps-Images/common/cleanup-apt-build-deps.sh /opt/alps/cleanup-apt-build-deps.sh
+COPY Alps-Images/apps/vllm/patches /opt/alps-vllm-patches
+
 RUN set -eux; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    chmod +x /opt/alps/cleanup-apt-build-deps.sh; \
+    source /opt/alps/cleanup-apt-build-deps.sh; \
+    vllm_apt_build_deps=( \
       build-essential \
-      ca-certificates \
       cmake \
       curl \
       git \
       ninja-build \
       pkg-config \
-      python3-dev; \
-    rm -rf /var/lib/apt/lists/*
-
-RUN set -eux; \
+      python3-dev \
+    ); \
+    vllm_apt_install_packages=(ca-certificates "${vllm_apt_build_deps[@]}"); \
+    snapshot_apt_packages /tmp/vllm-apt-before.txt; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${vllm_apt_install_packages[@]}"; \
+    rm -rf /var/lib/apt/lists/*; \
     python -m pip install --no-cache-dir --upgrade \
       build \
       jinja2 \
       'packaging<=25.0' \
       'setuptools>=77.0.3,<81.0.0' \
       setuptools-rust \
-      setuptools-scm
-
-COPY Alps-Images/apps/vllm/patches /opt/alps-vllm-patches
-
-RUN set -eux; \
+      setuptools-scm; \
     export CUDA_ARCH_LIST="${VLLM_CUDA_ARCH_LIST}" \
       TORCH_CUDA_ARCH_LIST="${VLLM_TORCH_CUDA_ARCH_LIST}" \
       MAX_JOBS="${MAX_JOBS}" \
@@ -90,7 +92,12 @@ RUN set -eux; \
     python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/vllm-dist .; \
     python -m pip install --no-cache-dir --no-deps /tmp/vllm-dist/*.whl; \
     python -m pip install --no-cache-dir "ray[default]"; \
-    rm -rf /tmp/vllm /tmp/vllm-dist /tmp/vllm-build-requirements.txt /root/.cache/pip
+    cleanup_new_apt_build_deps /tmp/vllm-apt-before.txt "${vllm_apt_build_deps[@]}"; \
+    rm -rf /tmp/vllm /tmp/vllm-dist /tmp/vllm-build-requirements.txt /tmp/vllm-apt-before.txt /root/.cache/pip
 
 RUN set -eux; \
     python -c 'import torch, vllm; print("torch={} cuda={}".format(torch.__version__, torch.version.cuda)); print("vllm={}".format(getattr(vllm, "__version__", "unknown")))'
+
+# Tests shipped with the image
+COPY Alps-Images/apps/vllm/tests/ /opt/tests/vllm/
+RUN chmod -R a+rX /opt/tests/vllm
