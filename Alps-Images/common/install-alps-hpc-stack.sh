@@ -3,6 +3,20 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
+apt_cmd() {
+    apt "$@" && return 0
+    local status=$?
+    printf 'apt failed with status %s; retrying with APT::Sandbox::User=root\n' "$status" >&2
+    apt -o APT::Sandbox::User=root "$@"
+}
+
+apt_get() {
+    apt-get "$@" && return 0
+    local status=$?
+    printf 'apt-get failed with status %s; retrying with APT::Sandbox::User=root\n' "$status" >&2
+    apt-get -o APT::Sandbox::User=root "$@"
+}
+
 die() {
     echo "ERROR: $*" >&2
     exit 1
@@ -19,11 +33,11 @@ apt_install_build_deps() {
         /etc/apt/sources.list.d/ubuntu.sources
     printf '%s\n%s' "Acquire::http::AllowRedirect "true";" "Acquire::http::Pipeline-Depth "0";" \
         > /etc/apt/apt.conf.d/99-jfrog-proxy
-    apt -o "Acquire::https::Verify-Peer=false" update
-    apt -o "Acquire::https::Verify-Peer=false" install ca-certificates
+    apt_cmd -o "Acquire::https::Verify-Peer=false" update
+    apt_cmd -o "Acquire::https::Verify-Peer=false" install -y ca-certificates
 
-    apt-get update
-    apt-get install -y --no-install-recommends \
+    apt_get update
+    apt_get install -y --no-install-recommends \
         build-essential ca-certificates pkg-config automake autoconf libtool cmake \
         bc gdb strace wget curl git bzip2 python3 gfortran \
         rdma-core numactl \
@@ -74,13 +88,14 @@ purge_preinstalled_network_stack() {
 
     if [[ "${#packages[@]}" -gt 0 ]]; then
         printf 'Purging preinstalled network-stack packages: %s\n' "${packages[*]}"
-        apt-get purge -y "${packages[@]}" || true
-        apt-get autoremove -y || true
+        apt_get purge -y "${packages[@]}" || true
+        apt_get autoremove -y || true
     fi
 
     local dirs=(
         /opt/amazon/aws-ofi-nccl
         /opt/amazon/efa
+        /opt/amazon/ofi-nccl
         /opt/aws-ofi-nccl
         /opt/hpcx/hcoll
         /opt/hpcx/nccl_mrc_plugin
@@ -88,9 +103,12 @@ purge_preinstalled_network_stack() {
         /opt/hpcx/nccl_spectrum-x_plugin
         /opt/hpcx/ncclnet_plugin
         /opt/hpcx/ompi
+        /opt/hpcx/ompi4
+        /opt/hpcx/ompi5
         /opt/hpcx/sharp
         /opt/hpcx/ucc
         /opt/hpcx/ucx
+        /usr/local/mpi
         /usr/local/ucx
         /usr/local/ucc
     )
@@ -274,8 +292,8 @@ ensure_debian_packaging_tools() {
         return 0
     fi
 
-    apt-get update
-    apt-get install -y --no-install-recommends devscripts debhelper fakeroot dh-make
+    apt_get update
+    apt_get install -y --no-install-recommends devscripts debhelper fakeroot dh-make
     rm -rf /var/lib/apt/lists/*
 
     command -v debuild >/dev/null 2>&1 || die "debuild not found after installing devscripts"
@@ -364,6 +382,8 @@ build_ompi5() {
         --with-cuda-libdir="${CUDA_DIR}/lib64/stubs"
     make -j"$(nproc)"
     make install
+    rm -rf /usr/local/mpi
+    ln -s "${hpcx}/ompi" /usr/local/mpi
     mkdir -p /opt/alps/env
     printf 'export OMPI_VERSION=%q\n' "${OMPI_VER}" >> /opt/alps/env/alps-versions.env
     popd
@@ -423,7 +443,7 @@ build_nvshmem() {
     : "${NVSHMEM_ENABLE_TESTS:=1}"
 
     # Remove preinstalled NVSHMEM
-    apt-get update
+    apt_get update
     local nvshmem_packages=() pkg
     while IFS= read -r pkg; do
         case "${pkg}" in
@@ -431,8 +451,8 @@ build_nvshmem() {
         esac
     done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
     if [[ "${#nvshmem_packages[@]}" -gt 0 ]]; then
-        apt-get purge -y "${nvshmem_packages[@]}" || true
-        apt-get autoremove -y || true
+        apt_get purge -y "${nvshmem_packages[@]}" || true
+        apt_get autoremove -y || true
     fi
 
     # Remove CUDA symlinks/copies that can shadow our install
@@ -496,6 +516,8 @@ build_nvshmem() {
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
         -DCUDAToolkit_ROOT="${CUDA_DIR}" \
+        -DMPI_C_COMPILER="${mpi_home}/bin/mpicc" \
+        -DMPI_CXX_COMPILER="${mpi_home}/bin/mpicxx" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
 
     cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
@@ -661,12 +683,12 @@ clean_up() {
     printf 'Marking packages to hold\n'
     apt-mark hold libibverbs-dev
     printf 'Removing build packages...\n'
-    apt-get remove --purge -y  \
+    apt_get remove --purge -y  \
         pkg-config automake autoconf libtool cmake \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libsensors-dev libcurl4-openssl-dev \
         fakeroot dh-make
     printf 'Running autoremove...\n'
-    apt-get autoremove -y
+    apt_get autoremove -y
     printf 'unhold packages\n'
     apt-mark unhold libibverbs-dev
 }

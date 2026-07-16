@@ -12,6 +12,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - `Alps-Images/patches/` contains upstream patches consumed by base builds and included in base hashes; `Alps-Images/apps/<app>/patches/` contains app-specific source patches included in app hashes.
 - `ci-pipelines/build-alps-extended-images.yaml` is the executable pipeline source; prefer it over README prose when they disagree.
 - `ci-pipelines/helpers/meta.sh` derives image refs and hashes; `ci-pipelines/helpers/skopeo.sh` owns registry copy/promotion behavior.
+- `manual-build/manual-build.sh` emits local `podman build` scripts using the same ref/hash logic as CI; keep `manual-build/README.md` aligned with it.
 
 ## Image Refs
 
@@ -34,6 +35,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - Build-stage dependency chain is `meta -> build -> retag-for-CI`; explicit `needs` can bypass stage barriers, so include every correctness dependency.
 - Matrix jobs must use matching `needs:parallel:matrix` mappings for every identity field (`NGC_NAME`/`NGC_TAG` or `NAME`) to avoid mixed dotenv artifacts.
 - Keep matrix values short because GitLab includes them in job names.
+- Current NGC base matrix in CI includes `pytorch` tags `26.06-py3`, `26.02-py3`, `26.01-py3`, and `25.12-py3`, plus `nemo` tags `26.02` and `25.11.01`, and `physicsnemo` tag `25.11`.
 - Current app matrix in CI is `apertus-1p5`, `apertus-2`, `sfttrainer`, `verl`, and `vllm`.
 - When adding or renaming tests, update `publish-gate.needs`; publishing depends on this gate, not just stage order.
 
