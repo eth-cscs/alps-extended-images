@@ -6,24 +6,25 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=5:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps5"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev"
 
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
-export PROJECT_NAME="scale-grpo-gsm8k"
+export PROJECT_NAME="cscs-async-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Sync-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
+export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
 
 
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
-cat > "env.toml" <<- EOF
+cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
-mounts = ["/capstor", "/iopsstor", "/users"]
+mounts = ["/capstor", "/iopsstor", "/users","/tmp"]
 workdir = "/workspace/verl"
 writable = true
 entrypoint = true
@@ -33,7 +34,7 @@ PMIX_MCA_psec = "native"
 com.hooks.cxi.enabled = "false"
 EOF
 
-cat > "grpo_gsm8k.yaml" <<- EOF
+cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
   - ppo_trainer
   - override rollout@actor_rollout_ref.rollout: rollout
@@ -58,12 +59,9 @@ actor_rollout_ref:
 
   actor:
     strategy: fsdp2
-    rollout_n: 8
+    #rollout_n: 8
     ppo_mini_batch_size: 32
     ppo_micro_batch_size_per_gpu: 2
-    use_torch_compile: false
-    optim:
-      lr: 1.0e-6
 
   rollout:
     name: sglang
@@ -89,7 +87,7 @@ algorithm:
 
 reward:
   custom_reward_function:
-    path: ${TRAINING_HOME}/gsm8k_reward.py
+    path: ${TRAINING_CONFIG}/gsm8k_reward.py
     name: compute_reward
 
 trainer:
@@ -113,7 +111,7 @@ distillation:
   enabled: false
 EOF
 
-cat > "gsm8k_reward.py" <<- EOF
+cat > "${TRAINING_CONFIG}/gsm8k_reward.py" <<- EOF
 # gsm8k_reward.py
 import re
 import math
@@ -144,17 +142,17 @@ def compute_reward(
     format_reward  = 0.1 if has_answer else 0.0
     outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Soft length penalty: discourage responses over 150 tokens
-    # No penalty under 150, linear penalty above up to -0.2 at 800 tokens
+    # Soft length penalty: discourage responses over 250 words
+    # No penalty under 250, linear penalty above up to -0.2 at 1000 words
     length = len(solution_str.split())
     length_penalty = 0.0
-    if length > 150:
-        length_penalty = -0.2 * min(1.0, (length - 150) / 650)
+    if length > 250:
+        length_penalty = -0.2 * min(1.0, (length - 250) / 750)
 
     return outcome_reward + format_reward + length_penalty
 EOF
 
-cat > "prepare_gsm8k.py" <<- EOF
+cat > "${TRAINING_CONFIG}/prepare_gsm8k.py" <<- EOF
 import re
 import os
 import datasets
@@ -213,11 +211,14 @@ if __name__ == "__main__":
     prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
 EOF
 
+sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
+sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
+
 # Download model (skip if already present)
 if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_HOME}/env.toml" \
+        --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         hf download ${MODEL_REPO}/${MODEL_NAME} \
             --local-dir ${TRAINING_HOME}/models/${MODEL_NAME} \
@@ -230,10 +231,10 @@ fi
 if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ]; then
     echo "Preparing GSM8K dataset..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_HOME}/env.toml" \
+        --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         # Try loading from cached raw download first, otherwise fetch from HF
-        python ${TRAINING_HOME}/prepare_gsm8k.py
+        python ${TRAINING_CONFIG}/prepare_gsm8k.py
     '
 else
     echo "Dataset already present, skipping preparation."
@@ -250,12 +251,13 @@ export WANDB_SILENT=true # Suppress WandB logs
 
 
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
-    --environment="${TRAINING_HOME}/env.toml" \
+    --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
 # Patch flash attention NoneType bug for Qwen2 on this transformers version
 sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
     /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
+
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
@@ -291,8 +293,8 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
-        --config-path ${TRAINING_HOME} \
+    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo_sync \
+        --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config
 else

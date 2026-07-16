@@ -57,3 +57,9 @@ RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylate
 RUN pip uninstall kernels -y --break-system-packages
 
 RUN pip install cupy-cuda13x
+RUN pip install cachetools
+
+# Tests shipped with the image
+COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
+RUN find /opt/tests/verl -name "*.sh" -exec chmod a+x {} \; && \
+    chmod -R a+rX /opt/tests/verl
