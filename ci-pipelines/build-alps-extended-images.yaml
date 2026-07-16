@@ -444,6 +444,7 @@ publish-gate:
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
     - test-app-images-vetnode
+    - test-verl-async
   script:
     - echo "Publish gate passed (tests completed)"
 

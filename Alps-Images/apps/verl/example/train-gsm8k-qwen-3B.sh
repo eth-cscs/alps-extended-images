@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=8:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-8e3ed122b263df15"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev"
 
 export MODEL_NAME="Qwen2.5-3B-Instruct"
 export MODEL_REPO="Qwen"
