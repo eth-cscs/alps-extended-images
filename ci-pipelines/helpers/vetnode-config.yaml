@@ -27,6 +27,17 @@ evals:
   requirements:
     - cuda-python==13.*
     - numpy
+- name: NCCL-Low-Level-Intranode
+  type: vetnode.evaluations.nccl_lib_eval.NcclLibEval
+  topology: intranode
+  scheduler: slurm
+  payload: 8 GB
+  method: allreduce
+  min_bandwidth: 250 GB/s
+  warmup:
+    payload: 8 GB
+    runs: 3
+  requirements: ["cuda-python","numpy"]
 - name: NCCL-Low-Level-Internode
   type: vetnode.evaluations.nccl_lib_eval.NcclLibEval
   topology: internode
