@@ -11,9 +11,9 @@ export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
-export PROJECT_NAME="cscs-async-grpo-gsm8k"
-export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
-export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
+export PROJECT_NAME="async-grpo-gsm8k"
+export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-fsdp2-async-${SLURM_JOB_NUM_NODES}n"
+export RUN_NAME="${EXPERIMENT_NAME}-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
