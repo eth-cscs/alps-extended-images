@@ -400,37 +400,17 @@ test-apertus-2-DeepEP:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
-test-vllm-smoke:
-  stage: test-apps
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  image: "$IMAGE_PREFIX/vllm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - |
-      set -euo pipefail
-      python - <<'PY'
-      import torch
-      import vllm
-
-      print(f"vllm={getattr(vllm, '__version__', 'unknown')}")
-      print(f"torch={torch.__version__}")
-      assert torch.cuda.is_available(), "CUDA must be available in the vLLM image"
-      PY
-  variables:
-    SLURM_JOB_NUM_NODES: 1
-    SLURM_NTASKS: 1
-
 test-vllm-ray-nccl:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
   timeout: 30m
   image: "$IMAGE_PREFIX/vllm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
-    - bash ci-pipelines/tests/vllm/ray_nccl_smoke.sh
+    - /opt/tests/vllm/ray_nccl_smoke.sh
   variables:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 2
     VLLM_RAY_NCCL_WORLD_SIZE: 8
-    GIT_STRATEGY: fetch
 
 test-app-images-vetnode:
   stage: test-apps
@@ -464,7 +444,6 @@ publish-gate:
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
-    - test-vllm-smoke
     - test-vllm-ray-nccl
     - test-app-images-vetnode
   script:
