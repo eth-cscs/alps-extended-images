@@ -51,11 +51,11 @@ ARG NCCL_TESTS_VER=2.18.2
 ARG OSU_VERSION=7.5.2
 
 COPY Alps-Images/patches/ /opt/alps/patches/
-COPY Alps-Images/common/apt-helpers.sh /opt/alps/apt-helpers.sh
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
 
 RUN set -eux; \
-    chmod +x /opt/alps/apt-helpers.sh /opt/alps/install-alps-hpc-stack.sh; \
+    chmod +x /opt/alps/install-alps-hpc-stack.sh; \
     /opt/alps/install-alps-hpc-stack.sh
 
 COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env

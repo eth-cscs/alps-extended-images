@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/apt-helpers.sh"
+source "${SCRIPT_DIR}/package-helpers.sh"
 
 die() {
     echo "ERROR: $*" >&2
@@ -33,10 +33,6 @@ apt_install_build_deps() {
         libsox-fmt-all \
         devscripts debhelper fakeroot dh-make
     rm -rf /var/lib/apt/lists/*
-}
-
-proxied_pip_install() {
-    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple "$@"
 }
 
 remove_efa() {
@@ -563,7 +559,7 @@ EOF
 
             [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
 
-            proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
+            python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
 
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
@@ -623,9 +619,9 @@ if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed
 PY
 
             if [[ -s "${constraint_file}" ]]; then
-                proxied_pip_install --no-cache-dir -c "${constraint_file}" -r "${req}"
+                python -m pip install --no-cache-dir -c "${constraint_file}" -r "${req}"
             else
-                proxied_pip_install --no-cache-dir -r "${req}"
+                python -m pip install --no-cache-dir -r "${req}"
             fi
 
             rm -f "${constraint_file}"

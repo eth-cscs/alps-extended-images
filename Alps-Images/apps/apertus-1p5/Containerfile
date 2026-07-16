@@ -19,8 +19,11 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+
 RUN set -eux; \
-    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple \
+    source /opt/alps/package-helpers.sh; \
+    python -m pip install \
         --no-cache-dir \
         --progress-bar off \
         flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]

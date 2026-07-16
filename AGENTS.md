@@ -12,7 +12,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - `Alps-Images/patches/` contains upstream patches consumed by base builds and included in base hashes; `Alps-Images/apps/<app>/patches/` contains app-specific source patches included in app hashes.
 - `ci-pipelines/build-alps-extended-images.yaml` is the executable pipeline source; prefer it over README prose when they disagree.
 - `ci-pipelines/helpers/meta.sh` derives image refs and hashes; `ci-pipelines/helpers/skopeo.sh` owns registry copy/promotion behavior.
-- `Alps-Images/common/apt-helpers.sh` owns apt wrappers, rootless sandbox fallback, and build-dependency cleanup helpers shared by base and app builds.
+- `Alps-Images/common/package-helpers.sh` owns apt wrappers, rootless sandbox fallback, pip proxy environment, and build-dependency cleanup helpers shared by base and app builds.
 - `manual-build/manual-build.sh` emits local `podman build` scripts using the same ref/hash logic as CI; keep `manual-build/README.md` aligned with it.
 
 ## Image Refs
@@ -52,7 +52,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 
 - Preserve `# syntax=docker/dockerfile:1`, `ARG BASE_IMAGE` followed by `FROM ${BASE_IMAGE}`, and OCI/CSCS labels in image Containerfiles.
 - Use `RUN set -eux; ...` for build steps and clean apt lists, temporary clones, build trees, and caches in the same layer.
-- Use `apt_cmd`, `apt_get`, and apt cleanup helpers from `Alps-Images/common/apt-helpers.sh` instead of raw apt commands in shared installer and app build steps.
+- Source `Alps-Images/common/package-helpers.sh` before pip installs, and use `apt_cmd`, `apt_get`, and cleanup helpers from it instead of raw apt commands in shared installer and app build steps.
 - Prefer pinned tags/commits for downloaded sources; avoid unbounded `pip -U` unless the existing image already requires it.
 - `install-alps-hpc-stack.sh` programmatically purges preinstalled generic network stacks before rebuilding the Alps stack; keep `REMOVE_HPCX_DIRS` only as an optional profile escape hatch for image-specific leftovers.
 - NGC variant `profile.env` is declarative and may carry optional `REMOVE_HPCX_DIRS` or `NVCR_PREFIX`; use `hooks.d/*.sh` only for deterministic late image fixes.

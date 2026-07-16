@@ -36,12 +36,11 @@ ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
     CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}" \
     CCACHE_NOHASHDIR="true"
 
-COPY Alps-Images/common/apt-helpers.sh /opt/alps/apt-helpers.sh
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 COPY Alps-Images/apps/vllm/patches /opt/alps-vllm-patches
 
 RUN set -eux; \
-    chmod +x /opt/alps/apt-helpers.sh; \
-    source /opt/alps/apt-helpers.sh; \
+    source /opt/alps/package-helpers.sh; \
     vllm_apt_build_deps=( \
       build-essential \
       cmake \

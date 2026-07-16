@@ -2,6 +2,7 @@
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
+export PIP_INDEX_URL="${PIP_INDEX_URL:-https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple}"
 
 apt_cmd() {
     apt "$@" && return 0

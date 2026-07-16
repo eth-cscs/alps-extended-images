@@ -20,10 +20,9 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 # System deps
-COPY Alps-Images/common/apt-helpers.sh /opt/alps/apt-helpers.sh
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 RUN set -eux; \
-    chmod +x /opt/alps/apt-helpers.sh; \
-    source /opt/alps/apt-helpers.sh; \
+    source /opt/alps/package-helpers.sh; \
     apt_get update; \
     apt_get install -y --no-install-recommends \
       ca-certificates \
@@ -35,4 +34,6 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 # Python deps 
 COPY Alps-Images/apps/sfttrainer/requirements.txt /tmp/requirements.txt
-RUN python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple -r /tmp/requirements.txt
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    python -m pip install -r /tmp/requirements.txt
