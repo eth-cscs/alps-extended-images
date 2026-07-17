@@ -9,7 +9,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
 variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
-  ALPS_REV: alps6-dev
+  ALPS_REV: alps7-dev
 
 
 # ----------------------------
@@ -20,9 +20,22 @@ variables:
 .alps_base_images_matrix: &alps_base_images_matrix
   - NGC_NAME: "pytorch"
     NGC_TAG: "26.02-py3"
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "26.01-py3"
+  - NGC_NAME: "pytorch"
+    NGC_TAG: "25.12-py3"
+  - NGC_NAME: "nemo"
+    NGC_TAG: "26.02"
+  - NGC_NAME: "nemo"
+    NGC_TAG: "25.11.01"
+  - NGC_NAME: "physicsnemo"
+    NGC_TAG: "25.11"
   
 
 .alps_app_images_matrix: &alps_app_images_matrix
+  - NAME: "apertus-1p5"
+  - NAME: "apertus-2"
+  - NAME: "sfttrainer"
   - NAME: "verl"
   
 # ----------------------------
@@ -61,6 +74,7 @@ variables:
     USE_MPI: NO
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
+    SLURM_GPUS_PER_NODE: 4
     PMIX_MCA_psec: native
 
 # ----------------------------
@@ -347,6 +361,52 @@ test-base-images-vetnode:
     SLURM_NTASKS: 16
     GIT_STRATEGY: fetch
 
+test-apertus-1p5:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 2h
+  image: "$IMAGE_PREFIX/apertus-1p5:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-1p5/megatron_pretrain.sh
+  variables:
+    CI_FAST: "1"
+    TP_CI: "1"
+    PP_CI: "1"
+    CHECKPOINT_STEPS_CI: "2"
+    USE_MPI: NO
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 8
+
+test-apertus-2-pplx-garden:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 2h
+  image: "$IMAGE_PREFIX/apertus-2:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-2/pplx-garden-benchmark.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 2
+
+test-apertus-2-DeepEP:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 2h
+  image: "$IMAGE_PREFIX/apertus-2:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/apertus-2/deep-ep-benchmark.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
+test-app-images-vetnode:
+  stage: test-apps
+  extends: [test-base-images-vetnode]
+  timeout: 2h
+  parallel:
+    matrix: *alps_app_images_matrix
+  image: "$IMAGE_PREFIX/${NAME}:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+
 test-verl-async:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
@@ -360,3 +420,92 @@ test-verl-async:
     CSCS_ADDITIONAL_MOUNTS: '["/tmp:/tmp"]'
 
 
+
+# ----------------------------
+# Publish
+# ----------------------------
+# Upload the images to the registry with stable tags under certain conditions:
+# - All tests must have executed and passed (enforced by the "needs:"
+#   dependency on the test jobs in the publish-gate job)
+# - The commit must be on the default branch (enforced in the script with a
+#   check on CI_COMMIT_BRANCH)
+# - The stable tag must not already exist with different content (enforced by
+#   promote_check_strict)
+# Note: Skopeo copy requires a larger memory limit.
+#       Therfore we are using the container-builder-cscs-gh200 worker that comes with the skopeo tool kit.
+publish-gate:
+  stage: publish
+  extends: [.container-runner-lightweight-gh200, .skopeo-template]
+  # make sure to keep the "needs" up to date when adding new test jobs
+  needs:
+    - test-base-images-env
+    - test-base-images-collectives
+    - test-base-images-vetnode
+    - test-apertus-1p5
+    - test-apertus-2-pplx-garden
+    - test-apertus-2-DeepEP
+    - test-app-images-vetnode
+    - test-verl-async
+  script:
+    - echo "Publish gate passed (tests completed)"
+
+.publish-template:
+  stage: publish
+  extends: [.container-builder-cscs-gh200]
+  variables:
+    KUBERNETES_MEMORY_REQUEST: 128Gi
+    KUBERNETES_MEMORY_LIMIT: 128Gi
+  script:
+    - |
+      source ci-pipelines/helpers/skopeo.sh
+      skopeo_login
+      skopeo_login_ghcr
+      set -euo pipefail
+
+      echo "Starting promotion process for $CANON_IMAGE_REF"
+
+      if [[ "${ALPS_REV}" =~ -dev$ ]]; then
+        # For dev versions, we allow non-strict promotion (overwrites stable
+        # tag regardless of content) but only on the default branch
+        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          echo "copy to: $STABLE_IMAGE_REF"
+          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
+          echo "copy to: $GHCR_STABLE_IMAGE_REF"
+          skopeo copy  "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
+          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
+        else
+          echo "Dry-run only (dev version detected and not default branch): promotion not executed."
+        fi
+      else
+        # Always run strict check (fails if stable exists but differs)
+        echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
+        promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+        # Only promote on default branch
+        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
+          promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
+          promote_strict "$CANON_IMAGE_REF" "$GHCR_STABLE_IMAGE_REF"
+          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
+        else
+          echo "Dry-run only (not default branch): promotion not executed."
+        fi
+      fi
+
+publish-base-images:
+  extends: [.publish-template]
+  parallel:
+    matrix: *alps_base_images_matrix
+  needs:
+    - job: publish-gate
+    - job: build-base-meta
+      artifacts: true
+      <<: *base_needs_map
+
+publish-app-images:
+  extends: [.publish-template]
+  parallel:
+    matrix: *alps_app_images_matrix
+  needs:
+    - job: publish-gate
+    - job: build-apps-meta
+      artifacts: true
+      <<: *app_needs_map
