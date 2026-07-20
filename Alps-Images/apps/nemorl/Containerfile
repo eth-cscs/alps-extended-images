@@ -3,6 +3,12 @@
 ARG BASE_IMAGE
 FROM ${BASE_IMAGE}
 
+# Where are we working
+ARG WORK_DIR="/workdir"
+ARG NEMORL_DIR="${WORK_DIR}/nemo_rl"
+
+ARG NEMORL_COMMIT="4806fc0ae43c2b44505f90455e705d3ad2454874"
+
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG OCI_SOURCE="unknown"
@@ -19,36 +25,66 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
-# Install dependencies for VeRL from pypi, including vLLM and SGLang.
+# Install uv at /usr/local/bin in case the root home directory is bind mounted
+# We need `uv` because the NeMoRL repo makes heavy use of it.
+ARG UV_VERSION=0.11.18
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
-#Note: disable vllm installation for now, as it causes issues. To re-enable consider using the ngc vllm base image.
-#RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu131
+# This will ensure that the venv is build at a static location.
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
 
-RUN pip install sglang[all]
-RUN pip install flash-attn --no-build-isolation
+# Let's put the cache at a specific well known location.
+ENV UV_CACHE_DIR="/opt/uv_cache"
 
+# This environment variables are important for building.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
-# Install dependencies for VeRL from source, including flashinfer, flash-attention, torch_memory_saver, XIELU
+# The base exports also 8.0 which leads to failure to build certain components.
+ENV TORCH_CUDA_ARCH_LIST="9.0"
 
-ENV SRC_DIR=/workspace/src \
-    WHL_DIR=/workspace/src/wheels
+# Already exported in the base.
+#ENV CUDA_PATH="/usr/local/cuda-13.1/"
 
+# Needed for installation of `DeepGEMM`.
+# NOTE: In the `nemo` container one must override `PYTHONPATH`, here it might not be needed.
+ARG DEEP_GEMM_SCRIPTS="${WORK_DIR}/deep_gemm_patch"
+ENV PYTHONPATH="${DEEP_GEMM_SCRIPTS}:"
 
-WORKDIR /workspace
+# Now pulling NeMoRL
+WORKDIR ${WORK_DIR}"
 
-RUN rm -rf ${SRC_DIR}
+# Clone Nemo and check out the last known PATH.
+RUN git clone https://github.com/NVIDIA-NeMo/RL.git "${NEMORL_DIR}"  && cd "${NEMORL_DIR}" && git checkout --detach "${NEMORL_COMMIT}"
 
-RUN git clone https://github.com/verl-project/verl
-RUN cd verl && pip install --no-deps -e ".[sglang]"
+# Now we need to download `DeepGEMM` to extract the patches for building it.
+# NOTE: The commit that NeMoRL's `pyproject.toml` file references, `67fc64863d43521080bf2005e6528d0fceee9510`does not exist in the
+#	_official_ repo, but in a fork. For some reason `uv` manages to find it, `git-ls-remote` also finds it. But we are using
+#	a commit that also works.
+RUN git clone https://github.com/deepseek-ai/DeepGEMM.git 	&& \
+	mkdir -p "${DEEP_GEMM_SCRIPTS}"				&& \
+	cp -r DeepGEMM/scripts "${DEEP_GEMM_SCRIPTS}"		&& \
+	rm -rf DeepGEMM
 
-RUN pip install -U "ray[data,train,tune,serve]"
-RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
-RUN pip uninstall kernels -y --break-system-packages
+# Now we move into the NeMoRL folder.
+WORKDIR "${NEMORL_DIR}"
 
-RUN pip install cupy-cuda13x
-RUN pip install cachetools
+# Now install NeMoRL.
+# - The venv of NeMoRL is located at `${UV_PROJECT_ENVIRONMENT}`
+# - Some additional components are installed inside the `venvs` folder of the project.
+RUN uv venv --seed --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
 
-# Tests shipped with the image
-COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
-RUN find /opt/tests/verl -name "*.sh" -exec chmod a+x {} \; && \
-    chmod -R a+rX /opt/tests/verl
+# TODO: Find out why `--no-install-project` is given and why `hardlink` is given.
+RUN uv sync --link-mode hardlink --locked --no-install-project
+
+# Now we perform the "install" of the helper, this will pull them into the cache such that they
+#  are installed faster when they are needed.
+# TODO: Find out why `vllm` is copied in using hardlinks.
+RUN uv sync --link-mode hardlink --locked --extra vllm --no-install-project
+RUN uv sync --link-mode symlink --locked --extra mcore --no-install-project
+RUN uv sync --link-mode symlink --locked --extra automodel --no-install-project
+RUN uv sync --link-mode symlink --locked --extra modelopt --no-install-project
+RUN uv sync --link-mode symlink --locked --all-groups --no-install-project
+
+# The NeMo Dockerfile also removes some files related to ray, we do not do that.
+# Furthermore, we will now install the project in full, i.e. without `--no-install-project`.
+RUN uv sync --link-mode hardlink --locked
