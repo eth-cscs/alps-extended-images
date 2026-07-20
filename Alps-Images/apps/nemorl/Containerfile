@@ -54,15 +54,18 @@ ENV PYTHONPATH="${DEEP_GEMM_SCRIPTS}:"
 WORKDIR "${WORK_DIR}"
 
 # Clone Nemo and check out the last known PATH.
-RUN git clone https://github.com/NVIDIA-NeMo/RL.git "${NEMORL_DIR}"  && cd "${NEMORL_DIR}" && git checkout --detach "${NEMORL_COMMIT}"
+RUN git clone https://github.com/NVIDIA-NeMo/RL.git "${NEMORL_DIR}"  	&& \
+	cd "${NEMORL_DIR}" 						&& \
+	git checkout --detach "${NEMORL_COMMIT}"			&& \
+	git submodule update --init --recursive
 
 # Now we need to download `DeepGEMM` to extract the patches for building it.
 # NOTE: The commit that NeMoRL's `pyproject.toml` file references, `67fc64863d43521080bf2005e6528d0fceee9510`does not exist in the
 #	_official_ repo, but in a fork. For some reason `uv` manages to find it, `git-ls-remote` also finds it. But we are using
 #	a commit that also works.
-RUN git clone https://github.com/deepseek-ai/DeepGEMM.git 	&& \
-	mkdir -p "${DEEP_GEMM_SCRIPTS}"				&& \
-	cp -r DeepGEMM/scripts "${DEEP_GEMM_SCRIPTS}"		&& \
+RUN git clone --depth 1 https://github.com/deepseek-ai/DeepGEMM.git 	&& \
+	mkdir -p "${DEEP_GEMM_SCRIPTS}"					&& \
+	cp -r DeepGEMM/scripts "${DEEP_GEMM_SCRIPTS}"			&& \
 	rm -rf DeepGEMM
 
 # Now we move into the NeMoRL folder.
