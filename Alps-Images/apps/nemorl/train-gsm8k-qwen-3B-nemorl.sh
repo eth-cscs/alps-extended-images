@@ -324,6 +324,17 @@ uv run python -c "print(${SLURM_PROCID})"
 RANK_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${SLURM_PROCID}_done"
 touch "${RANK_DONE_FILE}"
 
+# Chain barrier: rank k waits for rank k-1. This gives rank 0 priority to
+# finish its setup and open the Ray cluster before later ranks proceed.
+#if [ "${SLURM_PROCID}" -gt 0 ]; then
+#    PREV_RANK=$((SLURM_PROCID - 1))
+#    PREV_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${PREV_RANK}_done"
+#    echo "Rank ${SLURM_PROCID}: waiting for rank ${PREV_RANK} uv setup..."
+#    while [ ! -f "${PREV_DONE_FILE}" ]; do
+#        sleep 1
+#    done
+#fi
+
 if [ ${SLURM_PROCID} -eq 0 ]; then
     # Wait until every rank has finished its uv setup.
     for other_rank in $(seq 1 $((SLURM_JOB_NUM_NODES - 1))); do
@@ -367,6 +378,7 @@ if [ ${SLURM_PROCID} -eq 0 ]; then
     # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
     echo "Rank 0: stopping Ray cluster..."
     uv run ray stop --force || true
+
 else
     # Worker ranks wait for the Ray head to be ready, then join.
     RAY_OPEN_FILE="${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
