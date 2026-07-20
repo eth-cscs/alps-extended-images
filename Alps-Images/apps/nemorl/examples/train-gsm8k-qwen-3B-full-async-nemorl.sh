@@ -213,7 +213,7 @@ logger:
   monitor_gpus: true
   wandb:
     project: ${WANDB_PROJECT_NAME}
-    WANDB_name: ${RUN_NAME}
+    name: ${RUN_NAME}
 
 cluster:
   # Training nodes only; generation nodes are configured under policy.generation.colocated.resources.
