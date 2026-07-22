@@ -326,7 +326,7 @@ if [ ${SLURM_PROCID} -eq 0 ]; then
     # ray start --block cleanly instead of being killed by srun teardown,
     # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
     echo "Rank 0: stopping Ray cluster..."
-    uv run ray stop --grace-period 10 || true
+    uv run ray stop --grace-period 30 || true
 
     sleep 5s
 
