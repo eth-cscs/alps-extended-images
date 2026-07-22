@@ -76,13 +76,13 @@ WORKDIR "${NEMORL_DIR}"
 # - Some additional components are installed inside the `venvs` folder of the project.
 RUN uv venv --seed --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
 
-# TODO: Find out why `--no-install-project` is given and why `hardlink` is given.
-RUN uv sync --link-mode hardlink --locked --no-install-project
+# TODO: Find out why `--no-install-project` is given and why the original uses `hardlink`.
+RUN uv sync --link-mode symlink --locked --no-install-project
 
 # Now we perform the "install" of the helper, this will pull them into the cache such that they
 #  are installed faster when they are needed.
-# TODO: Find out why `vllm` is copied in using hardlinks.
-RUN uv sync --link-mode hardlink --locked --extra vllm --no-install-project
+# NOTE: In the original `vllm` used `hardlink` as mode, but I changed it to `symlink`.
+RUN uv sync --link-mode symlink --locked --extra vllm --no-install-project
 RUN uv sync --link-mode symlink --locked --extra mcore --no-install-project
 RUN uv sync --link-mode symlink --locked --extra automodel --no-install-project
 RUN uv sync --link-mode symlink --locked --extra modelopt --no-install-project
