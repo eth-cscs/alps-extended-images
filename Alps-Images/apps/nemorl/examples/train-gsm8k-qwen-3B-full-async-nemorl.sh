@@ -7,7 +7,7 @@
 #SBATCH --time=8:00:00
 
 # Specific settings
-export NEMORL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-nemo:25.11.01-alps6"
+export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_07_21_I.sqsh"
 export HF_TOKEN_PATH="${HOME}/.hf/clariden_token"
 
 #================================================
