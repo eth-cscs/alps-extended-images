@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+#FROM ${BASE_IMAGE}
+FROM jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ngc-pytorch:26.02-py3-alps6
 
 # Where are we working
 ARG WORK_DIR="/workdir"

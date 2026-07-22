@@ -64,7 +64,7 @@ cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${NEMORL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users", "/tmp"]
 workdir = "${NEMORL_DIR}"
-# Needed because of `venvs` that is written inside the container.
+# Needed because of venvs that is written inside the container.
 writable = true
 entrypoint = true
 [env]
@@ -319,7 +319,7 @@ if [ ${SLURM_PROCID} -eq 0 ]; then
         --config ${TRAINING_CONFIG}/grpo_gsm8k_qwen_async_nemorl.yaml
 
     # Gracefully stop the Ray cluster. This lets the worker nodes exit their
-    # `ray start --block` cleanly instead of being killed by srun teardown,
+    # ray start --block cleanly instead of being killed by srun teardown,
     # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
     echo "Rank 0: stopping Ray cluster..."
     uv run ray stop --grace-period 10s || true
