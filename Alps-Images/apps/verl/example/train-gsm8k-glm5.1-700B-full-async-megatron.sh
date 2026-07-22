@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-e797f7d7c5a406c3"
 
 export MODEL_NAME="GLM-5.1"
 export MODEL_REPO="zai-org"
@@ -25,7 +25,7 @@ cd $TRAINING_HOME
 
 
 # Rollout needs exactly 8 nodes for TP=32 (8 nodes × 4 GPUs = 32 GPUs, 1 replica).
-# Training gets the remaining 24 nodes (96 GPUs) for TP=4, PP=6, EP=4.
+# Training gets the remaining 24 nodes (96 GPUs) for TP=4, PP=3, EP=8.
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
@@ -63,7 +63,7 @@ rollout:
   nnodes: ${ROLLOUT_NNODES}
   n_gpus_per_node: 4
   total_rollout_steps: 22419
-  test_freq: 10
+  test_freq: 0  # disable validation — greedy decode over 1319 samples hangs at 24min (cuEventSynchronize deadlock)
 # ──────────────────────────────────────────────────────────────────────────────
 
 data:
@@ -72,6 +72,7 @@ data:
   train_batch_size: 0    # must be 0 in fully-async mode
   gen_batch_size: 1      # must be 1 in fully-async mode
   return_raw_chat: True
+  max_response_length: 1024  # keep below DSA dense-attention threshold (2048 tokens total); GSM8K needs <1024
 
 actor_rollout_ref:
   hybrid_engine: False
@@ -83,8 +84,10 @@ actor_rollout_ref:
     trust_remote_code: True  # GLM-5.1 uses a custom TokenizersBackend tokenizer
 
   actor:
-    # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=6, EP=4 → 4×6×4=96, DP=1
-    # PP=6: GLM-5.1 has 78 layers (78/6=13 layers/stage ✓); 256 experts, EP=4 → 64/rank.
+    # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=3, EP=8 → 4×3×8=96, DP=1
+    # PP=3: GLM-5.1 has 78 layers (78/3=26 layers/stage ✓).
+    # GLM-5.1 has 512 total experts; EP=8 → 64/rank — matching megatron-bridge's GLM-5.1 mapping.
+    # EP=4 gave 128 local experts, causing megatron-bridge to fail for experts 64-127 (unmapped).
     # megatron-bridge loads model then DDP allocates param_data + grad_data (3× total).
     # 744B/96=7.75B params/GPU × 3 × 2 bytes ≈ 46 GB << 95 GB ✓.
     optim:
@@ -96,8 +99,8 @@ actor_rollout_ref:
     use_dynamic_bsz: True
     megatron:
       tensor_model_parallel_size: 4
-      pipeline_model_parallel_size: 6
-      expert_model_parallel_size: 4
+      pipeline_model_parallel_size: 3
+      expert_model_parallel_size: 8
       param_offload: True
       grad_offload: True
       optimizer_offload: True
@@ -119,13 +122,17 @@ actor_rollout_ref:
     n: 16 #num responses per prompt
     # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32 (one replica) — 700B needs all 32 GPUs to fit
     tensor_model_parallel_size: 32
-    gpu_memory_utilization: 0.85
+    gpu_memory_utilization: 0.75
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
       backend: nccl # weight sync via NCCL broadcast
+      engine_kwargs:
+        nccl:
+          rebuild_group: true  # destroy NCCL group after each sync to free internal buffers before KV cache restore
     engine_kwargs:
       sglang:
-        watchdog_timeout: 3600  # cross-node TP=32 decode needs headroom beyond the default 300s
+        watchdog_timeout: 3600
+        max_running_requests: 128  # limit concurrent decode batch; keeps per-step latency and KV usage manageable
 
   ref:
     log_prob_use_dynamic_bsz: True
@@ -133,8 +140,8 @@ actor_rollout_ref:
     megatron:
       param_offload: True  # keep ref params on CPU when not computing log probs
       tensor_model_parallel_size: 4
-      pipeline_model_parallel_size: 6
-      expert_model_parallel_size: 4
+      pipeline_model_parallel_size: 3
+      expert_model_parallel_size: 8
       vanilla_mbridge: False  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge
 
 algorithm:
@@ -159,6 +166,7 @@ trainer:
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 50
+  test_freq: -1
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
@@ -351,6 +359,23 @@ pip install "transformers==5.8.1" "timm==1.0.16" ${PIP_TRUSTED} --quiet
 pip install "flashinfer_cubin==0.6.12" "flashinfer_python[cu13]==0.6.12" \
     ${PIP_TRUSTED} --quiet
 
+# Patch megatron-bridge safe_config_loader to skip filelock.
+# /dev/shm and /tmp on CSCS Alps do not support fcntl.flock in the container
+# (ENOLCK / ESTALE on every attempt). The lock is unnecessary because the config
+# files are written by localid=0 before any reader starts (purely read-only after that).
+python3 -c "
+import importlib.util, re
+spec = importlib.util.find_spec(\"megatron.bridge.models.hf_pretrained.safe_config_loader\")
+if spec:
+    p = spec.origin
+    with open(p) as f: s = f.read()
+    if \"import contextlib\" not in s:
+        s = \"import contextlib\n\" + s
+    s = re.sub(r\"with filelock\\.FileLock\\([^)]*\\):\", \"with contextlib.nullcontext():\", s)
+    with open(p, \"w\") as f: f.write(s)
+    print(\"Patched safe_config_loader:\", p)
+" 2>/dev/null || true
+
 # Apply fix: preserve load_format=dummy in STANDALONE mode so SGLang initialises with
 # random weights (fast) and receives real weights via NCCL broadcast instead of reading
 # 1.5 TB from Lustre across all 32 TP ranks simultaneously.
@@ -358,6 +383,28 @@ git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
 git fetch pr_origin Fix-sglang-dummy-model-load
 git reset --hard pr_origin/Fix-sglang-dummy-model-load
 
+
+# Mirror model config files to local tmpfs to avoid Lustre metadata contention.
+# 96 training workers all calling AutoConfig.from_pretrained() simultaneously causes
+# ENOLCK / ESTALE on the Lustre MDS. Only local rank 0 does the copy; others wait.
+export MODEL_LOCAL=/tmp/glm_model_${SLURM_JOB_ID}
+if [ $SLURM_LOCALID -eq 0 ]; then
+    mkdir -p $MODEL_LOCAL
+    # Copy small config/tokenizer files locally
+    find ${TRAINING_HOME}/models/${MODEL_NAME} -maxdepth 1 -not -name "*.safetensors" -type f \
+        -exec cp {} $MODEL_LOCAL/ \; 2>/dev/null || true
+    # Symlink safetensors back to Lustre so megatron-bridge can still load weights
+    for f in ${TRAINING_HOME}/models/${MODEL_NAME}/*.safetensors; do
+        ln -sf "$f" "$MODEL_LOCAL/$(basename "$f")"
+    done 2>/dev/null || true
+    touch $MODEL_LOCAL/.ready
+fi
+until [ -f $MODEL_LOCAL/.ready ]; do sleep 1; done
+
+# Patch the YAML on the head node to point at the local model dir
+if [ $SLURM_PROCID -eq 0 ]; then
+    sed -i "s|${TRAINING_HOME}/models/${MODEL_NAME}|${MODEL_LOCAL}|g" ${TRAINING_CONFIG}/grpo_gsm8k.yaml
+fi
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
