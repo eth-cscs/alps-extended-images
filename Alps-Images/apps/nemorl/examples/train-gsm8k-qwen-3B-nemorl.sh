@@ -71,6 +71,10 @@ HF_TOKEN_PATH = "${HF_TOKEN_PATH}"
 RAY_ADDRESS = "${RAY_ADDRESS}"
 MASTER_NODE_IP = "${MASTER_NODE_IP}"
 PORT = "${PORT}"
+# Keep Triton kernel cache on node-local storage; NFS-backed $HOME can give
+# "Stale file handle" during JIT compilation.
+TRITON_CACHE_DIR = "/tmp/triton_cache_${SLURM_JOB_ID}"
+TRITON_HOME = "/tmp/triton_home_${SLURM_JOB_ID}"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
