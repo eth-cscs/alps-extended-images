@@ -164,8 +164,7 @@ policy:
       # Matches verl rollout.gpu_memory_utilization.
       gpu_memory_utilization: 0.8
       max_model_len: 1536
-      # Required with this PyTorch/vLLM build to avoid torch.compile/Inductor crash.
-      enforce_eager: true
+      enforce_eager: false
       use_tqdm: true
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
