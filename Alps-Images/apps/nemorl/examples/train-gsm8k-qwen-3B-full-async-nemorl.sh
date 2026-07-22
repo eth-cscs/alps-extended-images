@@ -91,10 +91,10 @@ grpo:
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
   # NOTE: capped at 27 steps to match the sync comparison run.
-  # Async GRPO ignores max_num_epochs; the trajectory collector exhausts the
-  # dataloader after one pass. Keep this in sync with
+  # Async GRPO now respects both max_num_epochs and max_num_steps (training
+  # stops when the first limit is reached). Keep this in sync with
   # train-gsm8k-qwen-3B-nemorl.sh.
-  max_num_epochs: 1   # kept for symmetry, but async uses max_num_steps only
+  max_num_epochs: 1
   max_num_steps: 27
   val_period: 50
   val_at_start: false

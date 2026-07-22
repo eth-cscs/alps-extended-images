@@ -96,9 +96,7 @@ grpo:
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
   # NOTE: capped at 1 epoch / 27 steps to match the async comparison run.
-  # Async GRPO currently iterates the dataloader only once, so it cannot
-  # reliably do multiple epochs without a code change. Keep this in sync with
-  # train-gsm8k-qwen-3B-full-async-nemorl.sh.
+  # Keep this in sync with train-gsm8k-qwen-3B-full-async-nemorl.sh.
   max_num_epochs: 1
   max_num_steps: 27
   val_period: 50
