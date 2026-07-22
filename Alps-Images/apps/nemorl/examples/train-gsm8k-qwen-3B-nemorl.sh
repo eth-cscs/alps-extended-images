@@ -40,9 +40,8 @@ export TRAINING_CONFIG="${TRAINING_HOME}/config"
 export CHECKPOINT_HOME="${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}"
 export LOCAL_MODEL_DIR="${TRAINING_HOME}/models/${MODEL_NAME}"
 
-# Absolute path to the NeMo-RL checkout (repo root).
-#export NEMORL_DIR="${PWD}/NeMoRL"
-export NEMORL_DIR="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/NeMo/submit/NeMoRL"
+# Path where the container file installs the repo.
+export NEMORL_DIR="/workdir/nemo_rl"
 
 mkdir -p ${TRAINING_HOME}
 mkdir -p ${TRAINING_CONFIG}
@@ -60,8 +59,9 @@ export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${NEMORL_IMAGE}"
-mounts = ["/capstor", "/iopsstor", "/users", "/tmp", "${NEMORL_DIR}:${NEMORL_DIR}"]
+mounts = ["/capstor", "/iopsstor", "/users", "/tmp"]
 workdir = "${NEMORL_DIR}"
+# Needed because of `venvs` that is written inside the container.
 writable = true
 entrypoint = true
 [env]
@@ -300,12 +300,7 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
-# Needed for compilation
-export CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
-export TORCH_CUDA_ARCH_LIST="9.0"
-export PYTHONPATH="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/NeMo/DeepGEMM/script_wrapper:"
 unset PYTHONOPTIMIZE
-export CUDA_PATH="/usr/local/cuda-13.0/"
 
 # If a token file was passed, read it into the environment as a fallback for
 # libraries that do not natively honour HF_TOKEN_PATH.
@@ -314,15 +309,11 @@ if [[ -n "${HF_TOKEN_PATH}" && -f "${HF_TOKEN_PATH}" && -z "${HF_TOKEN}" ]]; the
     export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
 fi
 
-# The container ships with a global venv that uv rebuilds in memory on first
-# use. We must run from the NeMoRL checkout so uv uses the project lockfile.
-cd "${NEMORL_DIR}"
+cd ${NEMORL_DIR}
 
-# Force uv to update/rebuild the in-memory venv on this node. Each rank signals
-# completion with a per-rank done file; rank 0 waits for ALL done files before
-# it starts the Ray head, so slow venv rebuilds on some nodes cannot leave the
-# cluster in a partial state.
-uv run python -c "print(${SLURM_PROCID})"
+# Initializing ray to ensure that it is in cash (which the container should have ensured) and
+#  will load fast when we start the container.
+uv run ray --version >/dev/null 2>&1 || true
 
 # Signal that this rank has finished its uv setup.
 RANK_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${SLURM_PROCID}_done"
@@ -381,7 +372,9 @@ if [ ${SLURM_PROCID} -eq 0 ]; then
     # `ray start --block` cleanly instead of being killed by srun teardown,
     # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
     echo "Rank 0: stopping Ray cluster..."
-    uv run ray stop --force || true
+    uv run ray stop --grace-period 10s || true
+
+    sleep 5s
 
 else
     # Worker ranks wait for the Ray head to be ready, then join.
