@@ -369,8 +369,7 @@ if [ ${SLURM_PROCID} -eq 0 ]; then
     done
 
     # Run the NeMo-RL training driver.
-    uv run python examples/run_grpo.py \
-        --config ${TRAINING_CONFIG}/grpo_gsm8k_nemorl.yaml policy.generation.vllm_cfg.enforce_eager=true
+    uv run python examples/run_grpo.py --config ${TRAINING_CONFIG}/grpo_gsm8k_nemorl.yaml  # policy.generation.vllm_cfg.enforce_eager=true
 
     # Gracefully stop the Ray cluster. This lets the worker nodes exit their
     # ray start --block cleanly instead of being killed by srun teardown,
