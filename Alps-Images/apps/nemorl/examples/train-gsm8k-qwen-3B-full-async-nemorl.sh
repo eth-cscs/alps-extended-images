@@ -95,8 +95,12 @@ grpo:
   # 256 prompts per step x 16 generations = 4096 sequences per global batch.
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
-  max_num_epochs: 3
-  max_num_steps: 1000000
+  # NOTE: capped at 27 steps to match the sync comparison run.
+  # Async GRPO ignores max_num_epochs; the trajectory collector exhausts the
+  # dataloader after one pass. Keep this in sync with
+  # train-gsm8k-qwen-3B-nemorl.sh.
+  max_num_epochs: 1   # kept for symmetry, but async uses max_num_steps only
+  max_num_steps: 27
   val_period: 50
   val_at_start: false
   val_at_end: true
