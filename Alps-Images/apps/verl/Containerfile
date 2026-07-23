@@ -63,15 +63,10 @@ RUN pip install cachetools
 
 RUN pip install "PyYAML>=6.0.2" --ignore-installed
 
-# fast-hadamard-transform builds from source and calls `import torch` in setup.py.
-# Pip's isolated build env has no torch, so pre-install it with --no-build-isolation
-# (same pattern used for flash-attn above) so pip sees it as already satisfied when
-# megatron-core[dev,mlm] requests it transitively through megatron-bridge.
-RUN pip install --no-build-isolation fast-hadamard-transform
-
-# megatron-bridges PyPI wheel ships only megatron/bridge/* — its megatron-core dep
-# (a local path in the source repo) is excluded from requires_dist, so install separately.
-RUN pip install megatron-bridge "megatron-core>=0.17.0" "nvidia-resiliency-ext>=0.6.0"
+# megatron-bridge 0.5.1 bumped its megatron-core requirement to >=0.17.0, which pulls in
+# fast-hadamard-transform (a CUDA MLM extra with no aarch64 wheel and a broken source
+# tarball). Pin to 0.5.0, whose megatron-core dep stays <0.17.0 and avoids that extra.
+RUN pip install "megatron-bridge==0.5.0" "nvidia-resiliency-ext>=0.6.0"
 RUN pip install nvidia-modelopt[hf]
 
 # megatron-bridges mlflow/comet-ml deps upgrade opentelemetry-exporter-prometheus
