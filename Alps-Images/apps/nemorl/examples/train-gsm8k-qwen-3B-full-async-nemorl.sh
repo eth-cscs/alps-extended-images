@@ -8,10 +8,6 @@
 
 # Specific settings
 export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_07_21_I.sqsh"
-export HF_TOKEN_PATH="${HOME}/.hf/clariden_token"
-
-#================================================
-
 
 # W&B is enabled in the NeMo-RL config below. Make sure the API key is exported
 # in the environment before submitting; it is forwarded into the container.
@@ -46,9 +42,12 @@ export NEMORL_DIR="/workdir/nemo_rl"
 export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil(${SLURM_JOB_NUM_NODES} * 0.25)))")
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
-mkdir -p ${TRAINING_HOME}
-mkdir -p ${TRAINING_CONFIG}
-cd ${TRAINING_HOME}
+# Name of the generated YAML config consumed by the shared driver.
+export YAML_NAME="grpo_gsm8k_qwen_async_nemorl.yaml"
+
+mkdir -p "${TRAINING_HOME}"
+mkdir -p "${TRAINING_CONFIG}"
+cd "${TRAINING_HOME}"
 
 # Ray cluster settings (must be defined before the env.toml heredoc).
 export MASTER_NODE=$(hostname)
@@ -59,7 +58,6 @@ export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 # -----------------------------------------------------------------------------
 # Container environment (matches the verl env.toml style).
 # -----------------------------------------------------------------------------
-
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${NEMORL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users", "/tmp"]
@@ -75,7 +73,7 @@ RAY_ADDRESS = "${RAY_ADDRESS}"
 MASTER_NODE_IP = "${MASTER_NODE_IP}"
 PORT = "${PORT}"
 RAY_memory_usage_threshold = "0.99"
-# Keep Triton kernel cache on node-local storage; NFS-backed $HOME can give
+# Keep Triton kernel cache on node-local storage; NFS-backed \$HOME can give
 # "Stale file handle" during JIT compilation.
 TRITON_CACHE_DIR = "/tmp/triton_cache_${SLURM_JOB_ID}"
 TRITON_HOME = "/tmp/triton_home_${SLURM_JOB_ID}"
@@ -83,7 +81,7 @@ TRITON_HOME = "/tmp/triton_home_${SLURM_JOB_ID}"
 com.hooks.cxi.enabled = "false"
 EOF
 
-cat > "${TRAINING_CONFIG}/grpo_gsm8k_qwen_async_nemorl.yaml" <<- EOF
+cat > "${TRAINING_CONFIG}/${YAML_NAME}" <<- EOF
 defaults: ${NEMORL_DIR}/examples/configs/grpo_math_1B.yaml
 
 grpo:
@@ -179,6 +177,7 @@ policy:
         num_nodes: ${ROLLOUT_NNODES}
         gpus_per_node: 4
 
+# Replace the parent's OpenMathInstruct-2 data setup with GSM8K.
 data:
   _override_: true
   max_input_seq_length: \${policy.max_total_sequence_length}
@@ -222,126 +221,7 @@ cluster:
 EOF
 
 # -----------------------------------------------------------------------------
-# Download the model once avoids hitting HF with all workers.
+# Hand over to the shared driver for model download and execution.
 # -----------------------------------------------------------------------------
-if [ ! -d "${LOCAL_MODEL_DIR}" ]; then
-    echo "Downloading ${MODEL_REPO}/${MODEL_NAME} to ${LOCAL_MODEL_DIR}..."
-    HF_DOWNLOAD_DIR="${HOME}/tmp/hf_download_${SLURM_JOB_ID}"
-    mkdir -p "${HF_DOWNLOAD_DIR}"
-    pushd "${HF_DOWNLOAD_DIR}" >/dev/null || exit 1
-
-    if ! command -v uv >/dev/null 2>&1; then
-        echo "[ERROR] uv is not available on this node; cannot create download venv." >&2
-        exit 1
-    fi
-
-    if [[ -n "${HF_TOKEN_PATH}" && -f "${HF_TOKEN_PATH}" ]]; then
-        export HF_TOKEN="$(cat "${HF_TOKEN_PATH}")"
-    fi
-
-    uvx hf download "${MODEL_REPO}/${MODEL_NAME}" --local-dir "${LOCAL_MODEL_DIR}"
-
-    popd >/dev/null || true
-    rm -rf "${HF_DOWNLOAD_DIR}"
-
-else
-    echo "Model already present at ${LOCAL_MODEL_DIR}, skipping download."
-fi
-
-# -----------------------------------------------------------------------------
-# Start the Ray cluster manually (verl-style).
-#
-# NeMo-RL's run_grpo.py only starts a single-node local cluster automatically;
-# for multi-node it expects an existing Ray cluster. This explicit head + worker
-# setup is therefore required here, just as it is for verl.
-#
-# Note: NeMo-RL's canonical launcher is ray.sub, which also injects topology-
-# aware Ray resources (nvlink_domain_*, topo_rank, worker_units). This manual
-# start works, but without those extras NeMo-RL falls back to generic instead of
-# topology-aware scheduling. For a first comparison run this is acceptable.
-# -----------------------------------------------------------------------------
-srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
-    --environment="${TRAINING_CONFIG}/env.toml" \
-    --container-writable bash -c '
-
-unset PYTHONOPTIMIZE
-
-# If a token file was passed, read it into the environment as a fallback for
-# libraries that do not natively honour HF_TOKEN_PATH.
-if [[ -n "${HF_TOKEN_PATH}" && -f "${HF_TOKEN_PATH}" && -z "${HF_TOKEN}" ]]; then
-    export HF_TOKEN="$(cat "${HF_TOKEN_PATH}")"
-    export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
-fi
-
-cd ${NEMORL_DIR}
-
-# Initializing ray to ensure that it is in cash (which the container should have ensured) and
-#  will load fast when we start the container.
-uv run ray --version >/dev/null 2>&1 || true
-
-# Signal that this rank has finished its setup.
-RANK_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${SLURM_PROCID}_done"
-touch "${RANK_DONE_FILE}"
-
-if [ ${SLURM_PROCID} -eq 0 ]; then
-    # Wait until every rank has finished its uv setup.
-    for other_rank in $(seq 1 $((SLURM_JOB_NUM_NODES - 1))); do
-        OTHER_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${other_rank}_done"
-        echo "Rank 0: waiting for rank ${other_rank} uv setup..."
-        while [ ! -f "${OTHER_DONE_FILE}" ]; do
-            sleep 1
-        done
-    done
-
-    # Rank 0 starts the Ray head node.
-    uv run ray start --head \
-        --node-ip-address=${MASTER_NODE_IP} \
-        --port=${PORT} \
-        --num-cpus=${SLURM_CPUS_PER_TASK} \
-        --num-gpus=4 \
-        --disable-usage-stats || true
-
-    # Signal that the Ray head is ready.
-    touch "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
-
-    # Wait until all worker nodes have joined.
-    while true; do
-        alive_nodes=$(uv run ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
-        if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
-            alive_nodes=0
-        fi
-        if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
-            break
-        fi
-        echo "Rank 0: waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
-        sleep 5
-    done
-
-    # Run the NeMo-RL training driver.
-    uv run python examples/run_grpo.py \
-        --config ${TRAINING_CONFIG}/grpo_gsm8k_qwen_async_nemorl.yaml
-
-    # Gracefully stop the Ray cluster. This lets the worker nodes exit their
-    # ray start --block cleanly instead of being killed by srun teardown,
-    # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
-    echo "Rank 0: stopping Ray cluster..."
-    uv run ray stop --grace-period 30 || true
-
-    sleep 5s
-
-else
-    # Worker ranks wait for the Ray head to be ready, then join.
-    RAY_OPEN_FILE="${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
-    echo "Rank ${SLURM_PROCID}: waiting for Ray head..."
-    while [ ! -f "${RAY_OPEN_FILE}" ]; do
-        sleep 1
-    done
-
-    uv run ray start \
-        --address="${RAY_ADDRESS}" \
-        --node-ip-address=$(hostname -i) \
-        --num-cpus=${SLURM_CPUS_PER_TASK} \
-        --num-gpus=4 \
-        --block || true
-fi
-'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/nemorl-grpo-driver.sh"
