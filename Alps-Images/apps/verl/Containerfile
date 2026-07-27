@@ -69,7 +69,7 @@ RUN pip install "PyYAML>=6.0.2" --ignore-installed
 # the transitive dependency without ever attempting to download or compile it.
 RUN mkdir -p /tmp/fht && \
     printf '[project]\nname = "fast-hadamard-transform"\nversion = "1.1.0"\n' > /tmp/fht/pyproject.toml
-RUN pip install megatron-bridge "megatron-core>=0.17.0" "nvidia-resiliency-ext>=0.6.0" \
+RUN pip install "megatron-bridge>=0.5.1" "megatron-core>=0.17.0" "nvidia-resiliency-ext>=0.6.0" \
         "fast-hadamard-transform @ file:///tmp/fht"
 
 RUN pip install nvidia-modelopt[hf]
