@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-e797f7d7c5a406c3"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-0f334b540ccc7034" #alps7-dev-0f334b540ccc7034 image with megatron
 
 export MODEL_NAME="GLM-5.1"
 export MODEL_REPO="zai-org"
@@ -337,44 +337,41 @@ export PIP_CACHE_DIR=/tmp/pip_cache_${SLURM_JOB_ID}
 export TMPDIR=/tmp
 mkdir -p $PIP_CACHE_DIR
 
-# Cluster proxy intercepts PyPI HTTPS; --trusted-host bypasses the Content-Type check.
-PIP_TRUSTED="--trusted-host pypi.org --trusted-host files.pythonhosted.org"
-
-pip install "PyYAML>=6.0.2" --ignore-installed ${PIP_TRUSTED} --quiet
-
-# megatron-bridges PyPI wheel ships only megatron/bridge/* — its megatron-core dep
-# (a local path in the source repo) is excluded from requires_dist, so install separately.
-pip install megatron-bridge "megatron-core>=0.17.0" "nvidia-resiliency-ext>=0.6.0" \
-    ${PIP_TRUSTED} --quiet
-pip install nvidia-modelopt[hf] ${PIP_TRUSTED} --quiet
-
-# megatron-bridges mlflow/comet-ml deps upgrade opentelemetry-exporter-prometheus
-# to 0.64b0 which requires opentelemetry-sdk~=1.43.0, but the SDK stays at 1.33.1
-# → Ray dashboard crashes with AttributeError → GCS never starts → all workers fail.
-# Fix: upgrade the SDK to match the already-upgraded exporters.
-pip install "opentelemetry-sdk>=1.43.0" ${PIP_TRUSTED} --quiet
-
-# Restore sglang-compatible versions that megatron-bridge overwrites
-pip install "transformers==5.8.1" "timm==1.0.16" ${PIP_TRUSTED} --quiet
-pip install "flashinfer_cubin==0.6.12" "flashinfer_python[cu13]==0.6.12" \
-    ${PIP_TRUSTED} --quiet
 
 # Patch megatron-bridge safe_config_loader to skip filelock.
 # /dev/shm and /tmp on CSCS Alps do not support fcntl.flock in the container
 # (ENOLCK / ESTALE on every attempt). The lock is unnecessary because the config
 # files are written by localid=0 before any reader starts (purely read-only after that).
+#
+# We match line-by-line on the "with filelock." prefix rather than using a regex
+# that tries to parse the argument, because FileLock() arguments often contain
+# nested parens (e.g. os.path.join(...)) which break [^)]* patterns.
 python3 -c "
-import importlib.util, re
-spec = importlib.util.find_spec(\"megatron.bridge.models.hf_pretrained.safe_config_loader\")
-if spec:
+import importlib.util
+spec = importlib.util.find_spec('megatron.bridge.models.hf_pretrained.safe_config_loader')
+if not spec:
+    print('safe_config_loader not found — skipping patch')
+else:
     p = spec.origin
-    with open(p) as f: s = f.read()
-    if \"import contextlib\" not in s:
-        s = \"import contextlib\n\" + s
-    s = re.sub(r\"with filelock\\.FileLock\\([^)]*\\):\", \"with contextlib.nullcontext():\", s)
-    with open(p, \"w\") as f: f.write(s)
-    print(\"Patched safe_config_loader:\", p)
-" 2>/dev/null || true
+    with open(p) as f:
+        lines = f.readlines()
+    new_lines = []
+    n_patched = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('with filelock.') and stripped.endswith(':'):
+            indent = len(line) - len(line.lstrip())
+            new_lines.append(' ' * indent + 'with __import__(\"contextlib\").nullcontext():\n')
+            n_patched += 1
+        else:
+            new_lines.append(line)
+    if n_patched:
+        with open(p, 'w') as f:
+            f.writelines(new_lines)
+        print(f'Patched {n_patched} filelock site(s) in {p}')
+    else:
+        print(f'WARNING: no filelock sites found in {p} — patch may already be applied or code changed')
+"
 
 # Apply fix: preserve load_format=dummy in STANDALONE mode so SGLang initialises with
 # random weights (fast) and receives real weights via NCCL broadcast instead of reading
