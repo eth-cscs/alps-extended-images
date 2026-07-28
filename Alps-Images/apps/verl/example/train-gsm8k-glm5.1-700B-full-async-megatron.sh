@@ -348,29 +348,31 @@ mkdir -p $PIP_CACHE_DIR
 # nested parens (e.g. os.path.join(...)) which break [^)]* patterns.
 python3 -c "
 import importlib.util
-spec = importlib.util.find_spec('megatron.bridge.models.hf_pretrained.safe_config_loader')
+spec = importlib.util.find_spec(\"megatron.bridge.models.hf_pretrained.safe_config_loader\")
 if not spec:
-    print('safe_config_loader not found — skipping patch')
+    print(\"safe_config_loader not found — skipping patch\")
 else:
     p = spec.origin
     with open(p) as f:
         lines = f.readlines()
+    if not any(\"import contextlib\" in l for l in lines):
+        lines.insert(0, \"import contextlib\n\")
     new_lines = []
     n_patched = 0
     for line in lines:
         stripped = line.strip()
-        if stripped.startswith('with filelock.') and stripped.endswith(':'):
+        if stripped.startswith(\"with filelock.\") and stripped.endswith(\":\"):
             indent = len(line) - len(line.lstrip())
-            new_lines.append(' ' * indent + 'with __import__(\"contextlib\").nullcontext():\n')
+            new_lines.append(\" \" * indent + \"with contextlib.nullcontext():\n\")
             n_patched += 1
         else:
             new_lines.append(line)
     if n_patched:
-        with open(p, 'w') as f:
+        with open(p, \"w\") as f:
             f.writelines(new_lines)
-        print(f'Patched {n_patched} filelock site(s) in {p}')
+        print(f\"Patched {n_patched} filelock site(s) in {p}\")
     else:
-        print(f'WARNING: no filelock sites found in {p} — patch may already be applied or code changed')
+        print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
 "
 
 # Apply fix: preserve load_format=dummy in STANDALONE mode so SGLang initialises with
