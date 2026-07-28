@@ -167,6 +167,7 @@ trainer:
   n_gpus_per_node: 4
   save_freq: 50
   test_freq: -1
+  val_before_train: false
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
