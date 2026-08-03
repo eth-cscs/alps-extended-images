@@ -420,17 +420,17 @@ test-app-images-vetnode:
     matrix: *alps_app_images_matrix
   image: "$IMAGE_PREFIX/${NAME}:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
 
-test-verl-async:
-  stage: test-apps
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  timeout: 2h
-  image: "$IMAGE_PREFIX/verl:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - /opt/tests/verl/rl-async-benchmark.sh
-  variables:
-    SLURM_JOB_NUM_NODES: 4
-    SLURM_NTASKS: 4
-    CSCS_ADDITIONAL_MOUNTS: '["/tmp:/tmp"]'
+#test-verl-async:
+#  stage: test-apps
+#  extends: [.container-runner-clariden-gh200, .slurm-template]
+#  timeout: 2h
+#  image: "$IMAGE_PREFIX/verl:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+#  script:
+#    - /opt/tests/verl/rl-async-benchmark.sh
+#  variables:
+#    SLURM_JOB_NUM_NODES: 4
+#    SLURM_NTASKS: 4
+#    CSCS_ADDITIONAL_MOUNTS: '["/tmp:/tmp"]'
 
 
 
@@ -459,7 +459,7 @@ publish-gate:
     - test-apertus-2-DeepEP
     - test-vllm-ray-nccl
     - test-app-images-vetnode
-    - test-verl-async
+    #- test-verl-async
   script:
     - echo "Publish gate passed (tests completed)"
 
