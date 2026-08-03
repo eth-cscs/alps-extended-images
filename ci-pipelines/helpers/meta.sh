@@ -72,7 +72,7 @@ parse_ngc_base_image() {
 
 # Usage: base_refs NGC_NAME NGC_TAG
 # Returns a space-separated record:
-#   BASE_IMAGE_REF REOMVE_HPCX_DIRS_B64 DOCKERFILE CANON_REF TEST_REF STABLE_REF
+#   BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_REF TEST_REF STABLE_REF
 base_refs() {
   local ngc_name="${1:?ngc_name required}"   # e.g. pytorch
   local ngc_tag="${2:?ngc_tag required}"     # e.g. 25.12-py3
@@ -93,17 +93,20 @@ base_refs() {
   [[ -d "$common_dir" ]]   || { echo "ERROR: missing $common_dir" >&2; return 1; }
   [[ -d "$patches_dir" ]]  || { echo "ERROR: missing $patches_dir" >&2; return 1; }
 
-  # Load REMOVE_HPCX_DIRS from profile file
+  # Load optional NGC variant settings from profile file.
+  local REMOVE_HPCX_DIRS=""
+  local NVCR_PREFIX="nvidia"
   # shellcheck disable=SC1090
   source "$profile_file"
-  : "${REMOVE_HPCX_DIRS:?REMOVE_HPCX_DIRS must be set in ${profile_file}}"
   REMOVE_HPCX_DIRS_B64="$(printf '%s' "$REMOVE_HPCX_DIRS" | base64 -w0)"
+  # Keep the space-separated helper record parseable when the override is empty.
+  # Command substitution strips the decoded newline, yielding an empty value in CI.
+  [[ -n "$REMOVE_HPCX_DIRS_B64" ]] || REMOVE_HPCX_DIRS_B64="Cg=="
 
   # Some nvcr images have a different repo structure, e.g. physicsnemo:
   # nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
   # but most are like nvcr.io/nvidia/pytorch:25.12-py3, so we need to handle both cases.
-  # Load NVCR_PREFIX from profile file, default to "nvidia" if not set.
-  NVCR_PREFIX="${NVCR_PREFIX:-nvidia}"
+  # NVCR_PREFIX defaults to "nvidia" unless overridden by the profile file.
 
   # BASE IMAGE points to NGC image via remote proxy (jfrog) (speed up downloads
   # in CI and avoid hitting NGC rate limits)
@@ -136,14 +139,17 @@ app_refs() {
 
   local app_dir="Alps-Images/apps/${name}"
   local dockerfile="${app_dir}/Containerfile"
+  local patch_dir="${app_dir}/patches"
   local test_dir="${app_dir}/tests"
   local profile_file="${app_dir}/profile.env"
+  local cleanup_script="Alps-Images/common/cleanup-apt-build-deps.sh"
 
   [[ -d "$app_dir" ]]      || { echo "ERROR: missing $app_dir" >&2; return 1; }
   [[ -f "$dockerfile" ]]   || { echo "ERROR: missing $dockerfile" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
   # tests dir is optional but usually present
   [[ -d "$test_dir" ]] || test_dir=""
+  [[ -d "$patch_dir" ]] || patch_dir=""
 
   # Load BASE_IMAGE from profile file
   # shellcheck disable=SC1090
@@ -157,7 +163,11 @@ app_refs() {
   read -r _base_image_ref _remove_hpcx_dirs _base_dockerfile base_canon_ref _base_test_ref _base_stable_ref < <(base_refs "$ngc_name" "$ngc_tag")
 
   # Compute canonical tag from hashed content
-  local hash_paths="$dockerfile $profile_file $test_dir"
+  local hash_paths="$dockerfile $profile_file $patch_dir $test_dir"
+  if grep -Fq "$cleanup_script" "$dockerfile"; then
+    [[ -f "$cleanup_script" ]] || { echo "ERROR: missing $cleanup_script" >&2; return 1; }
+    hash_paths="$hash_paths $cleanup_script"
+  fi
   local tag="${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
   local canon_tag="$(canon_tag_for "$tag" "$h")"
