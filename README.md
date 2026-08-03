@@ -67,6 +67,7 @@ Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained 
 `common/alps-runtime.env` configures the runtime environment for Slingshot-based collective communication:
 
 - **NCCL**: uses the AWS libfabric transport (`NCCL_NET=AWS Libfabric`), protocol tuning, 4 channels per peer
+- **NCCL plugin cleanup**: clears inherited `NCCL_NET_PLUGIN` settings so NCCL can use the Alps libfabric plugin selected by `NCCL_NET`
 - **CXI / libfabric**: provider selection, memory registration caching, rendezvous and RX match-mode settings
 - **NVSHMEM**: libfabric remote transport over the Cassini provider, CUDA VMM disabled
 - **OpenMPI / PMIX**: security modules, byte transfer layer restricted to supported backends
@@ -86,7 +87,8 @@ The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs fiv
    - `apertus-1p5`: Megatron pretraining (2 nodes, 8 GPUs)
    - `apertus-2/pplx-garden`: perplexity garden benchmarks (2 nodes, 2 GPUs)
    - `apertus-2/DeepEP`: DeepEP benchmarks (1 node, 1 GPU)
-   - `vllm`: import/GPU smoke test and 2-node Ray/NCCL all-reduce
+   - `vllm`: 2-node Ray/NCCL all-reduce
+   - `verl`: async RL benchmark (4 nodes, 4 tasks)
    - app image vetnode coverage for all app images in the CI matrix
 5. **publish** — promotes all tested images to stable registries; overwrites are blocked on existing stable tags
 

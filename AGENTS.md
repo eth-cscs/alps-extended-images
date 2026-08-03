@@ -62,6 +62,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 ## Runtime Gotchas
 
 - `alps-runtime.env` uses `defvar`, which sets defaults only when variables are unset; preserve user overrides, including intentionally empty values.
+- The one runtime override exception is `NCCL_NET_PLUGIN`, which must be unset because inherited NGC plugin selections can point to network plugins removed from Alps images.
 - `source-alps-env.sh` must stay idempotent and Bash-safe because it is linked into NVIDIA entrypoint hooks and `/etc/profile.d`.
 - Runtime warning hooks run through non-interactive Bash `BASH_ENV` and Python `sitecustomize.py`; they must never break shell or interpreter startup.
 - Do not add `set -e`, `set -u`, or `pipefail` to scripts sourced through `BASH_ENV`.
