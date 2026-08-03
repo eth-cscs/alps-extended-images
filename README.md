@@ -20,12 +20,12 @@ Each variant corresponds to an NGC container extended with the Alps HPC stack:
 
 | Variant | NGC Base | Use Case |
 |---------|----------|----------|
-| `pytorch-25.12-py3-alps5` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
-| `pytorch-26.01-py3-alps5` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
-| `pytorch-26.02-py3-alps5` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
-| `nemo-25.11.01-alps5`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
-| `nemo-26.02-alps5`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
-| `physicsnemo-25.11-alps5` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
+| `pytorch-25.12-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:25.12-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.01-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
+| `pytorch-26.02-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
+| `nemo-25.11.01-alps7-dev`     | `nvcr.io/nvidia/nemo:25.11.01`                 | Speech & language model training  |
+| `nemo-26.02-alps7-dev`        | `nvcr.io/nvidia/nemo:26.02`                    | Speech & language model training  |
+| `physicsnemo-25.11-alps7-dev` | `nvcr.io/nvidia/physicsnemo/physicsnemo:25.11` | Physics-informed neural networks  |
 
 ### Application Images
 
@@ -33,12 +33,15 @@ Application images are built on top of the NGC base images and include additiona
 
 | Image | Base | Description |
 |-------|------|-------------|
-| `apertus-1p5-alps5` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2-alps5`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `apertus-1p5-alps7-dev` | `pytorch-26.02-py3` | Megatron-LM distributed LLM pretraining |
+| `apertus-2-alps7-dev`   | `pytorch-26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `sfttrainer-alps7-dev`  | `pytorch-26.02-py3` | Supervised fine-tuning trainer image |
+| `verl-alps7-dev`        | `pytorch-26.02-py3` | VeRL reinforcement learning workloads |
+| `vllm-alps7-dev`        | `pytorch-26.02-py3` | vLLM serving workloads built from source with Alps/NVIDIA PyTorch compatibility patches |
 
 ## HPC Stack Components
 
-The `common/install-alps-hpc-stack.sh` script builds and installs the following libraries:
+The `common/install-alps-hpc-stack.sh` script purges preinstalled generic network-stack packages/files, then builds and installs the following libraries:
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
@@ -56,7 +59,7 @@ The `common/install-alps-hpc-stack.sh` script builds and installs the following 
 
 All components are compiled with CUDA support (auto-detected) and architecture-specific flags for NVIDIA Hopper (SM90/SM90a).
 
-Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained under `patches/`.
+Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained under `Alps-Images/patches/` and are included in base image hashes. Application-specific patches are kept under `Alps-Images/apps/<app>/patches/` and are included in app image hashes.
 
 ## Runtime Environment
 
@@ -77,14 +80,16 @@ The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs fiv
    - environment variable checks (FI_PROVIDER, NCCL settings)
    - collective benchmarks (NCCL alltoall, NVSHMEM latency, OSU bandwidth)
    - hardware verification via the `vetnode` framework
-3. **build-apps** — builds application images on top of promoted base images
+3. **build-apps** — builds application images on top of canonical base image refs
 4. **test-apps** — runs end-to-end workload tests:
    - `apertus-1p5`: Megatron pretraining (2 nodes, 8 GPUs)
    - `apertus-2/pplx-garden`: perplexity garden benchmarks (2 nodes, 2 GPUs)
    - `apertus-2/DeepEP`: DeepEP benchmarks (1 node, 1 GPU)
+   - `vllm`: import/GPU smoke test and 2-node Ray/NCCL all-reduce
+   - app image vetnode coverage for all app images in the CI matrix
 5. **publish** — promotes all tested images to stable registries; overwrites are blocked on existing stable tags
 
-**Image tagging strategy:** each image name encodes a SHA256 hash of its source files, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds.
+**Image tagging strategy:** each image name encodes a SHA256 hash of its source files, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds. App hashes include the canonical base image ref, the app `Containerfile`, `profile.env`, optional `tests/`, and optional app-local `patches/`.
 
 ## Acknowledgements
 
