@@ -6,6 +6,12 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
 
+# Because slurm makes a copy of the script we can not find it through `BASH_SOURCE`
+#  instead we relly on that it is in the folder we started.
+#SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="${PWD}"
+
+
 # Specific settings
 export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_07_21_I.sqsh"
 
@@ -342,7 +348,4 @@ EOF
 # -----------------------------------------------------------------------------
 # Hand over to the shared driver for model download and execution.
 # -----------------------------------------------------------------------------
-#SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Because of SLURM we have to start it this way.
-SCRIPT_DIR="${PWD}"
 source "${SCRIPT_DIR}/nemorl-grpo-driver.sh"
