@@ -28,10 +28,6 @@ if [ ! -d "${LOCAL_MODEL_DIR}" ]; then
     mkdir -p "${HF_DOWNLOAD_DIR}"
     pushd "${HF_DOWNLOAD_DIR}" >/dev/null || exit 1
 
-    if [[ -n "${HF_TOKEN_PATH}" && -f "${HF_TOKEN_PATH}" ]]; then
-        export HF_TOKEN="$(cat "${HF_TOKEN_PATH}")"
-    fi
-
     uvx hf download "${MODEL_REPO}/${MODEL_NAME}" --local-dir "${LOCAL_MODEL_DIR}"
 
     popd >/dev/null || true
