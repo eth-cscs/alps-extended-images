@@ -342,5 +342,7 @@ EOF
 # -----------------------------------------------------------------------------
 # Hand over to the shared driver for model download and execution.
 # -----------------------------------------------------------------------------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Because of SLURM we have to start it this way.
+SCRIPT_DIR="${PWD}"
 source "${SCRIPT_DIR}/nemorl-grpo-driver.sh"
