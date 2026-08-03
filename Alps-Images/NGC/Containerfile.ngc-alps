@@ -55,7 +55,7 @@ COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
 
 RUN set -eux; \
-    chmod +x /opt/alps/install-alps-hpc-stack.sh; \
+    chmod +x /opt/alps/cleanup-apt-build-deps.sh /opt/alps/install-alps-hpc-stack.sh; \
     /opt/alps/install-alps-hpc-stack.sh
 
 COPY Alps-Images/common/alps-runtime.env /opt/alps/env/alps-runtime.env
