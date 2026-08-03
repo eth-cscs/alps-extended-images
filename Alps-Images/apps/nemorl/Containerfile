@@ -7,7 +7,7 @@ FROM ${BASE_IMAGE}
 ARG WORK_DIR="/workdir"
 ARG NEMORL_DIR="${WORK_DIR}/nemo_rl"
 
-ARG NEMORL_COMMIT="4806fc0ae43c2b44505f90455e705d3ad2454874"
+ARG NEMORL_COMMIT="89f4d1f857a369b1d565c97b7b4a12c1697bb68b"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
