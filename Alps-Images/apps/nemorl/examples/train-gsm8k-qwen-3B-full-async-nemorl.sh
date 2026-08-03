@@ -88,12 +88,15 @@ grpo:
   # 256 prompts per step x 16 generations = 4096 sequences per global batch.
   num_prompts_per_step: 256
   num_generations_per_prompt: 16
-  # NOTE: capped at 27 steps to match the sync comparison run.
-  # Async GRPO now respects both max_num_epochs and max_num_steps (training
-  # stops when the first limit is reached). Keep this in sync with
-  # train-gsm8k-qwen-3B-nemorl.sh.
+  # NOTE: async GRPO does NOT consult grpo.max_num_epochs for data iteration;
+  # the trajectory collector re-iterates the dataloader indefinitely and
+  # training is bounded solely by grpo.max_num_steps. See the warning at
+  # nemo_rl/algorithms/grpo.py:2534 and the multi-epoch support added in
+  # nemo_rl/algorithms/async_utils/trajectory_collector.py (_collection_loop).
+  # GSM8K train = 7,473 samples / 256 per step ≈ 29 steps/epoch; 81 steps
+  # ≈ 3 epochs. Keep this in sync with train-gsm8k-qwen-3B-nemorl.sh.
   max_num_epochs: 1
-  max_num_steps: 27
+  max_num_steps: 81
   val_period: 50
   val_at_start: false
   val_at_end: true
