@@ -11,7 +11,6 @@
 #SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="${PWD}"
 
-
 # Specific settings
 export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_07_21_I.sqsh"
 
@@ -20,15 +19,21 @@ export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 if [[ -z "$WANDB_API_KEY" ]]; then
     echo "[WARNING] WANDB_API_KEY is not set; W&B logging will fail or run in offline mode." >&2
+    unset WANDB_API_KEY
 fi
 
 # HuggingFace token: strongly recommended for multi-node runs. Without it, all
 # policy workers download the model unauthenticated and easily hit rate limits,
 # causing stragglers that fail the torch distributed rendezvous.
 # Prefer HF_TOKEN_PATH so the secret is not embedded in the job script/env.toml.
-export HF_TOKEN_PATH="${HF_TOKEN_PATH:-${HUGGINGFACE_TOKEN_PATH:-}}"
-if [[ -z "$HF_TOKEN_PATH" ]]; then
-    echo "[WARNING] HF_TOKEN_PATH is not set; HuggingFace downloads may be rate-limited on many workers." >&2
+if [ -n "${HF_HOME}" ]
+then
+	echo "[INFO] Found HF_HOME." >&2
+elif [ -n "$HF_TOKEN_PATH" ]
+then
+	echo "[INFO] Found HF_TOKEN_PATH." >&2
+else
+	echo "[WARNING] HF_TOKEN_PATH is not set; HuggingFace downloads may be rate-limited on many workers." >&2
 fi
 
 export MODEL_NAME="GLM-5.1"
@@ -67,6 +72,7 @@ export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 # -----------------------------------------------------------------------------
 # Container environment (matches the verl env.toml style).
 # -----------------------------------------------------------------------------
+# TODO: Store the file into a temporary folder such that the script can run in parallel.
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${NEMORL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users", "/tmp"]
