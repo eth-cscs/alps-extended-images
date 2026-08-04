@@ -101,9 +101,14 @@ EOF
 # train-gsm8k-glm5.1-700B-full-async-megatron.sh.
 #
 # Key mapping notes:
-#   verl SGLang rollout  → NeMo-RL vLLM with async_engine=true
+#   verl SGLang rollout  → NeMo-RL vLLM with async_engine=true (when EP = TP)
 #     (NeMo-RL async GRPO requires vLLM or Megatron backend, not SGLang;
 #      see nemo_rl/algorithms/grpo.py:3732.)
+#     NOTE: vLLM async_engine with EP > TP (native DP inside vLLM) is currently
+#     unsupported in NeMo-RL main; see https://github.com/NVIDIA-NeMo/RL/issues/1101
+#     and open PR https://github.com/NVIDIA-NeMo/RL/pull/2517. We therefore set
+#     EP = TP for the rollout so vLLM DP is not created. This is a NeMo-RL/vLLM
+#     integration limitation, not a problem in the verl/SGLang path.
 #   verl ppo_mini_batch_size (48) → grpo.num_prompts_per_step (48)
 #   verl rollout.n (16)          → grpo.num_generations_per_prompt (16)
 #   verl total_epochs (3)        → grpo.max_num_epochs (3)
@@ -284,11 +289,14 @@ policy:
       async_engine: true
       precision: bfloat16
       kv_cache_dtype: "auto"
-      # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32 (one replica).
-      # GLM-5.1 (700B) needs all 32 GPUs to fit for generation.
+  # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32, EP=32 (one replica).
+  # GLM-5.1 (700B) needs all 32 GPUs to fit for generation.
+  # We deliberately set EP = TP here because vLLM async_engine with EP > TP
+  # (native vLLM DP) is not supported on NeMo-RL main; see issue #1101 / PR #2517.
+  # With EP = TP there is no vLLM DP dimension and async_engine can be used.
       tensor_parallel_size: 32
       pipeline_parallel_size: 1
-      expert_parallel_size: 128
+      expert_parallel_size: 32
       # Matches verl rollout.gpu_memory_utilization.
       gpu_memory_utilization: 0.75
       max_model_len: \${policy.max_total_sequence_length}
