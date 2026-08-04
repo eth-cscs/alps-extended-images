@@ -47,6 +47,12 @@ export TRAINING_CONFIG="${TRAINING_HOME}/config"
 export CHECKPOINT_HOME="${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}"
 export LOCAL_MODEL_DIR="${TRAINING_HOME}/models/${MODEL_NAME}"
 
+# Megatron-Bridge converts the HF checkpoint to a torch_dist checkpoint once on
+# startup. That output must live on a filesystem with enough quota for a 700B
+# sharded model; /users/$USER/.hf is usually too small. Use the scratch area.
+export NRL_MEGATRON_CHECKPOINT_DIR="${TRAINING_HOME}/megatron_ckpts"
+mkdir -p "${NRL_MEGATRON_CHECKPOINT_DIR}"
+
 # Path where the container file installs the repo.
 export NEMORL_DIR="/workdir/nemo_rl"
 
@@ -98,6 +104,9 @@ TORCHINDUCTOR_CACHE_DIR = "/tmp/torchinductor_cache_${SLURM_JOB_ID}_${SLURM_PROC
 # vLLM V1 engine writes compile artifacts under \$HOME/.cache/vllm_0 by default;
 # point the whole vllm cache tree to /tmp as well.
 VLLM_CACHE_ROOT = "/tmp/vllm_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+# Megatron-Bridge initial HF -> Mcore conversion writes a large sharded
+# checkpoint. Point it to the same scratch area used for the model/logs.
+NRL_MEGATRON_CHECKPOINT_DIR = "${NRL_MEGATRON_CHECKPOINT_DIR}"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
