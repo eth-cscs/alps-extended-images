@@ -304,7 +304,7 @@ policy:
     colocated:
       enabled: false
       resources:
-        num_nodes: \${ROLLOUT_NNODES}
+        num_nodes: ${ROLLOUT_NNODES}
         gpus_per_node: 4
 
 # Replace the parent's OpenMathInstruct-2 data setup with GSM8K.
@@ -345,7 +345,7 @@ logger:
 cluster:
   # Training nodes only; generation nodes are configured under
   # policy.generation.colocated.resources.
-  num_nodes: \${TRAINING_NNODES}
+  num_nodes: ${TRAINING_NNODES}
   gpus_per_node: 4
   master_port_range_low: 25000
   master_port_range_high: 28000
