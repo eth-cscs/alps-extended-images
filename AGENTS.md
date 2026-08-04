@@ -12,6 +12,8 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - `Alps-Images/patches/` contains upstream patches consumed by base builds and included in base hashes; `Alps-Images/apps/<app>/patches/` contains app-specific source patches included in app hashes.
 - `ci-pipelines/build-alps-extended-images.yaml` is the executable pipeline source; prefer it over README prose when they disagree.
 - `ci-pipelines/helpers/meta.sh` derives image refs and hashes; `ci-pipelines/helpers/skopeo.sh` owns registry copy/promotion behavior.
+- `Alps-Images/common/package-helpers.sh` owns apt wrappers, rootless sandbox fallback, pip proxy environment, and build-dependency cleanup helpers shared by base and app builds.
+- `manual-build/manual-build.sh` emits local `podman build` scripts using the same ref/hash logic as CI; keep `manual-build/README.md` aligned with it.
 
 ## Image Refs
 
@@ -23,7 +25,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 ## Hashing Rules
 
 - Base hashes must cover the base Containerfile, variant directory/profile/hooks, `Alps-Images/common`, `Alps-Images/patches`, and logical build inputs used by `meta.sh`.
-- App hashes must cover the app Containerfile, `profile.env`, app-local `patches/` when present, copied tests when present, and the canonical base ref.
+- App hashes must cover the app Containerfile, `profile.env`, app-local `patches/` when present, copied tests when present, copied shared helper inputs when present, and the canonical base ref.
 - Do not add timestamps or commit SHAs to content hashes; they defeat reuse. OCI labels may still receive CI metadata.
 - Required hash inputs should fail when missing. Do not silently skip a declared Containerfile/profile/patch directory.
 - Any helper output field that can contain whitespace must be encoded or moved to dotenv; current `REMOVE_HPCX_DIRS` is base64 encoded for this reason.
@@ -34,6 +36,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - Build-stage dependency chain is `meta -> build -> retag-for-CI`; explicit `needs` can bypass stage barriers, so include every correctness dependency.
 - Matrix jobs must use matching `needs:parallel:matrix` mappings for every identity field (`NGC_NAME`/`NGC_TAG` or `NAME`) to avoid mixed dotenv artifacts.
 - Keep matrix values short because GitLab includes them in job names.
+- Current NGC base matrix in CI includes `pytorch` tags `26.06-py3`, `26.02-py3`, `26.01-py3`, and `25.12-py3`, plus `nemo` tags `26.02` and `25.11.01`, and `physicsnemo` tag `25.11`.
 - Current app matrix in CI is `apertus-1p5`, `apertus-2`, `sfttrainer`, `verl`, and `vllm`.
 - When adding or renaming tests, update `publish-gate.needs`; publishing depends on this gate, not just stage order.
 
@@ -49,6 +52,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 
 - Preserve `# syntax=docker/dockerfile:1`, `ARG BASE_IMAGE` followed by `FROM ${BASE_IMAGE}`, and OCI/CSCS labels in image Containerfiles.
 - Use `RUN set -eux; ...` for build steps and clean apt lists, temporary clones, build trees, and caches in the same layer.
+- Source `Alps-Images/common/package-helpers.sh` before pip installs, and use `apt_cmd`, `apt_get`, and cleanup helpers from it instead of raw apt commands in shared installer and app build steps.
 - Prefer pinned tags/commits for downloaded sources; avoid unbounded `pip -U` unless the existing image already requires it.
 - `install-alps-hpc-stack.sh` programmatically purges preinstalled generic network stacks before rebuilding the Alps stack; keep `REMOVE_HPCX_DIRS` only as an optional profile escape hatch for image-specific leftovers.
 - NGC variant `profile.env` is declarative and may carry optional `REMOVE_HPCX_DIRS` or `NVCR_PREFIX`; use `hooks.d/*.sh` only for deterministic late image fixes.
@@ -58,6 +62,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 ## Runtime Gotchas
 
 - `alps-runtime.env` uses `defvar`, which sets defaults only when variables are unset; preserve user overrides, including intentionally empty values.
+- The one runtime override exception is `NCCL_NET_PLUGIN`, which must be unset because inherited NGC plugin selections can point to network plugins removed from Alps images.
 - `source-alps-env.sh` must stay idempotent and Bash-safe because it is linked into NVIDIA entrypoint hooks and `/etc/profile.d`.
 - Runtime warning hooks run through non-interactive Bash `BASH_ENV` and Python `sitecustomize.py`; they must never break shell or interpreter startup.
 - Do not add `set -e`, `set -u`, or `pipefail` to scripts sourced through `BASH_ENV`.

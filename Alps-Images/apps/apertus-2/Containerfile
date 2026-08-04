@@ -20,9 +20,11 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 # System deps
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 RUN set -eux; \
-    apt-get update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
@@ -64,6 +66,7 @@ RUN set -eux; \
 ARG PPLX_GARDEN_REPO=https://github.com/pinxuezhao/pplx_garden_cxi.git
 ARG PPLX_GARDEN_COMMIT=3ce62f9993b6e4abdcda8dac3b87a944ea221f4f
 RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
     python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install --no-cache-dir build; \
     rm -rf /tmp/pplx_garden; \
     git clone --depth 1 "${PPLX_GARDEN_REPO}" /tmp/pplx_garden; \
@@ -105,6 +108,7 @@ RUN set -eux; \
 ARG QUACK_REPO=https://github.com/Dao-AILab/quack.git
 ARG QUACK_TAG=v0.2.10
 RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
     git clone --depth 1 --branch "${QUACK_TAG}" "${QUACK_REPO}" /tmp/quack; \
     pushd /tmp/quack; \
     python -m pip install --upgrade-strategy only-if-needed '.[cu13]'; \
