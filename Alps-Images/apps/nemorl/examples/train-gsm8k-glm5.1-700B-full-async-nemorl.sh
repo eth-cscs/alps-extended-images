@@ -51,7 +51,7 @@ export LOCAL_MODEL_DIR="${TRAINING_HOME}/models/${MODEL_NAME}"
 export NEMORL_DIR="/workdir/nemo_rl"
 
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
-# remaining 24 nodes for Megatron training (TP=4, PP=3, EP=8 → 96 GPUs, DP=1).
+# remaining 24 nodes for Megatron training (TP=4, PP=3 → 96 GPUs, DP=8).
 # GLM-5.1 has 78 layers (78/3=26 layers/stage ✓) and 512 total experts
 # (EP=8 → 64/rank, matching megatron-bridge's GLM-5.1 mapping).
 export ROLLOUT_NNODES=8
@@ -218,8 +218,8 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=3, EP=8 → DP=1
-    # PP=3: GLM-5.1 has 78 layers (78/3=26 layers/stage ✓).
+    # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=3 → DP=8
+    # GLM-5.1 has 78 layers (78/3=26 layers/stage ✓).
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 3
     expert_model_parallel_size: 8
@@ -358,9 +358,10 @@ logger:
     name: ${WANDB_RUN_NAME}
 
 cluster:
-  # Training nodes only; generation nodes are configured under
-  # policy.generation.colocated.resources.
-  num_nodes: ${TRAINING_NNODES}
+  # Total SLURM nodes.  NeMo-RL's non-colocated logic subtracts the rollout nodes
+  # configured under policy.generation.colocated.resources from this total to obtain
+  # the training node count, so this must be 32 (not 24).
+  num_nodes: ${SLURM_JOB_NUM_NODES}
   gpus_per_node: 4
   master_port_range_low: 25000
   master_port_range_high: 28000
