@@ -88,10 +88,16 @@ HF_TOKEN_PATH = "${HF_TOKEN_PATH}"
 RAY_ADDRESS = "${RAY_ADDRESS}"
 MASTER_NODE_IP = "${MASTER_NODE_IP}"
 PORT = "${PORT}"
-# Keep Triton kernel cache on node-local storage; NFS-backed \$HOME can give
-# "Stale file handle" during JIT compilation.
-TRITON_CACHE_DIR = "/tmp/triton_cache_${SLURM_JOB_ID}"
-TRITON_HOME = "/tmp/triton_home_${SLURM_JOB_ID}"
+# Keep Triton/torch.compile caches on node-local storage; Lustre-backed \$HOME
+# gives "Stale file handle" (ESTALE) when many ranks JIT-compile simultaneously.
+# Make each rank use its own sub-directory to avoid intra-node races.
+TRITON_CACHE_DIR = "/tmp/triton_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+TRITON_HOME = "/tmp/triton_home_${SLURM_JOB_ID}_${SLURM_PROCID}"
+VLLM_TORCH_COMPILE_CACHE_DIR = "/tmp/vllm_torch_compile_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+TORCHINDUCTOR_CACHE_DIR = "/tmp/torchinductor_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
+# vLLM V1 engine writes compile artifacts under \$HOME/.cache/vllm_0 by default;
+# point the whole vllm cache tree to /tmp as well.
+VLLM_CACHE_ROOT = "/tmp/vllm_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
@@ -290,11 +296,11 @@ policy:
       async_engine: true
       precision: bfloat16
       kv_cache_dtype: "auto"
-  # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32, EP=32 (one replica).
-  # GLM-5.1 (700B) needs all 32 GPUs to fit for generation.
-  # We deliberately set EP = TP here because vLLM async_engine with EP > TP
-  # (native vLLM DP) is not supported on NeMo-RL main; see issue #1101 / PR #2517.
-  # With EP = TP there is no vLLM DP dimension and async_engine can be used.
+      # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32, EP=32 (one replica).
+      # GLM-5.1 (700B) needs all 32 GPUs to fit for generation.
+      # We deliberately set EP = TP here because vLLM async_engine with EP > TP
+      # (native vLLM DP) is not supported on NeMo-RL main; see issue #1101 / PR #2517.
+      # With EP = TP there is no vLLM DP dimension and async_engine can be used.
       tensor_parallel_size: 32
       pipeline_parallel_size: 1
       expert_parallel_size: 32
