@@ -21,9 +21,30 @@ cd "${TRAINING_HOME}"
 
 # -----------------------------------------------------------------------------
 # Download the model once to shared storage.
+#
+# We check not only that the directory exists but also that a real (non-LFS-
+# pointer) config.json is present inside it. A previous run may have created
+# the directory but failed mid-download (network error, LFS not fetched,
+# etc.), leaving an incomplete model that `AutoTokenizer.from_pretrained`
+# later chokes on with a misleading "You need to have sentencepiece or
+# tiktoken installed" error.
 # -----------------------------------------------------------------------------
-if [ ! -d "${LOCAL_MODEL_DIR}" ]; then
-    echo "Downloading ${MODEL_REPO}/${MODEL_NAME} to ${LOCAL_MODEL_DIR}..."
+_model_complete=false
+if [ -d "${LOCAL_MODEL_DIR}" ] && [ -f "${LOCAL_MODEL_DIR}/config.json" ]; then
+    # An LFS pointer file starts with "version https://git-lfs.github.com/spec/v1".
+    # A real config.json starts with "{" (JSON).
+    if head -c 1 "${LOCAL_MODEL_DIR}/config.json" | grep -q '{'; then
+        _model_complete=true
+    fi
+fi
+
+if [ "${_model_complete}" = false ]; then
+    if [ -d "${LOCAL_MODEL_DIR}" ]; then
+        echo "WARNING: ${LOCAL_MODEL_DIR} exists but appears incomplete (missing or LFS-pointer config.json). Re-downloading." >&2
+        rm -rf "${LOCAL_MODEL_DIR}"
+    else
+        echo "Downloading ${MODEL_REPO}/${MODEL_NAME} to ${LOCAL_MODEL_DIR}..."
+    fi
     HF_DOWNLOAD_DIR="${HOME}/tmp/hf_download_${SLURM_JOB_ID}"
     mkdir -p "${HF_DOWNLOAD_DIR}"
     pushd "${HF_DOWNLOAD_DIR}" >/dev/null || exit 1
