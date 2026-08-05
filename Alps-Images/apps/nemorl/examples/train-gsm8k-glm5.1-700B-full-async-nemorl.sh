@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=34
+#SBATCH --nodes=60
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -57,7 +57,7 @@ mkdir -p "${NRL_MEGATRON_CHECKPOINT_DIR}"
 export NEMORL_DIR="/workdir/nemo_rl"
 
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
-# remaining 26 nodes for Megatron training (TP=4, PP=26 → 104 GPUs, DP=1).
+# remaining 52 nodes for Megatron training (TP=4, PP=26 → 208 GPUs, DP=1).
 # GLM-5.1 has 78 layers (78/26=3 layers/stage) and 512 total experts
 # (EP=8 → 64/rank, matching megatron-bridge's GLM-5.1 mapping).
 export ROLLOUT_NNODES=8
@@ -160,7 +160,7 @@ EOF
 #
 # Parallelism (temporary larger-PP check to avoid OOM while the container
 # image still lacks the NeMo-RL Megatron-FSDP wiring):
-#   Training: 26 nodes × 4 GPUs = 104 GPUs; TP=4, PP=26, EP=8 → DP=1
+#   Training: 52 nodes × 4 GPUs = 208 GPUs; TP=4, PP=26, EP=8 → DP=1
 #   Rollout:   8 nodes × 4 GPUs =  32 GPUs; TP=32 (one replica)
 #
 # We use PP=26 (instead of verl's PP=3) because the current image does not pass
@@ -239,8 +239,8 @@ policy:
   #     gives 3 layers/stage).
   #   - The vLLM generation engine needs TP=32 to fit the 700B model in GPU
   #     memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
-  #   - With training on the remaining 26 nodes (104 GPUs), TP=4 and PP=26 give
-  #     a model-parallel product of 104, so DP = 104 / 104 = 1.
+  #   - With training on the remaining 52 nodes (208 GPUs), TP=4 and PP=26 give
+  #     a model-parallel product of 208, so DP = 208 / 208 = 1.
   #   - EP=8 is taken from the upstream GLM-5.1 Megatron-Bridge recipe.
   # Changing these values requires re-checking all three constraints.
   #
@@ -251,7 +251,7 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    # 26 training nodes x 4 GPUs = 104 GPUs; TP=4, PP=26 -> DP=1
+    # 52 training nodes x 4 GPUs = 208 GPUs; TP=4, PP=26 -> DP=1
     # GLM-5.1 has 78 layers (78/26=3 layers/stage).
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 26
@@ -280,7 +280,7 @@ policy:
     moe_router_load_balancing_type: "none"
     moe_router_bias_update_rate: 0.0
 
-    # Offload optimizer states to CPU for 700B on 104 GPUs.
+    # Offload optimizer states to CPU for 700B on 208 GPUs.
     # The per-rank parameter count after TP=4, PP=26, EP=8 sharding is ~3.8B
     # parameters (see the Megatron "number of parameters on (tensor, pipeline)"
     # log lines).  The legacy DDP path (current image) allocates a full per-rank
