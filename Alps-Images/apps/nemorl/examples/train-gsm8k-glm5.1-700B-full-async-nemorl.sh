@@ -222,21 +222,21 @@ policy:
   dtensor_cfg:
     enabled: false
 
-    # Megatron backend for 700B training.
-    # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
-    #
-    # Divisibility constraints that fix the minimum node split:
-    #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly
-    #     (PP=3 gives 26 layers/stage; PP=6 would also work but doubles the
-    #     pipeline bubble).
-    #   - The vLLM generation engine needs TP=32 to fit the 700B model in
-    #     GPU memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
-    #   - With training on the remaining 24 nodes (96 GPUs), TP=4 and PP=3
-    #     give a model-parallel product of 12, so DP = 96 / 12 = 8.
-    #   - EP=8 must therefore align with the chosen TP/PP/DP layout; it is
-    #     taken from the upstream GLM-5.1 Megatron-Bridge recipe.
-    # Changing these values requires re-checking all three constraints.
-    megatron_cfg:
+  # Megatron backend for 700B training.
+  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
+  #
+  # Divisibility constraints that fix the minimum node split:
+  #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly
+  #     (PP=3 gives 26 layers/stage; PP=6 would also work but doubles the
+  #     pipeline bubble).
+  #   - The vLLM generation engine needs TP=32 to fit the 700B model in
+  #     GPU memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
+  #   - With training on the remaining 24 nodes (96 GPUs), TP=4 and PP=3
+  #     give a model-parallel product of 12, so DP = 96 / 12 = 8.
+  #   - EP=8 must therefore align with the chosen TP/PP/DP layout; it is
+  #     taken from the upstream GLM-5.1 Megatron-Bridge recipe.
+  # Changing these values requires re-checking all three constraints.
+  megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
     # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=3 → DP=8
