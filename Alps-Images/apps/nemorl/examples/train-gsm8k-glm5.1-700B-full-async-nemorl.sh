@@ -57,8 +57,8 @@ mkdir -p "${NRL_MEGATRON_CHECKPOINT_DIR}"
 export NEMORL_DIR="/workdir/nemo_rl"
 
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
-# remaining 26 nodes for Megatron training (TP=4, PP=13 → 104 GPUs, DP=2).
-# GLM-5.1 has 78 layers (78/13=6 layers/stage) and 512 total experts
+# remaining 26 nodes for Megatron training (TP=4, PP=26 → 104 GPUs, DP=1).
+# GLM-5.1 has 78 layers (78/26=3 layers/stage) and 512 total experts
 # (EP=8 → 64/rank, matching megatron-bridge's GLM-5.1 mapping).
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
@@ -158,17 +158,18 @@ EOF
 #   called too late (after init_workers)" — verify whether the same
 #   applies to NeMo-RL's megatron path.
 #
-# Parallelism (temporary larger-node check to avoid OOM while the container
+# Parallelism (temporary larger-PP check to avoid OOM while the container
 # image still lacks the NeMo-RL Megatron-FSDP wiring):
-#   Training: 26 nodes × 4 GPUs = 104 GPUs; TP=4, PP=13, EP=8 → DP=2
+#   Training: 26 nodes × 4 GPUs = 104 GPUs; TP=4, PP=26, EP=8 → DP=1
 #   Rollout:   8 nodes × 4 GPUs =  32 GPUs; TP=32 (one replica)
 #
-# We use PP=13 (instead of verl's PP=3) because the current image does not pass
+# We use PP=26 (instead of verl's PP=3) because the current image does not pass
 # use_megatron_fsdp=True to Megatron-Bridge, so the requested optim_grads_params
 # sharding is ignored and the legacy DDP path holds a full per-rank param+grad
-# buffer.  Reducing per-rank parameters with PP=13 avoids the OOM.  This is a
-# quick validation layout; it has a large pipeline bubble and should be replaced
-# by the PP=3 Megatron-FSDP config once the patched container is available.
+# buffer.  Reducing per-rank parameters with PP=26 avoids the OOM.  This is a
+# make-it-work validation layout with no data parallelism; it has a very large
+# pipeline bubble and should be replaced by the PP=3 Megatron-FSDP config once
+# the patched container is available.
 # -----------------------------------------------------------------------------
 cat > "${TRAINING_CONFIG}/${YAML_NAME}" <<- EOF
 defaults: ${NEMORL_DIR}/examples/configs/grpo_math_1B_megatron.yaml
@@ -220,7 +221,7 @@ policy:
   # Use the locally cached copy downloaded once below; avoids all workers
   # hitting the HuggingFace Hub simultaneously.
   model_name: "${LOCAL_MODEL_DIR}"
-  train_global_batch_size: 768
+  train_global_batch_size: 64
   train_micro_batch_size: 1
   logprob_batch_size: 1
   # 1024 prompt + 1024 response (matches verl max_response_length: 1024).
@@ -234,12 +235,12 @@ policy:
   # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
   #
   # Divisibility constraints:
-  #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly (PP=13
-  #     gives 6 layers/stage).
+  #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly (PP=26
+  #     gives 3 layers/stage).
   #   - The vLLM generation engine needs TP=32 to fit the 700B model in GPU
   #     memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
-  #   - With training on the remaining 26 nodes (104 GPUs), TP=4 and PP=13 give
-  #     a model-parallel product of 52, so DP = 104 / 52 = 2.
+  #   - With training on the remaining 26 nodes (104 GPUs), TP=4 and PP=26 give
+  #     a model-parallel product of 104, so DP = 104 / 104 = 1.
   #   - EP=8 is taken from the upstream GLM-5.1 Megatron-Bridge recipe.
   # Changing these values requires re-checking all three constraints.
   #
@@ -250,10 +251,10 @@ policy:
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    # 26 training nodes x 4 GPUs = 104 GPUs; TP=4, PP=13 -> DP=2
-    # GLM-5.1 has 78 layers (78/13=6 layers/stage).
+    # 26 training nodes x 4 GPUs = 104 GPUs; TP=4, PP=26 -> DP=1
+    # GLM-5.1 has 78 layers (78/26=3 layers/stage).
     tensor_model_parallel_size: 4
-    pipeline_model_parallel_size: 13
+    pipeline_model_parallel_size: 26
     expert_model_parallel_size: 8
     context_parallel_size: 1
     sequence_parallel: true
@@ -280,13 +281,13 @@ policy:
     moe_router_bias_update_rate: 0.0
 
     # Offload optimizer states to CPU for 700B on 104 GPUs.
-    # The per-rank parameter count after TP=4, PP=13, EP=8 sharding is ~15B
+    # The per-rank parameter count after TP=4, PP=26, EP=8 sharding is ~3.8B
     # parameters (see the Megatron "number of parameters on (tensor, pipeline)"
     # log lines).  The legacy DDP path (current image) allocates a full per-rank
     # param+grad buffer (~2x the model weights), so reducing per-rank parameters
-    # with PP=13 is required to fit on the 95 GB GH200 GPUs.  Keeping the FP32
+    # with PP=26 is required to fit on the 95 GB GH200 GPUs.  Keeping the FP32
     # master copy and Adam states (momentum + variance) on GPU would add another
-    # ~12-15 GB, so we offload them to CPU.
+    # ~6-8 GB, so we offload them to CPU.
     #
     # NeMo-RL/Megatron-Bridge exposes this via the optimizer CPU offloading
     # path (HybridDeviceOptimizer).  When enabled, only bf16 parameters and
