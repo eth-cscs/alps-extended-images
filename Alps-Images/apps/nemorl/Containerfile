@@ -139,7 +139,7 @@ RUN uv sync --link-mode hardlink --locked
 # Skip with: --build-arg SKIP_PREFETCH_VENVS=1
 ARG SKIP_PREFETCH_VENVS=
 RUN if [[ -z "${SKIP_PREFETCH_VENVS:-}" ]]; then \
-        UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py vllm dtensor megatron ; \
+        UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer vllm dtensor megatron ; \
     else \
         echo "Skipping venv prefetch (SKIP_PREFETCH_VENVS set)"; \
     fi
