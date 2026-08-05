@@ -107,6 +107,10 @@ VLLM_CACHE_ROOT = "/tmp/vllm_cache_${SLURM_JOB_ID}_${SLURM_PROCID}"
 # Megatron-Bridge initial HF -> Mcore conversion writes a large sharded
 # checkpoint. Point it to the same scratch area used for the model/logs.
 NRL_MEGATRON_CHECKPOINT_DIR = "${NRL_MEGATRON_CHECKPOINT_DIR}"
+# PyTorch allocator: use expandable segments to reduce fragmentation-related
+# OOM when a nearly-contiguous block is requested (observed in Megatron DDP
+# buffer allocation on GH200).
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
