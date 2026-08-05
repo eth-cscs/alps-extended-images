@@ -222,9 +222,21 @@ policy:
   dtensor_cfg:
     enabled: false
 
-  # Megatron backend for 700B training.
-  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
-  megatron_cfg:
+    # Megatron backend for 700B training.
+    # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
+    #
+    # Divisibility constraints that fix the minimum node split:
+    #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly
+    #     (PP=3 gives 26 layers/stage; PP=6 would also work but doubles the
+    #     pipeline bubble).
+    #   - The vLLM generation engine needs TP=32 to fit the 700B model in
+    #     GPU memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
+    #   - With training on the remaining 24 nodes (96 GPUs), TP=4 and PP=3
+    #     give a model-parallel product of 12, so DP = 96 / 12 = 8.
+    #   - EP=8 must therefore align with the chosen TP/PP/DP layout; it is
+    #     taken from the upstream GLM-5.1 Megatron-Bridge recipe.
+    # Changing these values requires re-checking all three constraints.
+    megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
     # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=3 → DP=8
@@ -256,12 +268,22 @@ policy:
     moe_router_load_balancing_type: "none"
     moe_router_bias_update_rate: 0.0
 
-    # Offload everything to CPU for 700B on 96 GPUs.
-    # 700B/96≈7.3B params/GPU × 3 (param+grad+optim) × 2 bytes ≈ 44 GB << 95 GB ✓.
-    # (Matches verl actor.megatron.param_offload/grad_offload/optimizer_offload: True.)
-    # NOTE: NeMo-RL's megatron_cfg does not have explicit param_offload/grad_offload/
-    # optimizer_offload fields — use_distributed_optimizer + empty_unused_memory_level=1
-    # provide the equivalent offload semantics in the Megatron-LM backend.
+    # Offload optimizer states to CPU for 700B on 96 GPUs.
+    # The per-rank parameter count after TP=4, PP=3, EP=8 sharding is ~30-33B
+    # parameters (see the Megatron "number of parameters on (tensor, pipeline)"
+    # log lines).  Even with bf16 params/grads (~60-66 GB) the process already
+    # fills most of the 95 GB GPU.  Keeping the FP32 master copy and Adam
+    # states (momentum + variance) on GPU then requires another ~50-60 GB,
+    # which OOMs inside Megatron's param/grad buffer allocation.
+    #
+    # NeMo-RL/Megatron-Bridge exposes this via the optimizer CPU offloading
+    # path (HybridDeviceOptimizer).  When enabled, only bf16 parameters and
+    # gradients stay on GPU; FP32 master params and Adam states live on CPU.
+    # NeMo-RL currently requires optimizer_offload_fraction=1.0 for full CPU
+    # offload (fractional hybrid offload is not supported), and
+    # overlap_cpu_optimizer_d2h_h2d overlaps the transfers with compute.
+    #
+    # This is the direct equivalent of verl's actor.megatron.optimizer_offload.
 
     optimizer:
       optimizer: "adam"
@@ -277,6 +299,9 @@ policy:
       use_distributed_optimizer: true
       use_precision_aware_optimizer: false
       clip_grad: 1.0
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+      overlap_cpu_optimizer_d2h_h2d: true
 
     scheduler:
       start_weight_decay: \${policy.megatron_cfg.optimizer.weight_decay}
