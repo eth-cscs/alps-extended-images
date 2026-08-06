@@ -217,6 +217,9 @@ checkpointing:
   checkpoint_dir: ${CHECKPOINT_HOME}
   save_period: 50
   keep_top_k: 10
+  # Megatron-FSDP requires the fsdp_dtensor checkpoint format (asserted by
+  # megatron.bridge.training.config._validate_and_apply_megatron_fsdp_configs).
+  ckpt_format: fsdp_dtensor
 
 policy:
   # Use the locally cached copy downloaded once below; avoids all workers
