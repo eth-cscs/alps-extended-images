@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=34
+#SBATCH --nodes=136
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -62,9 +62,26 @@ export NEMORL_FORK_URL="https://github.com/philip-paul-mueller/RL.git"
 export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
 
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
-# remaining 26 nodes for Megatron training (TP=4, PP=13 → 104 GPUs, DP=2).
-# GLM-5.1 has 78 layers (78/13=6 layers/stage) and 512 total experts
-# (EP=8 → 64/rank, matching megatron-bridge's GLM-5.1 mapping).
+# remaining 128 nodes for Megatron training (TP=8, PP=8, EP=64 → 512 GPUs, DP=8).
+#
+# This mirrors the validated demo config
+# (examples/configs/recipes/llm/grpo-glm5.1-64n8g-megatron.yaml: TP=8, PP=8,
+# EP=64, DP=8 on 512 GPUs) adapted to our 4-GPU async non-colocated setup.
+# TP=8 spans 2 nodes per TP group (cross-node TP via NCCL — slower than
+# node-local TP=4 but required: at TP=4/PP=8 the legacy DDP param+grad buffer
+# is ~88 GB, exceeding the 95 GB GH200).
+#
+# Divisibility: expert_TP=1 (parent default), so
+#   expert_tensor_model_pipeline_parallel = 1 * EP * PP = 512.
+#   world=512 % 512 = 0 ✓ (expert_DP=1).
+#   world=512 % (TP*PP) = 512 % 64 = 0 ✓ (DP=8).
+# Fewer training nodes (e.g. 64 → world=256) fails: 256 % 512 ≠ 0.
+#
+# GLM-5.1 has 78 layers; PP=8 with num_layers_in_first/last_pipeline_stage=9
+# gives 9 + 6×10 + 9 = 78.  512 total experts; EP=64 → 8/rank (matches
+# megatron-bridge's GLM-5.1 mapping, same as the demo).
+export ROLLOUT_NNODES=8
+export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
@@ -168,25 +185,23 @@ EOF
 #   called too late (after init_workers)" — verify whether the same
 #   applies to NeMo-RL's megatron path.
 #
-# Parallelism (legacy DDP, no FSDP — see HANDOFF.md for the FSDP dead end):
-#   Training: 26 nodes × 4 GPUs = 104 GPUs; TP=4, PP=13, EP=8 → DP=2
+# Parallelism (mirrors examples/configs/recipes/llm/grpo-glm5.1-64n8g-megatron.yaml,
+# adapted to our 4-GPU async non-colocated setup):
+#   Training: 64 nodes × 4 GPUs = 256 GPUs; TP=8, PP=8, EP=64 → DP=4
 #   Rollout:   8 nodes × 4 GPUs =  32 GPUs; TP=32 (one replica)
 #
-# We use PP=13 (instead of verl's PP=3) because the legacy DDP path keeps a
-# full per-rank param+grad buffer on GPU (~2× per-rank weights); NeMo-RL has
-# no equivalent of verl's param_offload/grad_offload (verified — those are
-# verl-only features in verl/workers/engine/megatron/transformer_impl.py).
-# PP=13 reduces per-rank params enough that the buffer fits on the 95 GB
-# GH200 with headroom for the FP32 master (sharded across DP=2 via
-# use_distributed_optimizer + optimizer_cpu_offload).
+# TP=8 spans 2 nodes per TP group (cross-node TP via NCCL).  At TP=4/PP=8 the
+# legacy DDP param+grad buffer is ~88 GB, exceeding the 95 GB GH200; TP=8
+# halves per-rank params to ~10.9B → buffer ~43.8 GB (fits, matches the demo).
 #
-# use_cpu_initialization=true instantiates the model on CPU and moves it to
-# GPU in one shot, which may reduce fragmentation compared to incremental
-# GPU allocation during startup.
+# PP=8 with num_layers_in_first/last_pipeline_stage=9: 9 + 6×10 + 9 = 78 ✓.
+# EP=64 → 8 experts/rank (matches megatron-bridge's GLM-5.1 mapping, same as
+# the demo).  expert_tensor_parallel_size defaults to 1 (parent
+# grpo_math_1B.yaml:191); the demo does not override it.
 #
-# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (in env.toml) is the
-# PyTorch-recommended mitigation for the small-allocation OOM we saw in
-# slurm-3007452 (96 MiB requested, 19 MiB free, 48 GB used of 95 GB).
+# Legacy DDP (use_megatron_fsdp absent/false).  See HANDOFF.md for the FSDP
+# dead end (upstream _get_dp_tp_mesh bug with PP>1) and why NeMo-RL has no
+# equivalent of verl's param_offload/grad_offload.
 # -----------------------------------------------------------------------------
 cat > "${TRAINING_CONFIG}/${YAML_NAME}" <<- EOF
 defaults: ${NEMORL_DIR}/examples/configs/grpo_math_1B_megatron.yaml
@@ -255,34 +270,31 @@ policy:
   # Megatron backend for 700B training.
   # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
   #
-  # Divisibility constraints:
-  #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly (PP=13
-  #     gives 6 layers/stage).
-  #   - The vLLM generation engine needs TP=32 to fit the 700B model in GPU
-  #     memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
-  #   - With training on the remaining 26 nodes (104 GPUs), TP=4 and PP=13 give
-  #     a model-parallel product of 52, so DP = 104 / 52 = 2.
-  #   - EP=8 is taken from the upstream GLM-5.1 Megatron-Bridge recipe.
-  # Changing these values requires re-checking all three constraints.
+  # Divisibility (mirrors the validated demo config
+  # examples/configs/recipes/llm/grpo-glm5.1-64n8g-megatron.yaml):
+  #   - GLM-5.1 has 78 transformer layers; PP=8 with
+  #     num_layers_in_first/last_pipeline_stage=9 gives 9+6x10+9=78.
+  #   - expert_tensor_parallel_size=1 (parent grpo_math_1B.yaml:191, not
+  #     overridden), so expert_tensor_model_pipeline_parallel = 1*EP*PP = 512.
+  #     world=512 % 512 = 0 (expert_DP=1).
+  #   - world=512 % (TP*PP) = 512 % 64 = 0 (DP=8).
+  #   - EP=64 -> 8 experts/rank (matches megatron-bridge GLM-5.1 mapping).
   #
-  # Legacy DDP (use_megatron_fsdp absent/false). The param+grad buffer is
-  # unsharded (~2× per-rank weights); PP=13 reduces per-rank params enough
-  # to fit on 95 GB GH200. optimizer_cpu_offload moves the FP32 master +
-  # Adam states to CPU, sharded across DP=2 by use_distributed_optimizer.
+  # Legacy DDP (use_megatron_fsdp absent).  At TP=8/PP=8, per-rank params are
+  # ~10.9B -> param+grad buffer ~43.8 GB (fits 95 GB GH200, matches the demo).
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    # 26 training nodes x 4 GPUs = 104 GPUs; TP=4, PP=13 -> DP=2
-    # GLM-5.1 has 78 layers (78/13=6 layers/stage).
-    tensor_model_parallel_size: 4
-    pipeline_model_parallel_size: 13
-    expert_model_parallel_size: 8
+    # 128 training nodes x 4 GPUs = 512 GPUs; TP=8, PP=8 -> DP=8
+    # GLM-5.1 has 78 layers; num_layers_in_first/last=9 -> 9+6*10+9=78.
+    tensor_model_parallel_size: 8
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 9
+    num_layers_in_last_pipeline_stage: 9
+    expert_model_parallel_size: 64
     context_parallel_size: 1
     sequence_parallel: true
     pipeline_dtype: \${policy.precision}
-    # Instantiate the model on CPU then move to GPU in one shot.  Reduces
-    # fragmentation during startup vs incremental GPU allocation.
-    use_cpu_initialization: true
 
     # Activation checkpointing (matches verl recompute_granularity: full,
     # recompute_method: uniform, recompute_num_layers: 1).
@@ -305,10 +317,12 @@ policy:
     moe_router_bias_update_rate: 0.0
 
     # Adam optimizer for GRPO.  Legacy DDP path: the bf16 param+grad buffer
-    # is unsharded on GPU (~30 GB at PP=13/DP=2), but the FP32 master + Adam
-    # m/v states are offloaded to CPU and sharded across DP=2 by
-    # use_distributed_optimizer.  This is the closest NeMo-RL equivalent to
-    # verl's optimizer_offload (NeMo-RL has no param_offload/grad_offload).
+    # is unsharded on GPU (~43.8 GB at TP=8/PP=8, matching the demo).  The
+    # FP32 master + Adam m/v states are offloaded to CPU and sharded across
+    # DP=8 by use_distributed_optimizer.  This is the closest NeMo-RL
+    # equivalent to verl's optimizer_offload (NeMo-RL has no
+    # param_offload/grad_offload — those are verl-only features in
+    # verl/verl/workers/engine/megatron/transformer_impl.py).
     optimizer:
       optimizer: "adam"
       lr: 5.0e-7
@@ -367,10 +381,10 @@ policy:
       tensor_parallel_size: 32
       pipeline_parallel_size: 1
       expert_parallel_size: 32
-      # Matches verl rollout.gpu_memory_utilization.
-      gpu_memory_utilization: 0.75
+      # Matches the demo (gpu_memory_utilization=0.5, enforce_eager=true).
+      gpu_memory_utilization: 0.5
       max_model_len: \${policy.max_total_sequence_length}
-      enforce_eager: false
+      enforce_eager: true
       use_tqdm: true
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
