@@ -1,8 +1,6 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [build-base, test-base, build-apps, test-apps, publish]
-
 .container-builder-cscs-mi300:
   extends: [.f7t-runner, .beverin]
   interruptible: true
@@ -14,12 +12,7 @@ stages: [build-base, test-base, build-apps, test-apps, publish]
     FIRECREST_SYSTEM: 'beverin'
     SLURM_PARTITION: mi300
 
-build ct image:
-  extends: .container-builder-cscs-mi300
-  stage: <the-stage>
-  variables:
-    DOCKERFILE: docker/Dockerfile.test
-    PERSIST_IMAGE_NAME: discard
+stages: [build-base, test-base, build-apps, test-apps, publish]
 
 # ----------------------------
 # Global variables
