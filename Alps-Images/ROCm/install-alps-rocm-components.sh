@@ -348,9 +348,28 @@ build_ucx() {
     build_ucx_common --with-rocm="${ROCM_BUILD_PREFIX}"
 }
 
+rocm_offload_arch_flags() {
+    local targets="${1:?ROCm GPU targets required}"
+    local target flags=()
+
+    for target in ${targets//[;,]/ }; do
+        [[ -n "${target}" ]] || continue
+        flags+=("--offload-arch=${target}")
+    done
+
+    [[ "${#flags[@]}" -gt 0 ]] || die "No ROCm offload architectures derived from: ${targets}"
+    printf '%s\n' "${flags[*]}"
+}
+
 build_ucc() {
+    : "${RCCL_GPU_TARGETS:?RCCL_GPU_TARGETS must be set}"
+
+    local ucc_rocm_arch_flags
+    ucc_rocm_arch_flags="$(rocm_offload_arch_flags "${UCC_GPU_TARGETS:-${RCCL_GPU_TARGETS}}")"
+
     build_ucc_common \
         --with-rocm="${ROCM_BUILD_PREFIX}" \
+        --with-rocm-arch="${ucc_rocm_arch_flags}" \
         --with-rccl="${RCCL_PREFIX}"
 }
 
