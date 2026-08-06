@@ -3,6 +3,24 @@ include:
 
 stages: [build-base, test-base, build-apps, test-apps, publish]
 
+.container-builder-cscs-mi300:
+  extends: [.f7t-runner, .beverin]
+  interruptible: true
+  script:
+    - build_new_container
+  variables:
+    CSCS_RUNNER_MODE: 'container-builder'
+    CSCS_REBUILD_POLICY: "if-not-exists"
+    FIRECREST_SYSTEM: 'beverin'
+    SLURM_PARTITION: mi300
+
+build ct image:
+  extends: .container-builder-cscs-mi300
+  stage: <the-stage>
+  variables:
+    DOCKERFILE: docker/Dockerfile.test
+    PERSIST_IMAGE_NAME: discard
+
 # ----------------------------
 # Global variables
 # ----------------------------
@@ -33,9 +51,9 @@ variables:
   - FAMILY: "ngc"
     NGC_NAME: "nemo"
     NGC_TAG: "26.02"
-  #- FAMILY: "ngc"
-  #  NGC_NAME: "nemo"
-  #  NGC_TAG: "25.11.01"
+  - FAMILY: "ngc"
+    NGC_NAME: "nemo"
+    NGC_TAG: "25.11.01"
   - FAMILY: "ngc"
     NGC_NAME: "physicsnemo"
     NGC_TAG: "25.11"
@@ -309,7 +327,8 @@ build-cuda-base-images:
 
 build-rocm-base-images:
   stage: build-base
-  extends: [.container-builder-cscs-zen2, .build-images-template]
+  #extends: [.container-builder-cscs-zen2, .build-images-template]
+  extends: [.container-builder-cscs-mi300, .build-images-template]
   parallel:
     matrix: *rocm_base_images_matrix
   needs:
@@ -353,7 +372,8 @@ build-rocm-base-images:
 
 build-cuda-app-images:
   <<: *app_build_images_template
-  extends: [.container-builder-cscs-gh200, .build-images-template]
+  #extends: [.container-builder-cscs-gh200, .build-images-template]
+  extends: [.container-builder-cscs-mi300, .build-images-template]
   parallel:
     matrix: *cuda_app_images_matrix
   needs:
@@ -363,7 +383,8 @@ build-cuda-app-images:
 
 build-rocm-app-images:
   <<: *app_build_images_template
-  extends: [.container-builder-cscs-zen2, .build-images-template]
+  #extends: [.container-builder-cscs-zen2, .build-images-template]
+  extends: [.container-builder-cscs-mi300, .build-images-template]
   parallel:
     matrix: *rocm_app_images_matrix
   needs:

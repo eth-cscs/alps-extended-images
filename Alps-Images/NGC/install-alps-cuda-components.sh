@@ -139,6 +139,10 @@ build_nvshmem() {
         mpi_home="$(realpath -e "${mpi_home}")"
     fi
 
+    # Nemo 25.11 injects /opt/venv site-packages through PYTHONPATH. NVSHMEM's
+    # CMake build creates nested venvs, and that inherited PYTHONPATH can shadow
+    # their freshly installed build dependencies.
+    env -u PYTHONPATH \
     NVSHMEM_BUILD_EXAMPLES=0 \
     NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
     NVSHMEM_DEBUG=0 \
@@ -183,7 +187,7 @@ build_nvshmem() {
         -DMPI_CXX_COMPILER="${mpi_home}/bin/mpicxx" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
 
-    cmake --build "${NVSHMEM_BUILDDIR}" -j"$(cmake_build_jobs)"
+    env -u PYTHONPATH cmake --build "${NVSHMEM_BUILDDIR}" -j"$(cmake_build_jobs)"
     cmake --install "${NVSHMEM_BUILDDIR}"
 
     # Ensure loader finds our NVSHMEM without LD_LIBRARY_PATH
