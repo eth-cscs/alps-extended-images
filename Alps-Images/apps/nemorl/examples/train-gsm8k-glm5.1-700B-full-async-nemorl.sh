@@ -217,9 +217,10 @@ checkpointing:
   checkpoint_dir: ${CHECKPOINT_HOME}
   save_period: 50
   keep_top_k: 10
-  # Megatron-FSDP requires the fsdp_dtensor checkpoint format (asserted by
-  # megatron.bridge.training.config._validate_and_apply_megatron_fsdp_configs).
-  ckpt_format: fsdp_dtensor
+  # NOTE: ckpt_format lives under policy.megatron_cfg.checkpoint below, not here.
+  # The top-level checkpointing block is the NeMo-RL PolicyConfig; the Megatron
+  # Bridge CheckpointConfig (what the assertion reads) is fed from
+  # policy.megatron_cfg.checkpoint via _create_checkpoint_config.
 
 policy:
   # Use the locally cached copy downloaded once below; avoids all workers
@@ -322,6 +323,14 @@ policy:
       # Enable Megatron-FSDP so optim_grads_params actually shards params/grads
       # across DP=8.  Requires the patched branch (NEMORL_BRANCH).
       use_megatron_fsdp: true
+
+    # Megatron-Bridge CheckpointConfig knobs.  _create_checkpoint_config
+    # (nemo_rl/models/megatron/setup.py) forwards these presence-checked; the
+    # parent grpo_math_1B.yaml sets async_save/ckpt_assume_constant_structure.
+    # ckpt_format MUST be fsdp_dtensor when use_megatron_fsdp=true (asserted by
+    # megatron.bridge.training.config._validate_and_apply_megatron_fsdp_configs).
+    checkpoint:
+      ckpt_format: fsdp_dtensor
 
   generation:
     backend: "vllm"
