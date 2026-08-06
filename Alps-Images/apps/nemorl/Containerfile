@@ -7,7 +7,10 @@ FROM ${BASE_IMAGE}
 ARG WORK_DIR="/workdir"
 ARG NEMORL_DIR="${WORK_DIR}/nemo_rl"
 
-ARG NEMORL_COMMIT="89f4d1f857a369b1d565c97b7b4a12c1697bb68b"
+#ARG NEMORL_URL="https://github.com/NVIDIA-NeMo/RL.git"
+#ARG NEMORL_COMMIT="89f4d1f857a369b1d565c97b7b4a12c1697bb68b"
+ARG NEMORL_URL="https://github.com/philip-paul-mueller/RL.git"
+ARG NEMORL_COMMIT="glm51-megatron-fsdp-wiring"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -76,9 +79,9 @@ ENV PYTHONPATH="${DEEP_GEMM_SCRIPTS}:"
 WORKDIR "${WORK_DIR}"
 
 # Clone Nemo and check out the last known PATH.
-RUN git clone https://github.com/NVIDIA-NeMo/RL.git "${NEMORL_DIR}"  	&& \
-	cd "${NEMORL_DIR}" 						&& \
-	git checkout --detach "${NEMORL_COMMIT}"			&& \
+RUN git clone "${NEMORL_URL}" "${NEMORL_DIR}"  		&& \
+	cd "${NEMORL_DIR}" 				&& \
+	git switch "${NEMORL_COMMIT}"			&& \
 	git submodule update --init --recursive
 
 # Now we need to download `DeepGEMM` to extract the patches for building it.
