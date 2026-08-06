@@ -2,7 +2,14 @@
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-export PIP_INDEX_URL="${PIP_INDEX_URL:-https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple}"
+
+pip_install() {
+    local python_bin="${1:?python executable required}"
+    local index_url="${PIP_INDEX_URL:-${CSCS_PYPI_INDEX_URL:-https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple}}"
+    shift
+
+    PIP_INDEX_URL="${index_url}" "${python_bin}" -m pip install "$@"
+}
 
 apt_cmd() {
     apt "$@" && return 0

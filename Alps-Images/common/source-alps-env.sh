@@ -14,3 +14,7 @@ fi
 if [ -f /opt/alps/env/alps-runtime.env ]; then
     . /opt/alps/env/alps-runtime.env
 fi
+
+if [ -f /opt/alps/env/alps-runtime-warning.sh ]; then
+    . /opt/alps/env/alps-runtime-warning.sh
+fi

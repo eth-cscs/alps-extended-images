@@ -38,42 +38,41 @@ ARG AWS_OFI_NCCL_COMMIT
 ARG AWS_OFI_NCCL_PATCH
 ARG OSU_VERSION
 
-ARG REMOVE_HPCX_DIRS=""
-
-ARG GDRCOPY_VER=2.5.1
-
-ARG NCCL_VER=2.30.7-1
-ARG NCCL_PATCH=""
-
-ARG NVSHMEM_VER=3.6.5-0
-ARG NVSHMEM_PATCH="nvshmem/requirements-v3.6.5-0.patch"
-
-ARG NCCL_TESTS_VER=2.18.2
+ARG ROCM_VARIANT_DIR=""
+ARG ROCM_VERSION
+ARG ROCM_REBUILD_RCCL
+ARG ROCM_SYSTEMS_REPO
+ARG ROCM_SYSTEMS_COMMIT
+ARG RCCL_GPU_TARGETS
+ARG RCCL_TESTS_GPU_TARGETS
+ARG ROCM_PYPI_INDEX_URL
 
 COPY Alps-Images/patches/ /opt/alps/patches/
 COPY Alps-Images/common/alps-stack-versions.env /opt/alps/alps-stack-versions.env
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
 COPY Alps-Images/common/run-alps-variant-hooks.sh /opt/alps/run-alps-variant-hooks.sh
-COPY Alps-Images/NGC/install-alps-cuda-components.sh /opt/alps/install-alps-cuda-components.sh
-COPY Alps-Images/NGC/install-alps-cuda-stack.sh /opt/alps/install-alps-cuda-stack.sh
+COPY Alps-Images/ROCm/install-alps-rocm-components.sh /opt/alps/install-alps-rocm-components.sh
+COPY Alps-Images/ROCm/install-alps-rocm-stack.sh /opt/alps/install-alps-rocm-stack.sh
 
 RUN set -eux; \
-    chmod +x /opt/alps/install-alps-cuda-stack.sh; \
-    /opt/alps/install-alps-cuda-stack.sh
+    chmod +x /opt/alps/install-alps-rocm-stack.sh; \
+    /opt/alps/install-alps-rocm-stack.sh
 
 COPY Alps-Images/common/alps-runtime.common.env /opt/alps/env/alps-runtime.common.env
 COPY Alps-Images/common/alps-runtime.nccl-like.env /opt/alps/env/alps-runtime.nccl-like.env
-COPY Alps-Images/NGC/alps-runtime.cuda.env /opt/alps/env/alps-runtime.cuda.env
+COPY Alps-Images/ROCm/alps-runtime.rocm.env /opt/alps/env/alps-runtime.rocm.env
 COPY Alps-Images/common/source-alps-env.sh /opt/alps/env/source-alps-env.sh
 COPY Alps-Images/common/install-alps-runtime-env.sh /opt/alps/env/install-alps-runtime-env.sh
 
 RUN set -eux; \
     chmod +x /opt/alps/env/install-alps-runtime-env.sh; \
-    ALPS_NVIDIA_ENTRYPOINT_HOOK=1 /opt/alps/env/install-alps-runtime-env.sh \
+    /opt/alps/env/install-alps-runtime-env.sh \
       /opt/alps/env/alps-runtime.common.env \
       /opt/alps/env/alps-runtime.nccl-like.env \
-      /opt/alps/env/alps-runtime.cuda.env
+      /opt/alps/env/alps-runtime.rocm.env
+
+ENV BASH_ENV=/opt/alps/env/source-alps-env.sh
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
@@ -82,11 +81,10 @@ COPY Alps-Images/common/install-alps-runtime-warnings.sh /opt/alps/env/install-a
 
 RUN set -eux; \
     chmod +x /opt/alps/env/install-alps-runtime-warnings.sh; \
-    /opt/alps/env/install-alps-runtime-warnings.sh
+    /opt/alps/env/install-alps-runtime-warnings.sh --python /opt/venv/bin/python
 
 # Optional image-specific fixes (late hooks)
-ARG NGC_VARIANT_DIR=""
-COPY Alps-Images/NGC/${NGC_VARIANT_DIR}/ /opt/alps/ngc-variant/
+COPY Alps-Images/ROCm/${ROCM_VARIANT_DIR}/ /opt/alps/rocm-variant/
 RUN set -eux; \
     chmod +x /opt/alps/run-alps-variant-hooks.sh; \
-    /opt/alps/run-alps-variant-hooks.sh /opt/alps/ngc-variant "NGC_VARIANT_DIR=${NGC_VARIANT_DIR}"
+    /opt/alps/run-alps-variant-hooks.sh /opt/alps/rocm-variant "ROCM_VARIANT_DIR=${ROCM_VARIANT_DIR}"
