@@ -92,6 +92,7 @@ PY
     export PATH="${ROCM_SDK_BIN}:${PATH}"
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
+    register_rocm_sdk_ldconfig
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
 }
@@ -121,6 +122,47 @@ persist_rocm_sdk_env() {
             printf 'export RCCL_LIB_DIR=%q\n' "${RCCL_LIB_DIR}"
         fi
     } > /opt/alps/env/alps-rocm-build.env
+}
+
+rocm_sdk_ldconfig_dirs() {
+    local candidate libdir seen=""
+
+    for candidate in \
+        "${ROCM_BUILD_PREFIX:-}" \
+        "${ROCM_DEVEL_PREFIX:-}" \
+        "${ROCM_CORE_PREFIX:-}" \
+        "${ROCM_LIBRARIES_PREFIX:-}" \
+        "${ROCM_SDK_ROOT:-}" \
+        "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
+        "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
+        "${ROCM_LIBRARIES_DIR:-}/_rocm_sdk_libraries"; do
+        [[ -n "${candidate}" ]] || continue
+        for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
+            [[ -d "${libdir}" ]] || continue
+            compgen -G "${libdir}/*.so*" >/dev/null || continue
+            case " ${seen} " in
+                *" ${libdir} "*) ;;
+                *)
+                    seen+=" ${libdir}"
+                    printf '%s\n' "${libdir}"
+                    ;;
+            esac
+        done
+    done
+}
+
+register_rocm_sdk_ldconfig() {
+    local conf="/etc/ld.so.conf.d/99-alps-rocm-sdk.conf"
+    local dirs=() dir
+
+    while IFS= read -r dir; do
+        [[ -n "${dir}" ]] || continue
+        dirs+=("${dir}")
+    done < <(rocm_sdk_ldconfig_dirs)
+
+    [[ "${#dirs[@]}" -gt 0 ]] || die "No ROCm SDK runtime library directories found"
+    printf '%s\n' "${dirs[@]}" > "${conf}"
+    ldconfig
 }
 
 load_rocm_sdk_env() {
@@ -277,8 +319,7 @@ build_cxi_bits() {
 
 build_libfabric() {
     build_libfabric_common \
-        --with-rocr="${ROCM_BUILD_PREFIX}" \
-        --enable-rocr-dlopen
+        --with-rocr="${ROCM_BUILD_PREFIX}"
 }
 
 build_rccl() {
