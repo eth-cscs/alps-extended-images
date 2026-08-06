@@ -84,6 +84,11 @@ fi
 
 cd "${NEMORL_DIR}"
 
+git remote remove fork 2>/dev/null || true
+git remote add fork "${NEMORL_FORK_URL}"
+git fetch fork "${NEMORL_BRANCH}"
+git switch -C "${NEMORL_BRANCH}" "fork/${NEMORL_BRANCH}"
+
 # Initializing ray to ensure that it is in cash (which the container should have ensured) and
 #  will load fast when we start the container.
 uv run ray --version >/dev/null 2>&1 || true

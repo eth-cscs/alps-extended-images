@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=60
+#SBATCH --nodes=32
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -56,9 +56,14 @@ mkdir -p "${NRL_MEGATRON_CHECKPOINT_DIR}"
 # Path where the container file installs the repo.
 export NEMORL_DIR="/workdir/nemo_rl"
 
+# Fork and branch carrying the Megatron-FSDP wiring fix (see HANDOFF.md).
+# The shared driver checks out this branch inside the container before Ray starts.
+export NEMORL_FORK_URL="https://github.com/philip-paul-mueller/RL.git"
+export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
+
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
-# remaining 52 nodes for Megatron training (TP=4, PP=26 → 208 GPUs, DP=1).
-# GLM-5.1 has 78 layers (78/26=3 layers/stage) and 512 total experts
+# remaining 24 nodes for Megatron training (TP=4, PP=3, EP=8 → 96 GPUs, DP=8).
+# GLM-5.1 has 78 layers (78/3=26 layers/stage) and 512 total experts
 # (EP=8 → 64/rank, matching megatron-bridge's GLM-5.1 mapping).
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
@@ -158,18 +163,14 @@ EOF
 #   called too late (after init_workers)" — verify whether the same
 #   applies to NeMo-RL's megatron path.
 #
-# Parallelism (temporary larger-PP check to avoid OOM while the container
-# image still lacks the NeMo-RL Megatron-FSDP wiring):
-#   Training: 52 nodes × 4 GPUs = 208 GPUs; TP=4, PP=26, EP=8 → DP=1
-#   Rollout:   8 nodes × 4 GPUs =  32 GPUs; TP=32 (one replica)
+# Parallelism (target layout with Megatron-FSDP wired through):
+#   Training: 24 nodes × 4 GPUs = 96 GPUs; TP=4, PP=3, EP=8 → DP=8
+#   Rollout:   8 nodes × 4 GPUs = 32 GPUs; TP=32 (one replica)
 #
-# We use PP=26 (instead of verl's PP=3) because the current image does not pass
-# use_megatron_fsdp=True to Megatron-Bridge, so the requested optim_grads_params
-# sharding is ignored and the legacy DDP path holds a full per-rank param+grad
-# buffer.  Reducing per-rank parameters with PP=26 avoids the OOM.  This is a
-# make-it-work validation layout with no data parallelism; it has a very large
-# pipeline bubble and should be replaced by the PP=3 Megatron-FSDP config once
-# the patched container is available.
+# Megatron-FSDP (use_megatron_fsdp=true) makes the requested
+# data_parallel_sharding_strategy=optim_grads_params actually shard parameters
+# and gradients across the DP=8 dimension. Without it the legacy DDP path keeps
+# a full per-rank param+grad buffer and OOMs on GH200.
 # -----------------------------------------------------------------------------
 cat > "${TRAINING_CONFIG}/${YAML_NAME}" <<- EOF
 defaults: ${NEMORL_DIR}/examples/configs/grpo_math_1B_megatron.yaml
@@ -221,7 +222,7 @@ policy:
   # Use the locally cached copy downloaded once below; avoids all workers
   # hitting the HuggingFace Hub simultaneously.
   model_name: "${LOCAL_MODEL_DIR}"
-  train_global_batch_size: 64
+  train_global_batch_size: 768
   train_micro_batch_size: 1
   logprob_batch_size: 1
   # 1024 prompt + 1024 response (matches verl max_response_length: 1024).
@@ -235,26 +236,26 @@ policy:
   # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
   #
   # Divisibility constraints:
-  #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly (PP=26
-  #     gives 3 layers/stage).
+  #   - GLM-5.1 has 78 transformer layers, so PP must divide 78 evenly (PP=3
+  #     gives 26 layers/stage).
   #   - The vLLM generation engine needs TP=32 to fit the 700B model in GPU
   #     memory, which consumes exactly 8 rollout nodes (8 x 4 GPUs).
-  #   - With training on the remaining 52 nodes (208 GPUs), TP=4 and PP=26 give
-  #     a model-parallel product of 208, so DP = 208 / 208 = 1.
+  #   - With training on the remaining 24 nodes (96 GPUs), TP=4, PP=3 and EP=8
+  #     give a model-parallel product of 12, so DP = 96 / 12 = 8.
   #   - EP=8 is taken from the upstream GLM-5.1 Megatron-Bridge recipe.
   # Changing these values requires re-checking all three constraints.
   #
   # Megatron-FSDP is enabled via use_megatron_fsdp=true.  This makes
   # data_parallel_sharding_strategy=optim_grads_params actually shard params
-  # and gradients across DP, avoiding the legacy DDP path that allocates a
+  # and gradients across DP=8, avoiding the legacy DDP path that allocates a
   # full per-rank param+grad buffer (~2x the model weights) and OOMs on GH200.
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    # 52 training nodes x 4 GPUs = 208 GPUs; TP=4, PP=26 -> DP=1
-    # GLM-5.1 has 78 layers (78/26=3 layers/stage).
+    # 24 training nodes x 4 GPUs = 96 GPUs; TP=4, PP=3, EP=8 -> DP=8
+    # GLM-5.1 has 78 layers (78/3=26 layers/stage).
     tensor_model_parallel_size: 4
-    pipeline_model_parallel_size: 26
+    pipeline_model_parallel_size: 3
     expert_model_parallel_size: 8
     context_parallel_size: 1
     sequence_parallel: true
@@ -280,24 +281,11 @@ policy:
     moe_router_load_balancing_type: "none"
     moe_router_bias_update_rate: 0.0
 
-    # Offload optimizer states to CPU for 700B on 208 GPUs.
-    # The per-rank parameter count after TP=4, PP=26, EP=8 sharding is ~3.8B
-    # parameters (see the Megatron "number of parameters on (tensor, pipeline)"
-    # log lines).  The legacy DDP path (current image) allocates a full per-rank
-    # param+grad buffer (~2x the model weights), so reducing per-rank parameters
-    # with PP=26 is required to fit on the 95 GB GH200 GPUs.  Keeping the FP32
-    # master copy and Adam states (momentum + variance) on GPU would add another
-    # ~6-8 GB, so we offload them to CPU.
-    #
-    # NeMo-RL/Megatron-Bridge exposes this via the optimizer CPU offloading
-    # path (HybridDeviceOptimizer).  When enabled, only bf16 parameters and
-    # gradients stay on GPU; FP32 master params and Adam states live on CPU.
-    # NeMo-RL currently requires optimizer_offload_fraction=1.0 for full CPU
-    # offload (fractional hybrid offload is not supported), and
-    # overlap_cpu_optimizer_d2h_h2d overlaps the transfers with compute.
-    #
-    # This is the direct equivalent of verl's actor.megatron.optimizer_offload.
-
+    # Adam optimizer for GRPO. With use_megatron_fsdp=true and DP=8, optimizer
+    # states are sharded across the DP group and the per-rank FP32 master/Adam
+    # footprint is small enough to keep on GPU. CPU offloading is therefore not
+    # required, but leaving use_distributed_optimizer=true keeps the expected
+    # Megatron-LM optimizer path.
     optimizer:
       optimizer: "adam"
       lr: 5.0e-7
@@ -312,9 +300,6 @@ policy:
       use_distributed_optimizer: true
       use_precision_aware_optimizer: false
       clip_grad: 1.0
-      optimizer_cpu_offload: true
-      optimizer_offload_fraction: 1.0
-      overlap_cpu_optimizer_d2h_h2d: true
 
     scheduler:
       start_weight_decay: \${policy.megatron_cfg.optimizer.weight_decay}
@@ -331,11 +316,9 @@ policy:
       overlap_param_gather: true
       use_custom_fsdp: false
       data_parallel_sharding_strategy: "optim_grads_params"
-      # NOTE: Megatron-FSDP is not enabled here because this quick check uses the
-      # existing container image.  The large PP=13 model-parallel degree is what
-      # makes the legacy DDP buffer fit.  Once the patched image is available,
-      # enable use_megatron_fsdp=true and revert to PP=3 / 32 nodes.
-      use_megatron_fsdp: false
+      # Enable Megatron-FSDP so optim_grads_params actually shards params/grads
+      # across DP=8.  Requires the patched branch (NEMORL_BRANCH).
+      use_megatron_fsdp: true
 
   generation:
     backend: "vllm"
