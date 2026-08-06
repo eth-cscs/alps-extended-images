@@ -175,7 +175,7 @@ build-cuda-base-meta:
 
 build-rocm-base-meta:
   stage: build-base
-  extends: [.container-runner-lightweight-zen2, .skopeo-template]
+  extends: [.container-runner-beverin-mi300, .skopeo-template]
   parallel:
     matrix: *rocm_base_images_matrix
   script:
@@ -226,7 +226,7 @@ build-cuda-apps-meta:
 
 build-rocm-apps-meta:
   <<: *app_meta_template
-  extends: [.container-runner-lightweight-zen2, .skopeo-template]
+  extends: [.container-runner-beverin-mi300, .skopeo-template]
   parallel:
     matrix: *rocm_app_images_matrix
   variables:
@@ -309,7 +309,7 @@ build-cuda-base-images:
 
 build-rocm-base-images:
   stage: build-base
-  extends: [.container-builder-cscs-zen2, .build-images-template]
+  extends: [.container-builder-beverin-mi300, .build-images-template]
   parallel:
     matrix: *rocm_base_images_matrix
   needs:
@@ -363,7 +363,7 @@ build-cuda-app-images:
 
 build-rocm-app-images:
   <<: *app_build_images_template
-  extends: [.container-builder-cscs-zen2, .build-images-template]
+  extends: [.container-builder-beverin-mi300, .build-images-template]
   parallel:
     matrix: *rocm_app_images_matrix
   needs:
@@ -403,7 +403,7 @@ tag-cuda-base-images-for-ci:
 
 tag-rocm-base-images-for-ci:
   stage: build-base
-  extends: [.container-runner-lightweight-zen2, .tag-images-template]
+  extends: [.container-runner-beverin-mi300, .tag-images-template]
   parallel:
     matrix: *rocm_base_images_matrix
   needs:
@@ -428,7 +428,7 @@ tag-cuda-app-images-for-ci:
 
 tag-rocm-app-images-for-ci:
   <<: *app_tag_template
-  extends: [.container-runner-lightweight-zen2, .tag-images-template]
+  extends: [.container-runner-beverin-mi300, .tag-images-template]
   parallel:
     matrix: *rocm_app_images_matrix
   needs:
