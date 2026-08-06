@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-#
 bootstrap_rocm_sdk() {
     : "${ROCM_VERSION:?ROCM_VERSION must be set}"
     : "${ROCM_PYPI_INDEX_URL:?ROCM_PYPI_INDEX_URL must be set to the ROCm wheel index}"
