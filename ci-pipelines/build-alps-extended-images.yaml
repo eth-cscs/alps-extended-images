@@ -309,7 +309,7 @@ build-cuda-base-images:
 
 build-rocm-base-images:
   stage: build-base
-  extends: [.container-builder-zen2, .build-images-template]
+  extends: [.container-builder-cscs-zen2, .build-images-template]
   parallel:
     matrix: *rocm_base_images_matrix
   needs:
@@ -363,7 +363,7 @@ build-cuda-app-images:
 
 build-rocm-app-images:
   <<: *app_build_images_template
-  extends: [.container-builder-zen2, .build-images-template]
+  extends: [.container-builder-cscs-zen2, .build-images-template]
   parallel:
     matrix: *rocm_app_images_matrix
   needs:
