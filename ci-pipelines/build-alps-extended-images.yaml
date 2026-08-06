@@ -11,6 +11,7 @@ include:
     CSCS_REBUILD_POLICY: "if-not-exists"
     FIRECREST_SYSTEM: 'beverin'
     SLURM_PARTITION: mi300
+    SLURM_TIMELIMIT: '04:00:00'
 
 stages: [build-base, test-base, build-apps, test-apps, publish]
 
