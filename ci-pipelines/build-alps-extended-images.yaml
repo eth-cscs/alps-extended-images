@@ -554,7 +554,7 @@ test-cuda-base-images-vetnode:
 
 test-rocm-base-images-env:
   stage: test-base
-  extends: [.container-runner-lightweight-zen2, .slurm-template]
+  extends: [.container-runner-beverin-mi300, .slurm-template]
   parallel:
     matrix: *rocm_base_images_matrix
   image: "$IMAGE_PREFIX/${ROCM_NAME}-rocm:${ROCM_VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
@@ -581,7 +581,7 @@ test-rocm-base-images-env:
 
 test-rocm-base-images-collectives:
   stage: test-base
-  extends: [.container-runner-lightweight-zen2, .slurm-template]
+  extends: [.container-runner-beverin-mi300, .slurm-template]
   parallel:
     matrix: *rocm_base_images_matrix
   image: "$IMAGE_PREFIX/${ROCM_NAME}-rocm:${ROCM_VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
@@ -637,7 +637,7 @@ test-vllm-ray-nccl:
 
 test-vllm-rocm-ray-rccl:
   <<: *vllm_ray_smoke_template
-  extends: [.container-runner-lightweight-zen2, .slurm-template]
+  extends: [.container-runner-beverin-mi300, .slurm-template]
   image: "$IMAGE_PREFIX/vllm-rocm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
 
 test-cuda-app-images-vetnode:
