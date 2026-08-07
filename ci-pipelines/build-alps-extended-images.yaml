@@ -75,6 +75,8 @@ variables:
 .rocm_app_images_matrix: &rocm_app_images_matrix
   - NAME: "vllm"
     APP_VARIANT: "rocm"
+  - NAME: "opencode"
+    APP_VARIANT: "rocm"
   
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
