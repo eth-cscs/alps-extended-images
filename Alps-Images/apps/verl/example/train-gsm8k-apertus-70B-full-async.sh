@@ -1,14 +1,14 @@
 #!/bin/bash
 
-#SBATCH --nodes=8
+#SBATCH --nodes=16
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
-#SBATCH --time=5:00:00
+#SBATCH --time=12:00:00
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev"
 
-export MODEL_NAME="Apertus-8B-Instruct-2509"
+export MODEL_NAME="Apertus-70B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
 export PROJECT_NAME="cscs-async-grpo-gsm8k"
@@ -22,8 +22,10 @@ export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLU
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
-export  ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
-export  TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
+
+
+export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
+export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -87,7 +89,8 @@ actor_rollout_ref:
 
   actor:
     strategy: fsdp2
-    ppo_mini_batch_size: 252 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
+    ppo_mini_batch_size: 48 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
+    ppo_micro_batch_size_per_gpu: 1
     use_rollout_log_probs: True   # required for fully-async log prob correctness
     use_dynamic_bsz: True
 
@@ -98,8 +101,8 @@ actor_rollout_ref:
     n_gpus_per_node: 4
     temperature: 1.0
     n: 16 #num responses per prompt 
-    tensor_model_parallel_size: 2
-    gpu_memory_utilization: 0.8 #don't set too high, otherwise the rollout will OOM, need to leave a buffer for NCCL comms.
+    tensor_model_parallel_size: 4
+    gpu_memory_utilization: 0.75
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
       backend: nccl # weight sync via NCCL broadcast
@@ -249,6 +252,7 @@ EOF
 sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
 
+
 # Download model (skip if already present)
 if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
     echo "Downloading ${MODEL_NAME}..."
@@ -281,7 +285,7 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
-export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key) 
+export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
 export RAY_memory_usage_threshold=0.99
@@ -301,6 +305,7 @@ sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
 git fetch pr_origin Fix-fsdp-model-loading-on-async
 git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
@@ -330,7 +335,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
         --disable-usage-stats || true
-    
+
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/package-helpers.sh"
 
 die() {
     echo "ERROR: $*" >&2
@@ -19,11 +20,11 @@ apt_install_build_deps() {
         /etc/apt/sources.list.d/ubuntu.sources
     printf '%s\n%s' "Acquire::http::AllowRedirect "true";" "Acquire::http::Pipeline-Depth "0";" \
         > /etc/apt/apt.conf.d/99-jfrog-proxy
-    apt -o "Acquire::https::Verify-Peer=false" update
-    apt -o "Acquire::https::Verify-Peer=false" install ca-certificates
+    apt_cmd -o "Acquire::https::Verify-Peer=false" update
+    apt_cmd -o "Acquire::https::Verify-Peer=false" install -y ca-certificates
 
-    apt-get update
-    apt-get install -y --no-install-recommends \
+    apt_get update
+    apt_get install -y --no-install-recommends \
         build-essential ca-certificates pkg-config automake autoconf libtool cmake \
         bc gdb strace wget curl git bzip2 python3 gfortran \
         rdma-core numactl \
@@ -34,10 +35,6 @@ apt_install_build_deps() {
     rm -rf /var/lib/apt/lists/*
 }
 
-proxied_pip_install() {
-    python -m pip install -i https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple "$@"
-}
-
 remove_efa() {
     rm -rf /opt/amazon/efa || true
     grep -R "/opt/amazon/efa" -n /etc/ld.so.conf.d || true
@@ -45,6 +42,97 @@ remove_efa() {
         [[ -f "$f" ]] || continue
         if grep -q "/opt/amazon/efa" "$f"; then rm -f "$f"; fi
     done
+    ldconfig
+}
+
+purge_preinstalled_network_stack() {
+    local package_patterns=(
+        '*aws-ofi-nccl*'
+        '*efa*'
+        '*hcoll*'
+        '*nccl*'
+        '*nvshmem*'
+        '*sharp*'
+        '*spectrum-x*'
+        '*ucx*'
+        '*ucc*'
+        'libfabric*'
+    )
+    local packages=() pkg pattern
+
+    while IFS= read -r pkg; do
+        for pattern in "${package_patterns[@]}"; do
+            if [[ "$pkg" == $pattern ]]; then
+                packages+=("$pkg")
+                break
+            fi
+        done
+    done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
+
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+        printf 'Purging preinstalled network-stack packages: %s\n' "${packages[*]}"
+        apt_get purge -y "${packages[@]}" || true
+        apt_get autoremove -y || true
+    fi
+
+    local dirs=(
+        /opt/amazon/aws-ofi-nccl
+        /opt/amazon/efa
+        /opt/amazon/ofi-nccl
+        /opt/aws-ofi-nccl
+        /opt/hpcx/hcoll
+        /opt/hpcx/nccl_mrc_plugin
+        /opt/hpcx/nccl_rdma_sharp_plugin
+        /opt/hpcx/nccl_spectrum-x_plugin
+        /opt/hpcx/ncclnet_plugin
+        /opt/hpcx/ompi
+        /opt/hpcx/ompi4
+        /opt/hpcx/ompi5
+        /opt/hpcx/sharp
+        /opt/hpcx/ucc
+        /opt/hpcx/ucx
+        /usr/local/mpi
+        /usr/local/ucx
+        /usr/local/ucc
+    )
+    local d
+    for d in "${dirs[@]}"; do
+        if [[ -e "$d" ]]; then
+            echo "Removing preinstalled network-stack path: $d"
+            rm -rf "$d" || true
+        fi
+    done
+
+    local lib_roots=(
+        /usr/local/cuda/lib64
+        /usr/local/cuda/targets/aarch64-linux/lib
+        /usr/local/cuda/targets/x86_64-linux/lib
+        /usr/local/lib
+        /usr/local/lib64
+        /usr/lib
+        /usr/lib64
+        /usr/lib/aarch64-linux-gnu
+        /usr/lib/x86_64-linux-gnu
+    )
+    local root
+    for root in "${lib_roots[@]}"; do
+        [[ -d "$root" ]] || continue
+        find "$root" -maxdepth 1 \( -type f -o -type l \) \( \
+            -name 'libaws-ofi-nccl*' -o \
+            -name 'libfabric*' -o \
+            -name 'libhcoll*' -o \
+            -name 'libnccl*' -o \
+            -name 'libnvshmem*' -o \
+            -name 'libsharp*' -o \
+            -name 'libucc*' -o \
+            -name 'libucm*' -o \
+            -name 'libucp*' -o \
+            -name 'libucs*' -o \
+            -name 'libuct*' \
+        \) -print -delete || true
+    done
+
+    remove_efa
     ldconfig
 }
 
@@ -182,7 +270,21 @@ build_libfabric() {
     ldconfig
 }
 
+ensure_debian_packaging_tools() {
+    if command -v debuild >/dev/null 2>&1; then
+        return 0
+    fi
+
+    apt_get update
+    apt_get install -y --no-install-recommends devscripts debhelper fakeroot dh-make
+    rm -rf /var/lib/apt/lists/*
+
+    command -v debuild >/dev/null 2>&1 || die "debuild not found after installing devscripts"
+}
+
 build_nccl_deb() {
+    ensure_debian_packaging_tools
+
     curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz
     tar -C /tmp -xzf /tmp/nccl.tar.gz
     pushd "/tmp/nccl-${NCCL_VER}"
@@ -263,6 +365,8 @@ build_ompi5() {
         --with-cuda-libdir="${CUDA_DIR}/lib64/stubs"
     make -j"$(nproc)"
     make install
+    rm -rf /usr/local/mpi
+    ln -s "${hpcx}/ompi" /usr/local/mpi
     mkdir -p /opt/alps/env
     printf 'export OMPI_VERSION=%q\n' "${OMPI_VER}" >> /opt/alps/env/alps-versions.env
     popd
@@ -289,6 +393,7 @@ build_aws_ofi_nccl() {
 
     ./configure \
         --prefix=/usr \
+        --disable-tests \
         --with-libfabric=/usr \
         --with-cuda="${CUDA_DIR}" \
         --with-mpi=/opt/hpcx/ompi \
@@ -321,9 +426,17 @@ build_nvshmem() {
     : "${NVSHMEM_ENABLE_TESTS:=1}"
 
     # Remove preinstalled NVSHMEM
-    apt-get update
-    apt-get purge -y 'libnvshmem*-cuda-*' 'nvshmem*' || true
-    apt-get autoremove -y || true
+    apt_get update
+    local nvshmem_packages=() pkg
+    while IFS= read -r pkg; do
+        case "${pkg}" in
+            libnvshmem*-cuda-*|nvshmem*) nvshmem_packages+=("${pkg}");;
+        esac
+    done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
+    if [[ "${#nvshmem_packages[@]}" -gt 0 ]]; then
+        apt_get purge -y "${nvshmem_packages[@]}" || true
+        apt_get autoremove -y || true
+    fi
 
     # Remove CUDA symlinks/copies that can shadow our install
     rm -f "${CUDA_DIR}/lib64/libnvshmem"*.so* || true
@@ -340,6 +453,11 @@ build_nvshmem() {
     pushd "${NVSHMEM_SRC_DIR}" >/dev/null
     apply_patch_if_set "${NVSHMEM_PATCH}"
     popd >/dev/null
+
+    local mpi_home="${MPI_HOME:-/opt/hpcx/ompi}"
+    if [[ -e "${mpi_home}" ]]; then
+        mpi_home="$(realpath -e "${mpi_home}")"
+    fi
 
     NVSHMEM_BUILD_EXAMPLES=0 \
     NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
@@ -372,11 +490,17 @@ build_nvshmem() {
     LIBFABRIC_HOME=/usr \
     NCCL_HOME=/usr \
     GDRCOPY_HOME=/usr/local \
-    MPI_HOME=/opt/hpcx/ompi \
-    PMIX_HOME=/opt/hpcx/ompi \
+    MPI_HOME="${mpi_home}" \
+    PMIX_HOME="${mpi_home}" \
+    SHMEM_HOME="${mpi_home}" \
+    UCX_HOME=/opt/hpcx/ucx \
+    CUDAToolkit_ROOT="${CUDA_DIR}" \
     cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
+        -DCUDAToolkit_ROOT="${CUDA_DIR}" \
+        -DMPI_C_COMPILER="${mpi_home}/bin/mpicc" \
+        -DMPI_CXX_COMPILER="${mpi_home}/bin/mpicxx" \
         -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
 
     cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
@@ -435,7 +559,7 @@ EOF
 
             [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
 
-            proxied_pip_install --no-cache-dir --no-deps --force-reinstall "${best}"
+            python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
 
             req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
             [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
@@ -495,9 +619,9 @@ if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed
 PY
 
             if [[ -s "${constraint_file}" ]]; then
-                proxied_pip_install --no-cache-dir -c "${constraint_file}" -r "${req}"
+                python -m pip install --no-cache-dir -c "${constraint_file}" -r "${req}"
             else
-                proxied_pip_install --no-cache-dir -r "${req}"
+                python -m pip install --no-cache-dir -r "${req}"
             fi
 
             rm -f "${constraint_file}"
@@ -538,18 +662,10 @@ build_osu() {
 }
 
 clean_up() {
-    printf 'Pacakages cleanup...\n'
-    printf 'Marking packages to hold\n'
-    apt-mark hold libibverbs-dev
-    printf 'Removing build packages...\n'
-    apt-get remove --purge -y  \
+    cleanup_apt_build_deps \
         pkg-config automake autoconf libtool cmake \
         libconfig-dev libuv1-dev libfuse-dev libfuse3-dev libyaml-dev libsensors-dev libcurl4-openssl-dev \
         fakeroot dh-make
-    printf 'Running autoremove...\n'
-    apt-get autoremove -y
-    printf 'unhold packages\n'
-    apt-mark unhold libibverbs-dev
 }
 
 main() {
@@ -560,7 +676,7 @@ main() {
 
     apt_install_build_deps
 
-    remove_efa
+    purge_preinstalled_network_stack
     remove_hpcx_plugins
 
     build_boost

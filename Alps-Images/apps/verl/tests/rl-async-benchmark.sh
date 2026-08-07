@@ -1,41 +1,48 @@
-#!/bin/bash
-
-#SBATCH --nodes=8
-#SBATCH --account=csstaff
-#SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=288
-#SBATCH --time=5:00:00
-
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev"
+#!/usr/bin/env bash
+set -euo pipefail
 
 export MODEL_NAME="Apertus-8B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
-export PROJECT_NAME="cscs-async-grpo-gsm8k"
-export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
+export PROJECT_NAME="cscs-async-grpo-gsm8k-pipeline"
+export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-pipeline-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
-export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
+export TRAINING_HOME=/tmp/verl-pipeline-${SLURM_JOB_ID}
 export TRAINING_CONFIG=/tmp
-export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
+export CHECKPOINT_HOME=/tmp/checkpoints-${SLURM_JOB_ID}
 
+export  HOME=/workspace/verl
 
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
+echo "Training home: $TRAINING_HOME on $(hostname) (rank $SLURM_PROCID and local rank $SLURM_LOCALID)"
+
+
+if [ $SLURM_PROCID -eq 0 ]; then
+    export MASTER_NODE=$(hostname)
+    export MASTER_NODE_IP=$(hostname -i)
+    export PORT=6382
+    export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
+    echo ${RAY_ADDRESS} > ${TRAINING_CONFIG}/ray_address.txt
+    echo "Master Ray address: ${RAY_ADDRESS}: $(cat ${TRAINING_CONFIG}/ray_address.txt)"
+    sbcast -f ${TRAINING_CONFIG}/ray_address.txt ${TRAINING_CONFIG}/ray_address.txt
+else
+   while true; do
+            if [ -f "${TRAINING_CONFIG}/ray_address.txt" ]; then
+                break
+            fi
+            echo "Waiting for master address..."
+            sleep 5
+    done
+   export RAY_ADDRESS=$(cat ${TRAINING_CONFIG}/ray_address.txt)
+fi
+
+
+
+if [ $SLURM_LOCALID -eq 0 ]; then
 
 export  ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
 export  TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
-
-cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
-image = "${VERL_IMAGE}"
-mounts = ["/capstor", "/iopsstor", "/users","/tmp"]
-workdir = "/workspace/verl"
-writable = true
-entrypoint = true
-[env]
-PMIX_MCA_psec = "native"
-[annotations]
-com.hooks.cxi.enabled = "false"
-EOF
 
 cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
@@ -47,14 +54,8 @@ defaults:
 
 # ── Required by fully_async_main ──────────────────────────────────────────────
 async_training:
-  
-  # On Policy Settings
-  # staleness_threshold: 0
-  # trigger_parameter_sync_step: 1
-  
-  # Stream Pipeline Settings
-  staleness_threshold: 0.1 
-  trigger_parameter_sync_step: 2
+  staleness_threshold: 0
+  trigger_parameter_sync_step: 1
 
   require_batches: 1
   partial_rollout: False
@@ -65,8 +66,8 @@ async_training:
 rollout:
   nnodes: ${ROLLOUT_NNODES}
   n_gpus_per_node: 4
-  total_rollout_steps: 22419
-  test_freq: 10
+  total_rollout_steps: 504  # 2 global steps: ppo_mini_batch_size=252 * 2 steps = 504
+  test_freq: 1
 # ──────────────────────────────────────────────────────────────────────────────
 
 data:
@@ -99,7 +100,7 @@ actor_rollout_ref:
     temperature: 1.0
     n: 16 #num responses per prompt 
     tensor_model_parallel_size: 2
-    gpu_memory_utilization: 0.8 #don't set too high, otherwise the rollout will OOM, need to leave a buffer for NCCL comms.
+    gpu_memory_utilization: 0.8 #do not set too high, otherwise the rollout will OOM, need to leave a buffer for NCCL comms.
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
       backend: nccl # weight sync via NCCL broadcast
@@ -123,14 +124,14 @@ reward:
     name: compute_reward
 
 trainer:
-  total_epochs: 3
+  total_epochs: 1
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 50
   default_local_dir: ${CHECKPOINT_HOME}
-  logger: ["console", "wandb"]
+  logger: ["console"]
 
 ray_kwargs:
   ray_init:
@@ -187,6 +188,18 @@ def compute_reward(
     return outcome_reward + format_reward + length_penalty
 EOF
 
+# Download model (skip if already present)
+if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+    echo "Downloading ${MODEL_NAME}..."
+    hf download ${MODEL_REPO}/${MODEL_NAME} --local-dir ${TRAINING_HOME}/models/${MODEL_NAME}
+else
+    echo "Model already present, skipping download."
+fi
+
+fi
+
+if [ $SLURM_PROCID -eq 0 ]; then
+
 cat > "${TRAINING_CONFIG}/prepare_gsm8k.py" <<- EOF
 import re
 import os
@@ -222,6 +235,10 @@ def prepare(split: str, output_path: str):
         print(f"Downloading {split} from HuggingFace...")
         ds = datasets.load_dataset("openai/gsm8k", "main", split=split)
 
+    # Use a slice large enough for 2 training steps (ppo_mini_batch_size=252 * 2 steps)
+    max_rows = 512 if split == "train" else 16
+    ds = ds.select(range(min(len(ds), max_rows)))
+
     rows = []
     skipped = 0
     for item in ds:
@@ -246,55 +263,19 @@ if __name__ == "__main__":
     prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
 EOF
 
-sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
-sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
 
-# Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
-    echo "Downloading ${MODEL_NAME}..."
-    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_CONFIG}/env.toml" \
-        --container-writable bash -c '
-        hf download ${MODEL_REPO}/${MODEL_NAME} \
-            --local-dir ${TRAINING_HOME}/models/${MODEL_NAME} \
-    '
-else
-    echo "Model already present, skipping download."
-fi
 
-# Prepare dataset (skip if already present)
-if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ]; then
-    echo "Preparing GSM8K dataset..."
-    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_CONFIG}/env.toml" \
-        --container-writable bash -c '
-        # Try loading from cached raw download first, otherwise fetch from HF
-        python ${TRAINING_CONFIG}/prepare_gsm8k.py
-    '
-else
-    echo "Dataset already present, skipping preparation."
+echo "Preparing GSM8K dataset (benchmark subset: 32 train / 16 test rows)..."
+python ${TRAINING_CONFIG}/prepare_gsm8k.py
+
+
 fi
 
 
-export MASTER_NODE=$(hostname)
-export MASTER_NODE_IP=$(hostname -i)
-export PORT=6382
-export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
+cd ${HOME}
 
-export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key) 
-export WANDB_SILENT=true # Suppress WandB logs
 
 export RAY_memory_usage_threshold=0.99
-
-
-
-srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
-    --environment="${TRAINING_CONFIG}/env.toml" \
-    --container-writable bash -c '
-
-# Patch flash attention NoneType bug for Qwen2 on this transformers version
-sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
-    /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
 
 
 # Apply Verl fixes
@@ -303,7 +284,7 @@ git fetch pr_origin Fix-fsdp-model-loading-on-async
 git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
-export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
+export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}
 mkdir -p $FLASHINFER_WORKSPACE_BASE
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
@@ -327,10 +308,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
     ray start --head \
         --node-ip-address=$MASTER_NODE_IP \
         --port=$PORT \
-        --num-cpus=${SLURM_CPUS_PER_TASK} \
+        --num-cpus=288 \
         --num-gpus=4 \
         --disable-usage-stats || true
-    
+
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -347,16 +328,20 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config
+    TRAINING_EXIT_CODE=$?
+
+    # Stop Ray cleanly so worker raylets shut down gracefully instead of
+    # flooding logs with GCS-unavailable errors after the head exits.
+    ray stop --force 2>/dev/null || true
+
+    exit $TRAINING_EXIT_CODE
 else
     # Worker nodes join the Ray cluster
     sleep 15
     ray start \
         --address="${RAY_ADDRESS}" \
         --node-ip-address=$(hostname -i) \
-        --num-cpus=${SLURM_CPUS_PER_TASK} \
+        --num-cpus=288 \
         --num-gpus=4 \
         --block || true
 fi
-
-
-'
