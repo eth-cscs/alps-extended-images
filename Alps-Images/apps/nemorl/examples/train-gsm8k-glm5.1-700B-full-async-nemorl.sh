@@ -381,8 +381,13 @@ policy:
       tensor_parallel_size: 32
       pipeline_parallel_size: 1
       expert_parallel_size: 32
-      # Matches the demo (gpu_memory_utilization=0.5, enforce_eager=true).
-      gpu_memory_utilization: 0.5
+      # Raised from the demo's 0.5 to 0.7: with TP=32, EP=32 each rollout
+      # GPU holds ~47.5 GiB of bf16 weights (logged in slurm-3020427). At
+      # util=0.5 the vLLM budget is ~48 GiB, leaving ~0.5 GiB for KV cache,
+      # which is below the minimum block size and triggers
+      # `ValueError: No available memory for the cache blocks`. At util=0.7
+      # the budget is ~67 GiB, leaving ~20 GiB for KV cache.
+      gpu_memory_utilization: 0.7
       max_model_len: \${policy.max_total_sequence_length}
       enforce_eager: true
       use_tqdm: true
