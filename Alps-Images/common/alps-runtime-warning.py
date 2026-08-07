@@ -62,4 +62,3 @@ def maybe_warn() -> None:
 
 if __name__ == "__main__":
     maybe_warn()
-

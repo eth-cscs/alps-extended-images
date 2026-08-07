@@ -65,9 +65,12 @@ EOF
 
 if grep -Fqx "$bash_marker" "$bash_env"; then
   info "Bash hook already present in $bash_env"
+elif grep -Fq "$WARN_SH" "$bash_env"; then
+  info "Bash env already sources $WARN_SH"
 else
-  # Note: we prepend the hook to ensure it runs even if the common PS1 guard is
-  # present (non-interactive check).
+  # Prepend the fallback hook so it still runs if the existing BASH_ENV returns
+  # early for non-interactive shells. source-alps-env.sh already sources the
+  # warning after runtime env setup, and is handled by the branch above.
   tmp="$(mktemp)"
   echo "$bash_hook" > "$tmp"
   cat "$bash_env" >> "$tmp"

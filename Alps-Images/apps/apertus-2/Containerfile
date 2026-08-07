@@ -67,7 +67,7 @@ ARG PPLX_GARDEN_REPO=https://github.com/pinxuezhao/pplx_garden_cxi.git
 ARG PPLX_GARDEN_COMMIT=3ce62f9993b6e4abdcda8dac3b87a944ea221f4f
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    python3 -m pip show build >/dev/null 2>&1 || python3 -m pip install --no-cache-dir build; \
+    python3 -m pip show build >/dev/null 2>&1 || pip_install python3 --no-cache-dir build; \
     rm -rf /tmp/pplx_garden; \
     git clone --depth 1 "${PPLX_GARDEN_REPO}" /tmp/pplx_garden; \
     pushd /tmp/pplx_garden; \
@@ -75,7 +75,7 @@ RUN set -eux; \
     git checkout -q "${PPLX_GARDEN_COMMIT}"; \
     export TORCH_CMAKE_PREFIX_PATH="$(python3 -c 'import torch; print(torch.utils.cmake_prefix_path)')"; \
     python3 -m build --wheel; \
-    python3 -m pip install --no-cache-dir dist/*.whl; \
+    pip_install python3 --no-cache-dir dist/*.whl; \
     popd; \
     # Vendor benchmark code into the image
     rm -rf /opt/pplx-garden; \
@@ -111,7 +111,7 @@ RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     git clone --depth 1 --branch "${QUACK_TAG}" "${QUACK_REPO}" /tmp/quack; \
     pushd /tmp/quack; \
-    python -m pip install --upgrade-strategy only-if-needed '.[cu13]'; \
+    pip_install python --upgrade-strategy only-if-needed '.[cu13]'; \
     popd; \
     rm -rf /tmp/quack
 

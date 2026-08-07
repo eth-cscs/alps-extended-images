@@ -9,6 +9,11 @@ die() {
     exit 1
 }
 
+STACK_VERSIONS_FILE="${SCRIPT_DIR}/alps-stack-versions.env"
+[[ -f "${STACK_VERSIONS_FILE}" ]] || die "Missing shared stack defaults: ${STACK_VERSIONS_FILE}"
+# shellcheck disable=SC1090
+source "${STACK_VERSIONS_FILE}"
+
 apt_install_build_deps() {
 
     # Use JFrog Artifactory as an APT proxy/cache for Ubuntu packages, to speed
@@ -159,30 +164,40 @@ apply_patch_if_set() {
     git apply --whitespace=nowarn "$patch"
 }
 
-detect_cuda_dir() {
-    if [[ -n "${CUDA_HOME:-}" && -d "${CUDA_HOME}" ]]; then
-        echo "${CUDA_HOME}"
-        return 0
-    fi
-    if [[ -n "${CUDA_PATH:-}" && -d "${CUDA_PATH}" ]]; then
-        echo "${CUDA_PATH}"
-        return 0
-    fi
-    if command -v nvcc >/dev/null 2>&1; then
-        # nvcc is typically in <CUDA_DIR>/bin/nvcc
-        local nvcc_path
-        nvcc_path="$(command -v nvcc)"
-        echo "$(cd "$(dirname "$nvcc_path")/.." && pwd)"
-        return 0
-    fi
-    if [[ -d /usr/local/cuda ]]; then
-        echo /usr/local/cuda
-        return 0
-    fi
-    return 1
+make_jobs() {
+    printf '%s\n' "${ALPS_BUILD_JOBS:-$(nproc)}"
+}
+
+cmake_build_jobs() {
+    printf '%s\n' "${ALPS_CMAKE_BUILD_JOBS:-${ALPS_BUILD_JOBS:-$(nproc)}}"
+}
+
+ensure_known_stack_step() {
+    local family="${1:?family required}"
+    local step="${2:?step required}"
+    shift 2
+
+    local known_step
+    for known_step in "$@"; do
+        [[ "${step}" == "${known_step}" ]] && return 0
+    done
+
+    die "Unknown ${family} stack step: ${step}"
+}
+
+run_stack_step_sequence() {
+    local runner="${1:?runner required}"
+    shift
+
+    local step
+    for step in "$@"; do
+        "${runner}" "${step}"
+    done
 }
 
 build_boost() {
+    local jobs="${BOOST_BUILD_JOBS:-$(nproc)}"
+
     wget https://archives.boost.io/release/${BOOST_VER}/source/boost_${BOOST_VER//./_}.tar.bz2 -O /tmp/boost.tar.bz2
     tar -xjf /tmp/boost.tar.bz2 -C /tmp
     pushd "/tmp/boost_${BOOST_VER//./_}"
@@ -196,7 +211,7 @@ build_boost() {
         link=shared \
         threading=multi \
         runtime-link=shared \
-        install -j"$(nproc)"
+        install -j"${jobs}"
     popd
     rm -rf "/tmp/boost_${BOOST_VER//./_}" /tmp/boost.tar.bz2
     ldconfig
@@ -209,25 +224,35 @@ build_xpmem() {
     git checkout "${ref}"
     ./autogen.sh
     ./configure --prefix=/usr --with-default-prefix=/usr --disable-kernel-module
-    make -j"$(nproc)"
+    make -j"$(make_jobs)"
     make install
     popd
     rm -rf /tmp/xpmem
     ldconfig
 }
 
-build_gdrcopy() {
-    local ver="${GDRCOPY_VER}"
-    git clone --depth 1 --branch "v${ver}" https://github.com/NVIDIA/gdrcopy.git /tmp/gdrcopy
-    pushd /tmp/gdrcopy
-    make CC=gcc CUDA="${CUDA_DIR}" lib -j"$(nproc)"
-    make lib_install
-    popd
-    rm -rf /tmp/gdrcopy
-    ldconfig
+init_hpc_stack_prefixes() {
+    : "${HPCX_PREFIX:=/opt/hpcx}"
+    : "${LIBFABRIC_PREFIX:=/usr}"
+    : "${UCX_PREFIX:=${HPCX_PREFIX}/ucx}"
+    : "${UCC_PREFIX:=${HPCX_PREFIX}/ucc}"
+    : "${OMPI_PREFIX:=${HPCX_PREFIX}/ompi}"
+    : "${HWLOC_PREFIX:=${OMPI_PREFIX}}"
+
+    export HPCX_PREFIX LIBFABRIC_PREFIX UCX_PREFIX UCC_PREFIX OMPI_PREFIX HWLOC_PREFIX
 }
 
-build_cxi_bits() {
+record_alps_version_var() {
+    local name="${1:?name required}"
+    local value="${2:-}"
+
+    mkdir -p /opt/alps/env
+    printf 'export %s=%q\n' "${name}" "${value}" >> /opt/alps/env/alps-versions.env
+}
+
+build_cxi_bits_common() {
+    init_hpc_stack_prefixes
+
     git clone --depth 1 --branch "${CASSINI_HEADERS_VERSION}" https://github.com/HewlettPackard/shs-cassini-headers.git /tmp/shs-cassini-headers
     cp -r /tmp/shs-cassini-headers/include/* /usr/include/
     cp -r /tmp/shs-cassini-headers/share/* /usr/share/
@@ -240,33 +265,147 @@ build_cxi_bits() {
     git clone --depth 1 --branch "${LIBCXI_VERSION}" https://github.com/HewlettPackard/shs-libcxi.git /tmp/shs-libcxi
     pushd /tmp/shs-libcxi
     ./autogen.sh
-    ./configure --prefix=/usr --with-cuda="${CUDA_DIR}"
-    make -j"$(nproc)"
+    ./configure --prefix="${LIBFABRIC_PREFIX}" "$@"
+    make -j"$(make_jobs)"
     make install
     popd
     rm -rf /tmp/shs-libcxi
     ldconfig
 }
 
-build_libfabric() {
+build_libfabric_common() {
+    init_hpc_stack_prefixes
+
     git clone https://github.com/ofiwg/libfabric.git /tmp/libfabric
     pushd /tmp/libfabric
     git reset --hard "${LIBFABRIC_COMMIT}"
     apply_patch_if_set "${LIBFABRIC_PATCH}"
     ./autogen.sh
-    ./configure --prefix=/usr \
-        --with-cuda="${CUDA_DIR}" \
-        --enable-cuda-dlopen \
-        --enable-gdrcopy-dlopen \
+    ./configure --prefix="${LIBFABRIC_PREFIX}" \
+        "$@" \
         --enable-xpmem=/usr \
         --enable-cxi
-    make -j"$(nproc)"
+    make -j"$(make_jobs)"
     make install
-    mkdir -p /opt/alps/env
-    printf 'export LIBFABRIC_VERSION=%q\n' "$(fi_info --version | head -n 1 | awk '{ print $2; }')" >> /opt/alps/env/alps-versions.env
-    printf 'export LIBFABRIC_COMMIT=%q\n' "${LIBFABRIC_COMMIT}" >> /opt/alps/env/alps-versions.env
+
+    local fi_info_bin="${LIBFABRIC_PREFIX}/bin/fi_info"
+    if [[ ! -x "${fi_info_bin}" ]]; then
+        fi_info_bin="$(command -v fi_info)"
+    fi
+    record_alps_version_var LIBFABRIC_VERSION "$(${fi_info_bin} --version | head -n 1 | awk '{ print $2; }')"
+    record_alps_version_var LIBFABRIC_COMMIT "${LIBFABRIC_COMMIT}"
     popd
     rm -rf /tmp/libfabric
+    ldconfig
+}
+
+build_ucx_common() {
+    init_hpc_stack_prefixes
+
+    rm -rf "${UCX_PREFIX}"
+    curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" -o /tmp/ucx.tar.gz
+    tar -C /tmp -xzf /tmp/ucx.tar.gz
+    pushd "/tmp/ucx-${UCX_VERSION}"
+    mkdir -p build && cd build
+    ../configure \
+        --prefix="${UCX_PREFIX}" \
+        "$@" \
+        --enable-mt \
+        --enable-devel-headers
+    make -j"$(make_jobs)"
+    make install
+    record_alps_version_var UCX_VERSION "${UCX_VERSION}"
+    popd
+    rm -rf "/tmp/ucx-${UCX_VERSION}" /tmp/ucx.tar.gz
+}
+
+build_ucc_common() {
+    init_hpc_stack_prefixes
+
+    rm -rf "${UCC_PREFIX}"
+    git clone --depth 1 --branch "v${UCC_VERSION}" https://github.com/openucx/ucc.git /tmp/ucc
+    pushd /tmp/ucc
+    ./autogen.sh
+    ./configure \
+        --prefix="${UCC_PREFIX}" \
+        --with-ucx="${UCX_PREFIX}" \
+        "$@"
+    make -j"$(make_jobs)"
+    make install
+    record_alps_version_var UCC_VERSION "${UCC_VERSION}"
+    popd
+    rm -rf /tmp/ucc
+}
+
+build_ompi5_common() {
+    init_hpc_stack_prefixes
+
+    rm -rf "${OMPI_PREFIX}"
+    curl -fsSL "https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-${OMPI_VER}.tar.gz" -o /tmp/ompi.tar.gz
+    tar -C /tmp -xzf /tmp/ompi.tar.gz
+    pushd "/tmp/openmpi-${OMPI_VER}"
+    ./configure \
+        --prefix="${OMPI_PREFIX}" \
+        --with-ofi="${LIBFABRIC_PREFIX}" \
+        --with-ucx="${UCX_PREFIX}" \
+        --with-ucc="${UCC_PREFIX}" \
+        --enable-oshmem \
+        "$@"
+    make -j"$(make_jobs)"
+    make install
+    rm -rf /usr/local/mpi
+    ln -s "${OMPI_PREFIX}" /usr/local/mpi
+    record_alps_version_var OMPI_VERSION "${OMPI_VER}"
+    popd
+    rm -rf "/tmp/openmpi-${OMPI_VER}" /tmp/ompi.tar.gz
+    ldconfig
+}
+
+build_aws_ofi_nccl_common() {
+    init_hpc_stack_prefixes
+
+    git clone "${AWS_OFI_NCCL_REPO}" /tmp/aws-ofi-nccl
+    pushd /tmp/aws-ofi-nccl
+    git reset --hard "${AWS_OFI_NCCL_COMMIT}"
+
+    if git config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null | grep -q ' 3rd-party/efa-dp-direct$'; then
+        git submodule update --init --recursive 3rd-party/efa-dp-direct
+    fi
+    apply_patch_if_set "${AWS_OFI_NCCL_PATCH}"
+
+    unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
+    export CPPFLAGS="${CPPFLAGS:-}"
+    export CFLAGS="${CFLAGS:-}"
+    export CXXFLAGS="${CXXFLAGS:-}"
+    CPPFLAGS="$(echo "$CPPFLAGS" | sed 's| -isystem /usr/include||g')"
+    CFLAGS="$(echo "$CFLAGS" | sed 's| -isystem /usr/include||g')"
+    CXXFLAGS="$(echo "$CXXFLAGS" | sed 's| -isystem /usr/include||g')"
+    export CPPFLAGS CFLAGS CXXFLAGS
+
+    ./autogen.sh
+    ./configure \
+        --prefix=/usr \
+        --disable-tests \
+        --with-libfabric="${LIBFABRIC_PREFIX}" \
+        --with-mpi="${OMPI_PREFIX}" \
+        --with-hwloc="${HWLOC_PREFIX}" \
+        "$@"
+
+    # Some base images inject /usr/include as -isystem, which breaks GCC system
+    # header handling during aws-ofi-nccl builds.
+    find . \( \
+        -name 'Makefile' -o -name 'Makefile.in' -o -name 'Makefile.am' -o -name '*.mk' -o -name 'config.status' -o -name 'libtool' \
+    \) -type f -print0 \
+    | xargs -0 -r sed -i 's| -isystem /usr/include||g'
+
+    make -j"$(make_jobs)"
+    make install
+
+    record_alps_version_var AWS_OFI_NCCL_VERSION "$(./m4/get_version.sh)"
+    record_alps_version_var AWS_OFI_NCCL_COMMIT "${AWS_OFI_NCCL_COMMIT}"
+
+    popd
+    rm -rf /tmp/aws-ofi-nccl
     ldconfig
 }
 
@@ -282,385 +421,6 @@ ensure_debian_packaging_tools() {
     command -v debuild >/dev/null 2>&1 || die "debuild not found after installing devscripts"
 }
 
-build_nccl_deb() {
-    ensure_debian_packaging_tools
-
-    curl -fsSL "https://github.com/NVIDIA/nccl/archive/refs/tags/v${NCCL_VER}.tar.gz" -o /tmp/nccl.tar.gz
-    tar -C /tmp -xzf /tmp/nccl.tar.gz
-    pushd "/tmp/nccl-${NCCL_VER}"
-    apply_patch_if_set "${NCCL_PATCH}"
-    make -j"$(nproc)" pkg.debian.build CUDA_HOME="${CUDA_DIR}"
-    dpkg -i build/pkg/deb/*.deb
-    mkdir -p /opt/alps/env
-    printf 'export NCCL_VERSION=%q\n' "${NCCL_VER}" >> /opt/alps/env/alps-versions.env
-    # Produces: ext-profiler/inspector/libnccl-profiler-inspector.so
-    pushd plugins/profiler/inspector
-    make -j"$(nproc)" CUDA_HOME="${CUDA_DIR}"
-    install -D -m 0644 libnccl-profiler-inspector.so /usr/local/lib/libnccl-profiler-inspector.so
-    popd
-    popd
-    rm -rf "/tmp/nccl-${NCCL_VER}" /tmp/nccl.tar.gz
-    ldconfig
-}
-
-build_ucx() {
-    local hpcx=/opt/hpcx
-    rm -rf "${hpcx}/ucx"
-    curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" -o /tmp/ucx.tar.gz
-    tar -C /tmp -xzf /tmp/ucx.tar.gz
-    pushd "/tmp/ucx-${UCX_VERSION}"
-    mkdir -p build && cd build
-    ../configure \
-        --prefix="${hpcx}/ucx" \
-        --with-cuda="${CUDA_DIR}" \
-        --with-gdrcopy=/usr/local \
-        --enable-mt \
-        --enable-devel-headers
-    make -j"$(nproc)"
-    make install
-    mkdir -p /opt/alps/env
-    printf 'export UCX_VERSION=%q\n' "${UCX_VERSION}" >> /opt/alps/env/alps-versions.env
-    popd
-    rm -rf "/tmp/ucx-${UCX_VERSION}" /tmp/ucx.tar.gz
-}
-
-build_ucc() {
-    local hpcx=/opt/hpcx
-    rm -rf "${hpcx}/ucc"
-    git clone --depth 1 --branch "v${UCC_VERSION}" https://github.com/openucx/ucc.git /tmp/ucc
-    pushd /tmp/ucc
-    ./autogen.sh
-
-    local gencode_sm90='-gencode arch=compute_90,code=sm_90 -gencode arch=compute_90,code=compute_90'
-    local gencode_sm90a='-gencode arch=compute_90a,code=sm_90a -gencode arch=compute_90a,code=compute_90a'
-    local gencode="${gencode_sm90} ${gencode_sm90a}"
-
-    ./configure \
-        --prefix="${hpcx}/ucc" \
-        --with-ucx="${hpcx}/ucx" \
-        --with-cuda="${CUDA_DIR}" \
-        --with-nvcc-gencode="${gencode}" \
-        --with-nccl
-    make -j"$(nproc)"
-    make install
-    mkdir -p /opt/alps/env
-    printf 'export UCC_VERSION=%q\n' "${UCC_VERSION}" >> /opt/alps/env/alps-versions.env
-    popd
-    rm -rf /tmp/ucc
-}
-
-build_ompi5() {
-    local hpcx=/opt/hpcx
-    rm -rf "${hpcx}/ompi"
-    curl -fsSL "https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-${OMPI_VER}.tar.gz" -o /tmp/ompi.tar.gz
-    tar -C /tmp -xzf /tmp/ompi.tar.gz
-    pushd "/tmp/openmpi-${OMPI_VER}"
-    ./configure \
-        --prefix="${hpcx}/ompi" \
-        --with-ofi=/usr \
-        --with-ucx="${hpcx}/ucx" \
-        --with-ucc="${hpcx}/ucc" \
-        --enable-oshmem \
-        --with-cuda="${CUDA_DIR}" \
-        --with-cuda-libdir="${CUDA_DIR}/lib64/stubs"
-    make -j"$(nproc)"
-    make install
-    rm -rf /usr/local/mpi
-    ln -s "${hpcx}/ompi" /usr/local/mpi
-    mkdir -p /opt/alps/env
-    printf 'export OMPI_VERSION=%q\n' "${OMPI_VER}" >> /opt/alps/env/alps-versions.env
-    popd
-    rm -rf "/tmp/openmpi-${OMPI_VER}" /tmp/ompi.tar.gz
-    ldconfig
-}
-
-build_aws_ofi_nccl() {
-    git clone https://github.com/aws/aws-ofi-nccl.git /tmp/aws-ofi-nccl
-    pushd /tmp/aws-ofi-nccl
-    git reset --hard "${AWS_OFI_NCCL_COMMIT}"
-    apply_patch_if_set "${AWS_OFI_NCCL_PATCH}"
-
-    unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
-    export CPPFLAGS="${CPPFLAGS:-}"
-    export CFLAGS="${CFLAGS:-}"
-    export CXXFLAGS="${CXXFLAGS:-}"
-    CPPFLAGS="$(echo "$CPPFLAGS" | sed 's| -isystem /usr/include||g')"
-    CFLAGS="$(echo "$CFLAGS" | sed 's| -isystem /usr/include||g')"
-    CXXFLAGS="$(echo "$CXXFLAGS" | sed 's| -isystem /usr/include||g')"
-    export CPPFLAGS CFLAGS CXXFLAGS
-
-    ./autogen.sh
-
-    ./configure \
-        --prefix=/usr \
-        --disable-tests \
-        --with-libfabric=/usr \
-        --with-cuda="${CUDA_DIR}" \
-        --with-mpi=/opt/hpcx/ompi \
-        --with-hwloc=/opt/hpcx/ompi
-
-    # critical fix: remove /usr/include being injected as -isystem
-    find . \( \
-        -name 'Makefile' -o -name 'Makefile.in' -o -name 'Makefile.am' -o -name '*.mk' -o -name 'config.status' -o -name 'libtool' \
-    \) -type f -print0 \
-    | xargs -0 -r sed -i 's| -isystem /usr/include||g'
-
-    make -j"$(nproc)"
-    make install
-
-    mkdir -p /opt/alps/env
-    printf 'export AWS_OFI_NCCL_VERSION=%q\n' "$(./m4/get_version.sh)" >> /opt/alps/env/alps-versions.env
-    printf 'export AWS_OFI_NCCL_COMMIT=%q\n' "${AWS_OFI_NCCL_COMMIT}" >> /opt/alps/env/alps-versions.env
-
-    popd
-    rm -rf /tmp/aws-ofi-nccl
-    ldconfig
-}
-
-build_nvshmem() {
-    : "${NVSHMEM_PREFIX:=/opt/nvshmem}"
-    : "${NVSHMEM_BUILDDIR:=/tmp/nvshmem-build}"
-    : "${NVSHMEM_SRC_DIR:=/tmp/nvshmem-src}"
-    : "${NVSHMEM_CUDA_ARCH:=90}"
-    : "${NVSHMEM_ENABLE_PYTHON:=1}"
-    : "${NVSHMEM_ENABLE_TESTS:=1}"
-
-    # Remove preinstalled NVSHMEM
-    apt_get update
-    local nvshmem_packages=() pkg
-    while IFS= read -r pkg; do
-        case "${pkg}" in
-            libnvshmem*-cuda-*|nvshmem*) nvshmem_packages+=("${pkg}");;
-        esac
-    done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
-    if [[ "${#nvshmem_packages[@]}" -gt 0 ]]; then
-        apt_get purge -y "${nvshmem_packages[@]}" || true
-        apt_get autoremove -y || true
-    fi
-
-    # Remove CUDA symlinks/copies that can shadow our install
-    rm -f "${CUDA_DIR}/lib64/libnvshmem"*.so* || true
-    rm -f "${CUDA_DIR}/targets/"*/lib/libnvshmem*.so* || true
-    rm -rf /usr/lib/*/nvshmem || true
-
-    rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
-    mkdir -p "${NVSHMEM_BUILDDIR}"
-
-    # Clone repo
-    git clone --depth 1 --branch "v${NVSHMEM_VER}" https://github.com/NVIDIA/nvshmem.git "${NVSHMEM_SRC_DIR}"
-
-    # Apply local nvshmem4py patch set
-    pushd "${NVSHMEM_SRC_DIR}" >/dev/null
-    apply_patch_if_set "${NVSHMEM_PATCH}"
-    popd >/dev/null
-
-    local mpi_home="${MPI_HOME:-/opt/hpcx/ompi}"
-    if [[ -e "${mpi_home}" ]]; then
-        mpi_home="$(realpath -e "${mpi_home}")"
-    fi
-
-    NVSHMEM_BUILD_EXAMPLES=0 \
-    NVSHMEM_BUILD_TESTS="$([[ "${NVSHMEM_ENABLE_TESTS}" == "1" ]] && echo 1 || echo 0)" \
-    NVSHMEM_DEBUG=0 \
-    NVSHMEM_DEVEL=0 \
-    NVSHMEM_DEFAULT_PMI2=0 \
-    NVSHMEM_DEFAULT_PMIX=1 \
-    NVSHMEM_DISABLE_COLL_POLL=1 \
-    NVSHMEM_ENABLE_ALL_DEVICE_INLINING=0 \
-    NVSHMEM_GPU_COLL_USE_LDST=0 \
-    NVSHMEM_LIBFABRIC_SUPPORT=1 \
-    NVSHMEM_MPI_SUPPORT=1 \
-    NVSHMEM_MPI_IS_OMPI=1 \
-    NVSHMEM_NVTX=1 \
-    NVSHMEM_PMIX_SUPPORT=1 \
-    NVSHMEM_SHMEM_SUPPORT=1 \
-    NVSHMEM_TEST_STATIC_LIB=0 \
-    NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-    NVSHMEM_TRACE=0 \
-    NVSHMEM_USE_DLMALLOC=0 \
-    NVSHMEM_USE_NCCL=1 \
-    NVSHMEM_USE_GDRCOPY=1 \
-    NVSHMEM_VERBOSE=0 \
-    NVSHMEM_DEFAULT_UCX=0 \
-    NVSHMEM_UCX_SUPPORT=1 \
-    NVSHMEM_IBGDA_SUPPORT=0 \
-    NVSHMEM_IBGDA_SUPPORT_GPUMEM_ONLY=0 \
-    NVSHMEM_IBDEVX_SUPPORT=0 \
-    NVSHMEM_IBRC_SUPPORT=0 \
-    LIBFABRIC_HOME=/usr \
-    NCCL_HOME=/usr \
-    GDRCOPY_HOME=/usr/local \
-    MPI_HOME="${mpi_home}" \
-    PMIX_HOME="${mpi_home}" \
-    SHMEM_HOME="${mpi_home}" \
-    UCX_HOME=/opt/hpcx/ucx \
-    CUDAToolkit_ROOT="${CUDA_DIR}" \
-    cmake -S "${NVSHMEM_SRC_DIR}" -B "${NVSHMEM_BUILDDIR}" -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="${NVSHMEM_PREFIX}" \
-        -DCUDAToolkit_ROOT="${CUDA_DIR}" \
-        -DMPI_C_COMPILER="${mpi_home}/bin/mpicc" \
-        -DMPI_CXX_COMPILER="${mpi_home}/bin/mpicxx" \
-        -DCMAKE_CUDA_ARCHITECTURES="${NVSHMEM_CUDA_ARCH}"
-
-    cmake --build "${NVSHMEM_BUILDDIR}" -j"$(nproc)"
-    cmake --install "${NVSHMEM_BUILDDIR}"
-
-    # Ensure loader finds our NVSHMEM without LD_LIBRARY_PATH
-    cat > /etc/ld.so.conf.d/99-nvshmem.conf <<EOF
-${NVSHMEM_PREFIX}/lib
-${NVSHMEM_PREFIX}/lib64
-EOF
-
-    mkdir -p /opt/alps/env
-    printf 'export NVSHMEM_VERSION=%q\n' "${NVSHMEM_VER}" >> /opt/alps/env/alps-versions.env
-
-    ldconfig
-
-    # Build installs/copies wheels into the tree, but does not install into python.
-    if [[ "${NVSHMEM_ENABLE_PYTHON}" == "1" ]]; then
-        if python -c 'import nvshmem.core as _' >/dev/null 2>&1; then
-            echo "[nvshmem4py] already importable; skipping wheel install"
-        else
-            local cp_tag mach cuda_major best req
-            local constraint_file
-
-            cp_tag="$(python -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"
-            mach="$(python -c 'import platform; print(platform.machine())')"
-            cuda_major="$("${CUDA_DIR}/bin/nvcc" --version | awk '
-                /release [0-9]+/ {
-                    for (i = 1; i <= NF; i++) {
-                        if ($i == "release") {
-                            gsub(",", "", $(i+1))
-                            split($(i+1), a, ".")
-                            print a[1]
-                            exit
-                        }
-                    }
-                }'
-            )"
-
-            # Prefer the most specific wheel: linux_<arch> > manylinux
-            best="$(
-                find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
-                    -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
-                | grep -E "${cp_tag}-${cp_tag}-linux_${mach}\.whl$" \
-                | sort -V | tail -n1 || true
-            )"
-
-            if [[ -z "${best}" ]]; then
-                best="$(
-                    find "${NVSHMEM_BUILDDIR}/dist" "${NVSHMEM_PREFIX}/lib" "${NVSHMEM_PREFIX}/lib64" \
-                        -type f -name "nvshmem4py_cu${cuda_major}-*.whl" 2>/dev/null \
-                    | grep -E "${cp_tag}-${cp_tag}-.*manylinux.*_${mach}\.whl$" \
-                    | sort -V | tail -n1 || true
-                )"
-            fi
-
-            [[ -n "${best}" ]] || die "[nvshmem4py] no suitable wheel found (cu=${cuda_major}, cp=${cp_tag}, arch=${mach})"
-
-            python -m pip install --no-cache-dir --no-deps --force-reinstall "${best}"
-
-            req="${NVSHMEM_SRC_DIR}/nvshmem4py/requirements_cuda${cuda_major}.txt"
-            [[ -f "${req}" ]] || die "nvshmem4py requirements not found: ${req}"
-
-            constraint_file="$(mktemp)"
-
-            # If cuda-pathfinder is already installed and satisfies the upstream
-            # requirement, pin it to the installed version for this install.
-            REQ_FILE="${req}" CONSTRAINT_FILE="${constraint_file}" python - <<'PY'
-import os
-import re
-from importlib.metadata import version, PackageNotFoundError
-
-try:
-    from packaging.requirements import Requirement
-except Exception:
-    raise SystemExit(0)
-
-req_file = os.environ["REQ_FILE"]
-constraint_file = os.environ["CONSTRAINT_FILE"]
-
-def norm(name: str) -> str:
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-pathfinder_req = None
-with open(req_file, "r", encoding="utf-8") as f:
-    for raw in f:
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        try:
-            req = Requirement(line)
-        except Exception:
-            continue
-        if norm(req.name) == "cuda-pathfinder":
-            pathfinder_req = req
-            break
-
-if pathfinder_req is None:
-    raise SystemExit(0)
-
-installed = None
-for candidate in ("cuda-pathfinder", "cuda.pathfinder", "cuda_pathfinder"):
-    try:
-        installed = version(candidate)
-        break
-    except PackageNotFoundError:
-        pass
-
-if installed is None:
-    raise SystemExit(0)
-
-if (not pathfinder_req.specifier) or pathfinder_req.specifier.contains(installed, prereleases=True):
-    with open(constraint_file, "w", encoding="utf-8") as out:
-        out.write(f"cuda-pathfinder=={installed}\n")
-    print(f"[nvshmem4py] pinning cuda-pathfinder to installed version: {installed}")
-PY
-
-            if [[ -s "${constraint_file}" ]]; then
-                python -m pip install --no-cache-dir -c "${constraint_file}" -r "${req}"
-            else
-                python -m pip install --no-cache-dir -r "${req}"
-            fi
-
-            rm -f "${constraint_file}"
-
-            python -c 'import nvshmem.core as _; print("nvshmem4py ok")'
-        fi
-    fi
-
-    rm -rf "${NVSHMEM_SRC_DIR}" "${NVSHMEM_BUILDDIR}"
-}
-
-build_nccl_tests() {
-    git clone --depth 1 --branch "v${NCCL_TESTS_VER}" https://github.com/NVIDIA/nccl-tests.git /tmp/nccl-tests
-    pushd /tmp/nccl-tests
-    MPI=1 MPI_HOME=/opt/hpcx/ompi CUDA_HOME="${CUDA_DIR}" make -j"$(nproc)"
-    install -d /usr/local/bin
-    find build -maxdepth 1 -type f -executable -name '*_perf' -print -exec install -m 0755 {} /usr/local/bin/ \;
-    popd
-    rm -rf /tmp/nccl-tests
-}
-
-build_osu() {
-    curl -fsSL "http://mvapich.cse.ohio-state.edu/download/mvapich/osu-micro-benchmarks-${OSU_VERSION}.tar.gz" -o /tmp/osu.tar.gz
-    tar --no-same-owner --no-same-permissions -C /tmp -xzf /tmp/osu.tar.gz
-    pushd "/tmp/osu-micro-benchmarks-${OSU_VERSION}"
-    CC=/opt/hpcx/ompi/bin/mpicc \
-    CFLAGS="-O3 -lcuda -lnvidia-ml" \
-    ./configure \
-        --prefix=/usr/local \
-        --enable-cuda \
-        --with-cuda-include="${CUDA_DIR}/include" \
-        --with-cuda-libpath="${CUDA_DIR}/lib64"
-    make -j"$(nproc)"
-    make install
-    popd
-    rm -rf "/tmp/osu-micro-benchmarks-${OSU_VERSION}" /tmp/osu.tar.gz
-    ldconfig
-}
-
 clean_up() {
     cleanup_apt_build_deps \
         pkg-config automake autoconf libtool cmake \
@@ -668,33 +428,6 @@ clean_up() {
         fakeroot dh-make
 }
 
-main() {
-    CUDA_DIR="$(detect_cuda_dir)" || die "Could not determine CUDA directory..."
-    export CUDA_DIR
-    export CUDA_HOME="${CUDA_HOME:-$CUDA_DIR}"
-    export CUDA_PATH="${CUDA_PATH:-$CUDA_DIR}"
-
-    apt_install_build_deps
-
-    purge_preinstalled_network_stack
-    remove_hpcx_plugins
-
-    build_boost
-    build_xpmem
-    build_gdrcopy
-    build_cxi_bits
-    build_libfabric
-    build_nccl_deb
-    build_ucx
-    build_ucc
-    build_ompi5
-    build_aws_ofi_nccl
-    build_nvshmem
-
-    build_nccl_tests
-    build_osu
-
-    clean_up
-}
-
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    die "This file provides stack build functions; run a family installer instead."
+fi
