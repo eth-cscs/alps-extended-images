@@ -403,7 +403,7 @@ policy:
       # GPU holds ~47.5 GiB of bf16 weights (logged in slurm-3020427). At
       # util=0.5 the vLLM budget is ~48 GiB, leaving ~0.5 GiB for KV cache,
       # which is below the minimum block size and triggers
-      # `ValueError: No available memory for the cache blocks`. At util=0.7
+      # "ValueError: No available memory for the cache blocks". At util=0.7
       # the budget is ~67 GiB, leaving ~20 GiB for KV cache.
       gpu_memory_utilization: 0.7
       max_model_len: \${policy.max_total_sequence_length}
