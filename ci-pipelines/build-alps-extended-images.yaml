@@ -366,8 +366,7 @@ build-rocm-base-images:
 
 build-cuda-app-images:
   <<: *app_build_images_template
-  #extends: [.container-builder-cscs-gh200, .build-images-template]
-  extends: [.container-builder-cscs-mi300, .build-images-template]
+  extends: [.container-builder-cscs-gh200, .build-images-template]
   parallel:
     matrix: *cuda_app_images_matrix
   needs:
