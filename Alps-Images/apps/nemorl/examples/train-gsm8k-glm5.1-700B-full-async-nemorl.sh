@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=32
+#SBATCH --nodes=56
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -62,8 +62,17 @@ export NEMORL_FORK_URL="https://github.com/philip-paul-mueller/RL.git"
 export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
 
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
-# remaining 24 nodes for Megatron training (TP=4, PP=3, EP=8, ETP=4 → 96 GPUs,
-# DP=8) — the same 32-node footprint as the verl reference script.
+# the rest for Megatron training with fixed TP=4, PP=3, EP=8, ETP=4.
+#
+# DEFAULT: 56 nodes = 48 training (192 GPUs, expert_DP=2, dense DP=16).
+#   Never tried before (history: 32/34/60/136 total nodes); first layout that
+#   fits by construction with the GPU-resident optimizer: ~39 GB buffers +
+#   ~45 GB optimizer shard ≈ 84 GB of 95 GB, idle host.  PRIORITY IS A RUN
+#   THAT TRAINS AT ALL — efficiency comes after (see HANDOFF §8).
+# Variant: `sbatch --nodes=32` = 24 training (96 GPUs, expert_DP=1) — verl
+#   parity, cheapest, but the unsharded ~87 GB expert optimizer state does
+#   NOT fit on GPU; only viable if the verl baseline proves the update phase
+#   fits (gated, see the OPTIMIZER_CPU_OFFLOAD comment below).
 #
 # Why 32 nodes works (see HANDOFF.md §8): GLM-5.1 is ~94% expert weights, and
 # Megatron shards experts over ETP × EP × PP ranks.  verl leaves
@@ -77,24 +86,57 @@ export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
 # = 512 GPUs (128 nodes) to reach the same per-rank footprint.  Setting
 # expert_tensor_parallel_size: 4 explicitly below restores the verl layout.
 #
-# Divisibility: ETP=4, so
-#   expert_tensor_model_pipeline_parallel = 4 * 8 * 3 = 96.
-#   world=96 % 96 = 0 ✓ (expert_DP=1).
-#   world=96 % (TP*PP) = 96 % 12 = 0 ✓ (DP=8).
+# Divisibility: expert_tensor_model_pipeline_parallel = ETP*EP*PP = 4*8*3 = 96,
+# so the training world must be a multiple of 96 GPUs = 24 nodes:
+#   24 training nodes (world  96): expert_DP=1, dense DP=8
+#   48 training nodes (world 192): expert_DP=2, dense DP=16  <- default
+# (anything in between is invalid — Megatron asserts world % 96 == 0).
 #
 # GLM-5.1 has 78 layers; PP=3 → 26 layers/stage (no uneven first/last stage
 # needed).  512 total experts; EP=8 → 64 experts/rank, each split 4-way by ETP
 # (matches megatron-bridge's GLM-5.1 mapping and the verl run).
 #
-# Host-RAM note: expert_DP=1 means the CPU-offloaded expert optimizer state
-# (FP32 master + Adam m/v ≈ 12 B/param) is unsharded: ~7.2B expert params/rank
-# × 12 B × 4 ranks/node ≈ 345 GB of the 450 GB node RAM.  Tight, but verl runs
-# exactly this on the same hardware.
+# Host-RAM note (only when OPTIMIZER_CPU_OFFLOAD=true): the CPU-offloaded
+# optimizer state (FP32 master + Adam m/v ≈ 12 B/param) is sharded only
+# expert_DP ways for the expert part.  At expert_DP=1 that is ~87 GB/rank
+# × 4 ranks/node ≈ 345 GB of the 450 GB node RAM — and the
+# HybridDeviceOptimizer allocates its pinned CPU clones eagerly at init
+# (see HANDOFF §8, slurm-3029253).  At expert_DP=2 it halves.  The default
+# (GPU-resident optimizer) leaves the host idle either way.
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
 # Name of the generated YAML config consumed by the shared driver.
 export YAML_NAME="grpo_gsm8k_glm51_async_nemorl.yaml"
+
+# -----------------------------------------------------------------------------
+# Optimizer placement toggle (see HANDOFF.md §8).
+#
+# "false" (default): fully GPU-resident optimizer, mirroring verl exactly.
+#   Rationale: slurm-3029253 showed that optimizer_cpu_offload's
+#   HybridDeviceOptimizer eagerly clones every param to pinned CPU + FP32 CPU
+#   copies at init (~240 GB/node) BEFORE the GPU master build — the leading
+#   suspect for the "phantom" HBM loss that OOM'd 25/96 workers.  Without
+#   offload, FusedAdam moments are created lazily at the first step (same as
+#   verl), and the host stays idle.
+#   At the DEFAULT 56 nodes (expert_DP=2) the GPU-resident optimizer fits by
+#   construction (~84 GB steady) — no gating, submit any time.
+#   At `sbatch --nodes=32` (expert_DP=1) it does NOT fit by our math
+#   (~126 GB); submit that variant only if the verl baseline (successor of
+#   slurm-3028399) reports step:1 metrics, proving the GPU-resident update
+#   phase fits at that sharding (per-rank params verified identical: 9.77B).
+#
+# "true": previous behavior (CPU-offloaded optimizer via HybridDeviceOptimizer)
+#   — kept for reference/experiments; OOM'd at init in slurm-3029253.
+# -----------------------------------------------------------------------------
+export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-false}"
+if [[ "${OPTIMIZER_CPU_OFFLOAD}" == "true" ]]; then
+    OPTIMIZER_PLACEMENT_YAML="      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+      overlap_cpu_optimizer_d2h_h2d: true"
+else
+    OPTIMIZER_PLACEMENT_YAML="      optimizer_cpu_offload: false"
+fi
 
 mkdir -p "${TRAINING_HOME}"
 mkdir -p "${TRAINING_CONFIG}"
@@ -186,10 +228,14 @@ EOF
 #   NeMo-RL has no param_offload/grad_offload equivalent, but those are NOT
 #   what lets verl fit on 96 GPUs (offload cannot shrink the in-step working
 #   set — params+grads must be on GPU during fwd/bwd anyway).  The fit comes
-#   from ETP=4 expert sharding (see the node-split comment above).  For the
-#   optimizer, optimizer_cpu_offload + optimizer_offload_fraction=1.0 below
-#   matches verl's optimizer_offload; the reference model is already held as
-#   a CPU state dict by NeMo-RL (setup.py:1756).
+#   from ETP=4 expert sharding (see the node-split comment above).
+#   NOTE: verl's optimizer_offload is verl-level lifecycle code
+#   (verl/verl/utils/megatron_utils.py:714,764 — lazy FusedAdam states moved
+#   at phase boundaries), NOT Megatron's optimizer_cpu_offload /
+#   HybridDeviceOptimizer.  Our optimizer placement is controlled by the
+#   OPTIMIZER_CPU_OFFLOAD toggle above (default: GPU-resident, like verl).
+#   The reference model is already held as a CPU state dict by NeMo-RL
+#   (setup.py:1756).
 #
 # lr_decay_iters (verify on first run):
 #   Set to 468 to match max_num_steps. The verl script notes that
@@ -197,17 +243,16 @@ EOF
 #   called too late (after init_workers)" — verify whether the same
 #   applies to NeMo-RL's megatron path.
 #
-# Parallelism (mirrors the verl reference script, NOT the NVIDIA demo — the
-# demo's EP=64/ETP=1 layout needs 512 training GPUs; ETP=4 achieves the same
-# per-rank footprint on 96):
-#   Training: 24 nodes × 4 GPUs = 96 GPUs; TP=4, PP=3, EP=8, ETP=4 → DP=8
-#   Rollout:   8 nodes × 4 GPUs = 32 GPUs; TP=32 (one replica)
+# Parallelism (verl-style sharding, NOT the NVIDIA demo — the demo's
+# EP=64/ETP=1 layout needs 512 training GPUs; ETP=4 reaches the same
+# per-rank footprint at 96):
+#   Training: TP=4, PP=3, EP=8, ETP=4 fixed; node count sets expert_DP/DP
+#             (default 48 training nodes = 192 GPUs → expert_DP=2, DP=16)
+#   Rollout:  8 nodes × 4 GPUs = 32 GPUs; TP=32 (one replica)
 #
 # TP=4 is node-local (4 GPUs/node — no cross-node TP).  Per-rank params
-# ~10.9B (~7.2B expert at 96-way expert sharding + ~3.7B dense at TP×PP=12)
-# → legacy DDP param+grad buffer ~44 GB, same as the validated demo's
-# per-rank footprint at TP=8/PP=8/EP=64 (which initialized fine in
-# slurm-3020427).
+# 9.77B measured (slurm-3029253 and the verl run slurm-3028399 — identical)
+# → legacy DDP param+grad buffer ~39 GB, independent of node count.
 #
 # Legacy DDP (use_megatron_fsdp absent/false).  See HANDOFF.md for the FSDP
 # dead end (upstream _get_dp_tp_mesh bug with PP>1) and §8 for why ETP — not
@@ -280,24 +325,24 @@ policy:
   # Megatron backend for 700B training.
   # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge (vanilla_mbridge: False).
   #
-  # Divisibility (mirrors the verl reference run: TP=4/PP=3/EP=8 with ETP
-  # defaulting to TP=4 in Megatron):
+  # Divisibility (verl-style sharding: TP=4/PP=3/EP=8 with explicit ETP=4 —
+  # the parent grpo_math_1B.yaml:191 pins ETP to 1, which caused the 30-33B
+  # params/rank OOMs; see HANDOFF §8):
   #   - GLM-5.1 has 78 transformer layers; PP=3 -> 26 layers/stage (even).
-  #   - expert_tensor_parallel_size=4 (explicit — parent grpo_math_1B.yaml:191
-  #     pins it to 1, which caused the 30-33B params/rank OOMs; see HANDOFF §8),
-  #     so expert_tensor_model_pipeline_parallel = 4*EP*PP = 4*8*3 = 96.
-  #     world=96 % 96 = 0 (expert_DP=1).
-  #   - world=96 % (TP*PP) = 96 % 12 = 0 (DP=8).
+  #   - expert_tensor_model_pipeline_parallel = 4*EP*PP = 4*8*3 = 96;
+  #     training world must be a multiple of 96 GPUs (= 24 nodes).
   #   - EP=8 -> 64 experts/rank, each split 4-way by ETP (matches
   #     megatron-bridge GLM-5.1 mapping and the verl run).
   #
-  # Legacy DDP (use_megatron_fsdp absent).  At TP=4/PP=3/EP=8/ETP=4, per-rank
-  # params are ~10.9B -> param+grad buffer ~44 GB (fits 95 GB GH200; same
-  # footprint as the demo's TP=8/PP=8/EP=64 which initialized in slurm-3020427).
+  # Legacy DDP (use_megatron_fsdp absent).  Per-rank params are 9.77B
+  # measured -> param+grad buffer ~39 GB regardless of node count (model
+  # build succeeded on all 96 GPUs in slurm-3029253).  The node count only
+  # changes how the optimizer state is sharded (expert_DP) — see the
+  # node-split comment at the top.
   megatron_cfg:
     enabled: true
     empty_unused_memory_level: 1
-    # 24 training nodes x 4 GPUs = 96 GPUs; TP=4, PP=3 -> DP=8
+    # TP=4 (node-local), PP=3; DP derived from the training world size.
     # GLM-5.1 has 78 layers; 78 / PP=3 = 26 layers/stage.
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 3
@@ -332,15 +377,15 @@ policy:
     moe_router_bias_update_rate: 0.0
 
     # Adam optimizer for GRPO.  Legacy DDP path: the bf16 param+grad buffer
-    # is unsharded on GPU (~44 GB at TP=4/PP=3/EP=8/ETP=4).  The FP32 master
-    # + Adam m/v states are offloaded to CPU; use_distributed_optimizer
-    # shards the dense part across DP=8, but the expert part has expert_DP=1
-    # and stays whole (~86 GB host RAM/rank, ~345 GB/node of 450 GB — tight
-    # but verl runs the same layout on this hardware).  This matches verl's
-    # optimizer_offload (NeMo-RL has no param_offload/grad_offload — those
-    # are verl-only features in
-    # verl/verl/workers/engine/megatron/transformer_impl.py — but they are
-    # not what makes verl fit; ETP is, see HANDOFF §8).
+    # is unsharded on GPU (~39 GB at TP=4/PP=3/EP=8/ETP=4).
+    # use_distributed_optimizer shards optimizer state across dense DP for
+    # dense params and expert_DP for expert params (expert_DP=2 at the
+    # default 48 training nodes -> ~45 GB/rank optimizer shard on GPU).
+    # Optimizer placement (GPU-resident vs CPU-offloaded) is controlled by
+    # OPTIMIZER_CPU_OFFLOAD at the top of this script — default is
+    # GPU-resident, mirroring verl (see HANDOFF §8: the CPU-offload path's
+    # eager pinned host clones at init are the leading suspect for the
+    # phantom-HBM OOM in slurm-3029253).
     optimizer:
       optimizer: "adam"
       lr: 5.0e-7
@@ -355,11 +400,7 @@ policy:
       use_distributed_optimizer: true
       use_precision_aware_optimizer: false
       clip_grad: 1.0
-      # Offload FP32 master + Adam states to CPU.
-      # NeMo-RL requires optimizer_offload_fraction=1.0 for full offload.
-      optimizer_cpu_offload: true
-      optimizer_offload_fraction: 1.0
-      overlap_cpu_optimizer_d2h_h2d: true
+${OPTIMIZER_PLACEMENT_YAML}
 
     scheduler:
       start_weight_decay: \${policy.megatron_cfg.optimizer.weight_decay}
