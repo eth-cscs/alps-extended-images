@@ -58,6 +58,7 @@ RUN set -eux; \
     apt_get install -y --no-install-recommends "${vllm_apt_install_packages[@]}"; \
     rm -rf /var/lib/apt/lists/*; \
     pip_install python --no-cache-dir --upgrade \
+      grep \
       build \
       jinja2 \
       'packaging<=25.0' \
@@ -119,8 +120,14 @@ RUN set -eux; \
       | grep -i -E '^(cuda-toolkit|nvidia-|flashinfer)' \
       || echo "  (none)"; \
     python -m pip check || echo "WARN: inconsistent pip dependency resolution (see above)"; \
-    missing="$(find "$(python -c 'import vllm; print(vllm.__path__[0])')" -name '*.so' \
-                 -exec ldd {} + 2>/dev/null | grep 'not found' || true)"; \
+    all_missing="$(find "$(python -c 'import vllm; print(vllm.__path__[0])')" -name '*.so' \
+                 -exec ldd {} + 2>/dev/null | awk '/not found/ { print }' || true)"; \
+    ignored_missing="$(printf '%s\n' "${all_missing}" | awk '$1 == "libcuda.so.1" { print }')"; \
+    missing="$(printf '%s\n' "${all_missing}" | awk 'NF && $1 != "libcuda.so.1" { print }')"; \
+    if [ -n "${ignored_missing}" ]; then \
+      echo "INFO: ignoring build-time unresolved host CUDA driver dependencies:"; \
+      echo "${ignored_missing}"; \
+    fi; \
     if [ -n "${missing}" ]; then \
       echo "FATAL: vLLM native extensions have unresolved dependencies:" >&2; \
       echo "${missing}" >&2; \
