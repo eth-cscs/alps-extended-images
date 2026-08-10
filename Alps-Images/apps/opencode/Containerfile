@@ -123,7 +123,7 @@ RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     git clone --depth 1 --branch "${QUACK_TAG}" "${QUACK_REPO}" /tmp/quack; \
     pushd /tmp/quack; \
-    pip_install install --upgrade-strategy only-if-needed '.[cu13]'; \
+    pip_install --upgrade-strategy only-if-needed '.[cu13]'; \
     popd; \
     rm -rf /tmp/quack
 
