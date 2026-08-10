@@ -1,10 +1,14 @@
 #!/bin/bash
 
-#SBATCH --nodes=32
+#SBATCH --nodes=56
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
 #SBATCH --time=12:00:00
+
+# Resolve the directory containing this script so patches/ is reachable inside
+# the container via the /users mount (e.g. /users/${USER}/.../example/patches/).
+export SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-0f334b540ccc7034" #alps7-dev-0f334b540ccc7034 image with megatron
 
@@ -25,7 +29,7 @@ cd $TRAINING_HOME
 
 
 # Rollout needs exactly 8 nodes for TP=32 (8 nodes × 4 GPUs = 32 GPUs, 1 replica).
-# Training gets the remaining 24 nodes (96 GPUs) for TP=4, PP=3, EP=8.
+# Training gets the remaining 48 nodes (192 GPUs) for TP=4, PP=3, EP=8, DP=2.
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
@@ -72,27 +76,26 @@ data:
   train_batch_size: 0    # must be 0 in fully-async mode
   gen_batch_size: 1      # must be 1 in fully-async mode
   return_raw_chat: True
-  max_response_length: 1024  # keep below DSA dense-attention threshold (2048 tokens total); GSM8K needs <1024
+  max_response_length: 256  # reduced from 1024 — at ~10 tok/s for 744B TP=32, 1024 tokens takes 83min for 48 samples
 
 actor_rollout_ref:
   hybrid_engine: False
 
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
-    use_remove_padding: True  # Megatron THD layout requires sequence packing
+    use_remove_padding: False  # DSA attention does not support THD packed-sequence format; use BSHD
     use_shm: false
     trust_remote_code: True  # GLM-5.1 uses a custom TokenizersBackend tokenizer
 
   actor:
-    # 24 training nodes × 4 GPUs = 96 GPUs; TP=4, PP=3, EP=8 → 4×3×8=96, DP=1
-    # PP=3: GLM-5.1 has 78 layers (78/3=26 layers/stage ✓).
-    # GLM-5.1 has 512 total experts; EP=8 → 64/rank — matching megatron-bridge's GLM-5.1 mapping.
-    # EP=4 gave 128 local experts, causing megatron-bridge to fail for experts 64-127 (unmapped).
-    # megatron-bridge loads model then DDP allocates param_data + grad_data (3× total).
-    # 744B/96=7.75B params/GPU × 3 × 2 bytes ≈ 46 GB << 95 GB ✓.
+    # 48 training nodes x 4 GPUs = 192 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=2.
+    # DP=2 halves FP32 master + Adam state per GPU; peak optimizer memory ~57 GiB
+    # vs 95 GiB limit (27 GiB headroom).
+    # EP=8: EP=4 causes megatron-bridge to fail for experts 64-127 (unmapped).
+    # PP=3: 78 layers / 3 = 26 layers/stage.
     optim:
       lr_decay_steps: 22419  # must be positive at init; set_total_train_steps is called too late (after init_workers)
-    ppo_mini_batch_size: 48
+    ppo_mini_batch_size: 16  # must be >= dp_size (DP=2 x EP=8 = 16)
     ppo_micro_batch_size_per_gpu: 1
     ppo_max_token_len_per_gpu: 16384
     use_rollout_log_probs: True   # required for fully-async log prob correctness
@@ -119,19 +122,21 @@ actor_rollout_ref:
     load_format: dummy
     n_gpus_per_node: 4
     temperature: 1.0
-    n: 16 #num responses per prompt
+    n: 1 #num responses per prompt — reduced from 16 for pipeline smoke test (GRPO advantages degenerate at n=1)
     # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32 (one replica) — 700B needs all 32 GPUs to fit
     tensor_model_parallel_size: 32
     gpu_memory_utilization: 0.75
+    free_cache_engine: false  # keep KV cache alive across weight syncs — avoids engine rebuild + CUDA graph re-capture across TP=32 (8-node deadlock)
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
       backend: nccl # weight sync via NCCL broadcast
       engine_kwargs:
         nccl:
-          rebuild_group: true  # destroy NCCL group after each sync to free internal buffers before KV cache restore
+          rebuild_group: false
     engine_kwargs:
       sglang:
-        watchdog_timeout: 3600
+        watchdog_timeout: 300
+        disable_cuda_graph: true
         max_running_requests: 128  # limit concurrent decode batch; keeps per-step latency and KV usage manageable
 
   ref:
@@ -428,8 +433,16 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
+# Inject debug instrumentation patches via sitecustomize.py.
+# patches/ lives next to this script on /users (mounted in the container).
+# sitecustomize.py is executed at Python startup for every process including
+# Ray workers, so the patches apply cluster-wide without modifying verl source.
+# Remove this line to disable all instrumentation.
+export PYTHONPATH="${SCRIPT_DIR}/patches:${PYTHONPATH:-}"
+
 # Required for Megatron communication/computation overlapping
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
