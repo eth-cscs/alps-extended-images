@@ -70,6 +70,7 @@ fi
 # topology-aware scheduling. For a first comparison run this is acceptable.
 # -----------------------------------------------------------------------------
 srun --mpi=pmix --network=disable_rdzv_get -N "${SLURM_JOB_NUM_NODES}" --ntasks-per-node=1 -u \
+    --kill-on-bad-exit=1 \
     --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
@@ -124,9 +125,24 @@ git remote add fork "${NEMORL_FORK_URL}"
 git fetch fork "${NEMORL_BRANCH}"
 git switch -C "${NEMORL_BRANCH}" "fork/${NEMORL_BRANCH}"
 
-# Initializing ray to ensure that it is in cash (which the container should have ensured) and
-#  will load fast when we start the container.
-uv run ray --version >/dev/null 2>&1 || true
+# Prepare the uv environment with retries, and GATE on success.  A single
+# flaky fetch (e.g. the flash-attn wheel from GitHub) otherwise kills
+# ray start on this node silently and the job hangs forever at N-1/N nodes
+# joined (slurm-3045644).  All later uv invocations use --no-sync so the
+# network is never touched again after this point.
+_uv_ready=false
+for _attempt in 1 2 3 4 5; do
+    if uv run ray --version >/dev/null 2>&1; then
+        _uv_ready=true
+        break
+    fi
+    echo "Rank ${SLURM_PROCID}: uv env preparation attempt ${_attempt}/5 failed; retrying in 30s..." >&2
+    sleep 30
+done
+if [ "${_uv_ready}" != true ]; then
+    echo "FATAL: Rank ${SLURM_PROCID}: uv environment could not be prepared after 5 attempts; aborting job." >&2
+    exit 1
+fi
 
 # Signal that this rank has finished its uv setup.
 RANK_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${SLURM_PROCID}_done"
@@ -144,7 +160,7 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
 
     # Rank 0 starts the Ray head node (under membind: raylet children — all
     # Ray actors — inherit the memory policy).
-    ${NUMACTL} uv run ray start --head \
+    ${NUMACTL} uv run --no-sync ray start --head \
         --node-ip-address="${MASTER_NODE_IP}" \
         --port="${PORT}" \
         --num-cpus="${SLURM_CPUS_PER_TASK}" \
@@ -154,28 +170,36 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
     # Signal that the Ray head is ready.
     touch "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
 
-    # Wait until all worker nodes have joined.
+    # Wait until all worker nodes have joined — with a timeout, so a single
+    # node that failed to start Ray aborts the job instead of hanging at
+    # N-1/N for the whole allocation (slurm-3045644).
+    _join_waited=0
     while true; do
-        alive_nodes=$(uv run ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep -c "node_" || true)
+        alive_nodes=$(uv run --no-sync ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep -c "node_" || true)
         if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
             alive_nodes=0
         fi
         if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
             break
         fi
+        if [ "${_join_waited}" -ge 1800 ]; then
+            echo "FATAL: Rank 0: only ${alive_nodes}/${SLURM_JOB_NUM_NODES} nodes joined the Ray cluster after 30 min; aborting job." >&2
+            exit 1
+        fi
         echo "Rank 0: waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
         sleep 5
+        _join_waited=$((_join_waited + 5))
     done
 
     # Run the NeMo-RL training driver (membind for consistency; its own
     # allocations are small, the heavy lifting is in the Ray actors).
-    ${NUMACTL} uv run python examples/run_grpo.py --config "${TRAINING_CONFIG}/${YAML_NAME}"
+    ${NUMACTL} uv run --no-sync python examples/run_grpo.py --config "${TRAINING_CONFIG}/${YAML_NAME}"
 
     # Gracefully stop the Ray cluster. This lets the worker nodes exit their
     # ray start --block cleanly instead of being killed by srun teardown,
     # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
     echo "Rank 0: stopping Ray cluster..."
-    uv run ray stop --grace-period 30 || true
+    uv run --no-sync ray stop --grace-period 30 || true
 
     sleep 5s
 else
@@ -186,7 +210,7 @@ else
         sleep 1
     done
 
-    ${NUMACTL} uv run ray start \
+    ${NUMACTL} uv run --no-sync ray start \
         --address="${RAY_ADDRESS}" \
         --node-ip-address="$(hostname -i)" \
         --num-cpus="${SLURM_CPUS_PER_TASK}" \
