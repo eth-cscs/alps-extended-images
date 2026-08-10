@@ -10,7 +10,7 @@ export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:
 
 export MODEL_NAME="Qwen2.5-3B-Instruct"
 export MODEL_REPO="Qwen"
-export PROJECT_NAME="cscs-async-grpo-gsm8k"
+export PROJECT_NAME="async-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Sync-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
@@ -262,7 +262,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo_sync \
+    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
         --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config \
