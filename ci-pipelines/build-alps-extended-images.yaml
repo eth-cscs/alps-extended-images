@@ -30,53 +30,36 @@ variables:
 # NOTE: Keep the matrices small to avoid "job name too long" issues
 
 .cuda_base_images_matrix: &cuda_base_images_matrix
-  - FAMILY: "ngc"
-    NGC_NAME: "pytorch"
-    NGC_TAG: "26.06-py3"
-  - FAMILY: "ngc"
-    NGC_NAME: "pytorch"
-    NGC_TAG: "26.02-py3"
-  - FAMILY: "ngc"
-    NGC_NAME: "pytorch"
-    NGC_TAG: "26.01-py3"
-  - FAMILY: "ngc"
-    NGC_NAME: "pytorch"
-    NGC_TAG: "25.12-py3"
-  - FAMILY: "ngc"
-    NGC_NAME: "nemo"
-    NGC_TAG: "26.02"
-  - FAMILY: "ngc"
-    NGC_NAME: "nemo"
-    NGC_TAG: "25.11.01"
-  - FAMILY: "ngc"
-    NGC_NAME: "physicsnemo"
-    NGC_TAG: "25.11"
+  - NAME: "pytorch"
+    VARIANT: "26.06-py3"
+  - NAME: "pytorch"
+    VARIANT: "26.02-py3"
+  - NAME: "pytorch"
+    VARIANT: "26.01-py3"
+  - NAME: "pytorch"
+    VARIANT: "25.12-py3"
+  - NAME: "nemo"
+    VARIANT: "26.02"
+  - NAME: "nemo"
+    VARIANT: "25.11.01"
+  - NAME: "physicsnemo"
+    VARIANT: "25.11"
 
 .rocm_base_images_matrix: &rocm_base_images_matrix
-  - FAMILY: "rocm"
-    ROCM_NAME: "pytorch"
-    ROCM_VARIANT: "rocm7.14-ubuntu24.04-py3.12-torch2.11"
-
+  - NAME: "pytorch"
+    VARIANT: "rocm7.14-ubuntu24.04-py3.12-torch2.11"
 
 .cuda_app_images_matrix: &cuda_app_images_matrix
   - NAME: "apertus-1p5"
-    APP_VARIANT: "cuda"
   - NAME: "apertus-2"
-    APP_VARIANT: "cuda"
   - NAME: "sfttrainer"
-    APP_VARIANT: "cuda"
   - NAME: "verl"
-    APP_VARIANT: "cuda"
   - NAME: "vllm"
-    APP_VARIANT: "cuda"
   - NAME: "opencode"
-    APP_VARIANT: "cuda"
 
 .rocm_app_images_matrix: &rocm_app_images_matrix
   - NAME: "vllm"
-    APP_VARIANT: "rocm"
   - NAME: "opencode"
-    APP_VARIANT: "rocm"
   
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
@@ -85,31 +68,16 @@ variables:
 # when explicitly defining "needs:" in the downstream job, as GitLab does not
 # support automatic mapping based on the matrix values.
 
-.cuda_base_needs_map: &cuda_base_needs_map
-  parallel:
-    matrix:
-      - FAMILY: ['$[[ matrix.FAMILY ]]']
-        NGC_NAME: ['$[[ matrix.NGC_NAME ]]']
-        NGC_TAG: ['$[[ matrix.NGC_TAG ]]']
-
-.rocm_base_needs_map: &rocm_base_needs_map
-  parallel:
-    matrix:
-      - FAMILY: ['$[[ matrix.FAMILY ]]']
-        ROCM_NAME: ['$[[ matrix.ROCM_NAME ]]']
-        ROCM_VARIANT: ['$[[ matrix.ROCM_VARIANT ]]']
-
-.cuda_app_needs_map: &cuda_app_needs_map
+.base_needs_map: &base_needs_map
   parallel:
     matrix:
       - NAME: ['$[[ matrix.NAME ]]']
-        APP_VARIANT: ['$[[ matrix.APP_VARIANT ]]']
+        VARIANT: ['$[[ matrix.VARIANT ]]']
 
-.rocm_app_needs_map: &rocm_app_needs_map
+.app_needs_map: &app_needs_map
   parallel:
     matrix:
       - NAME: ['$[[ matrix.NAME ]]']
-        APP_VARIANT: ['$[[ matrix.APP_VARIANT ]]']
 
 # ----------------------------
 # Skopeo: manipulate images in the registry
@@ -140,15 +108,6 @@ variables:
 
 .app-meta-template: &app_meta_template
   stage: build-apps
-  script:
-    - source ci-pipelines/helpers/meta.sh
-    - |
-      set -euo pipefail
-
-      write_app_build_env "$APP_BUILD_ENV_FILE" "$NAME" "$APP_VARIANT"
-
-      echo "Generated build variables:"
-      cat "$APP_BUILD_ENV_FILE"
 
 build-cuda-base-meta:
   stage: build-base
@@ -161,14 +120,14 @@ build-cuda-base-meta:
       set -euo pipefail
 
       # Generate content-hash based image references and additional container build variables
-      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$NGC_NAME" "$NGC_TAG")
+      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$NAME" "$VARIANT")
       REMOVE_HPCX_DIRS="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
       IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
 
       # Export variables to a file for the builder job
       cat > build.env <<EOF
       DOCKERFILE=$DOCKERFILE
-      NGC_VARIANT_DIR=${NGC_NAME}-${NGC_TAG}
+      NGC_VARIANT_DIR=${NAME}-${VARIANT}
       CANON_IMAGE_REF=$CANON_IMAGE_REF
       TEST_IMAGE_REF=$TEST_IMAGE_REF
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
@@ -199,8 +158,8 @@ build-rocm-base-meta:
     - |
       set -euo pipefail
 
-      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$ROCM_NAME" "$ROCM_VARIANT")
-      profile_file="$(rocm_profile_file "$ROCM_NAME" "$ROCM_VARIANT")"
+      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$NAME" "$VARIANT")
+      profile_file="$(rocm_profile_file "$NAME" "$VARIANT")"
       load_rocm_profile "$profile_file"
       IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
 
@@ -212,7 +171,7 @@ build-rocm-base-meta:
       STABLE_IMAGE_REF=$STABLE_IMAGE_REF
       BASE_IMAGE=$BASE_IMAGE_REF
       EOF
-        rocm_base_dotenv "${ROCM_NAME}-${ROCM_VARIANT}"
+        rocm_base_dotenv "${NAME}-${VARIANT}"
         cat <<EOF
       OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
       OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
@@ -221,35 +180,49 @@ build-rocm-base-meta:
       CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
       GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
       EOF
-      } > build_rocm.env
+      } > build.env
 
       echo "Generated build variables:"
-      cat build_rocm.env
+      cat build.env
   artifacts:
     reports:
-      dotenv: build_rocm.env
+      dotenv: build.env
 
 build-cuda-apps-meta:
   <<: *app_meta_template
   extends: [.container-runner-lightweight-gh200, .skopeo-template]
   parallel:
     matrix: *cuda_app_images_matrix
-  variables:
-    APP_BUILD_ENV_FILE: build_apps.env
+  script:
+    - source ci-pipelines/helpers/meta.sh
+    - |
+      set -euo pipefail
+
+      write_app_build_env build.env "$NAME" cuda
+
+      echo "Generated build variables:"
+      cat build.env
   artifacts:
     reports:
-      dotenv: build_apps.env
+      dotenv: build.env
 
 build-rocm-apps-meta:
   <<: *app_meta_template
   extends: [.container-runner-lightweight-zen2, .skopeo-template]
   parallel:
     matrix: *rocm_app_images_matrix
-  variables:
-    APP_BUILD_ENV_FILE: build_rocm_apps.env
+  script:
+    - source ci-pipelines/helpers/meta.sh
+    - |
+      set -euo pipefail
+
+      write_app_build_env build.env "$NAME" rocm
+
+      echo "Generated build variables:"
+      cat build.env
   artifacts:
     reports:
-      dotenv: build_rocm_apps.env
+      dotenv: build.env
 
 # ----------------------------
 # Build images
@@ -293,7 +266,7 @@ build-cuda-base-images:
   needs:
     - job: build-cuda-base-meta
       artifacts: true
-      <<: *cuda_base_needs_map
+      <<: *base_needs_map
   variables:
     DOCKER_BUILD_ARGS: '[
       "BASE_IMAGE",
@@ -332,7 +305,7 @@ build-rocm-base-images:
   needs:
     - job: build-rocm-base-meta
       artifacts: true
-      <<: *rocm_base_needs_map
+      <<: *base_needs_map
   variables:
     DOCKER_BUILD_ARGS: '[
       "BASE_IMAGE",
@@ -376,7 +349,7 @@ build-cuda-app-images:
   needs:
     - job: build-cuda-apps-meta
       artifacts: true
-      <<: *cuda_app_needs_map
+      <<: *app_needs_map
 
 build-rocm-app-images:
   <<: *app_build_images_template
@@ -387,7 +360,7 @@ build-rocm-app-images:
   needs:
     - job: build-rocm-apps-meta
       artifacts: true
-      <<: *rocm_app_needs_map
+      <<: *app_needs_map
 
 # ----------------------------
 # Re-tag images with commit SHA for testing
@@ -415,9 +388,9 @@ tag-cuda-base-images-for-ci:
   needs:
     - job: build-cuda-base-meta
       artifacts: true
-      <<: *cuda_base_needs_map
+      <<: *base_needs_map
     - job: build-cuda-base-images
-      <<: *cuda_base_needs_map
+      <<: *base_needs_map
 
 tag-rocm-base-images-for-ci:
   stage: build-base
@@ -427,9 +400,9 @@ tag-rocm-base-images-for-ci:
   needs:
     - job: build-rocm-base-meta
       artifacts: true
-      <<: *rocm_base_needs_map
+      <<: *base_needs_map
     - job: build-rocm-base-images
-      <<: *rocm_base_needs_map
+      <<: *base_needs_map
 
 tag-cuda-app-images-for-ci:
   <<: &app_tag_template
@@ -440,9 +413,9 @@ tag-cuda-app-images-for-ci:
   needs:
     - job: build-cuda-apps-meta
       artifacts: true
-      <<: *cuda_app_needs_map
+      <<: *app_needs_map
     - job: build-cuda-app-images
-      <<: *cuda_app_needs_map
+      <<: *app_needs_map
 
 tag-rocm-app-images-for-ci:
   <<: *app_tag_template
@@ -452,9 +425,9 @@ tag-rocm-app-images-for-ci:
   needs:
     - job: build-rocm-apps-meta
       artifacts: true
-      <<: *rocm_app_needs_map
+      <<: *app_needs_map
     - job: build-rocm-app-images
-      <<: *rocm_app_needs_map
+      <<: *app_needs_map
 
 # ----------------------------
 # Run tests on the images
@@ -494,7 +467,7 @@ test-cuda-base-images-env:
   extends: [.container-runner-clariden-gh200, .slurm-template]
   parallel:
     matrix: *cuda_base_images_matrix
-  image: "$IMAGE_PREFIX/${NGC_NAME}-cuda:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/${NAME}-cuda:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     - |
       set -euo pipefail
@@ -520,7 +493,7 @@ test-cuda-base-images-collectives:
   extends: [.container-runner-clariden-gh200, .slurm-template]
   parallel:
     matrix: *cuda_base_images_matrix
-  image: "$IMAGE_PREFIX/${NGC_NAME}-cuda:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/${NAME}-cuda:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     # NCCL
     - alltoall_perf -b 32 -e 4M -f 2 -g 1
@@ -539,7 +512,7 @@ test-cuda-base-images-vetnode:
   extends: [.container-runner-clariden-gh200, .slurm-template]
   parallel:
     matrix: *cuda_base_images_matrix
-  image: "$IMAGE_PREFIX/${NGC_NAME}-cuda:${NGC_TAG}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/${NAME}-cuda:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     - echo "[image-vet] Set-up vetnode on $(hostname)... "
     - |
@@ -575,7 +548,7 @@ test-rocm-base-images-env:
   extends: [.container-runner-beverin-mi300, .slurm-template]
   parallel:
     matrix: *rocm_base_images_matrix
-  image: "$IMAGE_PREFIX/${ROCM_NAME}-rocm:${ROCM_VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/${NAME}-rocm:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     - |
       set -euo pipefail
@@ -602,7 +575,7 @@ test-rocm-base-images-collectives:
   extends: [.container-runner-beverin-mi300, .slurm-template]
   parallel:
     matrix: *rocm_base_images_matrix
-  image: "$IMAGE_PREFIX/${ROCM_NAME}-rocm:${ROCM_VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/${NAME}-rocm:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
   script:
     - all_reduce_perf -b 32 -e 4M -f 2 -g 1
     - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator rocm
@@ -664,7 +637,7 @@ test-cuda-app-images-vetnode:
   timeout: 2h
   parallel:
     matrix: *cuda_app_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-${APP_VARIANT}:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  image: "$IMAGE_PREFIX/${NAME}-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
 
 #test-verl-async:
 #  stage: test-apps
@@ -761,7 +734,7 @@ publish-cuda-base-images:
     - job: publish-gate
     - job: build-cuda-base-meta
       artifacts: true
-      <<: *cuda_base_needs_map
+      <<: *base_needs_map
 
 publish-rocm-base-images:
   extends: [.publish-template]
@@ -771,7 +744,7 @@ publish-rocm-base-images:
     - job: publish-gate
     - job: build-rocm-base-meta
       artifacts: true
-      <<: *rocm_base_needs_map
+      <<: *base_needs_map
 
 publish-cuda-app-images:
   extends: [.publish-template]
@@ -781,7 +754,7 @@ publish-cuda-app-images:
     - job: publish-gate
     - job: build-cuda-apps-meta
       artifacts: true
-      <<: *cuda_app_needs_map
+      <<: *app_needs_map
 
 publish-rocm-app-images:
   extends: [.publish-template]
@@ -791,4 +764,4 @@ publish-rocm-app-images:
     - job: publish-gate
     - job: build-rocm-apps-meta
       artifacts: true
-      <<: *rocm_app_needs_map
+      <<: *app_needs_map
