@@ -583,7 +583,7 @@ test-rocm-base-images-collectives:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
 
-test-apertus-1p5:
+test-cuda-apertus-1p5:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
   timeout: 2h
@@ -599,7 +599,7 @@ test-apertus-1p5:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
 
-test-apertus-2-pplx-garden:
+test-cuda-apertus-2-pplx-garden:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
   timeout: 2h
@@ -610,7 +610,7 @@ test-apertus-2-pplx-garden:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 2
 
-test-apertus-2-DeepEP:
+test-cuda-apertus-2-DeepEP:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .slurm-template]
   timeout: 2h
@@ -621,12 +621,12 @@ test-apertus-2-DeepEP:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
-test-vllm-ray-nccl:
+test-cuda-vllm-ray-nccl:
   <<: *vllm_ray_smoke_template
   extends: [.container-runner-clariden-gh200, .slurm-template]
   image: "$IMAGE_PREFIX/vllm-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
 
-test-vllm-rocm-ray-rccl:
+test-rocm-vllm-ray-rccl:
   <<: *vllm_ray_smoke_template
   extends: [.container-runner-beverin-mi300, .slurm-template]
   image: "$IMAGE_PREFIX/vllm-rocm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
@@ -639,7 +639,7 @@ test-cuda-app-images-vetnode:
     matrix: *cuda_app_images_matrix
   image: "$IMAGE_PREFIX/${NAME}-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
 
-#test-verl-async:
+#test-cuda-verl-async:
 #  stage: test-apps
 #  extends: [.container-runner-clariden-gh200, .slurm-template]
 #  timeout: 2h
@@ -675,13 +675,13 @@ publish-gate:
     - test-cuda-base-images-vetnode
     - test-rocm-base-images-env
     - test-rocm-base-images-collectives
-    - test-apertus-1p5
-    - test-apertus-2-pplx-garden
-    - test-apertus-2-DeepEP
-    - test-vllm-ray-nccl
-    - test-vllm-rocm-ray-rccl
+    - test-cuda-apertus-1p5
+    - test-cuda-apertus-2-pplx-garden
+    - test-cuda-apertus-2-DeepEP
+    - test-cuda-vllm-ray-nccl
+    - test-rocm-vllm-ray-rccl
     - test-cuda-app-images-vetnode
-    #- test-verl-async
+    #- test-cuda-verl-async
   script:
     - echo "Publish gate passed (tests completed)"
 
