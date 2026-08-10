@@ -75,6 +75,41 @@ srun --mpi=pmix --network=disable_rdzv_get -N "${SLURM_JOB_NUM_NODES}" --ntasks-
 
 unset PYTHONOPTIMIZE
 
+# -----------------------------------------------------------------------------
+# Bind host memory to the CPU (LPDDR) NUMA nodes.
+#
+# On GH200 each GPU exposes its HBM as a memory-only NUMA node.  Under LPDDR
+# pressure the kernel places host pages there — including cudaHostAlloc
+# PINNED pages, which are unevictable — invisibly consuming GPU memory that
+# NVML attributes to no process (the "phantom", HANDOFF.md §8,
+# slurm-3044145).  Binding to the CPU-bearing nodes prevents this; CUDA
+# device allocations go through the GPU driver and are unaffected by the
+# host mempolicy.  The node list is detected, not hardcoded: LPDDR nodes
+# are the ones with a non-empty cpulist.
+# -----------------------------------------------------------------------------
+NUMACTL=""
+MEMBIND_NODES=""
+for _node_dir in /sys/devices/system/node/node[0-9]*; do
+    if [ -f "${_node_dir}/cpulist" ] && [ -n "$(tr -d "[:space:]" < "${_node_dir}/cpulist")" ]; then
+        _node_id="${_node_dir##*/node}"
+        MEMBIND_NODES="${MEMBIND_NODES:+${MEMBIND_NODES},}${_node_id}"
+    fi
+done
+# Fallback if sysfs is not available in the container: parse `numactl -H`
+# ("node <N> cpus: <list>" — CPU-bearing nodes have a non-empty list).
+if [ -z "${MEMBIND_NODES}" ] && command -v numactl >/dev/null 2>&1; then
+    MEMBIND_NODES="$(numactl -H 2>/dev/null | awk "/^node [0-9]+ cpus:/ { if (NF > 3) printf \"%s%s\", (n++ ? \",\" : \"\"), \$2 }")"
+fi
+if command -v numactl >/dev/null 2>&1 && [ -n "${MEMBIND_NODES}" ]; then
+    NUMACTL="numactl --membind=${MEMBIND_NODES}"
+    echo "Rank ${SLURM_PROCID}: binding host memory to NUMA nodes ${MEMBIND_NODES}"
+    if [ "${SLURM_PROCID}" -eq 0 ]; then
+        numactl -H || true
+    fi
+else
+    echo "WARNING: Rank ${SLURM_PROCID}: numactl unavailable or no CPU NUMA nodes detected (MEMBIND_NODES=\"${MEMBIND_NODES}\"); running WITHOUT membind — the phantom-memory mitigation is inactive." >&2
+fi
+
 # If a token file was passed, read it into the environment as a fallback for
 # libraries that do not natively honour HF_TOKEN_PATH.
 if [[ -n "${HF_TOKEN_PATH}" && -f "${HF_TOKEN_PATH}" && -z "${HF_TOKEN}" ]]; then
@@ -107,8 +142,9 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
         done
     done
 
-    # Rank 0 starts the Ray head node.
-    uv run ray start --head \
+    # Rank 0 starts the Ray head node (under membind: raylet children — all
+    # Ray actors — inherit the memory policy).
+    ${NUMACTL} uv run ray start --head \
         --node-ip-address="${MASTER_NODE_IP}" \
         --port="${PORT}" \
         --num-cpus="${SLURM_CPUS_PER_TASK}" \
@@ -131,8 +167,9 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
         sleep 5
     done
 
-    # Run the NeMo-RL training driver.
-    uv run python examples/run_grpo.py --config "${TRAINING_CONFIG}/${YAML_NAME}"
+    # Run the NeMo-RL training driver (membind for consistency; its own
+    # allocations are small, the heavy lifting is in the Ray actors).
+    ${NUMACTL} uv run python examples/run_grpo.py --config "${TRAINING_CONFIG}/${YAML_NAME}"
 
     # Gracefully stop the Ray cluster. This lets the worker nodes exit their
     # ray start --block cleanly instead of being killed by srun teardown,
@@ -149,7 +186,7 @@ else
         sleep 1
     done
 
-    uv run ray start \
+    ${NUMACTL} uv run ray start \
         --address="${RAY_ADDRESS}" \
         --node-ip-address="$(hostname -i)" \
         --num-cpus="${SLURM_CPUS_PER_TASK}" \
