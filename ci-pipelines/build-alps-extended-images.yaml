@@ -97,7 +97,6 @@ variables:
     USE_MPI: NO
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
-    SLURM_GPUS_PER_NODE: 4
     PMIX_MCA_psec: native
 
 # ----------------------------
