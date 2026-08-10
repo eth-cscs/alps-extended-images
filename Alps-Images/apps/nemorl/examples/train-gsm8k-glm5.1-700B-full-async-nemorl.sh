@@ -64,15 +64,15 @@ export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
 # the rest for Megatron training with fixed TP=4, PP=3, EP=8, ETP=4.
 #
-# DEFAULT: 56 nodes = 48 training (192 GPUs, expert_DP=2, dense DP=16).
-#   Never tried before (history: 32/34/60/136 total nodes); first layout that
-#   fits by construction with the GPU-resident optimizer: ~39 GB buffers +
-#   ~45 GB optimizer shard ≈ 84 GB of 95 GB, idle host.  PRIORITY IS A RUN
-#   THAT TRAINS AT ALL — efficiency comes after (see HANDOFF §8).
+# DEFAULT: 56 nodes = 48 training (192 GPUs, expert_DP=2, dense DP=16),
+#   with the CPU-offloaded optimizer (see the OPTIMIZER_CPU_OFFLOAD toggle
+#   below — slurm-3031411's measured numbers ruled out the GPU-resident
+#   optimizer at this node count).  PRIORITY IS A RUN THAT TRAINS AT ALL —
+#   efficiency comes after (see HANDOFF §8).
 # Variant: `sbatch --nodes=32` = 24 training (96 GPUs, expert_DP=1) — verl
 #   parity, cheapest, but the unsharded ~87 GB expert optimizer state does
-#   NOT fit on GPU; only viable if the verl baseline proves the update phase
-#   fits (gated, see the OPTIMIZER_CPU_OFFLOAD comment below).
+#   not fit on GPU and its CPU offload recreates 3029253's host burden;
+#   only viable if the verl baseline proves the update phase fits.
 #
 # Why 32 nodes works (see HANDOFF.md §8): GLM-5.1 is ~94% expert weights, and
 # Megatron shards experts over ETP × EP × PP ranks.  verl leaves
@@ -101,8 +101,8 @@ export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
 # expert_DP ways for the expert part.  At expert_DP=1 that is ~87 GB/rank
 # × 4 ranks/node ≈ 345 GB of the 450 GB node RAM — and the
 # HybridDeviceOptimizer allocates its pinned CPU clones eagerly at init
-# (see HANDOFF §8, slurm-3029253).  At expert_DP=2 it halves.  The default
-# (GPU-resident optimizer) leaves the host idle either way.
+# (see HANDOFF §8, slurm-3029253).  At the default expert_DP=2 it halves
+# to ~51 GB/rank × 4 ≈ 204 GB — the acceptable-risk regime.
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
@@ -112,24 +112,22 @@ export YAML_NAME="grpo_gsm8k_glm51_async_nemorl.yaml"
 # -----------------------------------------------------------------------------
 # Optimizer placement toggle (see HANDOFF.md §8).
 #
-# "false" (default): fully GPU-resident optimizer, mirroring verl exactly.
-#   Rationale: slurm-3029253 showed that optimizer_cpu_offload's
-#   HybridDeviceOptimizer eagerly clones every param to pinned CPU + FP32 CPU
-#   copies at init (~240 GB/node) BEFORE the GPU master build — the leading
-#   suspect for the "phantom" HBM loss that OOM'd 25/96 workers.  Without
-#   offload, FusedAdam moments are created lazily at the first step (same as
-#   verl), and the host stays idle.
-#   At the DEFAULT 56 nodes (expert_DP=2) the GPU-resident optimizer fits by
-#   construction (~84 GB steady) — no gating, submit any time.
-#   At `sbatch --nodes=32` (expert_DP=1) it does NOT fit by our math
-#   (~126 GB); submit that variant only if the verl baseline (successor of
-#   slurm-3028399) reports step:1 metrics, proving the GPU-resident update
-#   phase fits at that sharding (per-rank params verified identical: 9.77B).
+# "true" (default since slurm-3031411): CPU-offloaded optimizer via
+#   HybridDeviceOptimizer + CPUAdam.  Measured numbers from 3031411 killed
+#   the GPU-resident path at 56 nodes: buffers 39 GB + masters ~17-21 GB +
+#   Adam moments 2x masters (~34-42 GB at the first step) + ~9 GB measured
+#   NCCL overhead = 90-100+ GB > 95 GB.  With offload: GPU ~= 39 buffers +
+#   ~17 GPU shard-mains + 9 NCCL ~= 65 GB (~30 GB headroom vs the phantom);
+#   host ~= ~51 GB/rank x 4 ~= 204 GB of 450 GB — about half the burden that
+#   correlated with the init-phantom in slurm-3029253 (expert_DP=2 halves
+#   the eager pinned clones).
 #
-# "true": previous behavior (CPU-offloaded optimizer via HybridDeviceOptimizer)
-#   — kept for reference/experiments; OOM'd at init in slurm-3029253.
+# "false": fully GPU-resident optimizer (FusedAdam, moments lazy at first
+#   step, idle host).  Fits only at >= 80 total nodes (72 training,
+#   expert_DP=3, ~82 GB) — and even there only ~13 GB headroom against the
+#   27-45 GB phantom seen in 3031411.
 # -----------------------------------------------------------------------------
-export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-false}"
+export OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-true}"
 if [[ "${OPTIMIZER_CPU_OFFLOAD}" == "true" ]]; then
     OPTIMIZER_PLACEMENT_YAML="      optimizer_cpu_offload: true
       optimizer_offload_fraction: 1.0
@@ -184,6 +182,19 @@ NRL_MEGATRON_CHECKPOINT_DIR = "${NRL_MEGATRON_CHECKPOINT_DIR}"
 # PyTorch recommends expandable_segments when small allocations fail near
 # the limit (see the CUDA out of memory error message in slurm-3007452).
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
+# Log which network transport NCCL actually selects (Slingshot/CXI via
+# aws-ofi-nccl vs. TCP-socket fallback).  Look for "NCCL INFO NET/..." lines:
+# "Using network AWS Libfabric" = HSN; "Using network Socket" = slow fallback.
+# Added to diagnose the extremely slow TP=32 rollout decode in slurm-3030645.
+NCCL_DEBUG = "INFO"
+NCCL_DEBUG_SUBSYS = "INIT,NET"
+# Phantom-memory hedge (HANDOFF §8, slurm-3031411): 27-45 GB/GPU of memory
+# attributed to no process appears between init and the first training
+# transition.  Prime suspect: NCCL NVLS multicast buffers, allocated lazily
+# per communicator via cuMem — invisible to NVML per-process accounting.
+# NVLS only speeds up large all-reduces on the NVLink domain; TP=4
+# all-reduces at 2k tokens lose little.
+NCCL_NVLS_ENABLE = "0"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
@@ -380,12 +391,11 @@ policy:
     # is unsharded on GPU (~39 GB at TP=4/PP=3/EP=8/ETP=4).
     # use_distributed_optimizer shards optimizer state across dense DP for
     # dense params and expert_DP for expert params (expert_DP=2 at the
-    # default 48 training nodes -> ~45 GB/rank optimizer shard on GPU).
-    # Optimizer placement (GPU-resident vs CPU-offloaded) is controlled by
+    # default 48 training nodes).  Placement is controlled by
     # OPTIMIZER_CPU_OFFLOAD at the top of this script — default is
-    # GPU-resident, mirroring verl (see HANDOFF §8: the CPU-offload path's
-    # eager pinned host clones at init are the leading suspect for the
-    # phantom-HBM OOM in slurm-3029253).
+    # CPU-offloaded since slurm-3031411 measured that the GPU-resident
+    # optimizer (masters ~17-21 GB + moments 2x) exceeds 95 GB at the
+    # first optimizer.step even at 56 nodes.
     optimizer:
       optimizer: "adam"
       lr: 5.0e-7
@@ -453,8 +463,11 @@ ${OPTIMIZER_PLACEMENT_YAML}
       use_deep_gemm: false
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
-      enable_vllm_metrics_logger: false
-      vllm_metrics_logger_interval: 0.5
+      # Periodic tokens/s + running/waiting-request logging from the vLLM
+      # engine.  Enabled after slurm-3030645, where generation ran blind for
+      # minutes with no way to distinguish "slow" from "wedged" in the log.
+      enable_vllm_metrics_logger: true
+      vllm_metrics_logger_interval: 30.0
     vllm_kwargs: {}
     # Non-colocated generation: dedicated rollout nodes separate from training.
     colocated:
