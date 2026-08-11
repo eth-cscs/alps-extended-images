@@ -293,7 +293,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo_sync \
+    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
         --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config

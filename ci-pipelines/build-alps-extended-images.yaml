@@ -19,6 +19,8 @@ variables:
 
 .alps_base_images_matrix: &alps_base_images_matrix
   - NGC_NAME: "pytorch"
+    NGC_TAG: "26.06-py3"
+  - NGC_NAME: "pytorch"
     NGC_TAG: "26.02-py3"
   - NGC_NAME: "pytorch"
     NGC_TAG: "26.01-py3"
@@ -30,13 +32,14 @@ variables:
     NGC_TAG: "25.11.01"
   - NGC_NAME: "physicsnemo"
     NGC_TAG: "25.11"
-  
+
 
 .alps_app_images_matrix: &alps_app_images_matrix
   - NAME: "apertus-1p5"
   - NAME: "apertus-2"
   - NAME: "sfttrainer"
   - NAME: "verl"
+  - NAME: "vllm"
   
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
@@ -74,7 +77,6 @@ variables:
     USE_MPI: NO
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
-    SLURM_GPUS_PER_NODE: 4
     PMIX_MCA_psec: native
 
 # ----------------------------
@@ -267,7 +269,7 @@ tag-app-images-for-ci:
 # ----------------------------
 # The test jobs use the test tags created in the previous step. They run a set of
 # sanity checks to verify the functionality of the images.
-# Current tets for the baase images:
+# Current tests for the base images:
 # - Ensure environment variables are set correctly
 # - NCCL alltoall_perf
 # - NVSHMEM alltoall_latency
@@ -279,6 +281,10 @@ tag-app-images-for-ci:
 # Current tests for the app images:
 # - Apertus 1.5: Megatron pretraining script
 # - Apertus 2: pplx garden benchmark
+# - Apertus 2: DeepEP benchmark
+# - vLLM: Ray/NCCL smoke test
+# - VeRL: async RL benchmark
+# - vetnode diagnose across app image matrix
 
 test-base-images-env:
   stage: test-base
@@ -399,6 +405,18 @@ test-apertus-2-DeepEP:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
+test-vllm-ray-nccl:
+  stage: test-apps
+  extends: [.container-runner-clariden-gh200, .slurm-template]
+  timeout: 30m
+  image: "$IMAGE_PREFIX/vllm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+  script:
+    - /opt/tests/vllm/ray_nccl_smoke.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 2
+    VLLM_RAY_NCCL_WORLD_SIZE: 8
+
 test-app-images-vetnode:
   stage: test-apps
   extends: [test-base-images-vetnode]
@@ -444,6 +462,7 @@ publish-gate:
     - test-apertus-1p5
     - test-apertus-2-pplx-garden
     - test-apertus-2-DeepEP
+    - test-vllm-ray-nccl
     - test-app-images-vetnode
     - test-verl-async
   script:
