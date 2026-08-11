@@ -110,6 +110,18 @@ rocm_profile_file() {
   printf 'Alps-Images/ROCm/%s-%s/profile.env\n' "$rocm_name" "$rocm_variant"
 }
 
+rocm_version_from_variant() {
+  local rocm_variant="${1:?rocm_variant required}"
+
+  if [[ "$rocm_variant" =~ ^rocm([0-9]+\.[0-9]+)- ]]; then
+    printf '%s.0\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+
+  echo "ERROR: can not derive ROCm version from variant: ${rocm_variant}" >&2
+  return 1
+}
+
 rocm_base_image_ref() {
   local rocm_name="${1:?rocm_name required}"
   local rocm_variant="${2:?rocm_variant required}"
@@ -131,7 +143,6 @@ rocm_base_image_ref() {
 validate_rocm_profile() {
   local profile_file="${1:?profile_file required}"
 
-  [[ -n "${ROCM_VERSION:-}" ]] || { echo "ERROR: ROCM_VERSION must be set in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_PYPI_INDEX_URL:-}" ]] || { echo "ERROR: ROCM_PYPI_INDEX_URL must be set in $profile_file" >&2; return 1; }
   [[ "${ROCM_REBUILD_RCCL:-0}" == "0" || "${ROCM_REBUILD_RCCL:-0}" == "1" ]] || { echo "ERROR: ROCM_REBUILD_RCCL must be 0 or 1 in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_REPO:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_REPO must be set in $profile_file" >&2; return 1; }
@@ -143,7 +154,6 @@ validate_rocm_profile() {
 load_rocm_profile() {
   local profile_file="${1:?profile_file required}"
 
-  ROCM_VERSION=""
   ROCM_PYPI_INDEX_URL=""
   ROCM_REBUILD_RCCL="0"
   ROCM_SYSTEMS_REPO=""
@@ -217,6 +227,7 @@ rocm_base_refs() {
   local ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
   local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
   load_rocm_profile "$profile_file"
+  ROCM_VERSION="$(rocm_version_from_variant "$rocm_variant")"
   local base_image_ref
   base_image_ref="$(rocm_base_image_ref "$rocm_name" "$rocm_variant")"
 

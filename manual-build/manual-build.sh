@@ -115,6 +115,7 @@ emit_base_script() {
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
       profile_file="$root/$(rocm_profile_file "$name" "$variant")"
       load_rocm_profile "$profile_file"
+      ROCM_VERSION="$(rocm_version_from_variant "$variant")"
       image_description="This image extends ${BASE_IMAGE_REF} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
       family_build_args="$(rocm_base_build_args "$variant_dir")"$'\n'
       ;;
