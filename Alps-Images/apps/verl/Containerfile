@@ -21,6 +21,9 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
+
+ARG VERL_REF="v0.8.0"
+
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
 # Install dependencies for VeRL from pypi, including vLLM and SGLang.
@@ -55,7 +58,7 @@ WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
 
-RUN git clone https://github.com/verl-project/verl
+RUN git clone --branch ${VERL_REF} --depth 1 https://github.com/verl-project/verl
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     cd verl; \
