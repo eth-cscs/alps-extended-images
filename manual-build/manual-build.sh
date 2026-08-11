@@ -111,7 +111,7 @@ emit_base_script() {
     rocm)
       read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
       variant_dir="${name}-${variant}"
-      local profile_file ROCM_BASE_IMAGE_REF ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
+      local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
       profile_file="$root/$(rocm_profile_file "$name" "$variant")"
       load_rocm_profile "$profile_file"

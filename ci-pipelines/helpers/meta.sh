@@ -110,10 +110,27 @@ rocm_profile_file() {
   printf 'Alps-Images/ROCm/%s-%s/profile.env\n' "$rocm_name" "$rocm_variant"
 }
 
+rocm_base_image_ref() {
+  local rocm_name="${1:?rocm_name required}"
+  local rocm_variant="${2:?rocm_variant required}"
+
+  case "$rocm_name" in
+    pytorch)
+      if [[ "$rocm_variant" =~ ^rocm([0-9]+\.[0-9]+)-ubuntu([0-9]+\.[0-9]+)-py([0-9]+\.[0-9]+)-torch([0-9]+\.[0-9]+)$ ]]; then
+        printf 'docker.io/rocm/pytorch:rocm%s_ubuntu%s_py%s_pytorch_release_%s.0\n' \
+          "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+        return 0
+      fi
+      ;;
+  esac
+
+  echo "ERROR: can not derive ROCm base image ref from ${rocm_name}:${rocm_variant}" >&2
+  return 1
+}
+
 validate_rocm_profile() {
   local profile_file="${1:?profile_file required}"
 
-  [[ -n "${ROCM_BASE_IMAGE_REF:-}" ]] || { echo "ERROR: ROCM_BASE_IMAGE_REF must be set in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_VERSION:-}" ]] || { echo "ERROR: ROCM_VERSION must be set in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_PYPI_INDEX_URL:-}" ]] || { echo "ERROR: ROCM_PYPI_INDEX_URL must be set in $profile_file" >&2; return 1; }
   [[ "${ROCM_REBUILD_RCCL:-0}" == "0" || "${ROCM_REBUILD_RCCL:-0}" == "1" ]] || { echo "ERROR: ROCM_REBUILD_RCCL must be 0 or 1 in $profile_file" >&2; return 1; }
@@ -126,7 +143,6 @@ validate_rocm_profile() {
 load_rocm_profile() {
   local profile_file="${1:?profile_file required}"
 
-  ROCM_BASE_IMAGE_REF=""
   ROCM_VERSION=""
   ROCM_PYPI_INDEX_URL=""
   ROCM_REBUILD_RCCL="0"
@@ -198,14 +214,16 @@ rocm_base_refs() {
   [[ -d "$common_dir" ]]   || { echo "ERROR: missing $common_dir" >&2; return 1; }
   [[ -d "$patches_dir" ]]  || { echo "ERROR: missing $patches_dir" >&2; return 1; }
 
-  local ROCM_BASE_IMAGE_REF ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
+  local ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
   local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
   load_rocm_profile "$profile_file"
+  local base_image_ref
+  base_image_ref="$(rocm_base_image_ref "$rocm_name" "$rocm_variant")"
 
   local hash_paths="$dockerfile $rocm_installer $rocm_components $rocm_runtime_env $common_dir $patches_dir $image_dir"
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag ROCM_BASE_IMAGE_REF ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL")"
+  local h="$(content_hash "$hash_paths" "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL")"
   local canon_tag="$(canon_tag_for "$tag" "$h")"
 
   local canon_ref="$(img_ref "$name" "$canon_tag")"
@@ -213,7 +231,7 @@ rocm_base_refs() {
   local stable_ref="$(img_ref "$name" "$tag")"
 
   printf '%s %s %s %s %s\n' \
-    "$ROCM_BASE_IMAGE_REF" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+    "$base_image_ref" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
 }
 
 # Usage: ngc_base_refs NGC_NAME NGC_TAG
