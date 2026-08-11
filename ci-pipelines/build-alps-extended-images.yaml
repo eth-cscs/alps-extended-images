@@ -160,6 +160,7 @@ build-rocm-base-meta:
       read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$NAME" "$VARIANT")
       profile_file="$(rocm_profile_file "$NAME" "$VARIANT")"
       load_rocm_profile "$profile_file"
+      ROCM_VERSION="$(rocm_version_from_variant "$VARIANT")"
       IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
 
       {

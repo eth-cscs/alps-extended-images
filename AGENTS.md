@@ -30,7 +30,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - Add new accelerator families as sibling family directories and family-specific metadata/build/test/publish plumbing.
 - Do not generalize CUDA-only assumptions such as `NVCR_PREFIX`, `REMOVE_HPCX_DIRS`, SM90 flags, NCCL/NVSHMEM, NVIDIA hooks, GH200 runners, or CUDA selector parsing.
 - Keep shared Slingshot/CXI/HPC stack logic in `Alps-Images/common/`; keep accelerator-specific orchestration and pins in family directories or profiles.
-- ROCm profiles own upstream base refs, ROCm versions, wheel indexes, target lists, and whether RCCL is rebuilt. Keep ROCm installers free of hardcoded package indexes.
+- ROCm profiles own wheel indexes, target lists, and whether RCCL is rebuilt. Keep ROCm installers free of hardcoded package indexes if it can be avoided.
 
 ## Runtime Env
 
