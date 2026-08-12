@@ -145,18 +145,18 @@ variables:
 #    MIGRATION_BATCH: alps4
 #    CONFIRM_MIGRATION: copy
 #
-migrate-image-names-alps5:
-  stage: migrate
-  extends: [.migration-template]
-  variables:
-    MIGRATION_MODE: copy
-    MIGRATION_BATCH: alps5
-    CONFIRM_MIGRATION: copy
-
-#migrate-image-names-alps6:
+#migrate-image-names-alps5:
 #  stage: migrate
 #  extends: [.migration-template]
 #  variables:
 #    MIGRATION_MODE: copy
-#    MIGRATION_BATCH: alps6
+#    MIGRATION_BATCH: alps5
 #    CONFIRM_MIGRATION: copy
+
+migrate-image-names-alps6:
+  stage: migrate
+  extends: [.migration-template]
+  variables:
+    MIGRATION_MODE: copy
+    MIGRATION_BATCH: alps6
+    CONFIRM_MIGRATION: copy
