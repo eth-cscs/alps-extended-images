@@ -1,8 +1,7 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-#stages: [dry-run, migrate]
-stages: [dry-run]
+stages: [dry-run, migrate]
 
 variables:
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
@@ -122,12 +121,11 @@ dry-run-image-name-migration:
   variables:
     MIGRATION_MODE: check
 
-#migrate-image-names:
-#  stage: migrate
-#  extends: [.migration-template]
-#  needs:
-#    - dry-run-image-name-migration
-#  variables:
-#    MIGRATION_MODE: copy
-#    CONFIRM_MIGRATION: ""
-#  when: manual
+migrate-image-names:
+  stage: migrate
+  extends: [.migration-template]
+  needs:
+    - dry-run-image-name-migration
+  variables:
+    MIGRATION_MODE: copy
+    CONFIRM_MIGRATION: ""
