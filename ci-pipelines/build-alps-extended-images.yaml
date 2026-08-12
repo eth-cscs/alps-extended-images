@@ -1,142 +1,143 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [migrate]
+#stages: [migrate]
+stages: [cleanup]
 
 variables:
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   JFROG_IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
 
-.migration-template:
-  image: quay.io/skopeo/stable:latest
-  extends: [.container-runner-lightweight-gh200]
-  timeout: 6h
-  variables:
-    KUBERNETES_MEMORY_REQUEST: '4Gi'
-    KUBERNETES_MEMORY_LIMIT: '4Gi'
-    SLEEP_BETWEEN_IMAGES_SECONDS: '60'
-  before_script:
-    - |
-      set -euo pipefail
-      : "${JFROG_USER:?JFROG_USER must be set}"
-      : "${JFROG_KEY:?JFROG_KEY must be set}"
-      : "${GITHUB_ACTOR:?GITHUB_ACTOR must be set}"
-      : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
-      echo "login to: ghcr.io with user: ${GITHUB_ACTOR}"
-      skopeo login --username "${GITHUB_ACTOR}" --password "${GITHUB_TOKEN}" ghcr.io >/dev/null
-      echo "login to: jfrog.svc.cscs.ch with user: ${JFROG_USER}"
-      skopeo login --username "${JFROG_USER}" --password "${JFROG_KEY}" jfrog.svc.cscs.ch >/dev/null
-  script:
-    - |
-      set -euo pipefail
-
-      if [[ "${MIGRATION_MODE}" == "copy" && "${CONFIRM_MIGRATION:-}" != "copy" ]]; then
-        echo "ERROR: set CONFIRM_MIGRATION=copy when starting the manual migration job" >&2
-        exit 1
-      fi
-
-      img_digest() {
-        skopeo inspect --format '{{.Digest}}' "docker://$1" 2>/dev/null || true
-      }
-
-      copy_or_check() {
-        local registry_prefix="${1:?registry prefix required}"
-        local old_image="${2:?old image required}"
-        local new_image="${3:?new image required}"
-        local tag="${4:?tag required}"
-        local mode="${5:?mode required}"
-        local src="${registry_prefix}/${old_image}:${tag}"
-        local dst="${registry_prefix}/${new_image}:${tag}"
-        local src_digest dst_digest
-
-        src_digest="$(img_digest "${src}")"
-        if [[ -z "${src_digest}" ]]; then
-          echo "ERROR: source image is missing: ${src}" >&2
-          return 1
-        fi
-
-        dst_digest="$(img_digest "${dst}")"
-        if [[ -n "${dst_digest}" ]]; then
-          if [[ "${dst_digest}" == "${src_digest}" ]]; then
-            echo "NO-OP: ${dst} already points to ${src_digest}"
-            return 0
-          fi
-          echo "ERROR: destination exists with different digest: ${dst}" >&2
-          echo "  source:      ${src_digest}" >&2
-          echo "  destination: ${dst_digest}" >&2
-          return 1
-        fi
-
-        if [[ "${mode}" == "copy" ]]; then
-          echo "COPY: ${src} -> ${dst} (${src_digest})"
-          skopeo copy "docker://${src}" "docker://${dst}"
-        else
-          echo "WOULD COPY: ${src} -> ${dst} (${src_digest})"
-        fi
-      }
-
-      run_migration() {
-        local mode="${1:?mode required}"
-        local old_image new_image tag
-
-        while read -r old_image new_image tag; do
-          [[ -n "${old_image}" ]] || continue
-          [[ "${old_image}" != \#* ]] || continue
-          copy_or_check "${GHCR_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
-          copy_or_check "${JFROG_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
-          echo "sleeping ${SLEEP_BETWEEN_IMAGES_SECONDS}s before next image"
-          sleep "${SLEEP_BETWEEN_IMAGES_SECONDS}"
-        done
-      }
-
-      case "${MIGRATION_BATCH:?MIGRATION_BATCH must be set}" in
-        alps4)
-          run_migration "${MIGRATION_MODE}" <<'EOF'
-
-      ngc-pytorch pytorch-cuda 25.12-py3-alps4
-      ngc-pytorch pytorch-cuda 26.01-py3-alps4
-      ngc-pytorch pytorch-cuda 26.02-py3-alps4
-      ngc-nemo nemo-cuda 25.11.01-alps4
-      ngc-nemo nemo-cuda 26.02-alps4
-      ngc-physicsnemo physicsnemo-cuda 25.11-alps4
-      apertus-2 apertus-2-cuda alps4
-      apertus-1p5 apertus-1p5-cuda alps4
-      EOF
-          ;;
-        alps5)
-          run_migration "${MIGRATION_MODE}" <<'EOF'
-      ngc-pytorch pytorch-cuda 25.12-py3-alps5
-      ngc-pytorch pytorch-cuda 26.01-py3-alps5
-      ngc-pytorch pytorch-cuda 26.02-py3-alps5
-      ngc-nemo nemo-cuda 25.11.01-alps5
-      ngc-nemo nemo-cuda 26.02-alps5
-      ngc-physicsnemo physicsnemo-cuda 25.11-alps5
-      apertus-2 apertus-2-cuda alps5
-      apertus-1p5 apertus-1p5-cuda alps5
-      sfttrainer sfttrainer-cuda alps5
-      verl verl-cuda alps5
-      EOF
-          ;;
-        alps6)
-          run_migration "${MIGRATION_MODE}" <<'EOF'
-      ngc-pytorch pytorch-cuda 25.12-py3-alps6
-      ngc-pytorch pytorch-cuda 26.01-py3-alps6
-      ngc-pytorch pytorch-cuda 26.02-py3-alps6
-      ngc-nemo nemo-cuda 25.11.01-alps6
-      ngc-nemo nemo-cuda 26.02-alps6
-      ngc-physicsnemo physicsnemo-cuda 25.11-alps6
-      apertus-2 apertus-2-cuda alps6
-      apertus-1p5 apertus-1p5-cuda alps6
-      sfttrainer sfttrainer-cuda alps6
-      verl verl-cuda alps6
-      EOF
-          ;;
-        *)
-          echo "ERROR: unsupported MIGRATION_BATCH=${MIGRATION_BATCH}" >&2
-          exit 1
-          ;;
-      esac
-
+#.migration-template:
+#  image: quay.io/skopeo/stable:latest
+#  extends: [.container-runner-lightweight-gh200]
+#  timeout: 6h
+#  variables:
+#    KUBERNETES_MEMORY_REQUEST: '4Gi'
+#    KUBERNETES_MEMORY_LIMIT: '4Gi'
+#    SLEEP_BETWEEN_IMAGES_SECONDS: '60'
+#  before_script:
+#    - |
+#      set -euo pipefail
+#      : "${JFROG_USER:?JFROG_USER must be set}"
+#      : "${JFROG_KEY:?JFROG_KEY must be set}"
+#      : "${GITHUB_ACTOR:?GITHUB_ACTOR must be set}"
+#      : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
+#      echo "login to: ghcr.io with user: ${GITHUB_ACTOR}"
+#      skopeo login --username "${GITHUB_ACTOR}" --password "${GITHUB_TOKEN}" ghcr.io >/dev/null
+#      echo "login to: jfrog.svc.cscs.ch with user: ${JFROG_USER}"
+#      skopeo login --username "${JFROG_USER}" --password "${JFROG_KEY}" jfrog.svc.cscs.ch >/dev/null
+#  script:
+#    - |
+#      set -euo pipefail
+#
+#      if [[ "${MIGRATION_MODE}" == "copy" && "${CONFIRM_MIGRATION:-}" != "copy" ]]; then
+#        echo "ERROR: set CONFIRM_MIGRATION=copy when starting the manual migration job" >&2
+#        exit 1
+#      fi
+#
+#      img_digest() {
+#        skopeo inspect --format '{{.Digest}}' "docker://$1" 2>/dev/null || true
+#      }
+#
+#      copy_or_check() {
+#        local registry_prefix="${1:?registry prefix required}"
+#        local old_image="${2:?old image required}"
+#        local new_image="${3:?new image required}"
+#        local tag="${4:?tag required}"
+#        local mode="${5:?mode required}"
+#        local src="${registry_prefix}/${old_image}:${tag}"
+#        local dst="${registry_prefix}/${new_image}:${tag}"
+#        local src_digest dst_digest
+#
+#        src_digest="$(img_digest "${src}")"
+#        if [[ -z "${src_digest}" ]]; then
+#          echo "ERROR: source image is missing: ${src}" >&2
+#          return 1
+#        fi
+#
+#        dst_digest="$(img_digest "${dst}")"
+#        if [[ -n "${dst_digest}" ]]; then
+#          if [[ "${dst_digest}" == "${src_digest}" ]]; then
+#            echo "NO-OP: ${dst} already points to ${src_digest}"
+#            return 0
+#          fi
+#          echo "ERROR: destination exists with different digest: ${dst}" >&2
+#          echo "  source:      ${src_digest}" >&2
+#          echo "  destination: ${dst_digest}" >&2
+#          return 1
+#        fi
+#
+#        if [[ "${mode}" == "copy" ]]; then
+#          echo "COPY: ${src} -> ${dst} (${src_digest})"
+#          skopeo copy "docker://${src}" "docker://${dst}"
+#        else
+#          echo "WOULD COPY: ${src} -> ${dst} (${src_digest})"
+#        fi
+#      }
+#
+#      run_migration() {
+#        local mode="${1:?mode required}"
+#        local old_image new_image tag
+#
+#        while read -r old_image new_image tag; do
+#          [[ -n "${old_image}" ]] || continue
+#          [[ "${old_image}" != \#* ]] || continue
+#          copy_or_check "${GHCR_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
+#          copy_or_check "${JFROG_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
+#          echo "sleeping ${SLEEP_BETWEEN_IMAGES_SECONDS}s before next image"
+#          sleep "${SLEEP_BETWEEN_IMAGES_SECONDS}"
+#        done
+#      }
+#
+#      case "${MIGRATION_BATCH:?MIGRATION_BATCH must be set}" in
+#        alps4)
+#          run_migration "${MIGRATION_MODE}" <<'EOF'
+#
+#      ngc-pytorch pytorch-cuda 25.12-py3-alps4
+#      ngc-pytorch pytorch-cuda 26.01-py3-alps4
+#      ngc-pytorch pytorch-cuda 26.02-py3-alps4
+#      ngc-nemo nemo-cuda 25.11.01-alps4
+#      ngc-nemo nemo-cuda 26.02-alps4
+#      ngc-physicsnemo physicsnemo-cuda 25.11-alps4
+#      apertus-2 apertus-2-cuda alps4
+#      apertus-1p5 apertus-1p5-cuda alps4
+#      EOF
+#          ;;
+#        alps5)
+#          run_migration "${MIGRATION_MODE}" <<'EOF'
+#      ngc-pytorch pytorch-cuda 25.12-py3-alps5
+#      ngc-pytorch pytorch-cuda 26.01-py3-alps5
+#      ngc-pytorch pytorch-cuda 26.02-py3-alps5
+#      ngc-nemo nemo-cuda 25.11.01-alps5
+#      ngc-nemo nemo-cuda 26.02-alps5
+#      ngc-physicsnemo physicsnemo-cuda 25.11-alps5
+#      apertus-2 apertus-2-cuda alps5
+#      apertus-1p5 apertus-1p5-cuda alps5
+#      sfttrainer sfttrainer-cuda alps5
+#      verl verl-cuda alps5
+#      EOF
+#          ;;
+#        alps6)
+#          run_migration "${MIGRATION_MODE}" <<'EOF'
+#      ngc-pytorch pytorch-cuda 25.12-py3-alps6
+#      ngc-pytorch pytorch-cuda 26.01-py3-alps6
+#      ngc-pytorch pytorch-cuda 26.02-py3-alps6
+#      ngc-nemo nemo-cuda 25.11.01-alps6
+#      ngc-nemo nemo-cuda 26.02-alps6
+#      ngc-physicsnemo physicsnemo-cuda 25.11-alps6
+#      apertus-2 apertus-2-cuda alps6
+#      apertus-1p5 apertus-1p5-cuda alps6
+#      sfttrainer sfttrainer-cuda alps6
+#      verl verl-cuda alps6
+#      EOF
+#          ;;
+#        *)
+#          echo "ERROR: unsupported MIGRATION_BATCH=${MIGRATION_BATCH}" >&2
+#          exit 1
+#          ;;
+#      esac
+#
 #migrate-image-names-alps4:
 #  stage: migrate
 #  extends: [.migration-template]
@@ -152,11 +153,122 @@ variables:
 #    MIGRATION_MODE: copy
 #    MIGRATION_BATCH: alps5
 #    CONFIRM_MIGRATION: copy
+#
+#migrate-image-names-alps6:
+#  stage: migrate
+#  extends: [.migration-template]
+#  variables:
+#    MIGRATION_MODE: copy
+#    MIGRATION_BATCH: alps6
+#    CONFIRM_MIGRATION: copy
 
-migrate-image-names-alps6:
-  stage: migrate
-  extends: [.migration-template]
+cleanup-dev-ghcr:
+  stage: cleanup
+  image: python:3.12-slim
+  extends: [.container-runner-lightweight-gh200]
+  timeout: 2h
+  allow_failure: false
   variables:
-    MIGRATION_MODE: copy
-    MIGRATION_BATCH: alps6
-    CONFIRM_MIGRATION: copy
+    KUBERNETES_MEMORY_REQUEST: '4Gi'
+    KUBERNETES_MEMORY_LIMIT: '4Gi'
+    DELETE_DEV_GHCR: 'dry-run'
+  script:
+    - |
+      set -euo pipefail
+      : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
+      if [[ "${DELETE_DEV_GHCR}" != "dry-run" && "${DELETE_DEV_GHCR}" != "delete" ]]; then
+        echo "ERROR: set DELETE_DEV_GHCR=dry-run or DELETE_DEV_GHCR=delete when starting this manual cleanup job" >&2
+        exit 1
+      fi
+
+      python - <<'PY'
+      from __future__ import annotations
+
+      import json
+      import os
+      import sys
+      import time
+      import urllib.error
+      import urllib.parse
+      import urllib.request
+
+      owner = "eth-cscs"
+      package_names = [
+          "alps-extended-images/ngc-pytorch",
+          "alps-extended-images/ngc-nemo",
+          "alps-extended-images/ngc-physicsnemo",
+          "alps-extended-images/apertus-2",
+          "alps-extended-images/apertus-1p5",
+          "alps-extended-images/verl",
+          "alps-extended-images/sfttrainer",
+          "alps-extended-images/vllm",
+      ]
+      token = os.environ["GITHUB_TOKEN"]
+      delete_enabled = os.environ["DELETE_DEV_GHCR"] == "delete"
+      headers = {
+          "Accept": "application/vnd.github+json",
+          "Authorization": f"Bearer {token}",
+          "X-GitHub-Api-Version": "2022-11-28",
+      }
+
+      def request(method: str, url: str) -> tuple[int, object | None, dict[str, str]]:
+          req = urllib.request.Request(url, method=method, headers=headers)
+          try:
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  body = response.read()
+                  data = json.loads(body) if body else None
+                  return response.status, data, dict(response.headers)
+          except urllib.error.HTTPError as exc:
+              body = exc.read().decode("utf-8", "replace")
+              raise RuntimeError(f"GitHub API {method} {url} failed: HTTP {exc.code}: {body}") from exc
+
+      def list_versions(package_name: str) -> list[dict]:
+          encoded = urllib.parse.quote(package_name, safe="")
+          url = f"https://api.github.com/orgs/{owner}/packages/container/{encoded}/versions?per_page=100"
+          versions: list[dict] = []
+          while url:
+              _, data, response_headers = request("GET", url)
+              if not isinstance(data, list):
+                  raise RuntimeError(f"unexpected response for {package_name}: {data!r}")
+              versions.extend(data)
+              links = response_headers.get("Link", "")
+              next_url = ""
+              for part in links.split(","):
+                  if 'rel="next"' in part:
+                      next_url = part[part.find("<") + 1:part.find(">")]
+                      break
+              url = next_url
+          return versions
+
+      failures = 0
+      deleted = 0
+      for package_name in package_names:
+          print(f"## {package_name}")
+          versions = list_versions(package_name)
+          for version in versions:
+              tags = version.get("metadata", {}).get("container", {}).get("tags", [])
+              dev_tags = [tag for tag in tags if tag.endswith("-dev")]
+              if not dev_tags:
+                  continue
+              stable_tags = [tag for tag in tags if not tag.endswith("-dev")]
+              if stable_tags:
+                  print(f"ERROR: refusing to delete version {version['id']} with mixed tags: {tags}", file=sys.stderr)
+                  failures += 1
+                  continue
+              encoded = urllib.parse.quote(package_name, safe="")
+              url = f"https://api.github.com/orgs/{owner}/packages/container/{encoded}/versions/{version['id']}"
+              if delete_enabled:
+                  print(f"DELETE version {version['id']}: {', '.join(dev_tags)}")
+                  request("DELETE", url)
+                  deleted += 1
+                  time.sleep(2)
+              else:
+                  print(f"WOULD DELETE version {version['id']}: {', '.join(dev_tags)}")
+
+      if failures:
+          raise SystemExit(failures)
+      if delete_enabled:
+          print(f"Deleted {deleted} GHCR dev package versions")
+      else:
+          print("Dry run complete; rerun with DELETE_DEV_GHCR=delete to delete listed versions")
+      PY
