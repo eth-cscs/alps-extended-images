@@ -171,7 +171,7 @@ cleanup-dev-ghcr:
   variables:
     KUBERNETES_MEMORY_REQUEST: '4Gi'
     KUBERNETES_MEMORY_LIMIT: '4Gi'
-    DELETE_DEV_GHCR: 'dry-run'
+    DELETE_DEV_GHCR: 'delete'
   script:
     - |
       set -euo pipefail
