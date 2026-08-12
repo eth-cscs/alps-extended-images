@@ -1,0 +1,23 @@
+tests:
+  cuda:
+    - name: vetnode
+      kind: cuda-vetnode
+    - name: ray-nccl
+      runner: cuda
+      timeout: 30m
+      script:
+        - /opt/tests/vllm/ray_nccl_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "2"
+        VLLM_RAY_NCCL_WORLD_SIZE: "8"
+  rocm:
+    - name: ray-rccl
+      runner: rocm
+      timeout: 30m
+      script:
+        - /opt/tests/vllm/ray_nccl_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "2"
+        VLLM_RAY_NCCL_WORLD_SIZE: "8"

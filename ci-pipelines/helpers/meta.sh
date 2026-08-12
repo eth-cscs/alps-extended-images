@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Depends on skopeo.sh being sourced (for img_exists),
+# Depends on skopeo.sh being sourced for registry/marker helpers,
 # and IMAGE_PREFIX being set in CI variables.
 
 # Iterate paths
@@ -49,6 +49,68 @@ content_hash() {
     hash_paths_stream "$paths"
     vars_blob "$vars_to_hash"
   } | sha256sum | awk '{print $1}' | cut -c1-16
+}
+
+validation_hash() {
+  local paths="${1:?paths required}"
+  local vars_to_hash="${2:-}"
+
+  {
+    hash_paths_stream "$paths"
+    if [[ -n "$vars_to_hash" ]]; then
+      vars_blob "$vars_to_hash"
+    fi
+  } | sha256sum | awk '{print $1}' | cut -c1-16
+}
+
+base_validation_hash() {
+  local family="${1:?family required}"
+  local name="${2:?name required}"
+  local variant="${3:?variant required}"
+  local ci_file
+
+  case "$family" in
+    cuda) ci_file="Alps-Images/NGC/ci.yaml" ;;
+    rocm) ci_file="Alps-Images/ROCm/ci.yaml" ;;
+    *) echo "ERROR: unsupported base family for validation hash: $family" >&2; return 1 ;;
+  esac
+
+  validation_hash "$ci_file ci-pipelines/child-templates.yaml ci-pipelines/helpers/generate-child-pipeline.py ci-pipelines/helpers/vetnode-config.yaml" "family name variant"
+}
+
+app_validation_hash() {
+  local app_name="${1:?app name required}"
+  local app_variant="${2:?app variant required}"
+  local app_dir="Alps-Images/apps/${app_name}"
+  local ci_file="${app_dir}/ci.yaml"
+  local profile_file="${app_dir}/profile.env"
+  local paths="$ci_file ci-pipelines/child-templates.yaml ci-pipelines/helpers/generate-child-pipeline.py ci-pipelines/helpers/vetnode-config.yaml"
+
+  [[ -f "$ci_file" ]] || { echo "ERROR: missing $ci_file" >&2; return 1; }
+  [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
+
+  local APP_VARIANTS="" COMMON_TEST_DIR="" COMMON_PATCH_DIR=""
+  local variant_upper="${app_variant^^}"
+  local test_dir_var="${variant_upper}_TEST_DIR"
+  local patch_dir_var="${variant_upper}_PATCH_DIR"
+  local "$test_dir_var" "$patch_dir_var"
+  # shellcheck disable=SC1090
+  source "$profile_file"
+
+  if [[ -n "$COMMON_TEST_DIR" ]]; then
+    paths="$paths ${app_dir}/${COMMON_TEST_DIR}"
+  fi
+  if [[ -n "${!test_dir_var-}" ]]; then
+    paths="$paths ${app_dir}/${!test_dir_var}"
+  fi
+  if [[ -n "$COMMON_PATCH_DIR" ]]; then
+    paths="$paths ${app_dir}/${COMMON_PATCH_DIR}"
+  fi
+  if [[ -n "${!patch_dir_var-}" ]]; then
+    paths="$paths ${app_dir}/${!patch_dir_var}"
+  fi
+
+  validation_hash "$paths" "app_name app_variant"
 }
 
 # usage: canon_tag_for TAG HASH
@@ -316,15 +378,82 @@ validate_app_variant_name() {
   }
 }
 
+write_base_build_env() {
+  local output_file="${1:?output file required}"
+  local family="${2:?family required}"
+  local name="${3:?name required}"
+  local variant="${4:?variant required}"
+  local base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref tested_image_ref image_description validation_hash
+  local family_variant_dir="" family_dotenv=""
+
+  : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
+
+  case "$family" in
+    cuda|ngc)
+      read -r base_image_ref REMOVE_HPCX_DIRS_B64 dockerfile canon_image_ref test_image_ref stable_image_ref < <(ngc_base_refs "$name" "$variant")
+      local remove_hpcx_dirs
+      remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
+      family="cuda"
+      image_description="This image extends ${base_image_ref} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
+      family_variant_dir="NGC_VARIANT_DIR=${name}-${variant}"
+      family_dotenv="REMOVE_HPCX_DIRS=${remove_hpcx_dirs}"
+      ;;
+    rocm)
+      read -r base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref < <(rocm_base_refs "$name" "$variant")
+      local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
+      local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
+      profile_file="$(rocm_profile_file "$name" "$variant")"
+      load_rocm_profile "$profile_file"
+      ROCM_VERSION="$(rocm_version_from_variant "$variant")"
+      image_description="This image extends ${base_image_ref} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
+      family_dotenv="$(rocm_base_dotenv "${name}-${variant}")"
+      ;;
+    *)
+      echo "ERROR: unsupported base family: $family" >&2
+      return 1
+      ;;
+  esac
+
+  validation_hash="$(base_validation_hash "$family" "$name" "$variant")"
+  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash")"
+
+  {
+    printf '%s\n' \
+      "FAMILY=$family" \
+      "NAME=$name" \
+      "VARIANT=$variant" \
+      "DOCKERFILE=$dockerfile" \
+      "CANON_IMAGE_REF=$canon_image_ref" \
+      "TEST_IMAGE_REF=$test_image_ref" \
+      "STABLE_IMAGE_REF=$stable_image_ref" \
+      "TESTED_IMAGE_REF=$tested_image_ref" \
+      "VALIDATION_HASH=$validation_hash" \
+      "BASE_IMAGE=$base_image_ref" \
+      "$family_variant_dir"
+    printf '%s\n' "$family_dotenv"
+    source Alps-Images/common/alps-stack-versions.env
+    vars_blob "BOOST_VER BOOST_BUILD_JOBS ALPS_BUILD_JOBS ALPS_CMAKE_BUILD_JOBS XPMEM_REF CASSINI_HEADERS_VERSION CXI_DRIVER_VERSION LIBCXI_VERSION LIBFABRIC_COMMIT LIBFABRIC_PATCH UCX_VERSION UCC_VERSION OMPI_VER AWS_OFI_NCCL_REPO AWS_OFI_NCCL_COMMIT AWS_OFI_NCCL_PATCH OSU_VERSION"
+    printf '%s\n' \
+      "OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}" \
+      "OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \
+      "OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+      "OCI_DESCRIPTION=$image_description" \
+      "CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}" \
+      "GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#$IMAGE_PREFIX}"
+  } | sed '/^$/d' > "$output_file"
+}
+
 write_app_build_env() {
   local output_file="${1:?output file required}"
   local app_name="${2:?app name required}"
   local app_variant="${3:?app variant required}"
-  local base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref image_description
+  local base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref tested_image_ref image_description validation_hash
 
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
 
   read -r base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
+  validation_hash="$(app_validation_hash "$app_name" "$app_variant")"
+  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash")"
   image_description="This image extends ${base_image_ref} with application software for Alps."
 
   cat > "${output_file}" <<EOF
@@ -332,6 +461,8 @@ DOCKERFILE=$dockerfile
 CANON_IMAGE_REF=$canon_image_ref
 TEST_IMAGE_REF=$test_image_ref
 STABLE_IMAGE_REF=$stable_image_ref
+TESTED_IMAGE_REF=$tested_image_ref
+VALIDATION_HASH=$validation_hash
 BASE_IMAGE=$base_image_ref
 OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
 OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}

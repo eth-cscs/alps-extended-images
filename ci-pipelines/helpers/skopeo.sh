@@ -22,12 +22,88 @@ skopeo_login_ghcr() {
 # prints digest or empty string if missing/unreachable
 # usage: img_digest REF
 img_digest() {
-  skopeo inspect --format '{{.Digest}}' "docker://$1" 2>/dev/null || true
+  local ref="${1:?image ref required}"
+  local output status
+
+  set +e
+  output="$(skopeo inspect --format '{{.Digest}}' "docker://$ref" 2>&1)"
+  status=$?
+  set -e
+  if [[ "$status" -eq 0 ]]; then
+    printf '%s\n' "$output"
+    return 0
+  fi
+
+  if [[ "$output" == *"manifest unknown"* || "$output" == *"name unknown"* || "$output" == *"not found"* ]]; then
+    return 0
+  fi
+
+  echo "ERROR: failed to inspect image: $ref" >&2
+  echo "$output" >&2
+  return "$status"
 }
 
 # usage: img_exists REF
 img_exists() {
   [[ -n "$(img_digest "$1")" ]]
+}
+
+# usage: tested_ref_for CANON_REF [VALIDATION_HASH]
+tested_ref_for() {
+  local canon="${1:?canonical image ref required}"
+  local validation_hash="${2:-}"
+  local repo="${canon%:*}"
+  local tag="${canon##*:}"
+
+  [[ "$repo" != "$canon" ]] || { echo "ERROR: image ref must include a tag: $canon" >&2; return 1; }
+  if [[ -n "$validation_hash" ]]; then
+    printf '%s:%s-tested-%s\n' "$repo" "$tag" "$validation_hash"
+  else
+    printf '%s:%s-tested\n' "$repo" "$tag"
+  fi
+}
+
+# usage: tested_marker_valid CANON_REF TESTED_REF
+tested_marker_valid() {
+  local canon="${1:?canonical image ref required}"
+  local tested="${2:?tested marker ref required}"
+  local canon_digest tested_digest
+
+  canon_digest="$(img_digest "$canon")"
+  tested_digest="$(img_digest "$tested")"
+  [[ -n "$canon_digest" && -n "$tested_digest" && "$canon_digest" == "$tested_digest" ]]
+}
+
+# usage: require_tested_marker_not_mismatched CANON_REF TESTED_REF
+require_tested_marker_not_mismatched() {
+  local canon="${1:?canonical image ref required}"
+  local tested="${2:?tested marker ref required}"
+  local canon_digest tested_digest
+
+  canon_digest="$(img_digest "$canon")"
+  tested_digest="$(img_digest "$tested")"
+  [[ -n "$canon_digest" ]] || { echo "ERROR: canonical image missing: $canon" >&2; return 1; }
+  if [[ -n "$tested_digest" && "$tested_digest" != "$canon_digest" ]]; then
+    echo "ERROR: tested marker points to a different digest: $tested" >&2
+    echo "  canonical: $canon_digest" >&2
+    echo "  marker:    $tested_digest" >&2
+    return 1
+  fi
+}
+
+# usage: mark_tested CANON_REF TESTED_REF
+mark_tested() {
+  local canon="${1:?canonical image ref required}"
+  local tested="${2:?tested marker ref required}"
+
+  require_tested_marker_not_mismatched "$canon" "$tested"
+  if tested_marker_valid "$canon" "$tested"; then
+    echo "No-op: tested marker already matches canonical image: $tested"
+    return 0
+  fi
+
+  echo "Mark tested: $canon -> $tested"
+  skopeo copy "$(_ref_url "$canon")" "$(_ref_url "$tested")"
 }
 
 _ref_url() {

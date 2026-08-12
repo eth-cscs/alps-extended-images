@@ -1,0 +1,23 @@
+family: cuda
+variants:
+  - name: pytorch
+    variant: 26.06-py3
+  - name: pytorch
+    variant: 26.02-py3
+  - name: pytorch
+    variant: 26.01-py3
+  - name: pytorch
+    variant: 25.12-py3
+  - name: nemo
+    variant: "26.02"
+  - name: nemo
+    variant: 25.11.01
+  - name: physicsnemo
+    variant: "25.11"
+tests:
+  - name: env
+    kind: cuda-base-env
+  - name: collectives
+    kind: cuda-base-collectives
+  - name: vetnode
+    kind: cuda-vetnode

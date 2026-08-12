@@ -96,9 +96,10 @@ emit_base_script() {
   local root image_description variant_dir family_build_args
   root="$(repo_root)"
 
+  source "$root/ci-pipelines/helpers/skopeo.sh"
   source "$root/ci-pipelines/helpers/meta.sh"
   case "$family" in
-    ngc)
+    cuda|ngc)
       read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
       local remove_hpcx_dirs
       remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
@@ -121,6 +122,7 @@ emit_base_script() {
       ;;
     *)
       printf 'ERROR: unsupported base image family for manual builds: %s\n' "$family" >&2
+      printf 'Supported families: cuda, ngc, rocm\n' >&2
       return 1
       ;;
   esac
@@ -154,6 +156,7 @@ emit_app_script() {
   local root image_description
   root="$(repo_root)"
 
+  source "$root/ci-pipelines/helpers/skopeo.sh"
   source "$root/ci-pipelines/helpers/meta.sh"
   read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$app_name" "$app_variant")
   image_description="This image extends ${BASE_IMAGE_REF} with application software for Alps."

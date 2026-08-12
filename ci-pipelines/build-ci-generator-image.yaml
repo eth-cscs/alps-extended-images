@@ -1,0 +1,34 @@
+include:
+  - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
+
+stages: [build]
+
+variables:
+  CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.24.0-python3-arm64-v1
+  CI_GENERATOR_DOCKERFILE: ci-pipelines/generator-image/Containerfile
+  CI_GENERATOR_BASE_IMAGE: quay.io/skopeo/stable:v1.24.0
+
+build-ci-generator-image:
+  stage: build
+  extends: [.container-builder-cscs-gh200]
+  timeout: 1h
+  when: manual
+  allow_failure: false
+  variables:
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: if-not-exists
+    KUBERNETES_MEMORY_REQUEST: '16Gi'
+    KUBERNETES_MEMORY_LIMIT: '16Gi'
+    DOCKER_BUILD_ARGS: '[
+      "BASE_IMAGE"
+    ]'
+  before_script:
+    - |
+      set -euo pipefail
+      export PERSIST_IMAGE_NAME="$CI_GENERATOR_IMAGE"
+      export DOCKERFILE="$CI_GENERATOR_DOCKERFILE"
+      export BASE_IMAGE="$CI_GENERATOR_BASE_IMAGE"
+      echo "Building CI generator image: $PERSIST_IMAGE_NAME"
+  script:
+    - build_new_container

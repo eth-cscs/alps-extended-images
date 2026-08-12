@@ -1,0 +1,20 @@
+tests:
+  cuda:
+    - name: vetnode
+      kind: cuda-vetnode
+    - name: pplx-garden
+      runner: cuda
+      timeout: 2h
+      script:
+        - /opt/tests/apertus-2/pplx-garden-benchmark.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "2"
+    - name: deepep
+      runner: cuda
+      timeout: 2h
+      script:
+        - /opt/tests/apertus-2/deep-ep-benchmark.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
