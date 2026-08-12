@@ -128,4 +128,4 @@ migrate-image-names:
     - dry-run-image-name-migration
   variables:
     MIGRATION_MODE: copy
-    CONFIRM_MIGRATION: ""
+    CONFIRM_MIGRATION: copy
