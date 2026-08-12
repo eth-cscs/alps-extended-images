@@ -12,8 +12,6 @@ variables:
   extends: [.container-runner-lightweight-gh200]
   timeout: 6h
   variables:
-    KUBERNETES_MEMORY_REQUEST: '64Gi'
-    KUBERNETES_MEMORY_LIMIT: '64Gi'
     SLEEP_BETWEEN_IMAGES_SECONDS: '10'
   before_script:
     - |
