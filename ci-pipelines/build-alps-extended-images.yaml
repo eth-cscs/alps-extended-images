@@ -1,764 +1,133 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-.container-builder-cscs-mi300:
-  extends: [.f7t-runner, .beverin]
-  interruptible: true
-  script:
-    - build_new_container
-  variables:
-    CSCS_RUNNER_MODE: 'container-builder'
-    CSCS_REBUILD_POLICY: "if-not-exists"
-    FIRECREST_SYSTEM: 'beverin'
-    SLURM_PARTITION: mi300
-    SLURM_TIMELIMIT: '04:00:00'
+#stages: [dry-run, migrate]
+stages: [dry-run]
 
-stages: [build-base, test-base, build-apps, test-apps, publish]
-
-# ----------------------------
-# Global variables
-# ----------------------------
 variables:
-  IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
-  ALPS_REV: alps7-dev
+  JFROG_IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
 
-
-# ----------------------------
-# Image matrix anchors
-# ----------------------------
-# NOTE: Keep the matrices small to avoid "job name too long" issues
-
-.cuda_base_images_matrix: &cuda_base_images_matrix
-  - NAME: "pytorch"
-    VARIANT: "26.06-py3"
-  - NAME: "pytorch"
-    VARIANT: "26.02-py3"
-  - NAME: "pytorch"
-    VARIANT: "26.01-py3"
-  - NAME: "pytorch"
-    VARIANT: "25.12-py3"
-  - NAME: "nemo"
-    VARIANT: "26.02"
-  - NAME: "nemo"
-    VARIANT: "25.11.01"
-  - NAME: "physicsnemo"
-    VARIANT: "25.11"
-
-.rocm_base_images_matrix: &rocm_base_images_matrix
-  - NAME: "pytorch"
-    VARIANT: "rocm7.14-ubuntu24.04-py3.12-torch2.11"
-
-
-.cuda_app_images_matrix: &cuda_app_images_matrix
-  - NAME: "apertus-1p5"
-  - NAME: "apertus-2"
-  - NAME: "sfttrainer"
-  - NAME: "verl"
-  - NAME: "vllm"
-
-.rocm_app_images_matrix: &rocm_app_images_matrix
-  - NAME: "vllm"
-  
-# ----------------------------
-# Dependency mapping for matrix jobs as anchors
-# ----------------------------
-# These are required to achieve unambiguous mapping between two matrix jobs
-# when explicitly defining "needs:" in the downstream job, as GitLab does not
-# support automatic mapping based on the matrix values.
-
-.base_needs_map: &base_needs_map
-  parallel:
-    matrix:
-      - NAME: ['$[[ matrix.NAME ]]']
-        VARIANT: ['$[[ matrix.VARIANT ]]']
-
-.app_needs_map: &app_needs_map
-  parallel:
-    matrix:
-      - NAME: ['$[[ matrix.NAME ]]']
-
-# ----------------------------
-# Skopeo: manipulate images in the registry
-# ----------------------------
-.skopeo-template:
+.migration-template:
   image: quay.io/skopeo/stable:latest
-  before_script:
-    - source ci-pipelines/helpers/skopeo.sh
-    - skopeo_login
-    - skopeo_login_ghcr
-
-# ----------------------------
-# Slurm: set pertinent env variables
-# ----------------------------
-.slurm-template:
-  variables:
-    USE_MPI: NO
-    SLURM_MPI_TYPE: pmix
-    SLURM_NETWORK: disable_rdzv_get
-    PMIX_MCA_psec: native
-
-# ----------------------------
-# Meta job: determines image name
-# ----------------------------
-# Creates content hash and determines if build is needed based on changes in
-# relevant files. Passes necessary variables to the builder job via artifacts.
-
-.app-meta-template: &app_meta_template
-  stage: build-apps
-
-build-cuda-base-meta:
-  stage: build-base
-  extends: [.container-runner-lightweight-gh200, .skopeo-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  script:
-    - source ci-pipelines/helpers/meta.sh
-    - |
-      set -euo pipefail
-
-      # Generate content-hash based image references and additional container build variables
-      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$NAME" "$VARIANT")
-      REMOVE_HPCX_DIRS="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
-      IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
-
-      # Export variables to a file for the builder job
-      cat > build.env <<EOF
-      DOCKERFILE=$DOCKERFILE
-      NGC_VARIANT_DIR=${NAME}-${VARIANT}
-      CANON_IMAGE_REF=$CANON_IMAGE_REF
-      TEST_IMAGE_REF=$TEST_IMAGE_REF
-      STABLE_IMAGE_REF=$STABLE_IMAGE_REF
-      BASE_IMAGE=$BASE_IMAGE_REF
-      REMOVE_HPCX_DIRS=$REMOVE_HPCX_DIRS
-      OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
-      OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
-      OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      OCI_DESCRIPTION=$IMAGE_DESCRIPTION
-      CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
-      GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
-      EOF
-
-      # For debugging: print the generated variables
-      echo "Generated build variables:"
-      cat build.env
-  artifacts:
-    reports:
-      dotenv: build.env
-
-build-rocm-base-meta:
-  stage: build-base
-  extends: [.container-runner-lightweight-zen2, .skopeo-template]
-  parallel:
-    matrix: *rocm_base_images_matrix
-  script:
-    - source ci-pipelines/helpers/meta.sh
-    - |
-      set -euo pipefail
-
-      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$NAME" "$VARIANT")
-      profile_file="$(rocm_profile_file "$NAME" "$VARIANT")"
-      load_rocm_profile "$profile_file"
-      ROCM_VERSION="$(rocm_version_from_variant "$VARIANT")"
-      IMAGE_DESCRIPTION="This image extends ${BASE_IMAGE_REF} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
-
-      {
-        cat <<EOF
-      DOCKERFILE=$DOCKERFILE
-      CANON_IMAGE_REF=$CANON_IMAGE_REF
-      TEST_IMAGE_REF=$TEST_IMAGE_REF
-      STABLE_IMAGE_REF=$STABLE_IMAGE_REF
-      BASE_IMAGE=$BASE_IMAGE_REF
-      EOF
-        rocm_base_dotenv "${NAME}-${VARIANT}"
-        cat <<EOF
-      OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
-      OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
-      OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      OCI_DESCRIPTION=$IMAGE_DESCRIPTION
-      CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
-      GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${STABLE_IMAGE_REF#$IMAGE_PREFIX}
-      EOF
-      } > build.env
-
-      echo "Generated build variables:"
-      cat build.env
-  artifacts:
-    reports:
-      dotenv: build.env
-
-build-cuda-apps-meta:
-  <<: *app_meta_template
-  extends: [.container-runner-lightweight-gh200, .skopeo-template]
-  parallel:
-    matrix: *cuda_app_images_matrix
-  script:
-    - source ci-pipelines/helpers/meta.sh
-    - |
-      set -euo pipefail
-
-      write_app_build_env build.env "$NAME" cuda
-
-      echo "Generated build variables:"
-      cat build.env
-  artifacts:
-    reports:
-      dotenv: build.env
-
-build-rocm-apps-meta:
-  <<: *app_meta_template
-  extends: [.container-runner-lightweight-zen2, .skopeo-template]
-  parallel:
-    matrix: *rocm_app_images_matrix
-  script:
-    - source ci-pipelines/helpers/meta.sh
-    - |
-      set -euo pipefail
-
-      write_app_build_env build.env "$NAME" rocm
-
-      echo "Generated build variables:"
-      cat build.env
-  artifacts:
-    reports:
-      dotenv: build.env
-
-# ----------------------------
-# Build images
-# ----------------------------
-# The build jobs read the variables generated in the meta jobs and build the
-# images accordingly. BASE_IMAGE and REMOVE_HPCX_DIRS are passed as build args
-# to the image builder.
-
-.build-images-template:
-  variables:
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-    CSCS_REBUILD_POLICY: if-not-exists
-    CSCS_BUILD_CACHE: $CSCS_REGISTRY_PATH/build_cache
-    KUBERNETES_MEMORY_REQUEST: '400Gi'
-    KUBERNETES_MEMORY_LIMIT: '400Gi'
+  extends: [.container-runner-lightweight-gh200]
   before_script:
     - |
       set -euo pipefail
-      export PERSIST_IMAGE_NAME="$CANON_IMAGE_REF"
-      echo "Building: $PERSIST_IMAGE_NAME"
-  timeout: 6h
-
-.app-build-images-template: &app_build_images_template
-  stage: build-apps
-  variables:
-    DOCKER_BUILD_ARGS: '[
-      "BASE_IMAGE",
-      "OCI_SOURCE",
-      "OCI_REVISION",
-      "OCI_CREATED",
-      "OCI_DESCRIPTION",
-      "CSCS_ALPS_GIT_COMMIT_SHORT"
-    ]'
-
-build-cuda-base-images:
-  stage: build-base
-  extends: [.container-builder-cscs-gh200, .build-images-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  needs:
-    - job: build-cuda-base-meta
-      artifacts: true
-      <<: *base_needs_map
-  variables:
-    DOCKER_BUILD_ARGS: '[
-      "BASE_IMAGE",
-      "NGC_VARIANT_DIR",
-      "REMOVE_HPCX_DIRS",
-      "BOOST_VER",
-      "BOOST_BUILD_JOBS",
-      "ALPS_BUILD_JOBS",
-      "ALPS_CMAKE_BUILD_JOBS",
-      "XPMEM_REF",
-      "CASSINI_HEADERS_VERSION",
-      "CXI_DRIVER_VERSION",
-      "LIBCXI_VERSION",
-      "LIBFABRIC_COMMIT",
-      "LIBFABRIC_PATCH",
-      "UCX_VERSION",
-      "UCC_VERSION",
-      "OMPI_VER",
-      "AWS_OFI_NCCL_REPO",
-      "AWS_OFI_NCCL_COMMIT",
-      "AWS_OFI_NCCL_PATCH",
-      "OSU_VERSION",
-      "OCI_SOURCE",
-      "OCI_REVISION",
-      "OCI_CREATED",
-      "OCI_DESCRIPTION",
-      "CSCS_ALPS_GIT_COMMIT_SHORT"
-    ]'
-
-build-rocm-base-images:
-  stage: build-base
-  #extends: [.container-builder-cscs-zen2, .build-images-template]
-  extends: [.container-builder-cscs-mi300, .build-images-template]
-  parallel:
-    matrix: *rocm_base_images_matrix
-  needs:
-    - job: build-rocm-base-meta
-      artifacts: true
-      <<: *base_needs_map
-  variables:
-    DOCKER_BUILD_ARGS: '[
-      "BASE_IMAGE",
-      "ROCM_VARIANT_DIR",
-      "ROCM_VERSION",
-      "ROCM_REBUILD_RCCL",
-      "ROCM_SYSTEMS_REPO",
-      "ROCM_SYSTEMS_COMMIT",
-      "RCCL_GPU_TARGETS",
-      "RCCL_TESTS_GPU_TARGETS",
-      "ROCM_PYPI_INDEX_URL",
-      "BOOST_VER",
-      "BOOST_BUILD_JOBS",
-      "ALPS_BUILD_JOBS",
-      "ALPS_CMAKE_BUILD_JOBS",
-      "XPMEM_REF",
-      "CASSINI_HEADERS_VERSION",
-      "CXI_DRIVER_VERSION",
-      "LIBCXI_VERSION",
-      "LIBFABRIC_COMMIT",
-      "LIBFABRIC_PATCH",
-      "UCX_VERSION",
-      "UCC_VERSION",
-      "OMPI_VER",
-      "AWS_OFI_NCCL_REPO",
-      "AWS_OFI_NCCL_COMMIT",
-      "AWS_OFI_NCCL_PATCH",
-      "OSU_VERSION",
-      "OCI_SOURCE",
-      "OCI_REVISION",
-      "OCI_CREATED",
-      "OCI_DESCRIPTION",
-      "CSCS_ALPS_GIT_COMMIT_SHORT"
-    ]'
-
-build-cuda-app-images:
-  <<: *app_build_images_template
-  extends: [.container-builder-cscs-gh200, .build-images-template]
-  parallel:
-    matrix: *cuda_app_images_matrix
-  needs:
-    - job: build-cuda-apps-meta
-      artifacts: true
-      <<: *app_needs_map
-
-build-rocm-app-images:
-  <<: *app_build_images_template
-  #extends: [.container-builder-cscs-zen2, .build-images-template]
-  extends: [.container-builder-cscs-mi300, .build-images-template]
-  parallel:
-    matrix: *rocm_app_images_matrix
-  needs:
-    - job: build-rocm-apps-meta
-      artifacts: true
-      <<: *app_needs_map
-
-# ----------------------------
-# Re-tag images with commit SHA for testing
-# ----------------------------
-# The commit SHA is known at configuration time of the pipeline unlike the
-# content hash, which becomes known only at runtime of the pipeline. Thus, we
-# cannot use the content hash directly in the test stage to pull the image, but
-# we can copy the image to a new tag with the commit SHA for the test stage.
-
-.tag-images-template:
-  extends: [.skopeo-template]
-  variables:
-    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
-    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
-  script:
-    - |
-      set -euo pipefail
-      copy_if_needed "$CANON_IMAGE_REF" "$TEST_IMAGE_REF"
-
-tag-cuda-base-images-for-ci:
-  stage: build-base
-  extends: [.container-runner-lightweight-gh200, .tag-images-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  needs:
-    - job: build-cuda-base-meta
-      artifacts: true
-      <<: *base_needs_map
-    - job: build-cuda-base-images
-      <<: *base_needs_map
-
-tag-rocm-base-images-for-ci:
-  stage: build-base
-  extends: [.container-runner-lightweight-zen2, .tag-images-template]
-  parallel:
-    matrix: *rocm_base_images_matrix
-  needs:
-    - job: build-rocm-base-meta
-      artifacts: true
-      <<: *base_needs_map
-    - job: build-rocm-base-images
-      <<: *base_needs_map
-
-tag-cuda-app-images-for-ci:
-  <<: &app_tag_template
-    stage: build-apps
-  extends: [.container-runner-lightweight-gh200, .tag-images-template]
-  parallel:
-    matrix: *cuda_app_images_matrix
-  needs:
-    - job: build-cuda-apps-meta
-      artifacts: true
-      <<: *app_needs_map
-    - job: build-cuda-app-images
-      <<: *app_needs_map
-
-tag-rocm-app-images-for-ci:
-  <<: *app_tag_template
-  extends: [.container-runner-lightweight-zen2, .tag-images-template]
-  parallel:
-    matrix: *rocm_app_images_matrix
-  needs:
-    - job: build-rocm-apps-meta
-      artifacts: true
-      <<: *app_needs_map
-    - job: build-rocm-app-images
-      <<: *app_needs_map
-
-# ----------------------------
-# Run tests on the images
-# ----------------------------
-# The test jobs use the test tags created in the previous step. They run a set of
-# sanity checks to verify the functionality of the images.
-# Current tests for the base images:
-# - Ensure environment variables are set correctly
-# - NCCL alltoall_perf
-# - NVSHMEM alltoall_latency
-# - OSU alltoall
-# - vetnode diagnose
-#   - basic cuda kernel launch
-#   - NCCL low-level tests for intra-node, inter-node and full-topology scenarios
-#   - NCCL through PyTorch
-# Current tests for the app images:
-# - Apertus 1.5: Megatron pretraining script
-# - Apertus 2: pplx garden benchmark
-# - Apertus 2: DeepEP benchmark
-# - vLLM CUDA: Ray/NCCL smoke test
-# - vLLM ROCm: Ray/RCCL smoke test through PyTorch's NCCL backend
-# - VeRL: async RL benchmark
-# - vetnode diagnose across app image matrix
-
-.vllm-ray-smoke-template: &vllm_ray_smoke_template
-  stage: test-apps
-  timeout: 30m
-  script:
-    - /opt/tests/vllm/ray_nccl_smoke.sh
-  variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 2
-    VLLM_RAY_NCCL_WORLD_SIZE: 8
-
-test-cuda-base-images-env:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-cuda:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
+      : "${JFROG_USER:?JFROG_USER must be set}"
+      : "${JFROG_KEY:?JFROG_KEY must be set}"
+      : "${GITHUB_ACTOR:?GITHUB_ACTOR must be set}"
+      : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
+      echo "login to: ghcr.io with user: ${GITHUB_ACTOR}"
+      skopeo login --username "${GITHUB_ACTOR}" --password "${GITHUB_TOKEN}" ghcr.io >/dev/null
+      echo "login to: jfrog.svc.cscs.ch with user: ${JFROG_USER}"
+      skopeo login --username "${JFROG_USER}" --password "${JFROG_KEY}" jfrog.svc.cscs.ch >/dev/null
   script:
     - |
       set -euo pipefail
 
-      # Check that the relevant environment variables are set correctly in the image
-      test "${FI_PROVIDER:-}" = "cxi"
-      test "${FI_CXI_RDZV_PROTO:-}" = "alt_read"
-      test "${NCCL_NET:-}" = "AWS Libfabric"
-      test "${NCCL_PROTO:-}" = "^LL128"
-      test "${NVSHMEM_REMOTE_TRANSPORT:-}" = "libfabric"
-      test "${NVSHMEM_LIBFABRIC_PROVIDER:-}" = "cxi"
-
-      # Check that the environment variables are exported with the correct semantics
-      test "${NCCL_VERSION:-}" = "dummy"
-  variables:
-    SLURM_JOB_NUM_NODES: 1
-    SLURM_NTASKS: 1
-    # Set dummy value for environment variables to test that it will be overridden by the image's entrypoint or environment setup scripts
-    NCCL_VERSION: dummy
-
-test-cuda-base-images-collectives:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-cuda:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    # NCCL
-    - alltoall_perf -b 32 -e 4M -f 2 -g 1
-    # NCCL send/recv via RDMA protocol
-    - FI_CXI_ENABLE_WRITEDATA=1 OFI_NCCL_PROTOCOL=RDMA sendrecv_perf -b 32 -e 4M -f 2 -g 1
-    # NVSHMEM
-    - /opt/nvshmem/bin/perftest/device/coll/alltoall_latency --datatype float -b 32 -e 4194304 -f 2
-    # OSU
-    - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator cuda
-  variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 8
-
-test-cuda-base-images-vetnode:
-  stage: test-base
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-cuda:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - echo "[image-vet] Set-up vetnode on $(hostname)... "
-    - |
-      config=$(realpath ci-pipelines/helpers/vetnode-config.yaml)
-      tmp_dir="/tmp"
-      venv="$tmp_dir/.venv-${SLURM_NODEID}-${SLURM_JOB_ID}"
-      done_file="$tmp_dir/setup-done-${SLURM_NODEID}-${SLURM_JOB_ID}"
-      cd "$tmp_dir"
-      if [ "$SLURM_LOCALID" -eq 0 ]; then
-        python -m venv --system-site-packages "$venv"
-        source "$venv/bin/activate"
-        pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
-        vetnode setup "$config"
-        touch "$done_file"
-      else
-        echo "[image-vet] Waiting for setup on $(hostname)..."
-        timeout=60
-        while [ ! -f "$done_file" ] && [ $timeout -gt 0 ]; do
-            sleep 1
-            ((timeout--))
-        done
-      fi
-    - echo "[image-vet] diagnose"
-    - source "$venv/bin/activate"
-    - vetnode diagnose "$config"
-  variables:
-    SLURM_JOB_NUM_NODES: 4
-    SLURM_NTASKS: 16
-    GIT_STRATEGY: fetch
-
-test-rocm-base-images-env:
-  stage: test-base
-  extends: [.container-runner-beverin-mi300, .slurm-template]
-  parallel:
-    matrix: *rocm_base_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-rocm:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - |
-      set -euo pipefail
-
-      test "${FI_PROVIDER:-}" = "cxi"
-      test "${FI_CXI_RDZV_PROTO:-}" = "alt_read"
-      test "${NCCL_NET:-}" = "AWS Libfabric"
-      test "${NCCL_PROTO:-}" = "^LL128"
-      test -n "${ROCM_VERSION:-}"
-      test -n "${RCCL_VERSION:-}"
-
-      /opt/venv/bin/python - <<'PY'
-      import torch
-
-      assert torch.cuda.is_available(), "ROCm device is not visible to PyTorch"
-      print(torch.cuda.get_device_name(0))
-      PY
-  variables:
-    SLURM_JOB_NUM_NODES: 1
-    SLURM_NTASKS: 1
-
-test-rocm-base-images-collectives:
-  stage: test-base
-  extends: [.container-runner-beverin-mi300, .slurm-template]
-  parallel:
-    matrix: *rocm_base_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-rocm:${VARIANT}-${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - all_reduce_perf -b 32 -e 4M -f 2 -g 1
-    - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator rocm
-  variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 8
-
-test-cuda-apertus-1p5:
-  stage: test-apps
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  timeout: 2h
-  image: "$IMAGE_PREFIX/apertus-1p5-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - /opt/tests/apertus-1p5/megatron_pretrain.sh
-  variables:
-    CI_FAST: "1"
-    TP_CI: "1"
-    PP_CI: "1"
-    CHECKPOINT_STEPS_CI: "2"
-    USE_MPI: NO
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 8
-
-test-cuda-apertus-2-pplx-garden:
-  stage: test-apps
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  timeout: 2h
-  image: "$IMAGE_PREFIX/apertus-2-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - /opt/tests/apertus-2/pplx-garden-benchmark.sh
-  variables:
-    SLURM_JOB_NUM_NODES: 2
-    SLURM_NTASKS: 2
-
-test-cuda-apertus-2-DeepEP:
-  stage: test-apps
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  timeout: 2h
-  image: "$IMAGE_PREFIX/apertus-2-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - /opt/tests/apertus-2/deep-ep-benchmark.sh
-  variables:
-    SLURM_JOB_NUM_NODES: 1
-    SLURM_NTASKS: 1
-
-test-cuda-vllm-ray-nccl:
-  <<: *vllm_ray_smoke_template
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  image: "$IMAGE_PREFIX/vllm-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-
-test-rocm-vllm-ray-rccl:
-  <<: *vllm_ray_smoke_template
-  extends: [.container-runner-beverin-mi300, .slurm-template]
-  image: "$IMAGE_PREFIX/vllm-rocm:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-
-test-cuda-app-images-vetnode:
-  stage: test-apps
-  extends: [test-cuda-base-images-vetnode]
-  timeout: 2h
-  parallel:
-    matrix: *cuda_app_images_matrix
-  image: "$IMAGE_PREFIX/${NAME}-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-
-test-cuda-verl-async:
-  stage: test-apps
-  extends: [.container-runner-clariden-gh200, .slurm-template]
-  timeout: 2h
-  image: "$IMAGE_PREFIX/verl-cuda:${ALPS_REV}-$CI_COMMIT_SHORT_SHA"
-  script:
-    - /opt/tests/verl/rl-async-benchmark.sh
-  variables:
-    SLURM_JOB_NUM_NODES: 4
-    SLURM_NTASKS: 4
-    CSCS_ADDITIONAL_MOUNTS: '["/tmp:/tmp"]'
-
-# ----------------------------
-# Publish
-# ----------------------------
-# Upload the images to the registry with stable tags under certain conditions:
-# - All tests must have executed and passed (enforced by the "needs:"
-#   dependency on the test jobs in the publish-gate job)
-# - The commit must be on the default branch (enforced in the script with a
-#   check on CI_COMMIT_BRANCH)
-# - The stable tag must not already exist with different content (enforced by
-#   promote_check_strict)
-# Note: Skopeo copy requires a larger memory limit.
-#       Therfore we are using the container-builder-cscs-gh200 worker that comes with the skopeo tool kit.
-publish-gate:
-  stage: publish
-  extends: [.container-runner-lightweight-gh200, .skopeo-template]
-  # make sure to keep the "needs" up to date when adding new test jobs
-  needs:
-    - test-cuda-base-images-env
-    - test-cuda-base-images-collectives
-    - test-cuda-base-images-vetnode
-    - test-rocm-base-images-env
-    - test-rocm-base-images-collectives
-    - test-cuda-apertus-1p5
-    - test-cuda-apertus-2-pplx-garden
-    - test-cuda-apertus-2-DeepEP
-    - test-cuda-vllm-ray-nccl
-    - test-rocm-vllm-ray-rccl
-    - test-cuda-app-images-vetnode
-    - test-cuda-verl-async
-  script:
-    - echo "Publish gate passed (tests completed)"
-
-.publish-template:
-  stage: publish
-  extends: [.container-builder-cscs-gh200]
-  variables:
-    KUBERNETES_MEMORY_REQUEST: 128Gi
-    KUBERNETES_MEMORY_LIMIT: 128Gi
-  script:
-    - |
-      source ci-pipelines/helpers/skopeo.sh
-      skopeo_login
-      skopeo_login_ghcr
-      set -euo pipefail
-
-      echo "Starting promotion process for $CANON_IMAGE_REF"
-
-      if [[ "${ALPS_REV}" =~ -dev$ ]]; then
-        # For dev versions, we allow non-strict promotion (overwrites stable
-        # tag regardless of content) but only on the default branch
-        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
-          echo "copy to: $STABLE_IMAGE_REF"
-          skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
-          echo "copy to: $GHCR_STABLE_IMAGE_REF"
-          skopeo copy  "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$GHCR_STABLE_IMAGE_REF")"
-          echo "Promotion successful (dev version): $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
-        else
-          echo "Dry-run only (dev version detected and not default branch): promotion not executed."
-        fi
-      else
-        # Always run strict check (fails if stable exists but differs)
-        echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
-        promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
-        # Only promote on default branch
-        if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
-          promote_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
-          promote_strict "$CANON_IMAGE_REF" "$GHCR_STABLE_IMAGE_REF"
-          echo "Promotion successful: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF -> $GHCR_STABLE_IMAGE_REF"
-        else
-          echo "Dry-run only (not default branch): promotion not executed."
-        fi
+      if [[ "${MIGRATION_MODE}" == "copy" && "${CONFIRM_MIGRATION:-}" != "copy" ]]; then
+        echo "ERROR: set CONFIRM_MIGRATION=copy when starting the manual migration job" >&2
+        exit 1
       fi
 
-publish-cuda-base-images:
-  extends: [.publish-template]
-  parallel:
-    matrix: *cuda_base_images_matrix
-  needs:
-    - job: publish-gate
-    - job: build-cuda-base-meta
-      artifacts: true
-      <<: *base_needs_map
+      img_digest() {
+        skopeo inspect --format '{{.Digest}}' "docker://$1" 2>/dev/null || true
+      }
 
-publish-rocm-base-images:
-  extends: [.publish-template]
-  parallel:
-    matrix: *rocm_base_images_matrix
-  needs:
-    - job: publish-gate
-    - job: build-rocm-base-meta
-      artifacts: true
-      <<: *base_needs_map
+      copy_or_check() {
+        local registry_prefix="${1:?registry prefix required}"
+        local old_image="${2:?old image required}"
+        local new_image="${3:?new image required}"
+        local tag="${4:?tag required}"
+        local mode="${5:?mode required}"
+        local src="${registry_prefix}/${old_image}:${tag}"
+        local dst="${registry_prefix}/${new_image}:${tag}"
+        local src_digest dst_digest
 
-publish-cuda-app-images:
-  extends: [.publish-template]
-  parallel:
-    matrix: *cuda_app_images_matrix
-  needs:
-    - job: publish-gate
-    - job: build-cuda-apps-meta
-      artifacts: true
-      <<: *app_needs_map
+        src_digest="$(img_digest "${src}")"
+        if [[ -z "${src_digest}" ]]; then
+          echo "ERROR: source image is missing: ${src}" >&2
+          return 1
+        fi
 
-publish-rocm-app-images:
-  extends: [.publish-template]
-  parallel:
-    matrix: *rocm_app_images_matrix
-  needs:
-    - job: publish-gate
-    - job: build-rocm-apps-meta
-      artifacts: true
-      <<: *app_needs_map
+        dst_digest="$(img_digest "${dst}")"
+        if [[ -n "${dst_digest}" ]]; then
+          if [[ "${dst_digest}" == "${src_digest}" ]]; then
+            echo "NO-OP: ${dst} already points to ${src_digest}"
+            return 0
+          fi
+          echo "ERROR: destination exists with different digest: ${dst}" >&2
+          echo "  source:      ${src_digest}" >&2
+          echo "  destination: ${dst_digest}" >&2
+          return 1
+        fi
+
+        if [[ "${mode}" == "copy" ]]; then
+          echo "COPY: ${src} -> ${dst} (${src_digest})"
+          skopeo copy "docker://${src}" "docker://${dst}"
+        else
+          echo "WOULD COPY: ${src} -> ${dst} (${src_digest})"
+        fi
+      }
+
+      run_migration() {
+        local mode="${1:?mode required}"
+        local old_image new_image tag
+
+        while read -r old_image new_image tag; do
+          [[ -n "${old_image}" ]] || continue
+          [[ "${old_image}" != \#* ]] || continue
+          copy_or_check "${GHCR_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
+          copy_or_check "${JFROG_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
+        done <<'EOF'
+      ngc-pytorch pytorch-cuda 25.12-py3-alps4
+      ngc-pytorch pytorch-cuda 26.01-py3-alps4
+      ngc-pytorch pytorch-cuda 26.02-py3-alps4
+      ngc-nemo nemo-cuda 25.11.01-alps4
+      ngc-nemo nemo-cuda 26.02-alps4
+      ngc-physicsnemo physicsnemo-cuda 25.11-alps4
+      apertus-2 apertus-2-cuda alps4
+      apertus-1p5 apertus-1p5-cuda alps4
+
+      ngc-pytorch pytorch-cuda 25.12-py3-alps5
+      ngc-pytorch pytorch-cuda 26.01-py3-alps5
+      ngc-pytorch pytorch-cuda 26.02-py3-alps5
+      ngc-nemo nemo-cuda 25.11.01-alps5
+      ngc-nemo nemo-cuda 26.02-alps5
+      ngc-physicsnemo physicsnemo-cuda 25.11-alps5
+      apertus-2 apertus-2-cuda alps5
+      apertus-1p5 apertus-1p5-cuda alps5
+      sfttrainer sfttrainer-cuda alps5
+      verl verl-cuda alps5
+
+      ngc-pytorch pytorch-cuda 25.12-py3-alps6
+      ngc-pytorch pytorch-cuda 26.01-py3-alps6
+      ngc-pytorch pytorch-cuda 26.02-py3-alps6
+      ngc-nemo nemo-cuda 25.11.01-alps6
+      ngc-nemo nemo-cuda 26.02-alps6
+      ngc-physicsnemo physicsnemo-cuda 25.11-alps6
+      apertus-2 apertus-2-cuda alps6
+      apertus-1p5 apertus-1p5-cuda alps6
+      sfttrainer sfttrainer-cuda alps6
+      verl verl-cuda alps6
+      EOF
+      }
+
+      run_migration "${MIGRATION_MODE}"
+
+dry-run-image-name-migration:
+  stage: dry-run
+  extends: [.migration-template]
+  variables:
+    MIGRATION_MODE: check
+
+#migrate-image-names:
+#  stage: migrate
+#  extends: [.migration-template]
+#  needs:
+#    - dry-run-image-name-migration
+#  variables:
+#    MIGRATION_MODE: copy
+#    CONFIRM_MIGRATION: ""
+#  when: manual
