@@ -95,11 +95,10 @@ The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs fiv
    - ROCm/PyTorch GPU smoke checks and RCCL/OSU collectives for ROCm images
 3. **build-apps** — builds application images on top of canonical base image refs
 4. **test-apps** — runs end-to-end workload tests:
-   - `apertus-1p5`: Megatron pretraining (2 nodes, 8 GPUs)
-   - `apertus-2/pplx-garden`: perplexity garden benchmarks (2 nodes, 2 GPUs)
-   - `apertus-2/DeepEP`: DeepEP benchmarks (1 node, 1 GPU)
-   - `vllm`: 2-node Ray/NCCL all-reduce
-   - `verl`: async RL benchmark (4 nodes, 4 tasks)
+   - `apertus-1p5-cuda`: Megatron pretraining (2 nodes, 8 GPUs)
+   - `apertus-2-cuda`: perplexity garden and DeepEP benchmarks
+   - `vllm-cuda` and `vllm-rocm`: 2-node Ray/NCCL or Ray/RCCL all-reduce
+   - `verl-cuda`: async RL benchmark (4 nodes, 4 tasks)
    - app image vetnode coverage for all app images in the CI matrix
 5. **publish** — promotes all tested images to stable registries; overwrites are blocked on existing stable tags
 
