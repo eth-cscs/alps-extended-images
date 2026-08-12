@@ -33,7 +33,7 @@ RUN set -eux; \
       python3-venv; \
     rm -rf /var/lib/apt/lists/*
 # Python deps 
-COPY Alps-Images/apps/sfttrainer/requirements.txt /tmp/requirements.txt
+COPY Alps-Images/apps/sfttrainer/sources/requirements.txt /tmp/requirements.txt
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    python -m pip install -r /tmp/requirements.txt
+    pip_install python -r /tmp/requirements.txt

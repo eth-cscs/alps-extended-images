@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG VLLM_REF="v0.25.1"
+ARG VLLM_TARGET_DEVICE="rocm"
+ARG PYTORCH_ROCM_ARCH="gfx942"
+ARG MAX_JOBS="32"
+
+ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
+    PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
+    MAX_JOBS="${MAX_JOBS}" \
+    CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    vllm_apt_build_deps=( \
+      build-essential \
+      cargo \
+      cmake \
+      curl \
+      git \
+      ninja-build \
+      pkg-config \
+      rustc \
+      python3-dev \
+    ); \
+    vllm_apt_install_packages=(ca-certificates "${vllm_apt_build_deps[@]}"); \
+    snapshot_apt_packages /tmp/vllm-apt-before.txt; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends "${vllm_apt_install_packages[@]}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    source /opt/alps/env/alps-rocm-build.env; \
+    ROCM_BUILD_PREFIX="${ROCM_BUILD_PREFIX:-$(ROCM_DIST_NAME=rocm-sdk-devel ROCM_PACKAGE_DIR=_rocm_sdk_devel python -c 'import os; from importlib.metadata import distribution; dist = distribution(os.environ["ROCM_DIST_NAME"]); print(dist.locate_file(os.environ["ROCM_PACKAGE_DIR"]))')}"; \
+    test -d "${ROCM_BUILD_PREFIX}"; \
+    rocm_ldconfig_file=/etc/ld.so.conf.d/99-alps-vllm-rocm-sdk.conf; \
+    : > "${rocm_ldconfig_file}"; \
+    rocm_sdk_roots=("${ROCM_BUILD_PREFIX}" "${ROCM_LIBRARIES_PREFIX:-}" "${ROCM_DEVEL_PREFIX:-}" "${ROCM_CORE_PREFIX:-}" "${ROCM_SDK_ROOT:-}" "${ROCM_LIBRARIES_DIR:-}" "${ROCM_DEVEL_DIR:-}" "${ROCM_CORE_DIR:-}"); \
+    for rocm_prefix in "${rocm_sdk_roots[@]}"; do \
+      test -n "${rocm_prefix}" || continue; \
+      for rocm_lib_dir in "${rocm_prefix}/lib" "${rocm_prefix}/lib64"; do \
+        test -d "${rocm_lib_dir}" || continue; \
+        printf '%s\n' "${rocm_lib_dir}" >> "${rocm_ldconfig_file}"; \
+      done; \
+    done; \
+    for rocm_root in "${rocm_sdk_roots[@]}"; do \
+      test -n "${rocm_root}" || continue; \
+      test -d "${rocm_root}" || continue; \
+      while IFS= read -r rocm_lib_dir; do \
+        printf '%s\n' "${rocm_lib_dir}" >> "${rocm_ldconfig_file}"; \
+      done < <(find "${rocm_root}" -type f -name 'librocm-openblas.so*' -printf '%h\n' | sort -u); \
+    done; \
+    sort -u "${rocm_ldconfig_file}" -o "${rocm_ldconfig_file}"; \
+    export ROCM_PATH="${ROCM_BUILD_PREFIX}" HIP_PATH="${ROCM_BUILD_PREFIX}"; \
+    export PATH="${ROCM_BUILD_PREFIX}/bin:${ROCM_BUILD_PREFIX}/llvm/bin:${PATH}"; \
+    export LD_LIBRARY_PATH="${ROCM_BUILD_PREFIX}/lib:${LD_LIBRARY_PATH:-}"; \
+    pip_install python --no-cache-dir --upgrade \
+      'cmake<4' \
+      Cython \
+      ninja \
+      numba \
+      pybind11 \
+      scipy \
+      'huggingface-hub[cli]' \
+      'setuptools>=77.0.3,<80.0.0' \
+      setuptools-rust \
+      setuptools-scm \
+      wheel; \
+    rm -rf /opt/vllm; \
+    git clone --recursive "${VLLM_REPO}" /opt/vllm; \
+    cd /opt/vllm; \
+    git checkout -q "${VLLM_REF}"; \
+    git submodule update --init --recursive; \
+    python use_existing_torch.py --prefix || python use_existing_torch.py; \
+    pip_install python --no-cache-dir -r requirements/rocm.txt; \
+    python setup.py develop; \
+    pip_install python --no-cache-dir "ray[default]" sentencepiece tiktoken; \
+    torch_lib_dir="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"; \
+    test -d "${torch_lib_dir}"; \
+    printf '%s\n' "${torch_lib_dir}" > /etc/ld.so.conf.d/99-alps-vllm-torch.conf; \
+    ldconfig; \
+    cleanup_new_apt_build_deps /tmp/vllm-apt-before.txt "${vllm_apt_build_deps[@]}"; \
+    rm -rf /tmp/vllm-apt-before.txt /root/.cache/pip
+
+RUN set -eux; \
+    python -c 'import torch, vllm; print("torch={} hip={}".format(torch.__version__, torch.version.hip)); print("vllm={}".format(getattr(vllm, "__version__", "unknown")))'; \
+    python -m pip check || echo "WARN: inconsistent pip dependency resolution (see above)"; \
+    missing="$(find "$(python -c 'import vllm; print(vllm.__path__[0])')" -name '*.so' \
+                 -exec ldd {} + 2>/dev/null | grep 'not found' || true)"; \
+    if [ -n "${missing}" ]; then \
+      echo "FATAL: vLLM native extensions have unresolved dependencies:" >&2; \
+      echo "${missing}" >&2; \
+      exit 1; \
+    fi; \
+    echo "OK: vLLM ROCm smoke checks passed"
+
+# Tests shipped with the image
+COPY Alps-Images/apps/vllm/tests/ /opt/tests/vllm/
+RUN chmod -R a+rX /opt/tests/vllm
