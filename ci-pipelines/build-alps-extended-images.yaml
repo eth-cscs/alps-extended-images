@@ -1,7 +1,7 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
-stages: [dry-run, migrate]
+stages: [migrate]
 
 variables:
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
@@ -10,6 +10,11 @@ variables:
 .migration-template:
   image: quay.io/skopeo/stable:latest
   extends: [.container-runner-lightweight-gh200]
+  timeout: 6h
+  variables:
+    KUBERNETES_MEMORY_REQUEST: '64Gi'
+    KUBERNETES_MEMORY_LIMIT: '64Gi'
+    SLEEP_BETWEEN_IMAGES_SECONDS: '10'
   before_script:
     - |
       set -euo pipefail
@@ -79,7 +84,14 @@ variables:
           [[ "${old_image}" != \#* ]] || continue
           copy_or_check "${GHCR_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
           copy_or_check "${JFROG_IMAGE_PREFIX}" "${old_image}" "${new_image}" "${tag}" "${mode}"
-        done <<'EOF'
+          echo "sleeping ${SLEEP_BETWEEN_IMAGES_SECONDS}s before next image"
+          sleep "${SLEEP_BETWEEN_IMAGES_SECONDS}"
+        done
+      }
+
+      case "${MIGRATION_BATCH:?MIGRATION_BATCH must be set}" in
+        alps4)
+          run_migration "${MIGRATION_MODE}" <<'EOF'
       ngc-pytorch pytorch-cuda 25.12-py3-alps4
       ngc-pytorch pytorch-cuda 26.01-py3-alps4
       ngc-pytorch pytorch-cuda 26.02-py3-alps4
@@ -88,7 +100,10 @@ variables:
       ngc-physicsnemo physicsnemo-cuda 25.11-alps4
       apertus-2 apertus-2-cuda alps4
       apertus-1p5 apertus-1p5-cuda alps4
-
+      EOF
+          ;;
+        alps5)
+          run_migration "${MIGRATION_MODE}" <<'EOF'
       ngc-pytorch pytorch-cuda 25.12-py3-alps5
       ngc-pytorch pytorch-cuda 26.01-py3-alps5
       ngc-pytorch pytorch-cuda 26.02-py3-alps5
@@ -99,7 +114,10 @@ variables:
       apertus-1p5 apertus-1p5-cuda alps5
       sfttrainer sfttrainer-cuda alps5
       verl verl-cuda alps5
-
+      EOF
+          ;;
+        alps6)
+          run_migration "${MIGRATION_MODE}" <<'EOF'
       ngc-pytorch pytorch-cuda 25.12-py3-alps6
       ngc-pytorch pytorch-cuda 26.01-py3-alps6
       ngc-pytorch pytorch-cuda 26.02-py3-alps6
@@ -111,21 +129,33 @@ variables:
       sfttrainer sfttrainer-cuda alps6
       verl verl-cuda alps6
       EOF
-      }
+          ;;
+        *)
+          echo "ERROR: unsupported MIGRATION_BATCH=${MIGRATION_BATCH}" >&2
+          exit 1
+          ;;
+      esac
 
-      run_migration "${MIGRATION_MODE}"
-
-dry-run-image-name-migration:
-  stage: dry-run
-  extends: [.migration-template]
-  variables:
-    MIGRATION_MODE: check
-
-migrate-image-names:
+migrate-image-names-alps4:
   stage: migrate
   extends: [.migration-template]
-  needs:
-    - dry-run-image-name-migration
   variables:
     MIGRATION_MODE: copy
+    MIGRATION_BATCH: alps4
     CONFIRM_MIGRATION: copy
+
+#migrate-image-names-alps5:
+#  stage: migrate
+#  extends: [.migration-template]
+#  variables:
+#    MIGRATION_MODE: copy
+#    MIGRATION_BATCH: alps5
+#    CONFIRM_MIGRATION: copy
+#
+#migrate-image-names-alps6:
+#  stage: migrate
+#  extends: [.migration-template]
+#  variables:
+#    MIGRATION_MODE: copy
+#    MIGRATION_BATCH: alps6
+#    CONFIRM_MIGRATION: copy
