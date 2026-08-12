@@ -23,7 +23,7 @@ COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    python -m pip install \
+    pip_install python \
         --no-cache-dir \
         --progress-bar off \
         flask-restful einops sentencepiece transformers tiktoken wandb nvidia-modelopt[hf]
