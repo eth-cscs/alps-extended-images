@@ -195,6 +195,14 @@ NCCL_DEBUG_SUBSYS = "INIT,NET"
 # NVLS only speeds up large all-reduces on the NVLink domain; TP=4
 # all-reduces at 2k tokens lose little.
 NCCL_NVLS_ENABLE = "0"
+# Post-step weight-broadcast staging (slurm-3062482): the packed refit
+# broadcast (nemo_rl/utils/packed_tensor.py) targets 2% of GPU memory
+# (~1.9 GB) per bucket, overshoots by up to one tensor, and double-buffers
+# (x2) — ~3.55 GB allocations against ~2.7 GB free at the post-step peak.
+# Shrink the target to 0.5% and use a single buffer; largest single tensor
+# (~0.5 GB grouped-MoE layer shard) still fits the pack.
+NRL_REFIT_BUFFER_MEMORY_RATIO = "0.005"
+NRL_REFIT_NUM_BUFFERS = "1"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
