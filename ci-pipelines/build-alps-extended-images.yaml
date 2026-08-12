@@ -14,7 +14,7 @@ variables:
   variables:
     KUBERNETES_MEMORY_REQUEST: '4Gi'
     KUBERNETES_MEMORY_LIMIT: '4Gi'
-    SLEEP_BETWEEN_IMAGES_SECONDS: '10'
+    SLEEP_BETWEEN_IMAGES_SECONDS: '60'
   before_script:
     - |
       set -euo pipefail
@@ -92,6 +92,13 @@ variables:
       case "${MIGRATION_BATCH:?MIGRATION_BATCH must be set}" in
         alps4)
           run_migration "${MIGRATION_MODE}" <<'EOF'
+
+      ngc-pytorch pytorch-cuda 25.12-py3-alps4
+      ngc-pytorch pytorch-cuda 26.01-py3-alps4
+      ngc-pytorch pytorch-cuda 26.02-py3-alps4
+      ngc-nemo nemo-cuda 25.11.01-alps4
+      ngc-nemo nemo-cuda 26.02-alps4
+      ngc-physicsnemo physicsnemo-cuda 25.11-alps4
       apertus-2 apertus-2-cuda alps4
       apertus-1p5 apertus-1p5-cuda alps4
       EOF
@@ -130,22 +137,22 @@ variables:
           ;;
       esac
 
-migrate-image-names-alps4:
-  stage: migrate
-  extends: [.migration-template]
-  variables:
-    MIGRATION_MODE: copy
-    MIGRATION_BATCH: alps4
-    CONFIRM_MIGRATION: copy
-
-#migrate-image-names-alps5:
+#migrate-image-names-alps4:
 #  stage: migrate
 #  extends: [.migration-template]
 #  variables:
 #    MIGRATION_MODE: copy
-#    MIGRATION_BATCH: alps5
+#    MIGRATION_BATCH: alps4
 #    CONFIRM_MIGRATION: copy
 #
+migrate-image-names-alps5:
+  stage: migrate
+  extends: [.migration-template]
+  variables:
+    MIGRATION_MODE: copy
+    MIGRATION_BATCH: alps5
+    CONFIRM_MIGRATION: copy
+
 #migrate-image-names-alps6:
 #  stage: migrate
 #  extends: [.migration-template]
