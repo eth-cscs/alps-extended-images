@@ -8,7 +8,7 @@ variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps7-dev
-  CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.24.0-python3-arm64-v1
+  CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.22.2-python3-arm64-v1
 
 .generator-template:
   image: $CI_GENERATOR_IMAGE
