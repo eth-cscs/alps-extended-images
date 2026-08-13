@@ -36,3 +36,5 @@ run-generated-child-pipeline:
       - artifact: generated-child-pipeline.yaml
         job: generate-child-pipeline
     strategy: depend
+    forward:
+      pipeline_variables: true
