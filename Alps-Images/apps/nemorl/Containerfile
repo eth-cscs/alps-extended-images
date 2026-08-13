@@ -37,7 +37,13 @@ RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr
 ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
 
 # Let's put the cache at a specific well known location.
+# INVARIANT: never prune/remove this cache from the image — every venv
+# (the prefetched ones below AND any venv built at runtime) is a symlink
+# farm resolving into it.  Removing it breaks them all.
 ENV UV_CACHE_DIR="/opt/uv_cache"
+
+# Ensure that uv uses symlinks by default
+ENV UV_LINK_MODE="symlink"
 
 # Disable Ray's built-in uv-run runtime-env creation (ray>=2.47). NeMo-RL has
 # its own per-node venv creator (nemo_rl/utils/venvs.py) that runs once per
@@ -115,23 +121,23 @@ RUN uv venv --seed "${UV_PROJECT_ENVIRONMENT}"
 # upstream Dockerfile: the heavy dependency syncs are done first (warming the
 # uv cache), and the project itself is installed in a final step below once
 # the full source is present. See NeMoRL/docker/Dockerfile:183.
-RUN uv sync --link-mode symlink --locked --no-install-project
+# Link mode is NOT passed per command: the global UV_LINK_MODE=symlink (ENV
+# above) governs every sync here and at runtime — one source of truth.
+RUN uv sync --locked --no-install-project
 
 # Now we perform the "install" of the helper, this will pull them into the cache such that they
 #  are installed faster when they are needed.
-# NOTE: In the original `vllm` used `hardlink` as mode, but I changed it to `symlink`.
-RUN uv sync --link-mode symlink --locked --extra vllm --no-install-project
-RUN uv sync --link-mode symlink --locked --extra mcore --no-install-project
-RUN uv sync --link-mode symlink --locked --extra automodel --no-install-project
-RUN uv sync --link-mode symlink --locked --extra modelopt --no-install-project
-RUN uv sync --link-mode symlink --locked --all-groups --no-install-project
+RUN uv sync --locked --extra vllm --no-install-project
+RUN uv sync --locked --extra mcore --no-install-project
+RUN uv sync --locked --extra automodel --no-install-project
+RUN uv sync --locked --extra modelopt --no-install-project
+RUN uv sync --locked --all-groups --no-install-project
 
 # The NeMo Dockerfile also removes some files related to ray, we do not do that.
 # Furthermore, we will now install the project in full, i.e. without `--no-install-project`.
-RUN uv sync --link-mode hardlink --locked
+RUN uv sync --locked
 
-# Prefetch some per-actor venvs (Workers, Generators, ReplayBuffer,
-# AsyncTrajectoryCollector, ...) at build time so Ray doesn't create them on
+# Prefetch the per-actor venvs at build time so Ray doesn't create them on
 # the first launch of every actor. Mirrors NeMoRL/docker/Dockerfile:276.
 # `prefetch_venvs.py` imports nemo_rl and reads
 # ACTOR_ENVIRONMENT_REGISTRY, so it must run AFTER the project install above.
@@ -139,10 +145,16 @@ RUN uv sync --link-mode hardlink --locked
 # because NRL_CONTAINER=1 is set, also creates
 # /usr/local/bin/python-<ClassName> wrapper scripts for frozen-env use.
 #
+# Filter list: AsyncTrajectoryCollector added (it was runtime-built on every
+# node before — ~9 GB copied into the tmpfs overlay per node with the old
+# default hardlink mode, see HANDOFF.md §8 / slurm-3071878); dtensor removed
+# (unused by our runs).  ReplayBuffer may report "uses system Python" in the
+# build log — that is fine, such actors need no venv.
+#
 # Skip with: --build-arg SKIP_PREFETCH_VENVS=1
 ARG SKIP_PREFETCH_VENVS=
 RUN if [[ -z "${SKIP_PREFETCH_VENVS:-}" ]]; then \
-        UV_LINK_MODE=symlink uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer vllm dtensor megatron ; \
+        uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer AsyncTrajectoryCollector vllm megatron ; \
     else \
         echo "Skipping venv prefetch (SKIP_PREFETCH_VENVS set)"; \
     fi
