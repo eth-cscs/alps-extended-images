@@ -13,22 +13,15 @@ build-ci-generator-image:
   extends: [.container-builder-cscs-gh200]
   timeout: 1h
   when: manual
-  allow_failure: false
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
     CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
     CSCS_REBUILD_POLICY: if-not-exists
     KUBERNETES_MEMORY_REQUEST: '16Gi'
     KUBERNETES_MEMORY_LIMIT: '16Gi'
+    DOCKERFILE: $CI_GENERATOR_DOCKERFILE
+    BASE_IMAGE: $CI_GENERATOR_BASE_IMAGE
+    PERSIST_IMAGE_NAME: $CI_GENERATOR_IMAGE
     DOCKER_BUILD_ARGS: '[
       "BASE_IMAGE"
     ]'
-  before_script:
-    - |
-      set -euo pipefail
-      export PERSIST_IMAGE_NAME="$CI_GENERATOR_IMAGE"
-      export DOCKERFILE="$CI_GENERATOR_DOCKERFILE"
-      export BASE_IMAGE="$CI_GENERATOR_BASE_IMAGE"
-      echo "Building CI generator image: $PERSIST_IMAGE_NAME"
-  script:
-    - build_new_container
