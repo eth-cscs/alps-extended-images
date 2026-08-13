@@ -203,6 +203,14 @@ NCCL_NVLS_ENABLE = "0"
 # (~0.5 GB grouped-MoE layer shard) still fits the pack.
 NRL_REFIT_BUFFER_MEMORY_RATIO = "0.005"
 NRL_REFIT_NUM_BUFFERS = "1"
+# Venvs built at RUNTIME (e.g. AsyncTrajectoryCollector — not in the image's
+# prefetch list) land in the writable container overlay, which on diskless
+# GH200 nodes is tmpfs = RAM.  uv's default link mode (hardlink) cannot cross
+# from the squashfs lower layer (/opt/uv_cache) into the overlay and silently
+# falls back to FULL COPIES — potentially 15-30 GB of RAM per node.  Symlink
+# mode makes runtime venvs point into the read-only cache instead (same mode
+# the image build itself uses for the prefetched venvs).
+UV_LINK_MODE = "symlink"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
