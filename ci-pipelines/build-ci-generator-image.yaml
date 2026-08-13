@@ -6,7 +6,7 @@ stages: [build]
 variables:
   CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.24.0-python3-arm64-v1
   CI_GENERATOR_DOCKERFILE: ci-pipelines/generator-image/Containerfile
-  CI_GENERATOR_BASE_IMAGE: quay.io/skopeo/stable:v1.24.0
+  CI_GENERATOR_BASE_IMAGE: quay.io/skopeo/stable:v1.22.2
 
 build-ci-generator-image:
   stage: build
