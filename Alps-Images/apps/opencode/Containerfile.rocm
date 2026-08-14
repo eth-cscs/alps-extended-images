@@ -1,0 +1,242 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+ARG OPENCODE_VERSION=""
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+
+# System deps
+RUN set -euxo pipefail; \
+    source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        unzip \
+        xz-utils \
+        pkg-config \
+        clang \
+        libclang-dev \
+        python3 \
+        python3-dev \
+        python3-venv \
+        build-essential \
+        podman \
+        rustc \
+        cargo \
+        crun \
+        uidmap \
+        fuse-overlayfs \
+        ripgrep \
+        xclip \
+        xsel; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -euxo pipefail; \
+    install_args=(--no-modify-path); \
+    if [[ -n "${OPENCODE_VERSION}" ]]; then \
+        install_args+=(--version "${OPENCODE_VERSION}"); \
+    fi; \
+    curl -fsSL https://opencode.ai/install | bash -s -- "${install_args[@]}"; \
+    install -Dm0755 /root/.opencode/bin/opencode /usr/local/bin/opencode; \
+    opencode --version; \
+    rm -rf /root/.opencode
+
+ENV HOME=/config/home \
+    XDG_CONFIG_HOME=/config/xdg \
+    XDG_DATA_HOME=/data \
+    XDG_CACHE_HOME=/data/cache \
+    XDG_STATE_HOME=/data/state
+
+COPY Alps-Images/apps/opencode/tests/opencode-launch /usr/local/bin/opencode-launch
+
+RUN set -euxo pipefail; \
+    chmod 0755 /usr/local/bin/opencode-launch
+
+#-----------------------------------------------
+# Rootless Podman configuration for Enroot/Pyxis
+#-----------------------------------------------
+
+# Nested containers inherit the outer Enroot network namespace and Slurm
+# cgroup. This avoids requiring systemd, cgroup delegation, or a separate
+# rootless networking helper inside the outer container.
+RUN set -euxo pipefail; \
+    mkdir -p /etc/containers; \
+    cat > /etc/containers/containers.conf <<'EOF'
+[containers]
+cgroups = "disabled"
+netns = "host"
+
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+runtime = "crun"
+EOF
+
+# Wrap Podman so image layers use fuse-overlayfs on /dev/shm, matching the
+# supported host-side setup on Alps. Small runtime state and temporary files
+# use /run. Both filesystems are RAM-backed, so their contents count against
+# the Slurm memory allocation and remain ephemeral.
+RUN set -euxo pipefail; \
+    cat > /usr/local/bin/podman <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_podman=/usr/bin/podman
+
+session_id="${PODMAN_SESSION_ID:-${SLURM_JOB_ID:-interactive}-${SLURM_STEP_ID:-0}}"
+
+runtime_parent="${PODMAN_RUNTIME_PARENT:-/run}"
+storage_parent="${PODMAN_STORAGE_PARENT:-/dev/shm}"
+
+runtime_base="${PODMAN_RUNTIME_DIR:-${runtime_parent%/}/opencode-podman-${UID}-${session_id}}"
+storage_base="${PODMAN_STORAGE_DIR:-${storage_parent%/}/opencode-podman-${UID}-${session_id}}"
+
+xdg_runtime="${runtime_base}/xdg-runtime"
+runroot="${runtime_base}/runroot"
+tmpdir="${runtime_base}/tmp"
+storage_conf="${runtime_base}/storage.conf"
+
+graphroot="${storage_base}/graphroot"
+
+create_private_dir() {
+    local directory="$1"
+    local owner
+
+    install -d -m 0700 "${directory}"
+
+    owner="$(stat -c '%u' "${directory}")"
+    if [[ "${owner}" != "${UID}" ]]; then
+        printf \
+            'Podman directory %s is owned by UID %s, expected %s\n' \
+            "${directory}" "${owner}" "${UID}" >&2
+        exit 1
+    fi
+}
+
+create_private_dir "${runtime_base}"
+create_private_dir "${xdg_runtime}"
+create_private_dir "${runroot}"
+create_private_dir "${tmpdir}"
+create_private_dir "${storage_base}"
+create_private_dir "${graphroot}"
+
+if ! command -v fuse-overlayfs >/dev/null 2>&1; then
+    echo "Rootless Podman requires fuse-overlayfs in this image" >&2
+    exit 1
+fi
+
+if [[ ! -c /dev/fuse || ! -r /dev/fuse || ! -w /dev/fuse ]]; then
+    cat >&2 <<'ERROR'
+Rootless Podman overlay storage requires a usable /dev/fuse.
+
+Ensure /dev/fuse is exposed through the Enroot/Pyxis environment.
+ERROR
+    exit 1
+fi
+
+# Optionally reject builds before they risk filling /dev/shm or exhausting
+# the Slurm memory cgroup. The value is configured by run-opencode.
+min_free_gb="${PODMAN_MIN_FREE_GB:-0}"
+
+if [[ ! "${min_free_gb}" =~ ^[0-9]+$ ]]; then
+    printf 'Invalid PODMAN_MIN_FREE_GB value: %s\n' "${min_free_gb}" >&2
+    exit 1
+fi
+
+if ((min_free_gb > 0)); then
+    required_bytes=$((min_free_gb * 1024 * 1024 * 1024))
+
+    shm_available="$(
+        df --output=avail -B1 "${storage_base}" |
+            tail -n 1 |
+            tr -d '[:space:]'
+    )"
+
+    if ((shm_available < required_bytes)); then
+        available_gb=$((shm_available / 1024 / 1024 / 1024))
+
+        printf \
+            '/dev/shm has %s GiB free; Podman requires at least %s GiB\n' \
+            "${available_gb}" "${min_free_gb}" >&2
+        exit 1
+    fi
+
+    # On cgroup v2, tmpfs pages are charged to this memory cgroup. Check the
+    # actual remaining allocation as well as the apparent tmpfs capacity.
+    if [[ -r /sys/fs/cgroup/memory.max &&
+          -r /sys/fs/cgroup/memory.current ]]; then
+        memory_max="$(cat /sys/fs/cgroup/memory.max)"
+        memory_current="$(cat /sys/fs/cgroup/memory.current)"
+
+        if [[ "${memory_max}" != "max" ]]; then
+            memory_available=$((memory_max - memory_current))
+
+            if ((memory_available < required_bytes)); then
+                available_gb=$((memory_available / 1024 / 1024 / 1024))
+
+                printf \
+                    'Slurm cgroup has %s GiB memory headroom; Podman requires at least %s GiB\n' \
+                    "${available_gb}" "${min_free_gb}" >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+cat > "${storage_conf}" <<STORAGE_EOF
+[storage]
+driver = "overlay"
+graphroot = "${graphroot}"
+rootless_storage_path = "${graphroot}"
+runroot = "${runroot}"
+
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+ignore_chown_errors = "true"
+STORAGE_EOF
+
+# These changes apply only to Podman and its children. OpenCode retains its
+# persistent XDG paths under /config and /data.
+export XDG_RUNTIME_DIR="${xdg_runtime}"
+
+# Keep temporary executable files off the noexec /dev/shm backing filesystem.
+# /run is also tmpfs, so this affects placement but not memory accounting.
+export TMPDIR="${tmpdir}"
+
+export CONTAINERS_STORAGE_CONF="${storage_conf}"
+export CONTAINERS_CONF=/etc/containers/containers.conf
+
+if [[ "${PODMAN_WRAPPER_DEBUG:-0}" == "1" ]]; then
+    printf 'Podman graphroot: %s\n' "${graphroot}" >&2
+    printf 'Podman runroot:   %s\n' "${runroot}" >&2
+    printf 'Podman TMPDIR:    %s\n' "${tmpdir}" >&2
+fi
+
+exec "${real_podman}" "$@"
+EOF
+
+RUN chmod 0755 /usr/local/bin/podman
+
+WORKDIR /workspace
+
+CMD ["opencode-launch"]

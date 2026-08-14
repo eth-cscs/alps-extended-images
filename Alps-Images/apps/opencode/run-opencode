@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+usage() {
+  cat <<'EOF'
+Usage:
+  run-opencode [wrapper-options] [srun-options ...] [-- opencode-args ...]
+
+Wrapper options:
+  --image PATH
+      Container image or .sqsh path.
+
+  --project-dir PATH
+      Host project directory to mount at /workspace.
+
+  --config-dir PATH
+      Host config root to mount at /config.
+
+  --data-dir PATH
+      Host data root to mount at /data.
+
+  --podman-min-free-gb N
+      Refuse to initialize Podman unless /dev/shm and the Slurm memory cgroup
+      both have at least N GiB available. Default: 0, disabling the check.
+
+  --podman-debug
+      Print Podman's resolved graphroot, runroot, temporary directory, and
+      storage driver whenever Podman is invoked.
+
+  --keep-podman-storage
+      Keep the ephemeral Podman directories when OpenCode exits normally.
+      By default, opencode-launch removes them.
+
+  --entrypoint
+      Run the image entrypoint before opencode-launch. This is the default.
+
+  --no-entrypoint
+      Skip the image entrypoint.
+
+  -h, --help
+      Show this help.
+
+Behavior:
+  - Unknown options before `--` are passed through to srun.
+  - Arguments after `--` are passed to /usr/local/bin/opencode-launch.
+  - Podman uses fuse-overlayfs with graph storage under /dev/shm.
+  - Podman's small runtime state and temporary files use /run.
+  - Both /dev/shm and /run are tmpfs, so their contents count against the
+    Slurm job's memory allocation. Request sufficient memory with --mem.
+EOF
+}
+
+toml_escape() {
+  local s="${1}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "${s}"
+}
+
+require_value() {
+  local option="$1"
+  local value="${2-}"
+
+  if [[ -z "${value}" ]]; then
+    printf 'error: %s requires a value\n' "${option}" >&2
+    exit 2
+  fi
+}
+
+#IMAGE="${IMAGE:-jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/opencode:alps6-dev-f57f101abff39527}"
+IMAGE="${IMAGE:-jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/opencode:alps7-dev-4ae4780bd0f49a41}"
+
+PROJECT_DIR="$(pwd -P)"
+
+HOST_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+HOST_XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+
+OPENCODE_CONFIG_DIR="${HOST_XDG_CONFIG_HOME}/opencode-container"
+OPENCODE_DATA_DIR="${HOST_XDG_DATA_HOME}/opencode-container"
+
+PODMAN_MIN_FREE_GB="${OPENCODE_PODMAN_MIN_FREE_GB:-0}"
+PODMAN_DEBUG="${OPENCODE_PODMAN_DEBUG:-0}"
+PODMAN_CLEANUP="${OPENCODE_PODMAN_CLEANUP:-1}"
+
+ENTRYPOINT=true
+
+SRUN_ARGS=()
+OPENCODE_ARGS=()
+
+while (($#)); do
+  case "$1" in
+    --image)
+      require_value "$1" "${2-}"
+      IMAGE="$2"
+      shift 2
+      ;;
+    --image=*)
+      IMAGE="${1#*=}"
+      shift
+      ;;
+
+    --project-dir)
+      require_value "$1" "${2-}"
+      PROJECT_DIR="$2"
+      shift 2
+      ;;
+    --project-dir=*)
+      PROJECT_DIR="${1#*=}"
+      shift
+      ;;
+
+    --config-dir)
+      require_value "$1" "${2-}"
+      OPENCODE_CONFIG_DIR="$2"
+      shift 2
+      ;;
+    --config-dir=*)
+      OPENCODE_CONFIG_DIR="${1#*=}"
+      shift
+      ;;
+
+    --data-dir)
+      require_value "$1" "${2-}"
+      OPENCODE_DATA_DIR="$2"
+      shift 2
+      ;;
+    --data-dir=*)
+      OPENCODE_DATA_DIR="${1#*=}"
+      shift
+      ;;
+
+    --podman-min-free-gb)
+      require_value "$1" "${2-}"
+      PODMAN_MIN_FREE_GB="$2"
+      shift 2
+      ;;
+    --podman-min-free-gb=*)
+      PODMAN_MIN_FREE_GB="${1#*=}"
+      shift
+      ;;
+
+    --podman-debug)
+      PODMAN_DEBUG=1
+      shift
+      ;;
+
+    --keep-podman-storage)
+      PODMAN_CLEANUP=0
+      shift
+      ;;
+
+    --entrypoint)
+      ENTRYPOINT=true
+      shift
+      ;;
+
+    --no-entrypoint)
+      ENTRYPOINT=false
+      shift
+      ;;
+
+    -h|--help)
+      usage
+      exit 0
+      ;;
+
+    --)
+      shift
+      OPENCODE_ARGS=("$@")
+      break
+      ;;
+
+    *)
+      SRUN_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ! "${PODMAN_MIN_FREE_GB}" =~ ^[0-9]+$ ]]; then
+  printf \
+    'error: --podman-min-free-gb must be a non-negative integer\n' \
+    >&2
+  exit 2
+fi
+
+if [[ ! "${PODMAN_DEBUG}" =~ ^[01]$ ]]; then
+  printf \
+    'error: OPENCODE_PODMAN_DEBUG must be either 0 or 1\n' \
+    >&2
+  exit 2
+fi
+
+if [[ ! "${PODMAN_CLEANUP}" =~ ^[01]$ ]]; then
+  printf \
+    'error: OPENCODE_PODMAN_CLEANUP must be either 0 or 1\n' \
+    >&2
+  exit 2
+fi
+
+mkdir -p \
+  "${PROJECT_DIR}" \
+  "${OPENCODE_CONFIG_DIR}" \
+  "${OPENCODE_DATA_DIR}"
+
+PROJECT_DIR="$(cd "${PROJECT_DIR}" && pwd -P)"
+OPENCODE_CONFIG_DIR="$(cd "${OPENCODE_CONFIG_DIR}" && pwd -P)"
+OPENCODE_DATA_DIR="$(cd "${OPENCODE_DATA_DIR}" && pwd -P)"
+
+TUI_CONFIG_HOST="${OPENCODE_CONFIG_DIR}/xdg/opencode/tui.json"
+mkdir -p "$(dirname "${TUI_CONFIG_HOST}")"
+
+if [[ ! -f "${TUI_CONFIG_HOST}" ]]; then
+  cat > "${TUI_CONFIG_HOST}" <<'EOF'
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "mouse": false
+}
+EOF
+fi
+
+TERM_VALUE="${TERM:-xterm-256color}"
+LANG_VALUE="${LANG:-C.UTF-8}"
+
+edf="$(mktemp "${TMPDIR:-/tmp}/opencode.XXXXXX.toml")"
+trap 'rm -f "${edf}"' EXIT
+
+cat > "${edf}" <<EOF
+image = "$(toml_escape "${IMAGE}")"
+entrypoint = ${ENTRYPOINT}
+writable = true
+workdir = "/workspace"
+
+mounts = [
+  "$(toml_escape "${PROJECT_DIR}"):/workspace:private",
+  "$(toml_escape "${OPENCODE_CONFIG_DIR}"):/config:private",
+  "$(toml_escape "${OPENCODE_DATA_DIR}"):/data:private",
+  "/dev/fuse:/dev/fuse:private",
+]
+
+[env]
+PMIX_MCA_psec = "native"
+
+HOME = "/config/home"
+XDG_CONFIG_HOME = "/config/xdg"
+XDG_DATA_HOME = "/data"
+XDG_CACHE_HOME = "/data/cache"
+XDG_STATE_HOME = "/data/state"
+
+OPENCODE_TUI_CONFIG = "/config/xdg/opencode/tui.json"
+OPENCODE_DB = "opencode-local.db"
+
+# Podman uses fuse-overlayfs with graph storage on /dev/shm. The graph storage
+# is ephemeral and consumes memory charged to the Slurm job's cgroup.
+PODMAN_STORAGE_PARENT = "/dev/shm"
+
+# Small runtime state, mount metadata, and temporary files are kept under /run.
+# This is also tmpfs, but its expected footprint is much smaller than graphroot.
+PODMAN_RUNTIME_PARENT = "/run"
+
+# The Podman wrapper checks both apparent /dev/shm availability and remaining
+# cgroup memory before initializing its store.
+PODMAN_MIN_FREE_GB = "$(toml_escape "${PODMAN_MIN_FREE_GB}")"
+
+# Print the Podman paths and selected storage driver when enabled.
+PODMAN_WRAPPER_DEBUG = "$(toml_escape "${PODMAN_DEBUG}")"
+
+# opencode-launch removes ephemeral Podman state after a normal exit unless
+# this is disabled with --keep-podman-storage.
+OPENCODE_PODMAN_CLEANUP = "$(toml_escape "${PODMAN_CLEANUP}")"
+
+TERM = "$(toml_escape "${TERM_VALUE}")"
+LANG = "$(toml_escape "${LANG_VALUE}")"
+
+SSH_AUTH_SOCK = ""
+BASH_ENV = ""
+ENV = ""
+
+[annotations]
+com.hooks.cxi.enabled = "false"
+EOF
+
+SRUN_CMD=(
+  srun
+  -u
+  --export=NONE
+  --mpi=pmix
+  --network=disable_rdzv_get,no_vni
+  --environment="${edf}"
+  --ntasks=1
+  --pty
+)
+
+SRUN_CMD+=("${SRUN_ARGS[@]}")
+SRUN_CMD+=(/usr/local/bin/opencode-launch)
+SRUN_CMD+=("${OPENCODE_ARGS[@]}")
+
+exec "${SRUN_CMD[@]}"

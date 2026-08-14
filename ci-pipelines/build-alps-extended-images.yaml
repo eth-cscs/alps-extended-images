@@ -49,16 +49,17 @@ variables:
   - NAME: "pytorch"
     VARIANT: "rocm7.14-ubuntu24.04-py3.12-torch2.11"
 
-
 .cuda_app_images_matrix: &cuda_app_images_matrix
   - NAME: "apertus-1p5"
   - NAME: "apertus-2"
   - NAME: "sfttrainer"
   - NAME: "verl"
   - NAME: "vllm"
+  - NAME: "opencode"
 
 .rocm_app_images_matrix: &rocm_app_images_matrix
   - NAME: "vllm"
+  - NAME: "opencode"
   
 # ----------------------------
 # Dependency mapping for matrix jobs as anchors
