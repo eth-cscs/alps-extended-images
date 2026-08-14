@@ -77,6 +77,26 @@ srun --mpi=pmix --network=disable_rdzv_get -N "${SLURM_JOB_NUM_NODES}" --ntasks-
 unset PYTHONOPTIMIZE
 
 # -----------------------------------------------------------------------------
+# Salvage Ray error logs before the node-local tmpfs vanishes with the job.
+#
+# Workers that die silently mid-import (slurm-3046402 ReplayBuffer SIGSEGV,
+# slurm-3079454 MegatronPolicyWorker) leave their only trace in
+# /tmp/ray/session_*/logs/worker-*.err on the node — gone at teardown.  Copy
+# non-empty error files to Lustre on exit (also on SIGTERM from
+# --kill-on-bad-exit; slurm allows a grace period before SIGKILL).
+# -----------------------------------------------------------------------------
+salvage_ray_logs() {
+    _dst="${TRAINING_HOME}/ray_err_logs/${SLURM_JOB_ID}"
+    mkdir -p "${_dst}" 2>/dev/null || return 0
+    find /tmp/ray/session_latest/logs /tmp/ray/session_*/logs -maxdepth 1 \
+        \( -name "worker-*.err" -o -name "raylet.err" -o -name "gcs_server.err" \) \
+        -size +0c 2>/dev/null | sort -u | head -50 | while read -r _f; do
+        cp "${_f}" "${_dst}/$(hostname)_$(basename "${_f}")" 2>/dev/null || true
+    done
+}
+trap salvage_ray_logs EXIT TERM
+
+# -----------------------------------------------------------------------------
 # Bind host memory to the CPU (LPDDR) NUMA nodes.
 #
 # On GH200 each GPU exposes its HBM as a memory-only NUMA node.  Under LPDDR
