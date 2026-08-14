@@ -190,6 +190,11 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
     # Signal that the Ray head is ready.
     touch "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
 
+    # Every rank-done marker has been consumed by the wait loop above; remove
+    # our own here (each worker removes its own once it sees the ray_open
+    # marker) so no sentinel files accumulate in TRAINING_CONFIG.
+    rm -f "${RANK_DONE_FILE}"
+
     # Wait until all worker nodes have joined — with a timeout, so a single
     # node that failed to start Ray aborts the job instead of hanging at
     # N-1/N for the whole allocation (slurm-3045644).
@@ -221,6 +226,9 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
     echo "Rank 0: stopping Ray cluster..."
     uv run --no-sync ray stop --grace-period 30 || true
 
+    # The cluster is closed; the head-ready marker has served its purpose.
+    rm -f "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
+
     sleep 5s
 else
     # Worker ranks wait for the Ray head to be ready, then join.
@@ -229,6 +237,10 @@ else
     while [ ! -f "${RAY_OPEN_FILE}" ]; do
         sleep 1
     done
+
+    # ray_open exists => rank 0 has already consumed every rank-done marker
+    # (it touches ray_open only after its wait loop), so ours can go now.
+    rm -f "${RANK_DONE_FILE}"
 
     ${NUMACTL} uv run --no-sync ray start \
         --address="${RAY_ADDRESS}" \
