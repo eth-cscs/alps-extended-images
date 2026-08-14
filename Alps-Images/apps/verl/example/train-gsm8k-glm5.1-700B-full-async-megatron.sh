@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=56
+#SBATCH --nodes=80
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -88,14 +88,14 @@ actor_rollout_ref:
     trust_remote_code: True  # GLM-5.1 uses a custom TokenizersBackend tokenizer
 
   actor:
-    # 48 training nodes x 4 GPUs = 192 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=2.
-    # DP=2 halves FP32 master + Adam state per GPU; peak optimizer memory ~57 GiB
-    # vs 95 GiB limit (27 GiB headroom).
+    # 72 training nodes x 4 GPUs = 288 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=3.
+    # Memory at optimizer step: M*(2 + 8/DP) + 11 GiB NCCL = 14.5*(2+2.67)+11 = 78.7 GiB < 95 GiB.
+    # DP=2 was insufficient: 6M+11 = 98 GiB > 95 GiB (4 optimizer tensors + param + grad).
     # EP=8: EP=4 causes megatron-bridge to fail for experts 64-127 (unmapped).
     # PP=3: 78 layers / 3 = 26 layers/stage.
     optim:
       lr_decay_steps: 22419  # must be positive at init; set_total_train_steps is called too late (after init_workers)
-    ppo_mini_batch_size: 16  # must be >= dp_size (DP=2 x EP=8 = 16)
+    ppo_mini_batch_size: 24  # must be >= dp_size (DP=3 x EP=8 = 24)
     ppo_micro_batch_size_per_gpu: 1
     ppo_max_token_len_per_gpu: 16384
     use_rollout_log_probs: True   # required for fully-async log prob correctness
@@ -381,12 +381,35 @@ else:
         print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
 "
 
-# Apply fix: preserve load_format=dummy in STANDALONE mode so SGLang initialises with
-# random weights (fast) and receives real weights via NCCL broadcast instead of reading
-# 1.5 TB from Lustre across all 32 TP ranks simultaneously.
-git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Fix-sglang-dummy-model-load
-git reset --hard pr_origin/Fix-sglang-dummy-model-load
+# PR #7421: DSA (experimental_attention_variant=dsa) compatibility with mcore >= 0.16.2.
+# Upstream _run_core_attention no longer forwards the x/qr kwargs DSA requires; route
+# DSA instances through the verl patch_forward. Also injects a pure-PyTorch
+# Walsh-Hadamard fallback when fast_hadamard_transform is not installed.
+tmp=$(mktemp)
+curl -sL "https://github.com/verl-project/verl/pull/7421.patch" -o "$tmp"
+git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7421" \
+    || echo "PR #7421 already applied or not applicable, skipping"
+rm -f "$tmp"
+
+# PR #7422: Preserve load_format=dummy in disaggregated SGLang rollout.
+# A guard was silently overriding dummy to auto in non-hybrid rollout mode, causing
+# rollout workers to load weights from disk instead of receiving them via broadcast.
+tmp=$(mktemp)
+curl -sL "https://github.com/verl-project/verl/pull/7422.patch" -o "$tmp"
+git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7422" \
+    || echo "PR #7422 already applied or not applicable, skipping"
+rm -f "$tmp"
+
+# PR #7423: Fix NCCL deadlock in async disaggregated weight sync.
+# update_actor (thread-pool) and update_weights (event loop) both submit ops to the
+# same PP/EP NCCL communicators. A threading.Lock serialises them; entry and exit
+# barriers ensure all actors complete the weight-sync collective before any resumes
+# training, preventing seq-number mismatches across EP ranks.
+tmp=$(mktemp)
+curl -sL "https://github.com/verl-project/verl/pull/7423.patch" -o "$tmp"
+git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7423" \
+    || echo "PR #7423 already applied or not applicable, skipping"
+rm -f "$tmp"
 
 
 # Mirror model config files to local tmpfs to avoid Lustre metadata contention.
