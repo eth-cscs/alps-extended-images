@@ -8,7 +8,7 @@
 
 # Specific settings
 #export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_07_21_I.sqsh"  # original
-export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_08_13_I.sqsh,"
+export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_08_13_I.sqsh"
 
 # W&B is enabled in the NeMo-RL config below. Make sure the API key is exported
 # in the environment before submitting; it is forwarded into the container.
