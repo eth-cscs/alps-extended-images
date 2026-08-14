@@ -21,12 +21,19 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
+
+ARG VERL_REF="v0.8.0"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+
 # Install dependencies for VeRL from pypi, including vLLM and SGLang.
 
 #Note: disable vllm installation for now, as it causes issues. To re-enable consider using the ngc vllm base image.
-#RUN pip install vllm --extra-index-url https://download.pytorch.org/whl/cu131
+#RUN source /opt/alps/package-helpers.sh && pip_install python vllm --extra-index-url https://download.pytorch.org/whl/cu131
 
-RUN pip install sglang[all]
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python sglang[all]
 
 # Capture the exact torch + torchvision versions that sglang chose.
 # sglang pins its own deps, so this pair is guaranteed ABI-compatible.
@@ -35,7 +42,9 @@ RUN pip install sglang[all]
 RUN pip freeze | grep -E "^torch(vision)?==" | tee /tmp/torch_constraints.txt && \
     python -c "import torchvision, torch; print('After sglang — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
-RUN pip install flash-attn --no-build-isolation
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python flash-attn --no-build-isolation
 
 
 # Install dependencies for VeRL from source, including flashinfer, flash-attention, torch_memory_saver, XIELU
@@ -50,22 +59,33 @@ WORKDIR ${SRC_DIR}
 #    cd XIELU ;\
 #    git submodule update --init --recursive ;\
 #    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
-#RUN pip install --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
+#RUN source /opt/alps/package-helpers.sh && pip_install python --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
 
 
 WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
 
-RUN git clone https://github.com/verl-project/verl
-RUN cd verl && pip install --no-deps -e ".[sglang]"
+RUN git clone --branch ${VERL_REF} --depth 1 https://github.com/verl-project/verl
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    cd verl; \
+    pip_install python --no-deps -e ".[sglang]"
 
-RUN pip install -U "ray[data,train,tune,serve]"
-RUN pip install "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -U "ray[data,train,tune,serve]"
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
 RUN pip uninstall kernels -y --break-system-packages
 
-RUN pip install cupy-cuda13x
-RUN pip install cachetools
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python cupy-cuda13x
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python cachetools
 
 # Add Megatron
 
