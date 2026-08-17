@@ -94,7 +94,38 @@ salvage_ray_logs() {
         cp "${_f}" "${_dst}/$(hostname)_$(basename "${_f}")" 2>/dev/null || true
     done
 }
-trap salvage_ray_logs EXIT TERM
+
+# -----------------------------------------------------------------------------
+# Host-memory tracer (slurm-3100132 / slurm-3101957 post-mortems).
+#
+# Both runs died of a fleet-wide host-memory CLIMB (~400 GiB of anonymous
+# process memory by step 2, sacct MaxRSS ~= Ray monitor reading) whose per-
+# step growth source is unknown.  Every 30 s, append one line per node to
+# Lustre: step-cgroup usage, MemAvailable, Shmem, and the top-5 RSS
+# processes.  The curve SHAPE localizes the leak: refit-synchronized jumps
+# vs. smooth growth during generation/training, and which process carries it.
+# Overhead: one tiny append per node per 30 s.
+# -----------------------------------------------------------------------------
+MEM_TRACE_DIR="${TRAINING_HOME}/mem_trace/${SLURM_JOB_ID}"
+mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
+(
+    _cg_path="/sys/fs/cgroup$(awk -F: "{print \$3}" /proc/self/cgroup)"
+    _trace_file="${MEM_TRACE_DIR}/$(hostname).log"
+    while true; do
+        {
+            printf "%s" "$(date +%s)"
+            printf " cg_bytes=%s" "$(cat "${_cg_path}/memory.current" 2>/dev/null || echo -1)"
+            printf " avail_kb=%s" "$(awk "/MemAvailable/{print \$2}" /proc/meminfo)"
+            printf " shmem_kb=%s" "$(awk "/^Shmem:/{print \$2}" /proc/meminfo)"
+            printf " top5_rss_kb=%s" "$(ps -eo rss=,comm= --sort=-rss | head -5 | tr -s " " | tr "\n" ";")"
+            printf "\n"
+        } >> "${_trace_file}" 2>/dev/null
+        sleep 30
+    done
+) &
+MEM_TRACE_PID=$!
+
+trap "salvage_ray_logs; kill ${MEM_TRACE_PID} 2>/dev/null || true" EXIT TERM
 
 # -----------------------------------------------------------------------------
 # Bind host memory to the CPU (LPDDR) NUMA nodes.
