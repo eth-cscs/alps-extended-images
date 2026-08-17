@@ -13,6 +13,7 @@ derivation as CI. If OUTPUT is omitted, the script is written to stdout.
 Environment overrides:
   IMAGE_PREFIX              default: localhost/alps-images
   ALPS_REV                  default: parsed from CI YAML
+  CI_COMMIT_SHA             default: current git SHA
   CI_COMMIT_SHORT_SHA       default: current git short SHA
   CSCS_CI_ORIG_CLONE_URL    default: current branch remote URL or local path
 EOF
@@ -100,7 +101,7 @@ emit_base_script() {
   source "$root/ci-pipelines/helpers/meta.sh"
   case "$family" in
     cuda|ngc)
-      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
+      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
       local remove_hpcx_dirs
       remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
       variant_dir="${name}-${variant}"
@@ -110,7 +111,7 @@ emit_base_script() {
 "
       ;;
     rocm)
-      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
+      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
       variant_dir="${name}-${variant}"
       local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
@@ -158,7 +159,7 @@ emit_app_script() {
 
   source "$root/ci-pipelines/helpers/skopeo.sh"
   source "$root/ci-pipelines/helpers/meta.sh"
-  read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$app_name" "$app_variant")
+  read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$app_name" "$app_variant")
   image_description="This image extends ${BASE_IMAGE_REF} with application software for Alps."
 
   cat <<EOF

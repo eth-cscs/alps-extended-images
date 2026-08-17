@@ -1,6 +1,24 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
+# Hidden templates consumed by generated-child-pipeline.yaml.
+#
+# The generator emits concrete jobs with only the variables and dependencies
+# needed for the current registry state. These templates keep runner selection,
+# common build/test scripts, and promotion policy in one static file so generated
+# jobs stay small and reviewable.
+#
+# Stage flow:
+# - build-base: build missing canonical base images
+# - test-base: test bases whose validation marker is missing/stale
+# - mark-base-tested: retag tested bases to validation-marker refs
+# - build-apps: build missing canonical app images after their bases validate
+# - test-apps: test apps whose validation marker is missing/stale
+# - mark-app-tested: retag tested apps to validation-marker refs
+# - publish: promote only validated images to stable/JFrog/GHCR refs
+
+# CSCS recipes provide a GH200 builder template, but not an equivalent MI300
+# builder.
 .container-builder-cscs-mi300:
   extends: [.f7t-runner, .beverin]
   interruptible: true
@@ -13,6 +31,7 @@ include:
     SLURM_PARTITION: mi300
     SLURM_TIMELIMIT: '04:00:00'
 
+# Registry-operation setup used by marker and publish jobs.
 .child-skopeo-template:
   image: quay.io/skopeo/stable:latest
   before_script:
@@ -20,6 +39,7 @@ include:
     - skopeo_login
     - skopeo_login_ghcr
 
+# Used when the generator found no build, validation, or publish work.
 .child-noop-template:
   stage: build-base
   extends: [.container-runner-lightweight-gh200]
@@ -27,6 +47,8 @@ include:
   script:
     - echo "No work required."
 
+# Common Slurm defaults for generated image test jobs. Generated test jobs set
+# `image:` to the canonical ref and only appear when validation is missing/stale.
 .child-slurm-template:
   variables:
     USE_MPI: NO
@@ -34,6 +56,9 @@ include:
     SLURM_NETWORK: disable_rdzv_get
     PMIX_MCA_psec: native
 
+# Common build wrapper for generated build jobs. The generated job provides the
+# canonical target ref and selected Dockerfile/build args; the CSCS builder
+# helper reads these variables and performs the podman build/push.
 .child-build-images-template:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
@@ -49,6 +74,7 @@ include:
       echo "Building: $PERSIST_IMAGE_NAME"
   timeout: 6h
 
+# CUDA base build: NGC image plus Alps CUDA/HPC stack.
 .child-cuda-base-build-template:
   stage: build-base
   extends: [.container-builder-cscs-gh200, .child-build-images-template]
@@ -81,6 +107,7 @@ include:
       "CSCS_ALPS_GIT_COMMIT_SHORT"
     ]'
 
+# ROCm base build: ROCm image plus Alps ROCm/HPC stack.
 .child-rocm-base-build-template:
   stage: build-base
   extends: [.container-builder-cscs-mi300, .child-build-images-template]
@@ -119,6 +146,7 @@ include:
       "CSCS_ALPS_GIT_COMMIT_SHORT"
     ]'
 
+# CUDA app build on top of the selected canonical CUDA base image.
 .child-cuda-app-build-template:
   stage: build-apps
   extends: [.container-builder-cscs-gh200, .child-build-images-template]
@@ -132,6 +160,7 @@ include:
       "CSCS_ALPS_GIT_COMMIT_SHORT"
     ]'
 
+# ROCm app build on top of the selected canonical ROCm base image.
 .child-rocm-app-build-template:
   stage: build-apps
   extends: [.container-builder-cscs-mi300, .child-build-images-template]
@@ -145,6 +174,7 @@ include:
       "CSCS_ALPS_GIT_COMMIT_SHORT"
     ]'
 
+# CUDA base environment variable smoke test.
 .child-cuda-base-env-test-template:
   stage: test-base
   extends: [.container-runner-clariden-gh200, .child-slurm-template]
@@ -163,6 +193,7 @@ include:
     SLURM_NTASKS: 1
     NCCL_VERSION: dummy
 
+# CUDA base multi-node collectives and MPI smoke test.
 .child-cuda-base-collectives-test-template:
   stage: test-base
   extends: [.container-runner-clariden-gh200, .child-slurm-template]
@@ -175,6 +206,7 @@ include:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
 
+# CUDA base hardware/software diagnosis via vetnode.
 .child-cuda-vetnode-test-template:
   stage: test-base
   extends: [.container-runner-clariden-gh200, .child-slurm-template]
@@ -208,11 +240,13 @@ include:
     SLURM_NTASKS: 16
     GIT_STRATEGY: fetch
 
+# App variant of the CUDA vetnode test, emitted in the app test stage.
 .child-cuda-app-vetnode-test-template:
   extends: [.child-cuda-vetnode-test-template]
   stage: test-apps
   timeout: 2h
 
+# ROCm base environment and PyTorch device visibility smoke test.
 .child-rocm-base-env-test-template:
   stage: test-base
   extends: [.container-runner-beverin-mi300, .child-slurm-template]
@@ -234,6 +268,7 @@ include:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
+# ROCm base multi-node RCCL and MPI smoke test.
 .child-rocm-base-collectives-test-template:
   stage: test-base
   extends: [.container-runner-beverin-mi300, .child-slurm-template]
@@ -244,26 +279,36 @@ include:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
 
+# CUDA app test template; generated jobs provide the script.
 .child-cuda-custom-test-template:
   stage: test-apps
   extends: [.container-runner-clariden-gh200, .child-slurm-template]
 
+# ROCm app test template; generated jobs provide the script.
 .child-rocm-custom-test-template:
   stage: test-apps
   extends: [.container-runner-beverin-mi300, .child-slurm-template]
 
+# Marker jobs copy the already-tested canonical image digest to a synthetic tag:
+# <canonical-tag>-tested-<validation-hash>.
+
+# Base-image marker job.
 .child-mark-base-tested-template:
   stage: mark-base-tested
   extends: [.container-runner-lightweight-gh200, .child-skopeo-template]
   script:
     - mark_tested "$CANON_IMAGE_REF" "$TESTED_IMAGE_REF"
 
+# App-image marker job.
 .child-mark-app-tested-template:
   stage: mark-app-tested
   extends: [.container-runner-lightweight-gh200, .child-skopeo-template]
   script:
     - mark_tested "$CANON_IMAGE_REF" "$TESTED_IMAGE_REF"
 
+# Publish jobs are emitted only when a stable destination differs from the
+# canonical digest. They re-check the tested marker before copying, so promotion
+# stays safe even if registry state changed after generation.
 .child-publish-template:
   stage: publish
   extends: [.container-builder-cscs-gh200]
@@ -277,14 +322,13 @@ include:
       skopeo_login_ghcr
       set -euo pipefail
 
-      require_tested_marker_not_mismatched "$CANON_IMAGE_REF" "$TESTED_IMAGE_REF"
-      tested_marker_valid "$CANON_IMAGE_REF" "$TESTED_IMAGE_REF" || {
-        echo "ERROR: refusing to publish unvalidated image: $CANON_IMAGE_REF" >&2
-        exit 1
-      }
+      # Both $CANON_IMAGE_REF and $TESTED_IMAGE_REF must exist and point to the
+      # same digest.
+      require_tested_marker_valid "$CANON_IMAGE_REF" "$TESTED_IMAGE_REF"
 
       echo "Starting promotion process for $CANON_IMAGE_REF"
       if [[ "${ALPS_REV}" =~ -dev$ ]]; then
+        # Case: dev version
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then
           echo "copy to: $STABLE_IMAGE_REF"
           skopeo copy "$(_ref_url "$CANON_IMAGE_REF")" "$(_ref_url "$STABLE_IMAGE_REF")"
@@ -295,6 +339,7 @@ include:
           echo "Dry-run only (dev version detected and not default branch): promotion not executed."
         fi
       else
+        # Case: stable version
         echo "Publish check: $CANON_IMAGE_REF -> $STABLE_IMAGE_REF"
         promote_check_strict "$CANON_IMAGE_REF" "$STABLE_IMAGE_REF"
         if [[ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]]; then

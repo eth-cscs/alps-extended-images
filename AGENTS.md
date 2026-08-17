@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repo builds, tests, and publishes Alps-optimized container images. Preserve reproducible content hashing, canonical base-image selection, CI retagging for tests, multi-node validation, and strict stable promotion.
+This repo builds, tests, and publishes Alps-optimized container images. Preserve reproducible content hashing, canonical base-image selection, generated child-pipeline behavior, validation markers, multi-node validation, and strict stable promotion.
 
 ## Project Map
 
@@ -10,8 +10,10 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - `Alps-Images/ROCm/`: AMD ROCm base-image family for MI300-class systems. Keep ROCm SDK, RCCL/aws-ofi-rccl, and Beverin assumptions here.
 - `Alps-Images/common/`: shared Alps network-stack installers, package helpers, runtime env fragments, and source/version defaults used by base-image families.
 - `Alps-Images/apps/<app>/`: app Containerfiles, `profile.env`, optional app-local patches, and optional tests copied into `/opt/tests/<app>/`.
-- `ci-pipelines/build-alps-extended-images.yaml`: executable CI pipeline source; prefer this over README prose when they differ.
-- `ci-pipelines/helpers/meta.sh`: image refs and content hashes. `ci-pipelines/helpers/skopeo.sh`: registry copy and promotion behavior.
+- `ci-pipelines/build-alps-extended-images.yaml`: executable parent CI pipeline source and best high-level CI overview; prefer this over README prose when they differ.
+- `ci-pipelines/child-templates.yaml`: static templates used by generated child jobs for runner selection, build/test bodies, validation markers, and publish policy.
+- `ci-pipelines/helpers/generate-child-pipeline.py`: emits the registry-dependent child pipeline.
+- `ci-pipelines/helpers/meta.sh`: image refs, content hashes, validation hashes, and generated job env. `ci-pipelines/helpers/skopeo.sh`: registry digest, marker, copy, and promotion behavior.
 - `manual-build/manual-build.sh`: local `podman build` script generation using the same ref/hash logic as CI.
 
 ## Core Invariants
@@ -19,10 +21,11 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - Content hashes must not include timestamps or commit SHAs. OCI labels may include CI metadata.
 - Base hashes must cover the selected base Containerfile, family/profile inputs, shared common inputs, patches, and logical build inputs used by `meta.sh`.
 - App hashes must cover selected Containerfile/profile/test/patch/helper inputs plus the canonical base ref, so unchanged app content rebuilds when its base changes.
-- App images must build from the canonical base ref returned by the family base-ref helpers, never stable tags or commit-SHA test tags.
-- GitLab resolves job `image:` before dotenv artifacts exist; tests must use predictable commit-SHA test tags created by `tag-*-for-ci` jobs.
-- Matrix jobs with `needs:` must map every identity field through `needs:parallel:matrix` to avoid mixed dotenv artifacts.
-- Publishing is gated by explicit `publish-gate.needs`; update it whenever tests are added, removed, or renamed.
+- App images must build from the canonical base ref returned by the family base-ref helpers, never stable tags.
+- Validation hashes must cover test metadata/templates/helpers. A tested marker is valid only when `<canonical-tag>-tested-<validation-hash>` points to the same digest as the canonical image.
+- The generated child pipeline must emit concrete job `image:` refs and `needs:` based on registry state.
+- App builds must depend on base validation, not only base build completion.
+- Publish jobs must re-check tested markers and stable-tag policy at execution time because registry state can change after generation.
 - Stable non-dev tags are immutable. Dev stable tags may overwrite only on the default branch.
 
 ## Family Boundaries
@@ -52,7 +55,7 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 
 - After shell edits: `git ls-files '*.sh' | xargs -r -n1 bash -n`.
 - If ShellCheck is available, run it on changed shell scripts; no repo-local ShellCheck config exists.
-- After CI YAML edits, parse `ci-pipelines/build-alps-extended-images.yaml` locally and use GitLab CI lint when credentials/network are available.
+- After CI YAML edits, parse `ci-pipelines/build-alps-extended-images.yaml` and `ci-pipelines/child-templates.yaml` locally, syntax-check embedded shell snippets, and use GitLab CI lint when credentials/network are available.
 - For image-affecting changes, smoke-check `meta.sh` refs/hashes and `manual-build/manual-build.sh` script generation.
 
 ## Task-Specific Docs

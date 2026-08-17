@@ -4,6 +4,16 @@ set -euo pipefail
 # Depends on skopeo.sh being sourced for registry/marker helpers,
 # and IMAGE_PREFIX being set in CI variables.
 
+# Canonical ref and hash helpers shared by CI and manual builds.
+#
+# Tag model:
+# - canonical tags include a deterministic content hash and are build outputs;
+# - tested marker tags prove a canonical digest passed the current validation;
+# - stable tags are promotion targets and must never be used as app build bases.
+#
+# Content hashes intentionally exclude timestamps and commit SHAs. OCI labels may
+# carry CI metadata, but refs should only change when logical build inputs change.
+
 # Iterate paths
 _paths_iter() {
   # usage: _paths_iter "path1 path2 ..."
@@ -41,17 +51,10 @@ vars_blob() {
   done | sort
 }
 
-# usage: content_hash "paths..." "vars..."
-content_hash() {
-  local paths="${1:?paths required}"
-  local vars_to_hash="${2:?vars required}"
-  {
-    hash_paths_stream "$paths"
-    vars_blob "$vars_to_hash"
-  } | sha256sum | awk '{print $1}' | cut -c1-16
-}
-
-validation_hash() {
+# Hash file inputs and selected variables into the short tag hash format used by
+# both content hashes and validation hashes.
+# usage: short_input_hash "paths..." ["vars..."]
+short_input_hash() {
   local paths="${1:?paths required}"
   local vars_to_hash="${2:-}"
 
@@ -63,6 +66,22 @@ validation_hash() {
   } | sha256sum | awk '{print $1}' | cut -c1-16
 }
 
+# Hash content that affects image build output. The stream includes file hashes
+# in stable path order and selected logical variables, then truncates the sha256
+# for tag readability.
+# usage: content_hash "paths..." "vars..."
+content_hash() {
+  short_input_hash "${1:?paths required}" "${2:?vars required}"
+}
+
+validation_hash() {
+  short_input_hash "${1:?paths required}" "${2:-}"
+}
+
+# Validation hashes are separate from image content hashes. They cover test
+# declarations and the templates/helpers that implement testing. This lets CI
+# re-test an unchanged canonical image when validation logic changes, without
+# forcing a rebuild of the image itself.
 base_validation_hash() {
   local family="${1:?family required}"
   local name="${2:?name required}"
@@ -124,6 +143,18 @@ img_ref() {
   printf '%s/%s:%s\n' "$IMAGE_PREFIX" "$1" "$2"
 }
 
+# usage: image_refs NAME TAG HASH
+# Returns: CANON_REF STABLE_REF
+image_refs() {
+  local name="${1:?name required}"
+  local tag="${2:?tag required}"
+  local hash="${3:?hash required}"
+  local canon_tag
+
+  canon_tag="$(canon_tag_for "$tag" "$hash")"
+  printf '%s %s\n' "$(img_ref "$name" "$canon_tag")" "$(img_ref "$name" "$tag")"
+}
+
 # Parse BASE_IMAGE like:
 #   pytorch-cuda:25.12-py3 -> prints "ngc pytorch 25.12-py3"
 #   pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11 -> prints "rocm pytorch rocm7.14-ubuntu24.04-py3.12-torch2.11"
@@ -152,11 +183,11 @@ load_base_ref_vars() {
 
   case "$family" in
     ngc)
-      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
+      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
       ;;
     rocm)
       REMOVE_HPCX_DIRS_B64=""
-      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
+      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
       ;;
     *)
       echo "ERROR: unsupported base image family: $family" >&2
@@ -258,13 +289,12 @@ EOF
 }
 
 # Usage: rocm_base_refs NAME ROCM_VARIANT
-# Returns: BASE_IMAGE_REF DOCKERFILE CANON_REF TEST_REF STABLE_REF
+# Returns: BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF
 rocm_base_refs() {
   local rocm_name="${1:?rocm_name required}"       # e.g. pytorch
   local rocm_variant="${2:?rocm_variant required}" # e.g. rocm7.14-ubuntu24.04-py3.12-torch2.11
 
   : "${ALPS_REV:?ALPS_REV must be set}"
-  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
   : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local image_dir="Alps-Images/ROCm/${rocm_name}-${rocm_variant}"
@@ -297,14 +327,11 @@ rocm_base_refs() {
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL")"
-  local canon_tag="$(canon_tag_for "$tag" "$h")"
+  local canon_ref stable_ref
+  read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
-  local canon_ref="$(img_ref "$name" "$canon_tag")"
-  local test_ref="$(img_ref "$name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
-  local stable_ref="$(img_ref "$name" "$tag")"
-
-  printf '%s %s %s %s %s\n' \
-    "$base_image_ref" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+  printf '%s %s %s %s\n' \
+    "$base_image_ref" "$dockerfile" "$canon_ref" "$stable_ref"
 }
 
 # Usage: ngc_base_refs NGC_NAME NGC_TAG
@@ -313,7 +340,6 @@ ngc_base_refs() {
   local ngc_tag="${2:?ngc_tag required}"     # e.g. 25.12-py3
 
   : "${ALPS_REV:?ALPS_REV must be set}"
-  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
   : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local image_dir="Alps-Images/NGC/${ngc_name}-${ngc_tag}"
@@ -358,14 +384,11 @@ ngc_base_refs() {
   local name="${ngc_name}-cuda"
   local tag="${ngc_tag}-${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "name tag CSCS_CI_ORIG_CLONE_URL")"
-  local canon_tag="$(canon_tag_for "$tag" "$h")"
+  local canon_ref stable_ref
+  read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
-  local canon_ref="$(img_ref "$name" "$canon_tag")"
-  local test_ref="$(img_ref "$name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
-  local stable_ref="$(img_ref "$name" "$tag")"
-
-  printf '%s %s %s %s %s %s\n' \
-    "$base_image_ref" "$REMOVE_HPCX_DIRS_B64" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+  printf '%s %s %s %s %s\n' \
+    "$base_image_ref" "$REMOVE_HPCX_DIRS_B64" "$dockerfile" "$canon_ref" "$stable_ref"
 }
 
 validate_app_variant_name() {
@@ -383,14 +406,15 @@ write_base_build_env() {
   local family="${2:?family required}"
   local name="${3:?name required}"
   local variant="${4:?variant required}"
-  local base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref tested_image_ref image_description validation_hash
+  local base_image_ref dockerfile canon_image_ref stable_image_ref tested_image_ref image_description validation_hash_value
   local family_variant_dir="" family_dotenv=""
 
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
+  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
 
   case "$family" in
     cuda|ngc)
-      read -r base_image_ref REMOVE_HPCX_DIRS_B64 dockerfile canon_image_ref test_image_ref stable_image_ref < <(ngc_base_refs "$name" "$variant")
+      read -r base_image_ref REMOVE_HPCX_DIRS_B64 dockerfile canon_image_ref stable_image_ref < <(ngc_base_refs "$name" "$variant")
       local remove_hpcx_dirs
       remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
       family="cuda"
@@ -399,7 +423,7 @@ write_base_build_env() {
       family_dotenv="REMOVE_HPCX_DIRS=${remove_hpcx_dirs}"
       ;;
     rocm)
-      read -r base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref < <(rocm_base_refs "$name" "$variant")
+      read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(rocm_base_refs "$name" "$variant")
       local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
       profile_file="$(rocm_profile_file "$name" "$variant")"
@@ -414,8 +438,11 @@ write_base_build_env() {
       ;;
   esac
 
-  validation_hash="$(base_validation_hash "$family" "$name" "$variant")"
-  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash")"
+  # The generated child pipeline consumes one env record per variant. Keeping
+  # this assembly in shell preserves identical canonical refs between CI,
+  # publishing, and manual-build script generation.
+  validation_hash_value="$(base_validation_hash "$family" "$name" "$variant")"
+  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash_value")"
 
   {
     printf '%s\n' \
@@ -424,10 +451,9 @@ write_base_build_env() {
       "VARIANT=$variant" \
       "DOCKERFILE=$dockerfile" \
       "CANON_IMAGE_REF=$canon_image_ref" \
-      "TEST_IMAGE_REF=$test_image_ref" \
       "STABLE_IMAGE_REF=$stable_image_ref" \
       "TESTED_IMAGE_REF=$tested_image_ref" \
-      "VALIDATION_HASH=$validation_hash" \
+      "VALIDATION_HASH=$validation_hash_value" \
       "BASE_IMAGE=$base_image_ref" \
       "$family_variant_dir"
     printf '%s\n' "$family_dotenv"
@@ -447,22 +473,24 @@ write_app_build_env() {
   local output_file="${1:?output file required}"
   local app_name="${2:?app name required}"
   local app_variant="${3:?app variant required}"
-  local base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref tested_image_ref image_description validation_hash
+  local base_image_ref dockerfile canon_image_ref stable_image_ref tested_image_ref image_description validation_hash_value
 
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
+  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
 
-  read -r base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
-  validation_hash="$(app_validation_hash "$app_name" "$app_variant")"
-  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash")"
+  # App canonical hashes include the canonical base ref, so app images rebuild
+  # automatically when their selected base content changes.
+  read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
+  validation_hash_value="$(app_validation_hash "$app_name" "$app_variant")"
+  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash_value")"
   image_description="This image extends ${base_image_ref} with application software for Alps."
 
   cat > "${output_file}" <<EOF
 DOCKERFILE=$dockerfile
 CANON_IMAGE_REF=$canon_image_ref
-TEST_IMAGE_REF=$test_image_ref
 STABLE_IMAGE_REF=$stable_image_ref
 TESTED_IMAGE_REF=$tested_image_ref
-VALIDATION_HASH=$validation_hash
+VALIDATION_HASH=$validation_hash_value
 BASE_IMAGE=$base_image_ref
 OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
 OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
@@ -475,13 +503,12 @@ EOF
 
 # Usage: app_refs APP_NAME APP_VARIANT
 # Returns a space-separated record:
-#   BASE_IMAGE_REF DOCKERFILE CANON_REF TEST_REF STABLE_REF
+#   BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF
 app_refs() {
   local app_name="${1:?name required}"       # e.g. apertus-2
   local app_variant="${2:?app variant required}" # e.g. cuda
 
   : "${ALPS_REV:?ALPS_REV must be set}"
-  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
   : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local app_dir="Alps-Images/apps/${app_name}"
@@ -551,7 +578,7 @@ app_refs() {
   # Compute canonical ref of base
   local base_family base_name base_variant
   read -r base_family base_name base_variant < <(parse_base_image "$base_image")
-  local BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF
+  local BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF
   load_base_ref_vars "$base_family" "$base_name" "$base_variant"
   local base_canon_ref="$CANON_IMAGE_REF"
 
@@ -567,10 +594,8 @@ app_refs() {
   local image_name="${app_name}-${app_variant}"
   local tag="${ALPS_REV}"
   local h="$(content_hash "$hash_paths" "app_name app_variant image_name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
-  local canon_tag="$(canon_tag_for "$tag" "$h")"
-  local canon_ref="$(img_ref "$image_name" "$canon_tag")"
-  local test_ref="$(img_ref "$image_name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
-  local stable_ref="$(img_ref "$image_name" "$tag")"
+  local canon_ref stable_ref
+  read -r canon_ref stable_ref < <(image_refs "$image_name" "$tag" "$h")
 
-  printf '%s %s %s %s %s\n' "$base_canon_ref" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+  printf '%s %s %s %s\n' "$base_canon_ref" "$dockerfile" "$canon_ref" "$stable_ref"
 }

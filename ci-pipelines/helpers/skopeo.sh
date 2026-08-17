@@ -1,25 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Registry helpers used by both the generator and child pipeline jobs.
+#
+# The dynamic pipeline treats the registry as the source of truth for whether an
+# image is already built, tested, and published. Canonical image tags include a
+# content hash. Validation markers are extra tags that point at the same digest
+# after tests pass. Stable tags are promotion targets and are never trusted as
+# build inputs.
+
+_skopeo_login() {
+  local reg="${1:?registry required}"
+  local user="${2:?username required}"
+  local password="${3:?password required}"
+
+  echo "login to: ${reg} with user: ${user}"
+  skopeo login --username "${user}" --password "${password}" "${reg}" >/dev/null
+}
+
 skopeo_login() {
   : "${IMAGE_PREFIX:?IMAGE_PREFIX must be set}"
   : "${JFROG_USER:?JFROG_USER must be set}"
   : "${JFROG_KEY:?JFROG_KEY must be set}"
-  local reg="${IMAGE_PREFIX%%/*}"
-  echo "login to: ${reg} with user: ${JFROG_USER}"
-  skopeo login --username "${JFROG_USER}" --password "${JFROG_KEY}" "${reg}" >/dev/null
+  _skopeo_login "${IMAGE_PREFIX%%/*}" "$JFROG_USER" "$JFROG_KEY"
 }
 
 skopeo_login_ghcr() {
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
   : "${GITHUB_ACTOR:?GITHUB_ACTOR must be set}"
   : "${GITHUB_TOKEN:?GITHUB_TOKEN must be set}"
-  local reg="${GHCR_IMAGE_PREFIX%%/*}"
-  echo "login to: ${reg} with user: ${GITHUB_ACTOR}"
-  skopeo login --username "${GITHUB_ACTOR}" --password "${GITHUB_TOKEN}" "${reg}" >/dev/null
+  _skopeo_login "${GHCR_IMAGE_PREFIX%%/*}" "$GITHUB_ACTOR" "$GITHUB_TOKEN"
 }
 
-# prints digest or empty string if missing/unreachable
+# Print an image digest. Return an empty string only when the registry reports a
+# true missing-image condition. Auth, network, and other unexpected skopeo errors
+# fail closed so the generator does not skip required work based on uncertainty.
 # usage: img_digest REF
 img_digest() {
   local ref="${1:?image ref required}"
@@ -43,11 +58,6 @@ img_digest() {
   return "$status"
 }
 
-# usage: img_exists REF
-img_exists() {
-  [[ -n "$(img_digest "$1")" ]]
-}
-
 # usage: tested_ref_for CANON_REF [VALIDATION_HASH]
 tested_ref_for() {
   local canon="${1:?canonical image ref required}"
@@ -63,27 +73,23 @@ tested_ref_for() {
   fi
 }
 
-# usage: tested_marker_valid CANON_REF TESTED_REF
-tested_marker_valid() {
+# Tested refs are marker tags, not separate image builds. They have the form:
+#   <canonical-tag>-tested-<validation-hash>
+# The digest must equal the canonical digest. The validation hash covers test
+# definitions/templates/helper code, so changing tests invalidates old markers
+# without rebuilding unchanged canonical image content.
+
+# usage: require_tested_marker_valid CANON_REF TESTED_REF
+require_tested_marker_valid() {
   local canon="${1:?canonical image ref required}"
   local tested="${2:?tested marker ref required}"
   local canon_digest tested_digest
 
-  canon_digest="$(img_digest "$canon")"
-  tested_digest="$(img_digest "$tested")"
-  [[ -n "$canon_digest" && -n "$tested_digest" && "$canon_digest" == "$tested_digest" ]]
-}
-
-# usage: require_tested_marker_not_mismatched CANON_REF TESTED_REF
-require_tested_marker_not_mismatched() {
-  local canon="${1:?canonical image ref required}"
-  local tested="${2:?tested marker ref required}"
-  local canon_digest tested_digest
-
-  canon_digest="$(img_digest "$canon")"
-  tested_digest="$(img_digest "$tested")"
+  canon_digest="$(img_digest "$canon")" || return $?
+  tested_digest="$(img_digest "$tested")" || return $?
   [[ -n "$canon_digest" ]] || { echo "ERROR: canonical image missing: $canon" >&2; return 1; }
-  if [[ -n "$tested_digest" && "$tested_digest" != "$canon_digest" ]]; then
+  [[ -n "$tested_digest" ]] || { echo "ERROR: tested marker missing: $tested" >&2; return 1; }
+  if [[ "$tested_digest" != "$canon_digest" ]]; then
     echo "ERROR: tested marker points to a different digest: $tested" >&2
     echo "  canonical: $canon_digest" >&2
     echo "  marker:    $tested_digest" >&2
@@ -95,9 +101,18 @@ require_tested_marker_not_mismatched() {
 mark_tested() {
   local canon="${1:?canonical image ref required}"
   local tested="${2:?tested marker ref required}"
+  local canon_digest tested_digest
 
-  require_tested_marker_not_mismatched "$canon" "$tested"
-  if tested_marker_valid "$canon" "$tested"; then
+  canon_digest="$(img_digest "$canon")" || return $?
+  tested_digest="$(img_digest "$tested")" || return $?
+  [[ -n "$canon_digest" ]] || { echo "ERROR: canonical image missing: $canon" >&2; return 1; }
+  if [[ -n "$tested_digest" && "$tested_digest" != "$canon_digest" ]]; then
+    echo "ERROR: tested marker points to a different digest: $tested" >&2
+    echo "  canonical: $canon_digest" >&2
+    echo "  marker:    $tested_digest" >&2
+    return 1
+  fi
+  if [[ "$tested_digest" == "$canon_digest" ]]; then
     echo "No-op: tested marker already matches canonical image: $tested"
     return 0
   fi
@@ -115,32 +130,17 @@ _ref_url() {
   fi
 }
 
-# copy only if dst is missing or points to a different digest
-# usage: copy_if_needed SRC_REF DST_REF
-copy_if_needed() {
-  local src="$1" dst="$2"
-  local src_digest="$(img_digest "$src")"
-  [[ -n "$src_digest" ]] || { echo "ERROR: source image missing: $src" >&2; return 1; }
-  local dst_digest="$(img_digest "$dst")"
-
-  if [[ -n "$dst_digest" && "$dst_digest" == "$src_digest" ]]; then
-    echo "No-op: $dst already points to $src_digest"
-    return 0
-  fi
-
-  echo "Copy: $src -> $dst ($dst_digest -> $src_digest)"
-  skopeo copy "$(_ref_url "$src")" "$(_ref_url "$dst")"
-}
-
-# Check whether a promotion would succeed, without copying.
+# Check whether a strict stable promotion would succeed, without copying.
 # usage: promote_check_strict CANON_REF STABLE_REF
 # - returns 0 if safe/no-op
 # - returns 1 if it would fail (e.g. stable exists and differs)
 # - returns 2 if canonical missing
 promote_check_strict() {
   local canon="$1" stable="$2"
-  local canon_digest="$(img_digest "$canon")" || true
-  local stable_digest="$(img_digest "$stable")" || true
+  local canon_digest stable_digest
+
+  canon_digest="$(img_digest "$canon")" || return $?
+  stable_digest="$(img_digest "$stable")" || return $?
 
   if [[ -z "$canon_digest" ]]; then
     echo "PROMOTE-CHECK: canonical missing: $canon" >&2
@@ -161,20 +161,21 @@ promote_check_strict() {
   return 1
 }
 
-# Real promotion:
+# Real strict promotion for non-dev stable refs:
 # usage: promote_strict CANON_REF STABLE_REF
 # - no-op if stable already matches canonical
 # - fails if stable exists but differs
 # - fails if canonical missing
 promote_strict() {
   local canon="$1" stable="$2"
+  local rc=0 stable_digest
 
-  promote_check_strict "$canon" "$stable"
-  local rc=$?
+  promote_check_strict "$canon" "$stable" || rc=$?
   case "$rc" in
     0)
       # either no-op or safe to promote (stable missing)
-      if ! img_exists "$stable"; then
+      stable_digest="$(img_digest "$stable")" || return $?
+      if [[ -z "$stable_digest" ]]; then
         echo "PROMOTE: $canon -> $stable"
         skopeo copy "$(_ref_url "$canon")" "$(_ref_url "$stable")"
       fi
@@ -187,6 +188,9 @@ promote_strict() {
     2)
       echo "ERROR: canonical image missing, cannot promote: $canon" >&2
       return 1
+      ;;
+    *)
+      return "$rc"
       ;;
   esac
 }

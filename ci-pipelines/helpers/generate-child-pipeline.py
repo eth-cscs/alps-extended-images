@@ -1,8 +1,27 @@
 #!/usr/bin/env python3
+"""Generate the registry-dependent child pipeline for Alps images.
+
+The static parent pipeline only runs this script and then triggers the generated
+child pipeline. This indirection is deliberate: the correct CI graph depends on
+registry state that GitLab cannot know while parsing a static YAML file.
+
+For each declared base/app variant the generator asks meta.sh for canonical refs
+and validation-marker refs, then inspects the registries with skopeo.sh:
+
+* missing canonical image -> emit a build job;
+* missing/stale tested marker -> emit tests and a marker job;
+* validated image with missing/stale stable refs -> emit publish job;
+* everything current -> emit nothing for that image.
+
+The child jobs use hidden templates from ci-pipelines/child-templates.yaml. This
+keeps dynamic data in generated YAML while runner selection and scripts remain in
+reviewed static templates.
+"""
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -16,6 +35,12 @@ DIGEST_CACHE: dict[str, str] = {}
 
 
 def run_bash(script: str) -> str:
+    """Run repo shell helpers and return stdout.
+
+    Ref/hash derivation remains in shell because meta.sh is shared with manual
+    builds and CI jobs. Calling it here avoids duplicating canonical-ref logic in
+    Python.
+    """
     proc = subprocess.run(
         ["bash", "-lc", script],
         cwd=ROOT,
@@ -31,14 +56,17 @@ def run_bash(script: str) -> str:
 
 
 def shell_quote(value: str) -> str:
-    return "'" + value.replace("'", "'\\''") + "'"
+    """Quote a value for a Bash command string."""
+    return shlex.quote(value)
 
 
 def slug(value: str) -> str:
+    """Convert a value to a GitLab-safe job-name fragment."""
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
+    """Load a YAML mapping from path."""
     data = yaml.safe_load(path.read_text())
     if not isinstance(data, dict):
         raise RuntimeError(f"expected mapping in {path}")
@@ -46,6 +74,7 @@ def load_yaml(path: Path) -> dict[str, Any]:
 
 
 def load_env_text(text: str) -> dict[str, str]:
+    """Parse KEY=VALUE lines emitted by shell env helpers."""
     data: dict[str, str] = {}
     for line in text.splitlines():
         if line and not line.startswith("#") and "=" in line:
@@ -55,16 +84,19 @@ def load_env_text(text: str) -> dict[str, str]:
 
 
 def source_profile_value(profile: Path, key: str) -> str:
+    """Source a shell profile and print one variable value."""
     return run_bash(f"source {shell_quote(str(profile))} && printf '%s\\n' \"${{{key}:-}}\"")
 
 
 def img_digest(ref: str) -> str:
+    """Return the registry digest for ref, caching repeated skopeo lookups."""
     if ref not in DIGEST_CACHE:
         DIGEST_CACHE[ref] = run_bash(f"source ci-pipelines/helpers/skopeo.sh && img_digest {shell_quote(ref)}")
     return DIGEST_CACHE[ref]
 
 
 def marker_valid(canon_ref: str, tested_ref: str) -> bool:
+    """A tested marker is valid only when it points to the canonical digest."""
     canon_digest = img_digest(canon_ref)
     marker_digest = img_digest(tested_ref)
     if marker_digest and canon_digest and marker_digest != canon_digest:
@@ -75,28 +107,32 @@ def marker_valid(canon_ref: str, tested_ref: str) -> bool:
 
 
 def publish_needed(image: dict[str, str]) -> bool:
+    """Return true when either stable destination is missing or stale."""
     canon_digest = img_digest(image["CANON_IMAGE_REF"])
     if not canon_digest:
         return False
     return img_digest(image["STABLE_IMAGE_REF"]) != canon_digest or img_digest(image["GHCR_STABLE_IMAGE_REF"]) != canon_digest
 
 
-def base_env(family: str, name: str, variant: str) -> dict[str, str]:
+def helper_env(function: str, *args: str) -> dict[str, str]:
+    """Call a meta.sh env writer and parse its output."""
+    quoted_args = " ".join(shell_quote(arg) for arg in args)
     out = run_bash(
         "source ci-pipelines/helpers/skopeo.sh && "
         "source ci-pipelines/helpers/meta.sh && "
-        f"tmp=$(mktemp) && write_base_build_env \"$tmp\" {shell_quote(family)} {shell_quote(name)} {shell_quote(variant)} && cat \"$tmp\" && rm -f \"$tmp\""
+        f"tmp=$(mktemp) && {function} \"$tmp\" {quoted_args} && cat \"$tmp\" && rm -f \"$tmp\""
     )
     return load_env_text(out)
 
 
+def base_env(family: str, name: str, variant: str) -> dict[str, str]:
+    """Return generated-job variables for one base variant."""
+    return helper_env("write_base_build_env", family, name, variant)
+
+
 def app_env(app: str, variant: str) -> dict[str, str]:
-    out = run_bash(
-        "source ci-pipelines/helpers/skopeo.sh && "
-        "source ci-pipelines/helpers/meta.sh && "
-        f"tmp=$(mktemp) && write_app_build_env \"$tmp\" {shell_quote(app)} {shell_quote(variant)} && cat \"$tmp\" && rm -f \"$tmp\""
-    )
-    data = load_env_text(out)
+    """Return generated-job variables for one app variant."""
+    data = helper_env("write_app_build_env", app, variant)
     data.update({"FAMILY": variant, "NAME": app, "VARIANT": variant})
     return data
 
@@ -124,6 +160,7 @@ class Child:
         timeout: str | None = None,
         script: list[str] | None = None,
     ) -> None:
+        """Add a concrete generated job that extends one hidden template."""
         if name in self.jobs:
             raise RuntimeError(f"duplicate generated job: {name}")
         self.jobs.add(name)
@@ -141,9 +178,14 @@ class Child:
         self.data[name] = job
 
     def add_noop(self) -> None:
+        """Add the schedulable fallback job used when there is no work."""
+        # GitLab requires at least one job in a pipeline. Use a real runner
+        # template so the no-work pipeline can complete instead of waiting for an
+        # untagged/default runner that does not exist for this project.
         self.data["no-work-required"] = {"extends": [".child-noop-template"]}
 
     def write(self) -> None:
+        """Write the generated child pipeline YAML."""
         if not self.jobs:
             self.add_noop()
         OUTPUT.write_text(yaml.safe_dump(self.data, sort_keys=False, width=120))
@@ -156,24 +198,31 @@ BASE_TEST_TEMPLATES = {
     "rocm-base-env": ".child-rocm-base-env-test-template",
     "rocm-base-collectives": ".child-rocm-base-collectives-test-template",
 }
+BASE_TEST_KINDS_BY_FAMILY = {
+    "cuda": {"cuda-base-env", "cuda-base-collectives", "cuda-vetnode"},
+    "rocm": {"rocm-base-env", "rocm-base-collectives"},
+}
 
 APP_TEST_KINDS = {"", "cuda-vetnode"}
 APP_TEST_RUNNERS = {"cuda", "rocm"}
 
 
 def require_mapping(value: Any, context: str) -> dict[str, Any]:
+    """Require a YAML value to be a mapping."""
     if not isinstance(value, dict):
         raise RuntimeError(f"{context} must be a mapping")
     return value
 
 
 def require_list(value: Any, context: str) -> list[Any]:
+    """Require a YAML value to be a list."""
     if not isinstance(value, list):
         raise RuntimeError(f"{context} must be a list")
     return value
 
 
 def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
+    """Validate one family base ci.yaml file."""
     family = cfg.get("family")
     if family not in {"cuda", "rocm"}:
         raise RuntimeError(f"{path}: family must be cuda or rocm")
@@ -181,15 +230,19 @@ def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
         item = require_mapping(variant, f"{path}: variants[{idx}]")
         if not item.get("name") or not item.get("variant"):
             raise RuntimeError(f"{path}: variants[{idx}] must define name and variant")
-    for idx, test in enumerate(require_list(cfg.get("tests"), f"{path}: tests")):
+    tests = require_list(cfg.get("tests"), f"{path}: tests")
+    if not tests:
+        raise RuntimeError(f"{path}: tests must not be empty")
+    for idx, test in enumerate(tests):
         item = require_mapping(test, f"{path}: tests[{idx}]")
         if not item.get("name") or not item.get("kind"):
             raise RuntimeError(f"{path}: tests[{idx}] must define name and kind")
-        if item["kind"] not in BASE_TEST_TEMPLATES:
-            raise RuntimeError(f"{path}: unsupported base test kind: {item['kind']}")
+        if item["kind"] not in BASE_TEST_KINDS_BY_FAMILY[family]:
+            raise RuntimeError(f"{path}: unsupported {family} base test kind: {item['kind']}")
 
 
 def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> None:
+    """Validate one app ci.yaml file against declared variants."""
     tests_by_variant = require_mapping(cfg.get("tests"), f"{path}: tests")
     for variant in variants:
         tests = require_list(tests_by_variant.get(variant), f"{path}: tests.{variant}")
@@ -203,6 +256,8 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
             if kind not in APP_TEST_KINDS:
                 raise RuntimeError(f"{path}: unsupported app test kind: {kind}")
             if kind == "cuda-vetnode":
+                if variant != "cuda":
+                    raise RuntimeError(f"{path}: cuda-vetnode is only supported for cuda app tests")
                 continue
             runner = str(item.get("runner", variant))
             if runner not in APP_TEST_RUNNERS:
@@ -213,6 +268,7 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
 
 
 def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
+    """Load base variants/tests from family-local ci.yaml files."""
     result = []
     for path in [ROOT / "Alps-Images" / "NGC" / "ci.yaml", ROOT / "Alps-Images" / "ROCm" / "ci.yaml"]:
         cfg = load_yaml(path)
@@ -226,6 +282,7 @@ def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
 
 
 def discover_apps() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
+    """Load app variants from profile.env and tests from app-local ci.yaml."""
     apps = []
     for profile in sorted((ROOT / "Alps-Images" / "apps").glob("*/profile.env")):
         app = profile.parent.name
@@ -242,6 +299,11 @@ def discover_apps() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
 
 
 def add_publish(child: Child, image: dict[str, str], needs: list[str], prefix: str, force: bool = False) -> None:
+    """Emit promotion only when stable refs need updating, unless forced.
+
+    force=True is used after a new build because the canonical digest cannot be
+    inspected until the build job has completed.
+    """
     if not force and not publish_needed(image):
         return
     child.add_job(
@@ -257,7 +319,8 @@ def add_publish(child: Child, image: dict[str, str], needs: list[str], prefix: s
     )
 
 
-def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]]) -> str | None:
+def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], valid: bool) -> str | None:
+    """Emit the minimal build/test/mark/publish graph for one base image."""
     prefix = slug(f"base-{base['NAME']}-{base['FAMILY']}-{base['VARIANT']}")
     build = f"build-{prefix}"
     exists = bool(img_digest(base["CANON_IMAGE_REF"]))
@@ -265,10 +328,9 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]]) ->
         build_vars = {
             key: value
             for key, value in base.items()
-            if key not in {"FAMILY", "NAME", "VARIANT", "TEST_IMAGE_REF", "TESTED_IMAGE_REF", "VALIDATION_HASH", "STABLE_IMAGE_REF", "GHCR_STABLE_IMAGE_REF"}
+            if key not in {"FAMILY", "NAME", "VARIANT", "TESTED_IMAGE_REF", "VALIDATION_HASH", "STABLE_IMAGE_REF", "GHCR_STABLE_IMAGE_REF"}
         }
         child.add_job(build, f".child-{base['FAMILY']}-base-build-template", variables=build_vars)
-    valid = marker_valid(base["CANON_IMAGE_REF"], base["TESTED_IMAGE_REF"])
     if valid:
         add_publish(child, base, [], prefix)
         return None
@@ -281,11 +343,12 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]]) ->
         test_jobs.append(job)
     mark = f"mark-{prefix}-tested"
     child.add_job(mark, ".child-mark-base-tested-template", needs=test_jobs, variables={"CANON_IMAGE_REF": base["CANON_IMAGE_REF"], "TESTED_IMAGE_REF": base["TESTED_IMAGE_REF"]})
-    add_publish(child, base, [mark], prefix, force=True)
+    add_publish(child, base, [mark], prefix, force=not exists)
     return mark
 
 
 def add_app_test(child: Child, app: dict[str, str], test: dict[str, Any], needs: list[str]) -> str:
+    """Emit one generated app test job and return its name."""
     prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
     name = f"test-{prefix}-{slug(str(test['name']))}"
     kind = str(test.get("kind", ""))
@@ -308,6 +371,11 @@ def add_app_test(child: Child, app: dict[str, str], test: dict[str, Any], needs:
 
 
 def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base_marks: dict[str, str | None], base_valid: dict[str, bool]) -> None:
+    """Emit the minimal build/test/mark/publish graph for one app image.
+
+    App builds depend on base validation, not just base build completion. This
+    keeps app images from being built on top of an untested base digest.
+    """
     prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
     base_ref = app["BASE_IMAGE"]
     base_needs = [base_marks[base_ref]] if base_marks.get(base_ref) else []
@@ -344,16 +412,19 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
     test_jobs = [add_app_test(child, app, test, test_needs) for test in tests]
     mark = f"mark-{prefix}-tested"
     child.add_job(mark, ".child-mark-app-tested-template", needs=test_jobs, variables={"CANON_IMAGE_REF": app["CANON_IMAGE_REF"], "TESTED_IMAGE_REF": app["TESTED_IMAGE_REF"]})
-    add_publish(child, app, [mark], prefix, force=True)
+    add_publish(child, app, [mark], prefix, force=build_job is not None)
 
 
 def main() -> None:
+    """Generate the child pipeline for current metadata and registry state."""
     child = Child()
     base_marks: dict[str, str | None] = {}
     base_valid: dict[str, bool] = {}
     for base, tests in discover_bases():
-        base_valid[base["CANON_IMAGE_REF"]] = marker_valid(base["CANON_IMAGE_REF"], base["TESTED_IMAGE_REF"])
-        base_marks[base["CANON_IMAGE_REF"]] = add_base(child, base, tests)
+        canon_ref = base["CANON_IMAGE_REF"]
+        valid = marker_valid(canon_ref, base["TESTED_IMAGE_REF"])
+        base_valid[canon_ref] = valid
+        base_marks[canon_ref] = add_base(child, base, tests, valid)
     for app, tests in discover_apps():
         add_app(child, app, tests, base_marks, base_valid)
     child.write()

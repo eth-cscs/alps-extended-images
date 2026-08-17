@@ -1,6 +1,69 @@
 include:
   - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
 
+# Purpose
+#
+# Build, validate, and publish the Alps base and application container images.
+# The pipeline is designed to be reproducible and incremental: unchanged image
+# content should not be rebuilt, unchanged validation should not be re-run, and
+# stable tags should only be updated after the exact image digest has passed the
+# current tests.
+#
+# Image state model
+#
+# Each base/app variant has three important refs:
+# - canonical ref: an immutable content-addressed tag generated from logical
+#   build inputs. This is the image that gets built and tested. For apps, the
+#   content hash includes the canonical base ref, so apps rebuild when their base
+#   content changes. Content hashes intentionally exclude timestamps and commit
+#   SHAs; CI metadata is allowed in OCI labels, not in the content hash
+# - tested-marker ref: a synthetic tag of the form
+#   <canonical-tag>-tested-<validation-hash>. It is created only after tests pass
+#   and is valid only when it points to the same digest as the canonical ref.
+#   The validation hash covers test metadata, test templates, and helper code, so
+#   changing validation logic re-tests the same canonical image without forcing a
+#   rebuild
+# - stable refs: mutable dev tags or immutable release tags published to JFrog
+#   and GHCR. Stable refs are promotion outputs only; app builds always use
+#   canonical base refs, never stable tags
+#
+# Strategy
+#
+# This parent pipeline generates a child pipeline instead of declaring all jobs
+# statically. The generator reads image/test metadata, computes the refs above,
+# inspects registry digests, and emits only the jobs required for the current
+# state:
+# - build when a canonical ref is missing
+# - test and mark when the tested-marker ref is missing or stale
+# - publish when stable refs are missing or stale after validation
+#
+# Why generate a child pipeline instead of using one static DAG:
+#
+# - registry digests decide what work is needed, not only Git changes
+# - static jobs would allocate expensive GH200/MI300 runners just to discover
+#   they can skip
+# - job-local skip logic makes the DAG misleading because downstream jobs still
+#   have to exist
+# - static test jobs cannot use refs computed in dotenv artifacts because GitLab
+#   resolves job `image:` before dotenv artifacts exist. The previous static
+#   pipeline worked around this with predictable commit-SHA retags; generation
+#   avoids that extra retag layer by writing concrete canonical refs directly
+# - generated `needs:` express the real DAG for this run, including app builds
+#   waiting for base validation and publish jobs waiting for marker jobs
+# - static templates still keep runner selection, common scripts, marker creation,
+#   and publish policy reviewable in ci-pipelines/child-templates.yaml
+# - publish jobs verify markers and stable-tag policy again at execution time,
+#   because registry tags may change after the child pipeline was generated
+#
+# Metadata and helpers
+#
+# Base variants/tests live in Alps-Images/NGC/ci.yaml and
+# Alps-Images/ROCm/ci.yaml. App variants come from
+# Alps-Images/apps/<app>/profile.env, and app tests live in
+# Alps-Images/apps/<app>/ci.yaml. Ref/hash assembly is in
+# ci-pipelines/helpers/meta.sh, registry operations are in
+# ci-pipelines/helpers/skopeo.sh, and child generation is implemented by
+# ci-pipelines/helpers/generate-child-pipeline.py.
 stages: [generate-child, child]
 
 variables:
@@ -20,6 +83,8 @@ generate-child-pipeline:
   stage: generate-child
   extends: [.container-runner-lightweight-gh200, .generator-template]
   script:
+    # Produces generated-child-pipeline.yaml with concrete jobs, images, and
+    # `needs:` for the registry state observed at generation time.
     - python3 ci-pipelines/helpers/generate-child-pipeline.py
     - cat generated-child-pipeline.yaml
   artifacts:
@@ -32,6 +97,9 @@ run-generated-child-pipeline:
     - job: generate-child-pipeline
       artifacts: true
   trigger:
+    # `strategy: depend` makes this parent pipeline fail if any generated child
+    # job fails, while `forward.pipeline_variables` preserves image prefixes,
+    # ALPS_REV, and credentials for child jobs/templates.
     include:
       - artifact: generated-child-pipeline.yaml
         job: generate-child-pipeline
