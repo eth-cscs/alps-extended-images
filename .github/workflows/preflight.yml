@@ -1,0 +1,64 @@
+name: preflight
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Python and pytest
+        run: |
+          python -m py_compile ci-pipelines/helpers/generate-child-pipeline.py
+          uvx --with pyyaml pytest ci-pipelines/tests
+
+      - name: Shell syntax
+        run: git ls-files '*.sh' | xargs -r -n1 bash -n
+
+      - name: CI YAML and embedded shell syntax
+        run: |
+          uv run --with pyyaml python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          import yaml
+
+          for path in [
+              'ci-pipelines/build-alps-extended-images.yaml',
+              'ci-pipelines/build-ci-generator-image.yaml',
+              'ci-pipelines/child-templates.yaml',
+          ]:
+              data = yaml.safe_load(Path(path).read_text())
+              for job in data.values():
+                  if not isinstance(job, dict):
+                      continue
+                  for key in ('before_script', 'script'):
+                      for script in job.get(key) or []:
+                          if isinstance(script, str):
+                              subprocess.run(['bash', '-n'], input=script, text=True, check=True)
+          PY
+
+      - name: Manual-build smoke
+        run: |
+          export IMAGE_PREFIX=localhost/alps-images
+          export ALPS_REV=alps7-dev
+          export CI_COMMIT_SHORT_SHA=abc123
+          export CI_COMMIT_SHA=abc123
+          export CSCS_CI_ORIG_CLONE_URL=https://example.invalid/repo.git
+          manual-build/manual-build.sh base cuda pytorch 25.12-py3 /tmp/manual-base-cuda.sh
+          manual-build/manual-build.sh base rocm pytorch rocm7.14-ubuntu24.04-py3.12-torch2.11 /tmp/manual-base-rocm.sh
+          manual-build/manual-build.sh app vllm cuda /tmp/manual-app-cuda.sh
+          manual-build/manual-build.sh app vllm rocm /tmp/manual-app-rocm.sh
+          bash -n /tmp/manual-base-cuda.sh
+          bash -n /tmp/manual-base-rocm.sh
+          bash -n /tmp/manual-app-cuda.sh
+          bash -n /tmp/manual-app-rocm.sh
