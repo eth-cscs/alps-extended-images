@@ -20,6 +20,13 @@ include:
     - skopeo_login
     - skopeo_login_ghcr
 
+.child-noop-template:
+  stage: build-base
+  extends: [.container-runner-lightweight-gh200]
+  image: quay.io/skopeo/stable:latest
+  script:
+    - echo "No work required."
+
 .child-slurm-template:
   variables:
     USE_MPI: NO

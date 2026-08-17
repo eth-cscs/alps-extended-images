@@ -141,7 +141,7 @@ class Child:
         self.data[name] = job
 
     def add_noop(self) -> None:
-        self.data["no-work-required"] = {"stage": "build-base", "script": ['echo "No work required."']}
+        self.data["no-work-required"] = {"extends": [".child-noop-template"]}
 
     def write(self) -> None:
         if not self.jobs:
