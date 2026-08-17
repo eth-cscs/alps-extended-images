@@ -250,6 +250,10 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
     # Run the NeMo-RL training driver (membind for consistency; its own
     # allocations are small, the heavy lifting is in the Ray actors).
     ${NUMACTL} uv run --no-sync python examples/run_grpo.py --config "${TRAINING_CONFIG}/${YAML_NAME}"
+    # Preserve the training exit code across the teardown commands below, and
+    # exit with it so sacct records FAILED instead of COMPLETED on a crash
+    # (slurm-3101957 showed COMPLETED after an OOM-killed training loop).
+    _grpo_rc=$?
 
     # Gracefully stop the Ray cluster. This lets the worker nodes exit their
     # ray start --block cleanly instead of being killed by srun teardown,
@@ -261,6 +265,7 @@ if [ "${SLURM_PROCID}" -eq 0 ]; then
     rm -f "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
 
     sleep 5s
+    exit "${_grpo_rc}"
 else
     # Worker ranks wait for the Ray head to be ready, then join.
     RAY_OPEN_FILE="${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
