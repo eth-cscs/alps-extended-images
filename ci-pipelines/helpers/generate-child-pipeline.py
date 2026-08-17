@@ -301,8 +301,8 @@ def discover_apps() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
 def add_publish(child: Child, image: dict[str, str], needs: list[str], prefix: str, force: bool = False) -> None:
     """Emit promotion only when stable refs need updating, unless forced.
 
-    force=True is used after a new build because the canonical digest cannot be
-    inspected until the build job has completed.
+    force=True is used after validation work because publish must re-check the
+    new tested marker and stable-tag policy at execution time.
     """
     if not force and not publish_needed(image):
         return
@@ -343,7 +343,7 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], va
         test_jobs.append(job)
     mark = f"mark-{prefix}-tested"
     child.add_job(mark, ".child-mark-base-tested-template", needs=test_jobs, variables={"CANON_IMAGE_REF": base["CANON_IMAGE_REF"], "TESTED_IMAGE_REF": base["TESTED_IMAGE_REF"]})
-    add_publish(child, base, [mark], prefix, force=not exists)
+    add_publish(child, base, [mark], prefix, force=True)
     return mark
 
 
@@ -412,7 +412,7 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
     test_jobs = [add_app_test(child, app, test, test_needs) for test in tests]
     mark = f"mark-{prefix}-tested"
     child.add_job(mark, ".child-mark-app-tested-template", needs=test_jobs, variables={"CANON_IMAGE_REF": app["CANON_IMAGE_REF"], "TESTED_IMAGE_REF": app["TESTED_IMAGE_REF"]})
-    add_publish(child, app, [mark], prefix, force=build_job is not None)
+    add_publish(child, app, [mark], prefix, force=True)
 
 
 def main() -> None:
