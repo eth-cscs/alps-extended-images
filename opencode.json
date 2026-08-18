@@ -25,6 +25,6 @@
     }
   },
   "model": "cscs/zai-org/GLM-5.2",
-  "small_model": "cscs/zai-org/GLM-5.2",
+  "small_model": "cscs/moonshotai/Kimi-K2.7-Code",
   "share": "auto"
 }
