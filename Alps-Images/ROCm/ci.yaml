@@ -3,5 +3,6 @@ variants:
   - name: pytorch
     variant: rocm7.14-ubuntu24.04-py3.12-torch2.11
 tests:
+  # Pipeline exercise: validation-only ROCm base metadata change.
   - name: env
   - name: collectives
