@@ -45,6 +45,19 @@ if [ "${_model_complete}" = false ]; then
     else
         echo "Downloading ${MODEL_REPO}/${MODEL_NAME} to ${LOCAL_MODEL_DIR}..."
     fi
+
+    # Stripe the model directory across all OSTs BEFORE downloading: Lustre
+    # bakes the layout in at file creation, so the setstripe must precede
+    # hf download (which inherits the directory default for every new file).
+    # 384 training ranks + 32 vLLM ranks all read the same safetensors at
+    # startup; with the default stripe count of 1 each file is served by a
+    # single OST.  Existing complete downloads are deliberately NOT migrated
+    # (load is ~4.5 min either way, not worth the rewrite).
+    mkdir -p "${LOCAL_MODEL_DIR}"
+    if command -v lfs >/dev/null 2>&1; then
+        lfs setstripe -c -1 -S 4M "${LOCAL_MODEL_DIR}" \
+            || echo "WARNING: lfs setstripe on ${LOCAL_MODEL_DIR} failed; downloading unstriped." >&2
+    fi
     HF_DOWNLOAD_DIR="${HOME}/tmp/hf_download_${SLURM_JOB_ID}"
     mkdir -p "${HF_DOWNLOAD_DIR}"
     pushd "${HF_DOWNLOAD_DIR}" >/dev/null || exit 1
