@@ -107,6 +107,21 @@ salvage_ray_logs() {
         -size +0c 2>/dev/null | sort -u | head -60 | while read -r _f; do
         cp "${_f}" "${_dst}/$(hostname)_$(basename "${_f}")" 2>/dev/null || true
     done
+    # Fingerprint any still-alive Ray workers: an init-hang (3046402, 3079454,
+    # 3113822) leaves EMPTY logs — the only evidence is where the live process
+    # is stuck at teardown time.  wchan/syscall distinguish a FUSE/overlay read
+    # stall (dlopen through fuse-overlayfs) from a futex/collective wait.
+    for _p in $(pgrep -f "ray::" 2>/dev/null | head -30); do
+        {
+            echo "== pid ${_p}"
+            tr "\0" " " < "/proc/${_p}/cmdline" 2>/dev/null; echo
+            grep -E "^State|^Threads" "/proc/${_p}/status" 2>/dev/null
+            printf "wchan: "; cat "/proc/${_p}/wchan" 2>/dev/null; echo
+            printf "syscall: "; cat "/proc/${_p}/syscall" 2>/dev/null
+            echo "kstack:"; cat "/proc/${_p}/stack" 2>/dev/null
+            echo
+        } >> "${_dst}/$(hostname)_live_procs.txt" 2>/dev/null
+    done
 }
 
 # -----------------------------------------------------------------------------
