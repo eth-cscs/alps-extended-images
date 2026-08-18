@@ -2,9 +2,9 @@
 
 This image provides the runtime for `ci-pipelines/helpers/generate-child-pipeline.py`:
 
-- Python 3 from the `quay.io/skopeo/stable:v1.24.0` base distribution
+- Python 3 from the `quay.io/skopeo/stable:v1.22.2` base distribution
 - PyYAML from Debian (`python3-yaml`)
-- `skopeo` copied from `quay.io/skopeo/stable:v1.24.0`
+- `skopeo` copied from `quay.io/skopeo/stable:v1.22.2`
 - Bash and CA certificates
 
 It is pipeline bootstrap infrastructure and is built by the separate manual pipeline:

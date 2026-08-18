@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG BASE_IMAGE=quay.io/skopeo/stable:v1.24.0
+ARG BASE_IMAGE=quay.io/skopeo/stable:v1.22.2
 FROM ${BASE_IMAGE}
 
 LABEL org.opencontainers.image.title="Alps CI generator"
