@@ -93,8 +93,29 @@ PY
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
     register_rocm_sdk_ldconfig
+    install_amdsmi_python
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
+}
+
+install_amdsmi_python() {
+    local candidate amdsmi_src=""
+
+    for candidate in \
+        "${ROCM_CORE_PREFIX:-}/share/amd_smi" \
+        "${ROCM_CORE_DIR:-}/_rocm_sdk_core/share/amd_smi" \
+        "${ROCM_SDK_ROOT:-}/share/amd_smi"; do
+        [[ -d "${candidate}" ]] || continue
+        amdsmi_src="${candidate}"
+        break
+    done
+
+    [[ -n "${amdsmi_src}" ]] || die "Could not find AMD SMI Python sources in ROCm Core SDK"
+    "${ROCM_PYTHON}" -m pip install --no-cache-dir --index-url "${ROCM_PYPI_INDEX_URL}" --no-deps "${amdsmi_src}"
+    "${ROCM_PYTHON}" - <<'PY'
+import amdsmi
+print("amdsmi import ok")
+PY
 }
 
 persist_rocm_sdk_env() {

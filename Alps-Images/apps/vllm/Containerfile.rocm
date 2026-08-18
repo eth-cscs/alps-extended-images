@@ -20,7 +20,7 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_REF="v0.25.1"
+ARG VLLM_REF="v0.27.1"
 ARG VLLM_TARGET_DEVICE="rocm"
 ARG PYTORCH_ROCM_ARCH="gfx942"
 ARG MAX_JOBS="32"

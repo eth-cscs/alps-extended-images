@@ -260,8 +260,10 @@ include:
       test -n "${ROCM_VERSION:-}"
       test -n "${RCCL_VERSION:-}"
       /opt/venv/bin/python - <<'PY'
+      import amdsmi
       import torch
       assert torch.cuda.is_available(), "ROCm device is not visible to PyTorch"
+      print("amdsmi import ok")
       print(torch.cuda.get_device_name(0))
       PY
   variables:
