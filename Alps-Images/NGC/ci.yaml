@@ -16,8 +16,5 @@ variants:
     variant: "25.11"
 tests:
   - name: env
-    kind: cuda-base-env
   - name: collectives
-    kind: cuda-base-collectives
   - name: vetnode
-    kind: cuda-vetnode

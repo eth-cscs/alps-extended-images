@@ -61,7 +61,7 @@ def app_image(**overrides):
 
 
 def base_tests():
-    return [{"name": "env", "kind": "cuda-base-env"}]
+    return [{"name": "env"}]
 
 
 def app_tests():
@@ -217,11 +217,11 @@ def test_schema_base_rejects_empty_tests(gen):
         gen.validate_base_ci(Path("base.yaml"), {"family": "cuda", "variants": [{"name": "pytorch", "variant": "x"}], "tests": []})
 
 
-def test_schema_base_rejects_wrong_family_test_kind(gen):
-    with pytest.raises(RuntimeError, match="unsupported rocm base test kind"):
+def test_schema_base_rejects_rocm_vetnode(gen):
+    with pytest.raises(RuntimeError, match="unsupported rocm base test name"):
         gen.validate_base_ci(
             Path("base.yaml"),
-            {"family": "rocm", "variants": [{"name": "pytorch", "variant": "x"}], "tests": [{"name": "env", "kind": "cuda-base-env"}]},
+            {"family": "rocm", "variants": [{"name": "pytorch", "variant": "x"}], "tests": [{"name": "vetnode"}]},
         )
 
 

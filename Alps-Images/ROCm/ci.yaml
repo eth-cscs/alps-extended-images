@@ -4,6 +4,4 @@ variants:
     variant: rocm7.14-ubuntu24.04-py3.12-torch2.11
 tests:
   - name: env
-    kind: rocm-base-env
   - name: collectives
-    kind: rocm-base-collectives

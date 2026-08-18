@@ -192,15 +192,19 @@ class Child:
 
 
 BASE_TEST_TEMPLATES = {
-    "cuda-base-env": ".child-cuda-base-env-test-template",
-    "cuda-base-collectives": ".child-cuda-base-collectives-test-template",
-    "cuda-vetnode": ".child-cuda-vetnode-test-template",
-    "rocm-base-env": ".child-rocm-base-env-test-template",
-    "rocm-base-collectives": ".child-rocm-base-collectives-test-template",
+    "cuda": {
+        "env": ".child-cuda-base-env-test-template",
+        "collectives": ".child-cuda-base-collectives-test-template",
+        "vetnode": ".child-cuda-vetnode-test-template",
+    },
+    "rocm": {
+        "env": ".child-rocm-base-env-test-template",
+        "collectives": ".child-rocm-base-collectives-test-template",
+    },
 }
 BASE_TEST_KINDS_BY_FAMILY = {
-    "cuda": {"cuda-base-env", "cuda-base-collectives", "cuda-vetnode"},
-    "rocm": {"rocm-base-env", "rocm-base-collectives"},
+    family: set(templates)
+    for family, templates in BASE_TEST_TEMPLATES.items()
 }
 
 APP_TEST_KINDS = {"", "cuda-vetnode"}
@@ -235,10 +239,11 @@ def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
         raise RuntimeError(f"{path}: tests must not be empty")
     for idx, test in enumerate(tests):
         item = require_mapping(test, f"{path}: tests[{idx}]")
-        if not item.get("name") or not item.get("kind"):
-            raise RuntimeError(f"{path}: tests[{idx}] must define name and kind")
-        if item["kind"] not in BASE_TEST_KINDS_BY_FAMILY[family]:
-            raise RuntimeError(f"{path}: unsupported {family} base test kind: {item['kind']}")
+        if not item.get("name"):
+            raise RuntimeError(f"{path}: tests[{idx}] must define name")
+        name = str(item["name"])
+        if name not in BASE_TEST_KINDS_BY_FAMILY[family]:
+            raise RuntimeError(f"{path}: unsupported {family} base test name: {name}")
 
 
 def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> None:
@@ -337,9 +342,9 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], va
     test_needs = [build] if not exists else []
     test_jobs: list[str] = []
     for test in tests:
-        kind = str(test["kind"])
-        job = f"test-{prefix}-{slug(str(test['name']))}"
-        child.add_job(job, BASE_TEST_TEMPLATES[kind], image=base["CANON_IMAGE_REF"], needs=test_needs)
+        name = str(test["name"])
+        job = f"test-{prefix}-{slug(name)}"
+        child.add_job(job, BASE_TEST_TEMPLATES[base["FAMILY"]][name], image=base["CANON_IMAGE_REF"], needs=test_needs)
         test_jobs.append(job)
     mark = f"mark-{prefix}-tested"
     child.add_job(mark, ".child-mark-base-tested-template", needs=test_jobs, variables={"CANON_IMAGE_REF": base["CANON_IMAGE_REF"], "TESTED_IMAGE_REF": base["TESTED_IMAGE_REF"]})
