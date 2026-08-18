@@ -1,4 +1,5 @@
 tests:
   cuda:
+    # Pipeline exercise: validation-only app metadata change.
     - name: vetnode
       kind: cuda-vetnode
