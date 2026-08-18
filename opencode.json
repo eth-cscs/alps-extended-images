@@ -1,0 +1,30 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "cscs": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "CSCS Inference",
+      "options": {
+        "baseURL": "https://api.inference.cscs.ch/v1",
+        "apiKey": "{env:CSCS_INFERENCE_API_KEY}"
+      },
+      "models": {
+        "zai-org/GLM-5.2": {
+          "name": "GLM-5.2",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 200000, "output": 131072 }
+        },
+        "moonshotai/Kimi-K2.7-Code": {
+          "name": "Kimi K2.7-Code",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "limit": { "context": 262144, "output": 131072 }
+        }
+      }
+    }
+  },
+  "model": "cscs/zai-org/GLM-5.2",
+  "small_model": "cscs/zai-org/GLM-5.2",
+  "share": "auto"
+}
