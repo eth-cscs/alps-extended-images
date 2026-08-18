@@ -1,5 +1,13 @@
 name: preflight
 
+# Fast GitHub-side preflight for logic that does not require CSCS infrastructure.
+# These checks exercise the child-pipeline generator, metadata validation, shell
+# helpers, CI YAML syntax, and manual-build script generation with mocked registry
+# state. They are meant to catch cheap regressions before the GitLab/CSCS pipeline
+# spends runner time. GitLab/CSCS CI remains authoritative for real child-pipeline
+# creation, included template resolution, CSCS runners, Slurm tests, image builds,
+# registry authentication, validation markers, and publish promotion.
+
 on:
   pull_request:
   push:
@@ -9,6 +17,9 @@ permissions:
   contents: read
 
 jobs:
+  # PRs also receive push events for the same branch. This gate keeps the cheap
+  # preflight useful on branch pushes while skipping duplicate runs for the same
+  # content.
   deduplicate:
     runs-on: ubuntu-latest
     outputs:
@@ -36,14 +47,19 @@ jobs:
 
       - name: Python and pytest
         run: |
+          # Generator/schema tests use fake registry state; shell-helper tests use
+          # a fake skopeo executable, so no credentials or CSCS runners are needed.
           python -m py_compile ci-pipelines/helpers/generate-child-pipeline.py
           uvx --with pyyaml pytest ci-pipelines/tests
 
       - name: Shell syntax
+        # Catch syntax errors in tracked shell scripts, including sourced helpers.
         run: git ls-files '*.sh' | xargs -r -n1 bash -n
 
       - name: CI YAML and embedded shell syntax
         run: |
+          # Parse the static CI YAML files and syntax-check literal shell snippets
+          # embedded in script/before_script entries.
           uv run --with pyyaml python - <<'PY'
           import subprocess
           from pathlib import Path
@@ -66,6 +82,8 @@ jobs:
 
       - name: Manual-build smoke
         run: |
+          # Generate representative manual build scripts and syntax-check them.
+          # This verifies manual-build still matches the current meta.sh ref API.
           export IMAGE_PREFIX=localhost/alps-images
           export ALPS_REV=alps7-dev
           export CI_COMMIT_SHORT_SHA=abc123
