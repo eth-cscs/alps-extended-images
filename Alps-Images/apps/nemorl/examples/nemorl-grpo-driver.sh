@@ -135,6 +135,11 @@ mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
             printf " shm_top20_mb=%s" "$(du -m /dev/shm/* 2>/dev/null | sort -rn | head -20 | tr -s "\t" ":" | tr "\n" ";")"
             printf " tmp_top10_mb=%s" "$(du -m /tmp/* 2>/dev/null | sort -rn | head -10 | tr -s "\t" ":" | tr "\n" ";")"
             printf " sysv_shm_mb=%s" "$(awk "NR>1{s+=\$4} END{printf \"%d\", s/1048576}" /proc/sysvipc/shm 2>/dev/null)"
+            _p="$(pgrep -f MegatronPolicyWorker 2>/dev/null | head -1)"
+            if [ -n "${_p}" ]; then
+                printf " memfd_top5=%s" "$(for _fd in /proc/${_p}/fd/*; do _t=$(readlink "${_fd}" 2>/dev/null); case "${_t}" in /memfd:*) printf "%s %s\n" "$(stat -Lc %s "${_fd}" 2>/dev/null)" "${_t}";; esac; done | sort -rn | head -5 | tr "\n" ";")"
+                printf " memfd_maps_cnt=%s" "$(grep -c memfd /proc/${_p}/maps 2>/dev/null)"
+            fi
             printf "\n"
         } >> "${_trace_file}" 2>/dev/null
         sleep 30
