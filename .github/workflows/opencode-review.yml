@@ -26,7 +26,7 @@ jobs:
           CSCS_INFERENCE_API_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
         with:
           model: cscs/moonshotai/Kimi-K2.7-Code
-          agent: grumpy-reviewer.agent
+          agent: grumpy-reviewer
           # use_github_token: true
           # Your custom review instructions
           prompt: |
