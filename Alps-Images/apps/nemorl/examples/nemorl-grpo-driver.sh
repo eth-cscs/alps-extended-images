@@ -186,8 +186,31 @@ cd "${NEMORL_DIR}"
 
 git remote remove fork 2>/dev/null || true
 git remote add fork "${NEMORL_FORK_URL}"
-git fetch fork "${NEMORL_BRANCH}"
-git switch -C "${NEMORL_BRANCH}" "fork/${NEMORL_BRANCH}"
+
+# Fetch the current branch state with retries and GATE on success.  A single
+# transient GitHub 500 (slurm-3103672) otherwise leaves this node silently
+# running the image-baked commit while the rest of the cluster runs the
+# fetched one — a mixed-version cluster that fails in confusing ways (there:
+# TypeError on a method signature that only existed in the newer code).
+# Failing loudly here is strictly better: --kill-on-bad-exit tears the job
+# down within seconds with a clear message.
+_git_ready=false
+for _attempt in 1 2 3 4 5; do
+    if git fetch fork "${NEMORL_BRANCH}" 2>&1; then
+        _git_ready=true
+        break
+    fi
+    echo "Rank ${SLURM_PROCID}: git fetch attempt ${_attempt}/5 failed; retrying in 20s..." >&2
+    sleep 20
+done
+if [ "${_git_ready}" != true ]; then
+    echo "FATAL: Rank ${SLURM_PROCID}: could not fetch ${NEMORL_BRANCH} from the fork after 5 attempts; aborting job (refusing to run a mixed-version cluster)." >&2
+    exit 1
+fi
+git switch -C "${NEMORL_BRANCH}" "fork/${NEMORL_BRANCH}" || {
+    echo "FATAL: Rank ${SLURM_PROCID}: git switch to fork/${NEMORL_BRANCH} failed; aborting job." >&2
+    exit 1
+}
 
 # Prepare the uv environment with retries, and GATE on success.  A single
 # flaky fetch (e.g. the flash-attn wheel from GitHub) otherwise kills
@@ -208,18 +231,29 @@ if [ "${_uv_ready}" != true ]; then
     exit 1
 fi
 
-# Signal that this rank has finished its uv setup.
+# Signal that this rank has finished its uv setup.  The file CONTENT is the
+# checked-out NeMoRL commit of this rank: rank 0 compares it while collecting the
+# files, so a mixed-version cluster dies at rendezvous instead of at the
+# first cross-version RPC.  (Written via tmp+mv so readers never see a
+# partial file.)
 RANK_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${SLURM_PROCID}_done"
-touch "${RANK_DONE_FILE}"
+git rev-parse HEAD > "${RANK_DONE_FILE}.tmp" && mv "${RANK_DONE_FILE}.tmp" "${RANK_DONE_FILE}"
 
 if [ "${SLURM_PROCID}" -eq 0 ]; then
-    # Wait until every rank has finished its uv setup.
+    # Wait until every rank has finished its uv setup, and verify all ranks
+    # checked out the SAME NeMoRL commit (the rank-done files carry it).
+    _my_commit="$(git rev-parse HEAD)"
     for other_rank in $(seq 1 $((SLURM_JOB_NUM_NODES - 1))); do
         OTHER_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${other_rank}_done"
         echo "Rank 0: waiting for rank ${other_rank} uv setup..."
         while [ ! -f "${OTHER_DONE_FILE}" ]; do
             sleep 1
         done
+        _other_commit="$(cat "${OTHER_DONE_FILE}" 2>/dev/null)"
+        if [ -n "${_other_commit}" ] && [ "${_other_commit}" != "${_my_commit}" ]; then
+            echo "FATAL: Rank 0: rank ${other_rank} runs NeMoRL commit ${_other_commit} but rank 0 runs ${_my_commit} — mixed-version cluster (see slurm-3103672); aborting job." >&2
+            exit 1
+        fi
     done
 
     # Rank 0 starts the Ray head node (under membind: raylet children — all
