@@ -169,8 +169,8 @@ class Child:
             job["image"] = image
         if timeout:
             job["timeout"] = timeout
-        if needs:
-            job["needs"] = needs
+        if needs is not None:
+            job["needs"] = list(needs)
         if variables:
             job["variables"] = {key: str(value) for key, value in sorted(variables.items())}
         if script:

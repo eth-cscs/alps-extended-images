@@ -134,6 +134,7 @@ def test_generate_valid_base_with_stale_stable_emits_publish_only(monkeypatch, g
     assert gen.add_base(child, base, base_tests(), valid=True) is None
 
     assert set(child.data) >= {"publish-base-pytorch-cuda-26-06-py3"}
+    assert child.data["publish-base-pytorch-cuda-26-06-py3"]["needs"] == []
     assert "test-base-pytorch-cuda-26-06-py3-env" not in child.data
     assert "mark-base-pytorch-cuda-26-06-py3-tested" not in child.data
 
@@ -174,7 +175,26 @@ def test_generate_app_has_no_base_need_when_base_already_valid(monkeypatch, gen)
 
     gen.add_app(child, app, app_tests(), {app["BASE_IMAGE"]: None}, {app["BASE_IMAGE"]: True})
 
-    assert "needs" not in child.data["build-app-vllm-cuda"]
+    assert child.data["build-app-vllm-cuda"]["needs"] == []
+
+
+def test_generate_valid_app_with_stale_stable_emits_immediate_publish(monkeypatch, gen):
+    app = app_image()
+    fake_registry(
+        monkeypatch,
+        gen,
+        {
+            app["CANON_IMAGE_REF"]: "sha256:app",
+            app["TESTED_IMAGE_REF"]: "sha256:app",
+            app["STABLE_IMAGE_REF"]: "sha256:old",
+            app["GHCR_STABLE_IMAGE_REF"]: "sha256:app",
+        },
+    )
+    child = gen.Child()
+
+    gen.add_app(child, app, app_tests(), {app["BASE_IMAGE"]: None}, {app["BASE_IMAGE"]: True})
+
+    assert child.data["publish-app-vllm-cuda"]["needs"] == []
 
 
 def test_generate_marker_mismatch_fails_closed(monkeypatch, gen):
