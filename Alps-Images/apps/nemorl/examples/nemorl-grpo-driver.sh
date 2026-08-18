@@ -131,7 +131,7 @@ mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
             printf " avail_kb=%s" "$(awk "/MemAvailable/{print \$2}" /proc/meminfo)"
             printf " shmem_kb=%s" "$(awk "/^Shmem:/{print \$2}" /proc/meminfo)"
             printf " top5_rss_kb=%s" "$(ps -eo rss=,comm= --sort=-rss | head -5 | tr -s " " | tr "\n" ";")"
-            printf " shm_top3_mb=%s" "$(du -m /dev/shm/* 2>/dev/null | sort -rn | head -3 | tr -s "\t" ":" | tr "\n" ";")"
+            printf " shm_top20_mb=%s" "$(du -m /dev/shm/* 2>/dev/null | sort -rn | head -20 | tr -s "\t" ":" | tr "\n" ";")"
             printf "\n"
         } >> "${_trace_file}" 2>/dev/null
         sleep 30
