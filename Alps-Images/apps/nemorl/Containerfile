@@ -32,7 +32,11 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
 
 # Install uv at /usr/local/bin in case the root home directory is bind mounted
 # We need `uv` because the NeMoRL repo makes heavy use of it.
-ARG UV_VERSION=0.12.1
+# MUST match the uv that wrote the branch uv.lock — upstream docker/Dockerfile
+# pins 0.11.28 on current main.  A different uv (e.g. 0.12.x) re-validates
+# the lock with new rules and errors "lockfile needs to be updated" even
+# though nothing changed.
+ARG UV_VERSION=0.11.28
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # This will ensure that the venv is build at a static location.
@@ -125,19 +129,25 @@ RUN uv venv --seed "${UV_PROJECT_ENVIRONMENT}"
 # the full source is present. See NeMoRL/docker/Dockerfile:183.
 # Link mode is NOT passed per command: the global UV_LINK_MODE=symlink (ENV
 # above) governs every sync here and at runtime — one source of truth.
-RUN uv sync --locked --no-install-project
+# --frozen (not --locked), mirroring upstream: install exactly what the
+# committed lock says without re-validating it against pyproject — the
+# upstream lock does not pass strict validation (extras warnings) and
+# upstream itself builds with --frozen.  Deliberately NOT ported: the
+# sglang extra (unused backend) and the aiohttp CVE cache prune (our
+# venvs are SYMLINK farms into the cache; pruning breaks them).
+RUN uv sync --frozen --no-install-project
 
 # Now we perform the "install" of the helper, this will pull them into the cache such that they
 #  are installed faster when they are needed.
-RUN uv sync --locked --extra vllm --no-install-project
-RUN uv sync --locked --extra mcore --no-install-project
-RUN uv sync --locked --extra automodel --no-install-project
-RUN uv sync --locked --extra modelopt --no-install-project
-RUN uv sync --locked --all-groups --no-install-project
+RUN uv sync --frozen --extra vllm --no-install-project
+RUN uv sync --frozen --extra mcore --no-install-project
+RUN uv sync --frozen --extra automodel --no-install-project
+RUN uv sync --frozen --extra modelopt --no-install-project
+RUN uv sync --frozen --all-groups --no-install-project
 
 # The NeMo Dockerfile also removes some files related to ray, we do not do that.
 # Furthermore, we will now install the project in full, i.e. without `--no-install-project`.
-RUN uv sync --locked
+RUN uv sync --frozen
 
 # Prefetch the per-actor venvs at build time so Ray doesn't create them on
 # the first launch of every actor. Mirrors NeMoRL/docker/Dockerfile:276.
