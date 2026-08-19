@@ -215,6 +215,12 @@ NRL_REFIT_NUM_BUFFERS = "1"
 # mode makes runtime venvs point into the read-only cache instead (same mode
 # the image build itself uses for the prefetched venvs).
 UV_LINK_MODE = "symlink"
+# THE LEAK FIX (named via the 2+2-node Qwen rig, slurm-3125000): every refit
+# left ~7.5 GB/rank of pinned host staging in torch's CachingHostAllocator
+# ("/dev/zero (deleted)" mappings, Shmem-accounted on GH200) — the staircase
+# that killed every run since 3100132 at ~step 2-3.  Fork commit 552d7d131
+# flushes the pinned-host cache after each weight broadcast.
+NRL_EMPTY_HOST_CACHE_AFTER_REFIT = "${NRL_EMPTY_HOST_CACHE_AFTER_REFIT:-1}"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
