@@ -162,6 +162,7 @@ mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
             printf " top5_rss_kb=%s" "$(ps -eo rss=,comm= --sort=-rss | head -5 | tr -s " " | tr "\n" ";")"
             printf " shm_top20_mb=%s" "$(du -m /dev/shm/* 2>/dev/null | sort -rn | head -20 | tr -s "\t" ":" | tr "\n" ";")"
             printf " tmp_top10_mb=%s" "$(du -m /tmp/* 2>/dev/null | sort -rn | head -10 | tr -s "\t" ":" | tr "\n" ";")"
+            printf " top5_rssshmem=%s" "$(ps -eo pid=,comm= --sort=-rss | head -5 | while read -r _pp _cc; do _rs=$(grep RssShmem "/proc/${_pp}/status" 2>/dev/null | tr -s " " | cut -d" " -f2); printf "%s:%s:%skB;" "${_cc}" "${_pp}" "${_rs:-0}"; done)"
             printf " sysv_shm_mb=%s" "$(awk "NR>1{s+=\$4} END{printf \"%d\", s/1048576}" /proc/sysvipc/shm 2>/dev/null)"
             _p="$(_pids_by_prefix "ray::MegatronPolicyWorker" | head -1)"
             if [ -n "${_p}" ]; then
