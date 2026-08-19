@@ -165,8 +165,16 @@ mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
             printf " sysv_shm_mb=%s" "$(awk "NR>1{s+=\$4} END{printf \"%d\", s/1048576}" /proc/sysvipc/shm 2>/dev/null)"
             _p="$(_pids_by_prefix "ray::MegatronPolicyWorker" | head -1)"
             if [ -n "${_p}" ]; then
-                printf " memfd_top5=%s" "$(for _fd in /proc/${_p}/fd/*; do _t=$(readlink "${_fd}" 2>/dev/null); case "${_t}" in /memfd:*) printf "%s %s\n" "$(stat -Lc %s "${_fd}" 2>/dev/null)" "${_t}";; esac; done | sort -rn | head -5 | tr "\n" ";")"
-                printf " memfd_maps_cnt=%s" "$(grep -c memfd /proc/${_p}/maps 2>/dev/null)"
+                printf " shmfd_top5=%s" "$(for _fd in /proc/${_p}/fd/*; do _t=$(readlink "${_fd}" 2>/dev/null); case "${_t}" in /memfd:*|/dev/shm/*|*"(deleted)"*) printf "%s %s\n" "$(stat -Lc %s "${_fd}" 2>/dev/null)" "${_t}";; esac; done | sort -rn | head -5 | tr "\n" ";")"
+                _del_mb=0
+                while read -r _range _perm _off _dev _ino _path; do
+                    case "${_path}" in *"(deleted)"*|*deleted*)
+                        _s16="${_range%-*}"; _e16="${_range#*-}"
+                        _del_mb=$(( _del_mb + ( 16#${_e16} - 16#${_s16} ) / 1048576 ));;
+                    esac
+                done < "/proc/${_p}/maps" 2>/dev/null
+                printf " del_map_mb=%s" "${_del_mb}"
+                printf " del_map_names=%s" "$(grep -oE "/[^ ]+ \(deleted\)" /proc/${_p}/maps 2>/dev/null | sort | uniq -c | sort -rn | head -4 | tr -s " " | tr "\n" ";")"
             fi
             printf "\n"
         } >> "${_trace_file}" 2>/dev/null
