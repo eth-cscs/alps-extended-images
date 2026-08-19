@@ -27,6 +27,7 @@ jobs:
         with:
           model: cscs/moonshotai/Kimi-K2.7-Code
           agent: grumpy-reviewer
+          share: false
           # use_github_token: true
           # Your custom review instructions
           prompt: |

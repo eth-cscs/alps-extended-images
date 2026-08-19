@@ -32,3 +32,4 @@ jobs:
         with:
           agent: grumpy-reviewer
           model: cscs/moonshotai/Kimi-K2.7-Code
+          share: false
