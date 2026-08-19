@@ -10,6 +10,8 @@ ARG NEMORL_DIR="${WORK_DIR}/nemo_rl"
 #ARG NEMORL_URL="https://github.com/NVIDIA-NeMo/RL.git"
 #ARG NEMORL_COMMIT="89f4d1f857a369b1d565c97b7b4a12c1697bb68b"
 ARG NEMORL_URL="https://github.com/philip-paul-mueller/RL.git"
+# Build against the upstream-merged branch (Python 3.13.14, new uv.lock)
+# with: --build-arg NEMORL_COMMIT=glm51-megatron-fsdp-wiring_merged
 ARG NEMORL_COMMIT="glm51-megatron-fsdp-wiring"
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -158,3 +160,30 @@ RUN if [[ -z "${SKIP_PREFETCH_VENVS:-}" ]]; then \
     else \
         echo "Skipping venv prefetch (SKIP_PREFETCH_VENVS set)"; \
     fi
+
+# py-spy in the base python: lets the driver / an interactive shell take
+# PYTHON-level stack dumps of hung or leaking workers (the init-hang of
+# 3046402/3079454/3113822 leaves no other trace).
+RUN python3 -m pip install --no-cache-dir py-spy
+
+# ---------------------------------------------------------------------------
+# Runtime hardening: uv serves everything FROM THE BAKED CACHE.
+#
+# slurm-3110935 showed ~55 GB/node of silent runtime installs into the tmpfs
+# overlay (32.8 GB uv-cache writes incl. an 8.9 GB flashinfer_jit_cache wheel
+# downloaded mid-job, 7.6 GB pip'd into the system python).  With UV_OFFLINE
+# any dependency missing from the image cache fails IMMEDIATELY with the
+# package name instead of spending RAM and network per node per run — the
+# failure message tells us exactly what to bake below.
+#
+# These ENVs are placed AFTER every build-time uv/pip step, so the build
+# itself stays online.  To debug online inside a running container:
+#   UV_OFFLINE=0 uv ...
+#
+# KNOWN GAP TO BAKE (add explicit warm steps here as offline runs name them):
+#   - flashinfer_jit_cache (+cu130 wheel, ~8.9 GB) — resolved at runtime on
+#     GH200 but not cached by the build-time prefetch (suspected environment
+#     -marker mismatch between build machine and node).
+# ---------------------------------------------------------------------------
+ENV UV_OFFLINE=1
+ENV PIP_NO_INDEX=1
