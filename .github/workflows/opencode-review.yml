@@ -28,15 +28,3 @@ jobs:
           model: cscs/moonshotai/Kimi-K2.7-Code
           agent: grumpy-reviewer
           share: false
-          
-      - name: Debug agent discovery
-        if: always()
-        run: |
-          echo "=== .opencode tree ==="
-          find .opencode -type f 2>/dev/null || echo "NO .opencode DIR"
-          echo "=== frontmatter ==="
-          head -20 .opencode/agents/grumpy-reviewer.md 2>/dev/null || echo "FILE NOT FOUND"
-          echo "=== agents opencode sees ==="
-          opencode agent list || echo "agent list failed"
-          echo "=== config as loaded ==="
-          jq -r '.agent // "no agent block"' opencode.json
