@@ -125,8 +125,8 @@ EOF
 # -----------------------------------------------------------------------------
 # GRPO config: structurally the GLM recipe, dimensionally tiny.
 #   Training: 1 node x 4 GPUs, TP=1/PP=1 -> dense DP=4.
-#   Rollout:  1 node x 4 GPUs, one TP=4 vLLM engine (single engine => no
-#             vLLM-DP, async_engine allowed; joint broadcast world = 4+4).
+#   Rollout:  1 node x 4 GPUs, two TP=2 vLLM engines (0.5B has 14 heads,
+#             TP=4 does not divide; multi-rank refit broadcasts remain).
 #   8 steps x (8 prompts x 8 gens) — a step should take ~1-2 min.
 # -----------------------------------------------------------------------------
 cat > "${TRAINING_CONFIG}/${YAML_NAME}" <<- EOF
@@ -226,9 +226,11 @@ policy:
       async_engine: true
       precision: bfloat16
       kv_cache_dtype: "auto"
-      # One TP=4 engine on the rollout node: single engine => no vLLM DP,
-      # and the refit is a real multi-rank NCCL broadcast like the big run.
-      tensor_parallel_size: 4
+      # TP=2: Qwen2.5-0.5B has 14 attention heads, which TP=4 does not
+      # divide (vLLM ValidationError, slurm-3124112); 14/2 and 12/2 (1.5B)
+      # both work.  The rollout node runs TWO TP=2 engines — still real
+      # multi-rank NCCL refit broadcasts, now to two engine replicas.
+      tensor_parallel_size: 2
       pipeline_parallel_size: 1
       expert_parallel_size: 1
       gpu_memory_utilization: 0.7
