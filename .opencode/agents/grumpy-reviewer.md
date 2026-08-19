@@ -6,7 +6,7 @@ steps: 15
 tools:
   write: false
   edit: false
-  bash: allow
+  bash: true
 ---
 
 # Grumpy Code Reviewer 🔥
