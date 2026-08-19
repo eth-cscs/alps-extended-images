@@ -98,6 +98,19 @@ unset PYTHONOPTIMIZE
 # non-empty error files to Lustre on exit (also on SIGTERM from
 # --kill-on-bad-exit; slurm allows a grace period before SIGKILL).
 # -----------------------------------------------------------------------------
+# Resolve Ray worker pids by the START of /proc/<pid>/cmdline (the ray::
+# proctitle).  NEVER pgrep -f: this whole script is the cmdline of our own
+# shells, so any substring of it (ray::, MegatronPolicyWorker, ...) matches
+# ourselves — exactly the trap train_monitor.sh warns about, and exactly what
+# emptied the memfd census and polluted live_procs in slurm-3116103.
+_pids_by_prefix() {
+    for _c in /proc/[0-9]*/cmdline; do
+        case "$(tr "\0" " " < "${_c}" 2>/dev/null)" in
+            "$1"*) _pp="${_c%/cmdline}"; echo "${_pp##*/}";;
+        esac
+    done
+}
+
 salvage_ray_logs() {
     _dst="${TRAINING_HOME}/ray_err_logs/${SLURM_JOB_ID}"
     mkdir -p "${_dst}" 2>/dev/null || return 0
@@ -111,7 +124,7 @@ salvage_ray_logs() {
     # 3113822) leaves EMPTY logs — the only evidence is where the live process
     # is stuck at teardown time.  wchan/syscall distinguish a FUSE/overlay read
     # stall (dlopen through fuse-overlayfs) from a futex/collective wait.
-    for _p in $(pgrep -f "ray::" 2>/dev/null | head -30); do
+    for _p in $(_pids_by_prefix "ray::" | head -30); do
         {
             echo "== pid ${_p}"
             tr "\0" " " < "/proc/${_p}/cmdline" 2>/dev/null; echo
@@ -150,7 +163,7 @@ mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
             printf " shm_top20_mb=%s" "$(du -m /dev/shm/* 2>/dev/null | sort -rn | head -20 | tr -s "\t" ":" | tr "\n" ";")"
             printf " tmp_top10_mb=%s" "$(du -m /tmp/* 2>/dev/null | sort -rn | head -10 | tr -s "\t" ":" | tr "\n" ";")"
             printf " sysv_shm_mb=%s" "$(awk "NR>1{s+=\$4} END{printf \"%d\", s/1048576}" /proc/sysvipc/shm 2>/dev/null)"
-            _p="$(pgrep -f MegatronPolicyWorker 2>/dev/null | head -1)"
+            _p="$(_pids_by_prefix "ray::MegatronPolicyWorker" | head -1)"
             if [ -n "${_p}" ]; then
                 printf " memfd_top5=%s" "$(for _fd in /proc/${_p}/fd/*; do _t=$(readlink "${_fd}" 2>/dev/null); case "${_t}" in /memfd:*) printf "%s %s\n" "$(stat -Lc %s "${_fd}" 2>/dev/null)" "${_t}";; esac; done | sort -rn | head -5 | tr "\n" ";")"
                 printf " memfd_maps_cnt=%s" "$(grep -c memfd /proc/${_p}/maps 2>/dev/null)"
