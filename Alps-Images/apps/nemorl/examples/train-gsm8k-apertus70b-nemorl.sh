@@ -7,20 +7,22 @@
 #SBATCH --time=04:00:00
 
 # =============================================================================
-# GRPO on Apertus 70B (swiss-ai) — text-only v1.0 line, dtensor backend.
+# GRPO on Apertus v1.5 70B (swiss-ai) — dedicated fork stack, dtensor backend.
 #
-# WHY v1.0 (Apertus-70B-Instruct-2509) AND NOT v1.5 — checked BEFORE writing
-# this config (the Qwen-head-count lesson, applied one level up):
-#   - Apertus-v1.5-70B is MULTIMODAL (text+image+audio, 262K ctx, 266,752
-#     vocab) and per its model card requires swiss-ai's FORKED transformers
-#     and a MODIFIED vLLM ("upstreaming in progress").  Our locked stack
-#     (vllm 0.25.1, transformers 5.5.0) cannot load it.  Revisit when
-#     upstreamed; until then it would need the merged-branch custom-vllm
-#     build machinery + the swiss transformers fork.
+# TARGET: Apertus-v1.5-70B on the DEDICATED APERTUS STACK — the NeMoRL
+# branch `apertus-stack` pins swiss-ai's forked transformers (@3797303d)
+# and modified vLLM (@a601a9d9) in the lockfile, and the image is built
+# from that branch (see NeMoRL/APERTUS_STACK.md for the relock + image
+# build procedure; both MUST exist before this script can run).  The
+# shared driver is stack-agnostic — only image+branch change.
 #   - Megatron-Bridge has ZERO Apertus support (grep-verified) → the
 #     megatron backend is impossible for ANY Apertus.  Hence dtensor/FSDP2.
-#   - v1.0 (2509 release) IS upstreamed: supported by the transformers and
-#     vLLM versions in our lock.
+#   - v1.5 loads via the new AutoModelForMultimodalLM class — the NeMo-RL
+#     automodel load path may need extending (first light will tell; the
+#     vlm_grpo automodel recipes are the in-tree precedent).
+#   - Fallback that runs on the NORMAL stack today:
+#     APERTUS_MODEL=Apertus-70B-Instruct-2509 NEMORL_BRANCH=glm51-megatron-fsdp-wiring \
+#         sbatch ... (text-only v1.0, upstreamed in vllm 0.25.1/transformers 5.5).
 #
 # Geometry (Apertus-70B v1.0): 80 layers, hidden 8192, 64 attention heads,
 # 8 KV heads (GQA), vocab 131,072.  Divisibility: TP=4 → 64/4=16 q-heads,
@@ -41,7 +43,9 @@
 
 SCRIPT_DIR="${PWD}"
 
-export NEMORL_IMAGE="/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_2026_08_13_I.sqsh"
+# The Apertus-stack image (built from NEMORL_COMMIT=apertus-stack per
+# APERTUS_STACK.md).  Override APERTUS_IMAGE while iterating on builds.
+export NEMORL_IMAGE="${APERTUS_IMAGE:-/capstor/scratch/cscs/phimuell/.uenv-images/__ML__/nemo_rl_apertus15.sqsh}"
 
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 if [[ -z "$WANDB_API_KEY" ]]; then
@@ -57,7 +61,7 @@ else
     echo "[WARNING] HF_TOKEN_PATH is not set — the Apertus repo is GATED; the download WILL fail without an authorized token." >&2
 fi
 
-export MODEL_NAME="${APERTUS_MODEL:-Apertus-70B-Instruct-2509}"
+export MODEL_NAME="${APERTUS_MODEL:-Apertus-v1.5-70B}"
 export MODEL_REPO="swiss-ai"
 export WANDB_PROJECT_NAME="async-grpo-gsm8k"
 export WANDB_RUN_NAME="${MODEL_NAME}-nemorl-vllm-dtensor-async-${SLURM_JOB_NUM_NODES}n-${SLURM_JOB_ID}"
@@ -74,7 +78,7 @@ mkdir -p "${NRL_MEGATRON_CHECKPOINT_DIR}"
 export NEMORL_DIR="/workdir/nemo_rl"
 export NEMORL_FORK_URL="https://github.com/philip-paul-mueller/RL.git"
 # Image and branch ship together (see the GLM entry script).
-export NEMORL_BRANCH="${NEMORL_BRANCH:-glm51-megatron-fsdp-wiring}"
+export NEMORL_BRANCH="${NEMORL_BRANCH:-apertus-stack}"
 
 export ROLLOUT_NNODES=2
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
