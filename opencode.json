@@ -37,5 +37,6 @@
   "instructions": ["CONTRIBUTING.md","AGENTS.md"],
   "model": "cscs/moonshotai/Kimi-K2.7-Code",
   "small_model": "cscs/moonshotai/Kimi-K2.7-Code",
-  "share": "disabled"
+  "share": "disabled",
+  "default_agent": "grumpy-reviewer"
 }
