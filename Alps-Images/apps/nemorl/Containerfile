@@ -32,7 +32,7 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
 
 # Install uv at /usr/local/bin in case the root home directory is bind mounted
 # We need `uv` because the NeMoRL repo makes heavy use of it.
-ARG UV_VERSION=0.11.18
+ARG UV_VERSION=0.12.1
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
 
 # This will ensure that the venv is build at a static location.
