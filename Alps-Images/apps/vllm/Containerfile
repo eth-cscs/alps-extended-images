@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
+ARG VLLM_REF="v0.25.1"
+ARG VLLM_TARGET_DEVICE="cuda"
+ARG VLLM_CUDA_ARCH_LIST="9.0"
+ARG VLLM_TORCH_CUDA_ARCH_LIST="9.0"
+ARG VLLM_VERSION_OVERRIDE=""
+ARG MAX_JOBS="32"
+ARG NVCC_THREADS="4"
+
+ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
+    CUDA_ARCH_LIST="${VLLM_CUDA_ARCH_LIST}" \
+    TORCH_CUDA_ARCH_LIST="${VLLM_TORCH_CUDA_ARCH_LIST}" \
+    MAX_JOBS="${MAX_JOBS}" \
+    NVCC_THREADS="${NVCC_THREADS}" \
+    CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}" \
+    CCACHE_NOHASHDIR="true"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+COPY Alps-Images/apps/vllm/patches /opt/alps-vllm-patches
+
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    vllm_apt_build_deps=( \
+      build-essential \
+      cargo \
+      cmake \
+      curl \
+      git \
+      ninja-build \
+      pkg-config \
+      rustc \
+      python3-dev \
+    ); \
+    vllm_apt_install_packages=(ca-certificates "${vllm_apt_build_deps[@]}"); \
+    snapshot_apt_packages /tmp/vllm-apt-before.txt; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends "${vllm_apt_install_packages[@]}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    pip_install python --no-cache-dir --upgrade \
+      grep \
+      build \
+      jinja2 \
+      'packaging<=25.0' \
+      'setuptools>=77.0.3,<81.0.0' \
+      setuptools-rust \
+      setuptools-scm; \
+    export CUDA_ARCH_LIST="${VLLM_CUDA_ARCH_LIST}" \
+      TORCH_CUDA_ARCH_LIST="${VLLM_TORCH_CUDA_ARCH_LIST}" \
+      MAX_JOBS="${MAX_JOBS}" \
+      NVCC_THREADS="${NVCC_THREADS}" \
+      CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}"; \
+    printf 'CUDA_ARCH_LIST=%s\nTORCH_CUDA_ARCH_LIST=%s\nMAX_JOBS=%s\nNVCC_THREADS=%s\n' \
+      "${CUDA_ARCH_LIST}" "${TORCH_CUDA_ARCH_LIST}" "${MAX_JOBS}" "${NVCC_THREADS}"; \
+    rm -rf /tmp/vllm; \
+    git clone --recursive "${VLLM_REPO}" /tmp/vllm; \
+    cd /tmp/vllm; \
+    git checkout -q "${VLLM_REF}"; \
+    git submodule update --init --recursive; \
+    for patch_file in /opt/alps-vllm-patches/*.patch; do git apply "${patch_file}"; done; \
+    grep -n 'CUDA_ARCH_LIST' CMakeLists.txt; \
+    python use_existing_torch.py --prefix || python use_existing_torch.py; \
+    if [ -z "${VLLM_VERSION_OVERRIDE}" ] && [[ "${VLLM_REF}" == v[0-9]* ]]; then \
+      export VLLM_VERSION_OVERRIDE="${VLLM_REF#v}"; \
+    elif [ -n "${VLLM_VERSION_OVERRIDE}" ]; then \
+      export VLLM_VERSION_OVERRIDE; \
+    fi; \
+    build_requirements="requirements/build/cuda.txt"; \
+    if [ ! -f "${build_requirements}" ]; then build_requirements="requirements/build.txt"; fi; \
+    awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/) { print }' "${build_requirements}" > /tmp/vllm-build-requirements.txt; \
+    pip_install python --no-cache-dir -r /tmp/vllm-build-requirements.txt; \
+    awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/ || $0 ~ /^cuda-toolkit/ || $0 ~ /^humming-kernels/ || $0 ~ /^nvidia-cuda-/ || $0 ~ /^nvidia-cudnn-frontend/ || $0 ~ /^nvidia-cutlass-dsl/ || $0 ~ /^nvidia-nvjitlink/ || $0 ~ /^nvidia-nvvm/ || $0 ~ /^quack-kernels/ || $0 ~ /^tokenspeed-mla/) { print }' requirements/cuda.txt > requirements/cuda-alps.txt; \
+    pip_install python --no-cache-dir -r requirements/cuda-alps.txt; \
+    python -m pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/vllm-dist .; \
+    pip_install python --no-cache-dir --no-deps /tmp/vllm-dist/*.whl; \
+    pip_install python --no-cache-dir "ray[default]" sentencepiece tiktoken; \
+    torch_lib_dir="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"; \
+    test -d "${torch_lib_dir}"; \
+    printf '%s\n' "${torch_lib_dir}" > /etc/ld.so.conf.d/99-alps-vllm-torch.conf; \
+    ldconfig; \
+    cleanup_new_apt_build_deps /tmp/vllm-apt-before.txt "${vllm_apt_build_deps[@]}"; \
+    rm -rf /tmp/vllm /tmp/vllm-dist /tmp/vllm-build-requirements.txt /tmp/vllm-apt-before.txt /root/.cache/pip
+
+RUN set -eux; \
+    python -c 'import torch, vllm; print("torch={} cuda={}".format(torch.__version__, torch.version.cuda)); print("vllm={}".format(getattr(vllm, "__version__", "unknown")))'; \
+    python -c 'import flashinfer; print("flashinfer={}".format(flashinfer.__version__))'; \
+    cubin_dir="$(python -c 'from flashinfer.jit.env import FLASHINFER_CUBIN_DIR; print(FLASHINFER_CUBIN_DIR)')"; \
+    echo "INFO: flashinfer resolves cubins from ${cubin_dir}"; \
+    cubin_count="$(find "${cubin_dir}" -name '*.cubin' 2>/dev/null | wc -l)"; \
+    if [ "${cubin_count}" -eq 0 ]; then \
+      echo "MAYBE FATAL: no flashinfer cubins in ${cubin_dir};"; \
+      echo "       the flashinfer-cubin package must be installed (it is pinned in"; \
+      echo "       vLLM's requirements/cuda.txt and must not be filtered out above)"; \
+    fi; \
+    chmod -R a+rX "${cubin_dir}"; \
+    echo "INFO: ${cubin_count} cubins pre-installed"; \
+    du -sh "${cubin_dir}"; \
+    echo "INFO: pip-installed CUDA packages after flashinfer install:"; \
+    python -m pip list --format=freeze \
+      | grep -i -E '^(cuda-toolkit|nvidia-|flashinfer)' \
+      || echo "  (none)"; \
+    python -m pip check || echo "WARN: inconsistent pip dependency resolution (see above)"; \
+    all_missing="$(find "$(python -c 'import vllm; print(vllm.__path__[0])')" -name '*.so' \
+                 -exec ldd {} + 2>/dev/null | awk '/not found/ { print }' || true)"; \
+    ignored_missing="$(printf '%s\n' "${all_missing}" | awk '$1 == "libcuda.so.1" { print }')"; \
+    missing="$(printf '%s\n' "${all_missing}" | awk 'NF && $1 != "libcuda.so.1" { print }')"; \
+    if [ -n "${ignored_missing}" ]; then \
+      echo "INFO: ignoring build-time unresolved host CUDA driver dependencies:"; \
+      echo "${ignored_missing}"; \
+    fi; \
+    if [ -n "${missing}" ]; then \
+      echo "FATAL: vLLM native extensions have unresolved dependencies:" >&2; \
+      echo "${missing}" >&2; \
+      exit 1; \
+    fi; \
+    echo "OK: vLLM smoke checks passed"
+
+# Tests shipped with the image
+COPY Alps-Images/apps/vllm/tests/ /opt/tests/vllm/
+RUN chmod -R a+rX /opt/tests/vllm

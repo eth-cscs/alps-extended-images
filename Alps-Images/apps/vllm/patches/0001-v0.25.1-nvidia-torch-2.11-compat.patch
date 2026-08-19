@@ -1,0 +1,143 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 48c0270e2..5af560db8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -212,6 +212,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+   #
+   clear_cuda_arches(CUDA_ARCH_FLAGS)
+   extract_unique_cuda_archs_ascending(CUDA_ARCHS "${CUDA_ARCH_FLAGS}")
++  if(DEFINED ENV{CUDA_ARCH_LIST})
++    string(REPLACE " " ";" CUDA_ARCHS "$ENV{CUDA_ARCH_LIST}")
++  endif()
+   message(STATUS "CUDA target architectures: ${CUDA_ARCHS}")
+   # Filter the target architectures by the supported supported archs
+   # since for some files we will build for all CUDA_ARCHS.
+diff --git a/csrc/libtorch_stable/cuda_view.cu b/csrc/libtorch_stable/cuda_view.cu
+index 7bf826747..1526532c1 100644
+--- a/csrc/libtorch_stable/cuda_view.cu
++++ b/csrc/libtorch_stable/cuda_view.cu
+@@ -8,7 +8,31 @@
+ #include <cuda_runtime.h>
+ 
+ #include <array>
++#include <memory>
++#include <mutex>
+ #include <optional>
++#include <vector>
++
++namespace {
++struct UvaLifetimeRegistry {
++  std::mutex mutex;
++  std::vector<torch::stable::Tensor> cpu_tensors;
++  std::vector<void*> mapped_host_allocations;
++};
++
++UvaLifetimeRegistry& uva_lifetime_registry() {
++  static auto* registry = new UvaLifetimeRegistry();
++  return *registry;
++}
++
++struct CudaHostDeleter {
++  void operator()(void* ptr) const {
++    if (ptr != nullptr) {
++      cudaFreeHost(ptr);
++    }
++  }
++};
++}  // namespace
+ 
+ // This function assumes that `cpu_tensor` is a CPU tensor,
+ // and that UVA (Unified Virtual Addressing) is enabled.
+@@ -17,7 +41,7 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+   STD_TORCH_CHECK(cpu_tensor.device().is_cpu(), "Input tensor must be on CPU");
+ 
+   const auto dtype = cpu_tensor.scalar_type();
+-  const auto layout = cpu_tensor.layout();
++  const auto layout = torch::headeronly::Layout::Strided;
+   const torch::stable::Device cuda_dev(torch::headeronly::DeviceType::CUDA);
+ 
+   // handle empty tensor
+@@ -38,9 +62,13 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+     STD_TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
+                     cudaGetErrorString(err));
+ 
+-    return torch::stable::from_blob(
+-        device_ptr, cpu_tensor.sizes(), cpu_tensor.strides(), cuda_dev, dtype,
+-        [base = cpu_tensor](void*) {});  // keep cpu tensor alive
++    auto cuda_view = torch::stable::from_blob(device_ptr, cpu_tensor.sizes(),
++                                              cpu_tensor.strides(), cuda_dev,
++                                              dtype);
++    auto& registry = uva_lifetime_registry();
++    std::lock_guard<std::mutex> lock(registry.mutex);
++    registry.cpu_tensors.emplace_back(cpu_tensor);
++    return cuda_view;
+   }
+ 
+   // If CPU tensor is not pinned, allocate a new pinned memory buffer.
+@@ -52,25 +80,26 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+   if (err != cudaSuccess) {
+     STD_TORCH_CHECK(false, "cudaHostAlloc failed: ", cudaGetErrorString(err));
+   }
++  std::unique_ptr<void, CudaHostDeleter> host_owner(host_ptr);
+ 
+   err = cudaMemcpy(host_ptr, contiguous_cpu.const_data_ptr(), nbytes,
+                    cudaMemcpyDefault);
+   if (err != cudaSuccess) {
+-    cudaFreeHost(host_ptr);
+     STD_TORCH_CHECK(false, "cudaMemcpy failed: ", cudaGetErrorString(err));
+   }
+ 
+   void* device_ptr = nullptr;
+   err = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
+   if (err != cudaSuccess) {
+-    cudaFreeHost(host_ptr);
+     STD_TORCH_CHECK(
+         false, "cudaHostGetDevicePointer failed: ", cudaGetErrorString(err));
+   }
+ 
+-  auto deleter = [host_ptr](void*) { cudaFreeHost(host_ptr); };
+-
+-  return torch::stable::from_blob(device_ptr, contiguous_cpu.sizes(),
+-                                  contiguous_cpu.strides(), cuda_dev,
+-                                  contiguous_cpu.scalar_type(), deleter);
++  auto cuda_view = torch::stable::from_blob(device_ptr, contiguous_cpu.sizes(),
++                                            contiguous_cpu.strides(), cuda_dev,
++                                            contiguous_cpu.scalar_type());
++  auto& registry = uva_lifetime_registry();
++  std::lock_guard<std::mutex> lock(registry.mutex);
++  registry.mapped_host_allocations.emplace_back(host_owner.release());
++  return cuda_view;
+ }
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index cf821a54b..d0160464e 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -865,17 +865,23 @@ def is_torch_equal(target: str) -> bool:
+ 
+ HAS_OPAQUE_TYPE = is_torch_equal_or_newer("2.11.0.dev")
+ 
+-# Allow toggling LayerName usage via environment variable.
+-# Defaults to True on torch >= 2.11, False otherwise.
+-# Set VLLM_USE_LAYERNAME=0 to disable even on torch >= 2.11.
+-_USE_LAYERNAME = HAS_OPAQUE_TYPE and envs.VLLM_USE_LAYERNAME
+ 
+ if HAS_OPAQUE_TYPE:
+-    from torch._opaque_base import OpaqueBase
++    try:
++        from torch._opaque_base import OpaqueBase
++    except ImportError:
++        HAS_OPAQUE_TYPE = False
++        OpaqueBase = object  # type: ignore[misc, assignment]
+ else:
+     OpaqueBase = object  # type: ignore[misc, assignment]
+ 
+ 
++# Allow toggling LayerName usage via environment variable.
++# Defaults to True on torch >= 2.11, False otherwise.
++# Set VLLM_USE_LAYERNAME=0 to disable even on torch >= 2.11.
++_USE_LAYERNAME = HAS_OPAQUE_TYPE and envs.VLLM_USE_LAYERNAME
++
++
+ class LayerName(OpaqueBase):  # type: ignore[misc]
+     """Wraps a module name string for use as a torch opaque type.
+ 
