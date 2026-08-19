@@ -159,14 +159,16 @@ RUN uv sync --frozen
 #
 # Filter list: AsyncTrajectoryCollector added (it was runtime-built on every
 # node before — ~9 GB copied into the tmpfs overlay per node with the old
-# default hardlink mode, see HANDOFF.md §8 / slurm-3071878); dtensor removed
-# (unused by our runs).  ReplayBuffer may report "uses system Python" in the
+# default hardlink mode, see HANDOFF.md §8 / slurm-3071878); dtensor RE-ADDED
+# 2026-08-19 for the Apertus dtensor/FSDP2 runs (DTensorPolicyWorkerV2 →
+# automodel venv; the automodel extra is cached by the syncs above anyway, so
+# this only adds a symlink farm).  ReplayBuffer may report "uses system Python" in the
 # build log — that is fine, such actors need no venv.
 #
 # Skip with: --build-arg SKIP_PREFETCH_VENVS=1
 ARG SKIP_PREFETCH_VENVS=
 RUN if [[ -z "${SKIP_PREFETCH_VENVS:-}" ]]; then \
-        uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer AsyncTrajectoryCollector vllm megatron ; \
+        uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer AsyncTrajectoryCollector vllm megatron dtensor ; \
     else \
         echo "Skipping venv prefetch (SKIP_PREFETCH_VENVS set)"; \
     fi
