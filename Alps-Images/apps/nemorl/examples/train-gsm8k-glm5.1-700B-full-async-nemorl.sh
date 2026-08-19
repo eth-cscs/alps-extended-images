@@ -58,7 +58,12 @@ export NEMORL_DIR="/workdir/nemo_rl"
 # Fork and branch carrying NeMo-RL patches for this run (see HANDOFF.md).
 # The shared driver checks out this branch inside the container before Ray starts.
 export NEMORL_FORK_URL="https://github.com/philip-paul-mueller/RL.git"
-export NEMORL_BRANCH="glm51-megatron-fsdp-wiring"
+# ⚠️ IMAGE AND BRANCH SHIP TOGETHER.  The driver git-fetches this branch at
+# job start INTO the image checkout: running the 3.13.14 image with the old
+# branch (or vice versa) recreates the mixed-version breakage of 3103672 at
+# the python level.  Old image (nemo_rl_2026_08_13_I) ↔ glm51-megatron-
+# fsdp-wiring; offline image ↔ glm51-megatron-fsdp-wiring_merged.
+export NEMORL_BRANCH="${NEMORL_BRANCH:-glm51-megatron-fsdp-wiring}"
 
 # Node split: 8 nodes for non-colocated vLLM generation (TP=32, one replica),
 # the rest for Megatron training with fixed TP=4, PP=3, EP=8, ETP=4.
