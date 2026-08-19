@@ -122,6 +122,10 @@ NCCL_NVLS_ENABLE = "0"
 NRL_REFIT_BUFFER_MEMORY_RATIO = "0.005"
 NRL_REFIT_NUM_BUFFERS = "1"
 UV_LINK_MODE = "symlink"
+# LEAK A/B (slurm-3125000 repro): flush torch's pinned-host cache after each
+# refit (fork commit 552d7d131).  "1" = flush on (expected: staircase gone).
+# Set NRL_EMPTY_HOST_CACHE_AFTER_REFIT=0 in the submit env for a control run.
+NRL_EMPTY_HOST_CACHE_AFTER_REFIT = "${NRL_EMPTY_HOST_CACHE_AFTER_REFIT:-1}"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
