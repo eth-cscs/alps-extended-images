@@ -33,7 +33,7 @@ include:
 
 # Registry-operation setup used by marker and publish jobs.
 .child-skopeo-template:
-  image: quay.io/skopeo/stable:latest
+  image: quay.io/skopeo/stable:v1.22.2
   before_script:
     - source ci-pipelines/helpers/skopeo.sh
     - skopeo_login
@@ -43,7 +43,7 @@ include:
 .child-noop-template:
   stage: build-base
   extends: [.container-runner-lightweight-gh200]
-  image: quay.io/skopeo/stable:latest
+  image: quay.io/skopeo/stable:v1.22.2
   script:
     - echo "No work required."
 
@@ -226,10 +226,10 @@ include:
         touch "$done_file"
       else
         echo "[image-vet] Waiting for setup on $(hostname)..."
-        timeout=60
-        while [ ! -f "$done_file" ] && [ $timeout -gt 0 ]; do
+        remaining=60
+        while [ ! -f "$done_file" ] && [ $remaining -gt 0 ]; do
             sleep 1
-            ((timeout--))
+            ((remaining--))
         done
       fi
     - echo "[image-vet] diagnose"
@@ -311,15 +311,9 @@ include:
 # stays safe even if registry state changed after generation.
 .child-publish-template:
   stage: publish
-  extends: [.container-builder-cscs-gh200]
-  variables:
-    KUBERNETES_MEMORY_REQUEST: 128Gi
-    KUBERNETES_MEMORY_LIMIT: 128Gi
+  extends: [.container-runner-lightweight-gh200, .child-skopeo-template]
   script:
     - |
-      source ci-pipelines/helpers/skopeo.sh
-      skopeo_login
-      skopeo_login_ghcr
       set -euo pipefail
 
       # Both $CANON_IMAGE_REF and $TESTED_IMAGE_REF must exist and point to the

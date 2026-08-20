@@ -14,7 +14,7 @@ _skopeo_login() {
   local user="${2:?username required}"
   local password="${3:?password required}"
 
-  echo "login to: ${reg} with user: ${user}"
+  echo "login to: ${reg}"
   skopeo login --username "${user}" --password "${password}" "${reg}" >/dev/null
 }
 
@@ -49,7 +49,10 @@ img_digest() {
     return 0
   fi
 
-  if [[ "$output" == *"manifest unknown"* || "$output" == *"name unknown"* || "$output" == *"not found"* ]]; then
+  # Skopeo returns status 1 for missing manifests. Only treat known missing-image
+  # messages with that status as cache misses; auth, network, and tool errors
+  # return non-zero so the generator stops instead of assuming an image is absent.
+  if [[ "$status" -eq 1 && ("$output" == *"manifest unknown"* || "$output" == *"name unknown"* || "$output" == *"not found"*) ]]; then
     return 0
   fi
 

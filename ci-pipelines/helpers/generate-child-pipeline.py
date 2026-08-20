@@ -32,6 +32,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = ROOT / "generated-child-pipeline.yaml"
 DIGEST_CACHE: dict[str, str] = {}
+SAFE_SHELL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def run_bash(script: str) -> str:
@@ -42,7 +43,7 @@ def run_bash(script: str) -> str:
     Python.
     """
     proc = subprocess.run(
-        ["bash", "-lc", script],
+        ["bash", "-c", script],
         cwd=ROOT,
         env=os.environ.copy(),
         text=True,
@@ -62,7 +63,10 @@ def shell_quote(value: str) -> str:
 
 def slug(value: str) -> str:
     """Convert a value to a GitLab-safe job-name fragment."""
-    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    result = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    if not result:
+        raise RuntimeError(f"slug produced empty string for {value!r}")
+    return result
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -85,6 +89,8 @@ def load_env_text(text: str) -> dict[str, str]:
 
 def source_profile_value(profile: Path, key: str) -> str:
     """Source a shell profile and print one variable value."""
+    if not SAFE_SHELL_NAME.fullmatch(key):
+        raise RuntimeError(f"unsafe shell variable name: {key!r}")
     return run_bash(f"source {shell_quote(str(profile))} && printf '%s\\n' \"${{{key}:-}}\"")
 
 
@@ -111,7 +117,9 @@ def publish_needed(image: dict[str, str]) -> bool:
     canon_digest = img_digest(image["CANON_IMAGE_REF"])
     if not canon_digest:
         return False
-    return img_digest(image["STABLE_IMAGE_REF"]) != canon_digest or img_digest(image["GHCR_STABLE_IMAGE_REF"]) != canon_digest
+    stable_digest = img_digest(image["STABLE_IMAGE_REF"])
+    ghcr_digest = img_digest(image["GHCR_STABLE_IMAGE_REF"])
+    return stable_digest != canon_digest or ghcr_digest != canon_digest
 
 
 def helper_env(function: str, *args: str) -> dict[str, str]:
@@ -133,6 +141,8 @@ def base_env(family: str, name: str, variant: str) -> dict[str, str]:
 def app_env(app: str, variant: str) -> dict[str, str]:
     """Return generated-job variables for one app variant."""
     data = helper_env("write_app_build_env", app, variant)
+    # App variants are accelerator-family names today; validate_app_variant_name
+    # in meta.sh keeps them safe as generated-job metadata keys.
     data.update({"FAMILY": variant, "NAME": app, "VARIANT": variant})
     return data
 
@@ -275,8 +285,10 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
 def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
     """Load base variants/tests from family-local ci.yaml files."""
     result = []
-    for path in [ROOT / "Alps-Images" / "NGC" / "ci.yaml", ROOT / "Alps-Images" / "ROCm" / "ci.yaml"]:
+    for path in sorted((ROOT / "Alps-Images").glob("*/ci.yaml")):
         cfg = load_yaml(path)
+        if "family" not in cfg:
+            continue
         validate_base_ci(path, cfg)
         family = str(cfg["family"])
         tests = cfg.get("tests") or []

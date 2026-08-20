@@ -326,7 +326,8 @@ rocm_base_refs() {
   local hash_paths="$dockerfile $rocm_installer $rocm_components $rocm_runtime_env $common_dir $patches_dir $image_dir"
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL")"
+  local h
+  h="$(content_hash "$hash_paths" "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
@@ -383,7 +384,8 @@ ngc_base_refs() {
   local hash_paths="$dockerfile $ngc_installer $ngc_components $ngc_runtime_env $common_dir $patches_dir $image_dir"
   local name="${ngc_name}-cuda"
   local tag="${ngc_tag}-${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag CSCS_CI_ORIG_CLONE_URL")"
+  local h
+  h="$(content_hash "$hash_paths" "name tag CSCS_CI_ORIG_CLONE_URL")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
@@ -457,6 +459,7 @@ write_base_build_env() {
       "BASE_IMAGE=$base_image_ref" \
       "$family_variant_dir"
     printf '%s\n' "$family_dotenv"
+    # shellcheck source=Alps-Images/common/alps-stack-versions.env
     source Alps-Images/common/alps-stack-versions.env
     vars_blob "BOOST_VER BOOST_BUILD_JOBS ALPS_BUILD_JOBS ALPS_CMAKE_BUILD_JOBS XPMEM_REF CASSINI_HEADERS_VERSION CXI_DRIVER_VERSION LIBCXI_VERSION LIBFABRIC_COMMIT LIBFABRIC_PATCH UCX_VERSION UCC_VERSION OMPI_VER AWS_OFI_NCCL_REPO AWS_OFI_NCCL_COMMIT AWS_OFI_NCCL_PATCH OSU_VERSION"
     printf '%s\n' \
@@ -465,7 +468,7 @@ write_base_build_env() {
       "OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
       "OCI_DESCRIPTION=$image_description" \
       "CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}" \
-      "GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#$IMAGE_PREFIX}"
+      "GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}"
   } | sed '/^$/d' > "$output_file"
 }
 
@@ -497,7 +500,7 @@ OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
 OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 OCI_DESCRIPTION=$image_description
 CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
-GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#$IMAGE_PREFIX}
+GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}
 EOF
 }
 
@@ -578,6 +581,9 @@ app_refs() {
   # Compute canonical ref of base
   local base_family base_name base_variant
   read -r base_family base_name base_variant < <(parse_base_image "$base_image")
+  # load_base_ref_vars fills the shared base-ref variables, but app hashing only
+  # needs CANON_IMAGE_REF from that record.
+  # shellcheck disable=SC2034
   local BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF
   load_base_ref_vars "$base_family" "$base_name" "$base_variant"
   local base_canon_ref="$CANON_IMAGE_REF"
@@ -593,7 +599,8 @@ app_refs() {
   fi
   local image_name="${app_name}-${app_variant}"
   local tag="${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "app_name app_variant image_name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
+  local h
+  h="$(content_hash "$hash_paths" "app_name app_variant image_name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$image_name" "$tag" "$h")
 

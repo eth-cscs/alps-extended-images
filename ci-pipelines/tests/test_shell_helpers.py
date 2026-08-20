@@ -13,7 +13,7 @@ def run_bash(script, *, env=None, check=True):
     if env:
         merged_env.update(env)
     result = subprocess.run(
-        ["bash", "-lc", script],
+        ["bash", "-c", script],
         cwd=ROOT,
         env=merged_env,
         text=True,
@@ -134,6 +134,16 @@ def test_skopeo_mark_tested_creates_missing_marker(tmp_path):
     assert copy_log.read_text().strip() == "docker://registry/image:canon docker://registry/image:canon-tested-hash"
 
 
+def test_skopeo_ref_url_preserves_existing_prefix():
+    result = run_bash(source_skopeo("_ref_url docker://registry/image:tag"))
+    assert result.stdout.strip() == "docker://registry/image:tag"
+
+
+def test_skopeo_ref_url_adds_docker_prefix():
+    result = run_bash(source_skopeo("_ref_url registry/image:tag"))
+    assert result.stdout.strip() == "docker://registry/image:tag"
+
+
 def test_skopeo_mark_tested_noops_matching_marker(tmp_path):
     env, copy_log = fake_skopeo_env(tmp_path, {"registry/image:canon": "sha256:123", "registry/image:canon-tested-hash": "sha256:123"})
     result = run_bash(source_skopeo("mark_tested registry/image:canon registry/image:canon-tested-hash"), env=env)
@@ -168,8 +178,8 @@ def test_skopeo_promote_strict_rejects_different_stable(tmp_path):
     assert "refusing to overwrite" in result.stderr
 
 
-def run_meta(command, **extra_env):
-    return run_bash(f"source ci-pipelines/helpers/skopeo.sh; source ci-pipelines/helpers/meta.sh; {command}", env=meta_env(**extra_env))
+def run_meta(command, *, check=True, **extra_env):
+    return run_bash(f"source ci-pipelines/helpers/skopeo.sh; source ci-pipelines/helpers/meta.sh; {command}", env=meta_env(**extra_env), check=check)
 
 
 def test_meta_base_refs_return_expected_fields():
@@ -183,6 +193,31 @@ def test_meta_app_refs_use_canonical_base_ref():
     fields = run_meta("app_refs vllm cuda").stdout.split()
     assert len(fields) == 4
     assert re.match(r"localhost/alps-images/pytorch-cuda:26\.02-py3-alps7-dev-[0-9a-f]{16}$", fields[0])
+
+
+def test_meta_parse_base_image_rejects_unsupported_format():
+    result = run_meta("parse_base_image pytorch:plain", check=False)
+    assert result.returncode != 0
+    assert "expected BASE_IMAGE" in result.stderr
+
+
+def test_meta_validate_rocm_profile_rejects_invalid_rebuild_flag(tmp_path):
+    profile = tmp_path / "profile.env"
+    profile.write_text(
+        "\n".join(
+            [
+                'ROCM_PYPI_INDEX_URL="https://example.invalid"',
+                'ROCM_REBUILD_RCCL="maybe"',
+                'ROCM_SYSTEMS_REPO="https://example.invalid/repo.git"',
+                'ROCM_SYSTEMS_COMMIT="abc123"',
+                'RCCL_GPU_TARGETS="gfx942"',
+                'RCCL_TESTS_GPU_TARGETS="gfx942"',
+            ]
+        )
+    )
+    result = run_meta(f"load_rocm_profile {profile}", check=False)
+    assert result.returncode != 0
+    assert "ROCM_REBUILD_RCCL must be 0 or 1" in result.stderr
 
 
 def test_meta_refs_are_deterministic():
