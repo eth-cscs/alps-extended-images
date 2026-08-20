@@ -122,27 +122,27 @@ WORKDIR "${NEMORL_DIR}"
 # pinned versions.
 RUN uv venv --seed "${UV_PROJECT_ENVIRONMENT}"
 
-# RELOCK escape hatch (used by branches whose pyproject changed but whose
-# committed uv.lock is stale, e.g. apertus-stack swapping in the swiss-ai
-# forks — see NeMoRL/APERTUS_STACK.md).  Build once with
-#   --build-arg RELOCK=1
-# then EXTRACT the fresh lock from the image and commit it to the branch:
-#   podman create --name relock <image>
-#   podman cp relock:/workdir/nemo_rl/uv.lock uv.lock && podman rm relock
-# This is MANDATORY, not cosmetic: at runtime the driver checks the branch
-# out inside the container, and if the committed lock differs from the one
-# the venvs here were built from, uv re-resolves into the enroot overlay
-# (or fails offline).  Subsequent builds run WITHOUT the arg as pure
-# consumers of the committed lock.  Every `uv sync --frozen` below uses
-# uv.lock verbatim, so with RELOCK the whole image is built from the
-# fresh resolution.  ⚠️ Layer-cache trap: the clone step above caches by
-# command text — when rebuilding a branch whose HEAD moved, bust the cache
+# Lock generation for LOCKLESS branches (currently apertus-stack — see
+# NeMoRL/APERTUS_STACK.md): such branches delete + .gitignore uv.lock by
+# design (pyproject is authoritative; the lock is a build artifact,
+# because only this build container has the uv version + aarch64/CUDA
+# torch that the vllm fork's dynamic metadata needs).  If the checkout
+# ships no uv.lock, generate it here so every `uv sync --frozen` below
+# consumes the fresh resolution; branches that DO commit a lock are
+# consumed verbatim as before.  RELOCK=1 forces regeneration either way.
+# The sha256 is printed so a running image can be matched to its build
+# log (the generated lock itself lives at ${NEMORL_DIR}/uv.lock in the
+# image).  ⚠️ Layer-cache trap: the clone step above caches by command
+# text — when rebuilding a branch whose HEAD moved, bust the cache
 # (e.g. `--no-cache`), or `git switch` silently gives you the OLD commit.
 ARG RELOCK=
-RUN if [[ -n "${RELOCK:-}" ]]; then \
-        UV_OFFLINE= uv lock ; \
+RUN if [[ ! -f uv.lock || -n "${RELOCK:-}" ]]; then \
+        echo "Generating uv.lock (lockless branch or RELOCK=1)" && \
+        UV_OFFLINE= uv lock && \
+        sha256sum uv.lock ; \
     else \
-        echo "Skipping relock (RELOCK not set): uv.lock consumed as committed" ; \
+        echo "Committed uv.lock found: consumed verbatim" && \
+        sha256sum uv.lock ; \
     fi
 
 # `--no-install-project` installs only the dependencies listed in
