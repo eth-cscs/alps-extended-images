@@ -138,7 +138,7 @@ RUN uv venv --seed "${UV_PROJECT_ENVIRONMENT}"
 ARG RELOCK=
 RUN if [[ ! -f uv.lock || -n "${RELOCK:-}" ]]; then \
         echo "Generating uv.lock (lockless branch or RELOCK=1)" && \
-        UV_OFFLINE= uv lock && \
+        UV_OFFLINE=0 uv lock && \
         sha256sum uv.lock ; \
     else \
         echo "Committed uv.lock found: consumed verbatim" && \
