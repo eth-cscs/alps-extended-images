@@ -94,6 +94,11 @@ PY
 
     register_rocm_sdk_ldconfig
     install_amdsmi_python
+    register_amdsmi_ldconfig
+    "${ROCM_PYTHON}" - <<'PY'
+import amdsmi
+print("amdsmi import ok")
+PY
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
 }
@@ -112,10 +117,57 @@ install_amdsmi_python() {
 
     [[ -n "${amdsmi_src}" ]] || die "Could not find AMD SMI Python sources in ROCm Core SDK"
     "${ROCM_PYTHON}" -m pip install --no-cache-dir --index-url "${ROCM_PYPI_INDEX_URL}" --no-deps "${amdsmi_src}"
-    "${ROCM_PYTHON}" - <<'PY'
-import amdsmi
-print("amdsmi import ok")
-PY
+}
+
+register_amdsmi_ldconfig() {
+    local conf="/etc/ld.so.conf.d/99-alps-rocm-amdsmi.conf"
+    local amdsmi_lib=""
+    local candidate libdir
+
+    for candidate in \
+        "${ROCM_BUILD_PREFIX:-}" \
+        "${ROCM_DEVEL_PREFIX:-}" \
+        "${ROCM_CORE_PREFIX:-}" \
+        "${ROCM_LIBRARIES_PREFIX:-}" \
+        "${ROCM_SDK_ROOT:-}" \
+        "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
+        "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
+        "${ROCM_LIBRARIES_DIR:-}/_rocm_sdk_libraries"; do
+        [[ -n "${candidate}" ]] || continue
+        for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
+            [[ -d "${libdir}" ]] || continue
+            if [[ -e "${libdir}/libamd_smi.so" ]]; then
+                amdsmi_lib="${libdir}"
+                break 2
+            fi
+        done
+    done
+
+    # Fallback: search the Python environment for the library
+    if [[ -z "${amdsmi_lib}" ]]; then
+        local site_pkgs
+        site_pkgs="$("${ROCM_PYTHON}" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
+        if [[ -n "${site_pkgs}" && -d "${site_pkgs}" ]]; then
+            amdsmi_lib="$(find "${site_pkgs}" -maxdepth 3 -type f -name 'libamd_smi.so*' -printf '%h\n' 2>/dev/null | head -n1 || true)"
+        fi
+    fi
+
+    [[ -n "${amdsmi_lib}" ]] || die "libamd_smi.so not found after installing amdsmi"
+
+    local existing_dirs=""
+    if [[ -f "${conf}" ]]; then
+        existing_dirs="$(cat "${conf}")"
+    fi
+
+    case " ${existing_dirs} " in
+        *" ${amdsmi_lib} "*) ;;
+        *)
+            printf '%s\n' "${amdsmi_lib}" >> "${conf}"
+            ;;
+    esac
+
+    ldconfig
+    echo "Registered amdsmi library directory: ${amdsmi_lib}"
 }
 
 persist_rocm_sdk_env() {
