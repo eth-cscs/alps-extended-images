@@ -43,10 +43,6 @@
 # is the first thing to look at if init OOMs.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Resolve the directory containing this script so patches/ is reachable inside
-# the container via the /users mount (e.g. /users/${USER}/.../example/patches/).
-export SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-0f334b540ccc7034" #alps7-dev-0f334b540ccc7034 image with megatron
 
 export MODEL_NAME="GLM-5.1"
@@ -343,6 +339,129 @@ EOF
 sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
 
+# Content of example/patches/sitecustomize-verl-v0.9.0.py (see Known hazards in
+# CLAUDE.md), embedded here rather than read via a script-relative path: under
+# sbatch, BASH_SOURCE[0] resolves to the spool-staged copy of this script
+# (/var/spool/slurmd/job<ID>/...) on every node, not its checkout location, so a
+# `cp "$SCRIPT_DIR"/patches/...` silently failed on all 80 nodes in run 3129805 —
+# the hybrid-rollout OOM fallback patch was never applied and the run OOMed exactly
+# like runs 3121001/3125195. Generating it as a heredoc, like gsm8k_reward.py above,
+# and sbcast-ing it removes the dependency on the script's own filesystem location.
+cat > "${TRAINING_CONFIG}/sitecustomize-verl-v0.9.0.py" <<- 'EOF'
+"""
+Hybrid-rollout OOM fallback for verl v0.9.0, V1 separate-async trainer.
+
+Injected at Python startup via PYTHONPATH — does not modify verl source files.
+Distinct from sitecustomize.py (written against v0.8.0; class/module paths there
+are not verified against v0.9.0) so that file is left alone. This file must be
+staged as the process's actual "sitecustomize.py" on sys.path to be auto-loaded —
+see the training script for how it's copied into place per node.
+
+Why: PPOTrainer._setup() (verl/trainer/ppo/v1/trainer_base.py, v0.9.0) always
+builds hybrid rollout replicas on top of the training worker group
+(trainer_world_size / rollout_world_size replicas, e.g. 288/32 = 9 here) *in
+addition to* the standalone rollout — actor_rollout_ref.hybrid_engine is not
+consulted anywhere in the V1 path, so this cannot be disabled from config. Those
+replicas are instantiated at gpu_memory_utilization=0.75 on the training GPUs
+during trainer.init(), before the first on_sample_end() ever runs, and
+free_cache_engine=false (required for TP=32 SGLang stability) makes their
+sleep() a no-op — so they hold ~71 GiB per training GPU for the life of the run.
+trainer.init() then needs ~15 GiB back on those same GPUs to stage Megatron
+params for the NCCL export to the standalone rollout, and OOMs (run 3121001,
+repeated unpatched in run 3125195).
+
+separate-async never actually needs the hybrid engine: get_llm_client() is
+overridden in PPOTrainerSeparateAsync to always route through the standalone
+rollout, so the hybrid replicas exist only to be immediately put to sleep.
+
+Patches applied:
+  - LLMServerManager._initialize_llm_servers (verl.workers.rollout.llm_server):
+    no-ops when called in hybrid mode (worker_group is not None) instead of
+    launching replicas via init_hybrid(). Standalone-mode calls (worker_group
+    is None) are unaffected.
+  - PPOTrainerSeparateAsync.on_init_end (verl.trainer.ppo.v1.trainer_separate_async):
+    drops the self.checkpoint_manager.update_weights(...) call. That manager's
+    backend is forced to "naive" (trainer_base.py), which pushes weights into
+    each worker's colocated hybrid engine directly rather than going through
+    the (now empty) replica list — with hybrid replicas disabled above, that
+    colocated engine is never created, so the call would push into nothing.
+    self.standalone_checkpoint_manager.update_weights(...), the actual sync to
+    the standalone rollout, is left untouched.
+"""
+import sys
+
+_PATCHED: set = set()
+
+
+class _HybridRolloutOomPatcher:
+    """sys.meta_path hook: patches specific verl modules immediately after they load."""
+
+    _TARGETS = frozenset({
+        "verl.workers.rollout.llm_server",
+        "verl.trainer.ppo.v1.trainer_separate_async",
+    })
+
+    def find_module(self, fullname, path=None):
+        if fullname in self._TARGETS and fullname not in _PATCHED:
+            return self
+        return None
+
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            return sys.modules[fullname]
+        # Remove self temporarily to avoid recursion during the real import.
+        sys.meta_path[:] = [m for m in sys.meta_path if m is not self]
+        try:
+            import importlib
+            mod = importlib.import_module(fullname)
+        finally:
+            sys.meta_path.append(self)
+        _PATCHED.add(fullname)
+        _apply_patches(fullname, mod)
+        return mod
+
+
+def _apply_patches(name: str, mod) -> None:
+    # ── LLMServerManager: skip hybrid replica launch ────────────────────────────
+    if name == "verl.workers.rollout.llm_server":
+        cls = mod.LLMServerManager
+        _orig_init_servers = cls._initialize_llm_servers
+
+        async def _initialize_llm_servers(self, start_rank: int = None):
+            if self.worker_group is not None:
+                self.rollout_replicas = []
+                self.server_handles = []
+                self.server_addresses = []
+                print(
+                    "[sitecustomize-verl-v0.9.0] LLMServerManager: hybrid replicas "
+                    "disabled (worker_group is set) — skipping init_hybrid()",
+                    flush=True,
+                )
+                return
+            await _orig_init_servers(self, start_rank=start_rank)
+
+        cls._initialize_llm_servers = _initialize_llm_servers
+
+    # ── PPOTrainerSeparateAsync: drop the hybrid-engine weight push at init ─────
+    elif name == "verl.trainer.ppo.v1.trainer_separate_async":
+        cls = mod.PPOTrainerSeparateAsync
+
+        def _on_init_end(self):
+            self.standalone_checkpoint_manager.update_weights(self.global_steps)
+            print(
+                "[sitecustomize-verl-v0.9.0] on_init_end: skipped "
+                "self.checkpoint_manager.update_weights (naive backend, no hybrid "
+                "replicas to push into)",
+                flush=True,
+            )
+
+        cls.on_init_end = _on_init_end
+
+
+sys.meta_path.append(_HybridRolloutOomPatcher())
+EOF
+sbcast -f ${TRAINING_CONFIG}/sitecustomize-verl-v0.9.0.py ${TRAINING_CONFIG}/sitecustomize-verl-v0.9.0.py
+
 # Fetch the upstream PR patches once here and sbcast them to every node, instead of
 # curl-ing them from inside the srun. In run 3124273 each of the 80 nodes downloaded
 # them independently and only ~45/80 succeeded, so the cluster ran mixed verl code:
@@ -536,12 +655,28 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
-# Inject debug instrumentation patches via sitecustomize.py.
-# patches/ lives next to this script on /users (mounted in the container).
-# sitecustomize.py is executed at Python startup for every process including
-# Ray workers, so the patches apply cluster-wide without modifying verl source.
-# Remove this line to disable all instrumentation.
-export PYTHONPATH="${SCRIPT_DIR}/patches:${PYTHONPATH:-}"
+# Inject the v0.9.0 hybrid-rollout-OOM fallback patch (see Known hazards in
+# CLAUDE.md — runs 3121001 and 3125195) via sitecustomize.py, executed at Python
+# startup for every process including Ray workers, so it applies cluster-wide
+# without modifying verl source.
+#
+# Python only auto-imports a module literally named "sitecustomize" found on
+# sys.path — patches/sitecustomize.py (written against v0.8.0, not verified
+# against v0.9.0) keeps that name and is left untouched. The v0.9.0-specific
+# patch was sbcast to ${TRAINING_CONFIG} above (as sitecustomize-verl-v0.9.0.py)
+# and has to be staged under the "sitecustomize.py" name here to be picked up,
+# so copy it into a local tmpfs dir instead of pointing PYTHONPATH at
+# ${TRAINING_CONFIG} directly. Local rank 0 does the copy; other local ranks
+# wait — same pattern as the model-config mirror above.
+# Remove this block (and its PYTHONPATH export) to disable the patch.
+export SITECUSTOMIZE_LOCAL=/tmp/verl_patches_${SLURM_JOB_ID}
+if [ $SLURM_LOCALID -eq 0 ]; then
+    mkdir -p $SITECUSTOMIZE_LOCAL
+    cp "${TRAINING_CONFIG}/sitecustomize-verl-v0.9.0.py" "$SITECUSTOMIZE_LOCAL/sitecustomize.py"
+    touch $SITECUSTOMIZE_LOCAL/.ready
+fi
+until [ -f $SITECUSTOMIZE_LOCAL/.ready ]; do sleep 1; done
+export PYTHONPATH="${SITECUSTOMIZE_LOCAL}:${PYTHONPATH:-}"
 
 # Required for Megatron communication/computation overlapping
 export CUDA_DEVICE_MAX_CONNECTIONS=1
