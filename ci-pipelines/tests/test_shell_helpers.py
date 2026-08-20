@@ -49,6 +49,9 @@ if args[0] == 'inspect':
     if digest == '__ERROR__':
         print('unauthorized: authentication required', file=sys.stderr)
         raise SystemExit(7)
+    if digest == '__MISSING_FATAL__':
+        print('time="2026-08-20T08:09:50Z" level=fatal msg="Error parsing image name \\\"docker://' + ref + '\\\": reading manifest tag in repo: manifest unknown: The named manifest is not known to the registry."', file=sys.stderr)
+        raise SystemExit(2)
     if digest:
         print(digest)
         raise SystemExit(0)
@@ -95,6 +98,12 @@ def test_skopeo_img_digest_returns_digest_for_existing_ref(tmp_path):
 
 def test_skopeo_img_digest_returns_empty_for_missing_ref(tmp_path):
     env, _ = fake_skopeo_env(tmp_path, {})
+    result = run_bash(source_skopeo("img_digest registry/missing:tag"), env=env)
+    assert result.stdout == ""
+
+
+def test_skopeo_img_digest_returns_empty_for_jfrog_missing_manifest(tmp_path):
+    env, _ = fake_skopeo_env(tmp_path, {"registry/missing:tag": "__MISSING_FATAL__"})
     result = run_bash(source_skopeo("img_digest registry/missing:tag"), env=env)
     assert result.stdout == ""
 
