@@ -465,7 +465,6 @@ write_base_build_env() {
     printf '%s\n' \
       "OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}" \
       "OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \
-      "OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
       "OCI_DESCRIPTION=$image_description" \
       "CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}" \
       "GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}"
@@ -497,7 +496,6 @@ VALIDATION_HASH=$validation_hash_value
 BASE_IMAGE=$base_image_ref
 OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
 OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
-OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 OCI_DESCRIPTION=$image_description
 CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
 GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}

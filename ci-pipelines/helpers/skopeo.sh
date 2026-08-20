@@ -14,7 +14,6 @@ _skopeo_login() {
   local user="${2:?username required}"
   local password="${3:?password required}"
 
-  echo "login to: ${reg}"
   skopeo login --username "${user}" --password "${password}" "${reg}" >/dev/null
 }
 

@@ -249,8 +249,10 @@ def test_meta_write_build_env_includes_validation_marker_refs(tmp_path):
     app_env = output.read_text()
     assert "VALIDATION_HASH=" in base_env
     assert "TESTED_IMAGE_REF=" in base_env
+    assert "OCI_CREATED=" not in base_env
     assert "VALIDATION_HASH=" in app_env
     assert "TESTED_IMAGE_REF=" in app_env
+    assert "OCI_CREATED=" not in app_env
 
 
 def generate_manual(*args, output):

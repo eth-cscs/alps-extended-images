@@ -42,6 +42,8 @@ default_remote_url() {
   printf '%s\n' "$root"
 }
 
+# Parse ALPS_REV from the simple top-level `variables:` mapping used by this
+# repo's GitLab CI YAML. This intentionally supports only scalar one-line values.
 default_alps_rev() {
   local root="${1:?root required}"
   local ci_yaml="${root}/ci-pipelines/build-alps-extended-images.yaml"
@@ -141,7 +143,7 @@ podman build --format docker \\
   --build-arg BASE_IMAGE="$BASE_IMAGE_REF" \\
 ${family_build_args}  --build-arg OCI_SOURCE="$CSCS_CI_ORIG_CLONE_URL" \\
   --build-arg OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \\
-  --build-arg OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
+  --build-arg OCI_CREATED="\$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
   --build-arg OCI_DESCRIPTION="$image_description" \\
   --build-arg CSCS_ALPS_GIT_COMMIT_SHORT="$CI_COMMIT_SHORT_SHA" \\
   .
@@ -175,7 +177,7 @@ podman build --format docker \\
   --build-arg BASE_IMAGE="$BASE_IMAGE_REF" \\
   --build-arg OCI_SOURCE="$CSCS_CI_ORIG_CLONE_URL" \\
   --build-arg OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \\
-  --build-arg OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
+  --build-arg OCI_CREATED="\$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
   --build-arg OCI_DESCRIPTION="$image_description" \\
   --build-arg CSCS_ALPS_GIT_COMMIT_SHORT="$CI_COMMIT_SHORT_SHA" \\
   .

@@ -70,6 +70,7 @@ include:
   before_script:
     - |
       set -euo pipefail
+      export OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
       export PERSIST_IMAGE_NAME="$CANON_IMAGE_REF"
       echo "Building: $PERSIST_IMAGE_NAME"
   timeout: 6h
