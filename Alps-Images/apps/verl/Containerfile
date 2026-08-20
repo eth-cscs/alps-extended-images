@@ -46,6 +46,9 @@ RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python flash-attn --no-build-isolation
 
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python flash-attn --no-build-isolation
 
 # Install dependencies for VeRL from source, including flashinfer, flash-attention, torch_memory_saver, XIELU
 
