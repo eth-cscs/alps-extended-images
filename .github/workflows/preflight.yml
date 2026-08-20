@@ -47,14 +47,17 @@ jobs:
 
       - name: Python and pytest
         run: |
-          # Generator/schema tests use fake registry state; shell-helper tests use
-          # a fake skopeo executable, so no credentials or CSCS runners are needed.
+          # Generator/schema tests use mocked digest lookups; shell-helper tests
+          # use a fake skopeo executable, so no credentials or CSCS runners are needed.
           python -m py_compile ci-pipelines/helpers/generate-child-pipeline.py
           uvx --with pyyaml pytest ci-pipelines/tests
 
       - name: Shell syntax
         # Catch syntax errors in tracked shell scripts, including sourced helpers.
         run: git ls-files '*.sh' | xargs -r -n1 bash -n
+
+      - name: ShellCheck
+        run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh
 
       - name: CI YAML and embedded shell syntax
         run: |

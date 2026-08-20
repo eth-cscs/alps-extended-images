@@ -82,6 +82,10 @@ validation_hash() {
 # declarations and the templates/helpers that implement testing. This lets CI
 # re-test an unchanged canonical image when validation logic changes, without
 # forcing a rebuild of the image itself.
+validation_helper_paths() {
+  printf '%s\n' "ci-pipelines/child-templates.yaml ci-pipelines/helpers/generate-child-pipeline.py ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh ci-pipelines/helpers/vetnode-config.yaml"
+}
+
 base_validation_hash() {
   local family="${1:?family required}"
   local name="${2:?name required}"
@@ -94,7 +98,7 @@ base_validation_hash() {
     *) echo "ERROR: unsupported base family for validation hash: $family" >&2; return 1 ;;
   esac
 
-  validation_hash "$ci_file ci-pipelines/child-templates.yaml ci-pipelines/helpers/generate-child-pipeline.py ci-pipelines/helpers/vetnode-config.yaml" "family name variant"
+  validation_hash "$ci_file $(validation_helper_paths)" "family name variant"
 }
 
 app_validation_hash() {
@@ -103,7 +107,8 @@ app_validation_hash() {
   local app_dir="Alps-Images/apps/${app_name}"
   local ci_file="${app_dir}/ci.yaml"
   local profile_file="${app_dir}/profile.env"
-  local paths="$ci_file ci-pipelines/child-templates.yaml ci-pipelines/helpers/generate-child-pipeline.py ci-pipelines/helpers/vetnode-config.yaml"
+  local paths
+  paths="$ci_file $(validation_helper_paths)"
 
   [[ -f "$ci_file" ]] || { echo "ERROR: missing $ci_file" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }

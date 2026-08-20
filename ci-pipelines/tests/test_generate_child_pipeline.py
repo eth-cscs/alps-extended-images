@@ -338,6 +338,23 @@ def test_schema_app_rejects_unknown_runner(gen):
         )
 
 
+def test_schema_app_rejects_extra_cuda_vetnode_fields(gen):
+    with pytest.raises(RuntimeError, match="cuda-vetnode app tests do not support: script, timeout"):
+        gen.validate_app_ci(
+            Path("app.yaml"),
+            ["cuda"],
+            {"tests": {"cuda": [{"name": "vetnode", "kind": "cuda-vetnode", "timeout": "1h", "script": ["true"]}]}},
+        )
+
+
+def test_schema_app_accepts_explicit_custom_kind(gen):
+    gen.validate_app_ci(
+        Path("app.yaml"),
+        ["cuda"],
+        {"tests": {"cuda": [{"name": "smoke", "kind": "custom", "runner": "cuda", "script": ["true"]}]}},
+    )
+
+
 def test_schema_current_repo_metadata_is_valid(gen):
     for path in [ROOT / "Alps-Images" / "NGC" / "ci.yaml", ROOT / "Alps-Images" / "ROCm" / "ci.yaml"]:
         gen.validate_base_ci(path, gen.load_yaml(path))

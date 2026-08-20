@@ -217,13 +217,16 @@ BASE_TEST_TEMPLATES = {
         "collectives": ".child-rocm-base-collectives-test-template",
     },
 }
+# Adding a new accelerator family requires registering its base test templates
+# here and its ref/hash plumbing in meta.sh.
 BASE_TEST_KINDS_BY_FAMILY = {
     family: set(templates)
     for family, templates in BASE_TEST_TEMPLATES.items()
 }
 
-APP_TEST_KINDS = {"", "cuda-vetnode"}
+APP_TEST_KINDS = {"custom", "cuda-vetnode"}
 APP_TEST_RUNNERS = {"cuda", "rocm"}
+APP_CUDA_VETNODE_KEYS = {"name", "kind"}
 
 
 def require_mapping(value: Any, context: str) -> dict[str, Any]:
@@ -273,12 +276,16 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
             item = require_mapping(test, f"{path}: tests.{variant}[{idx}]")
             if not item.get("name"):
                 raise RuntimeError(f"{path}: tests.{variant}[{idx}] must define name")
-            kind = str(item.get("kind", ""))
+            kind = str(item.get("kind", "custom"))
             if kind not in APP_TEST_KINDS:
                 raise RuntimeError(f"{path}: unsupported app test kind: {kind}")
             if kind == "cuda-vetnode":
                 if variant != "cuda":
                     raise RuntimeError(f"{path}: cuda-vetnode is only supported for cuda app tests")
+                extra_keys = set(item) - APP_CUDA_VETNODE_KEYS
+                if extra_keys:
+                    extras = ", ".join(sorted(extra_keys))
+                    raise RuntimeError(f"{path}: cuda-vetnode app tests do not support: {extras}")
                 continue
             runner = str(item.get("runner", variant))
             if runner not in APP_TEST_RUNNERS:
@@ -376,7 +383,7 @@ def add_app_test(child: Child, app: dict[str, str], test: dict[str, Any], needs:
     """Emit one generated app test job and return its name."""
     prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
     name = f"test-{prefix}-{slug(str(test['name']))}"
-    kind = str(test.get("kind", ""))
+    kind = str(test.get("kind", "custom"))
     runner = str(test.get("runner", app["FAMILY"]))
     if kind == "cuda-vetnode":
         child.add_job(name, ".child-cuda-app-vetnode-test-template", image=app["CANON_IMAGE_REF"], needs=needs)

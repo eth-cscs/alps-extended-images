@@ -64,10 +64,12 @@ img_digest() {
 tested_ref_for() {
   local canon="${1:?canonical image ref required}"
   local validation_hash="${2:-}"
-  local repo="${canon%:*}"
-  local tag="${canon##*:}"
+  local last_path_component="${canon##*/}"
+  local repo tag
 
-  [[ "$repo" != "$canon" ]] || { echo "ERROR: image ref must include a tag: $canon" >&2; return 1; }
+  [[ "$last_path_component" == *:* ]] || { echo "ERROR: image ref must include a tag: $canon" >&2; return 1; }
+  repo="${canon%:*}"
+  tag="${canon##*:}"
   if [[ -n "$validation_hash" ]]; then
     printf '%s:%s-tested-%s\n' "$repo" "$tag" "$validation_hash"
   else
