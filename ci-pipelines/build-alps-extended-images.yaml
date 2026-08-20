@@ -70,6 +70,10 @@ variables:
   IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps7-dev
+  # Bootstrap generator runtime built by ci-pipelines/build-ci-generator-image.yaml.
+  # Keep this as an explicit versioned tag in source; switching to a digest pin
+  # requires first publishing the image and then updating this ref with the
+  # registry digest that only exists after that manual bootstrap build.
   CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.22.2-python3-arm64-v1
 
 .generator-template:

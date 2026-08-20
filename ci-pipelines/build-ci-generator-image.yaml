@@ -4,6 +4,9 @@ include:
 stages: [build]
 
 variables:
+  # Output ref for the manual bootstrap image build. This is intentionally a tag:
+  # the digest is only known after this pipeline publishes the image. Consumers
+  # that want a digest pin must update their image ref after the manual build.
   CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.22.2-python3-arm64-v1
   CI_GENERATOR_DOCKERFILE: ci-pipelines/generator-image/Containerfile
   CI_GENERATOR_BASE_IMAGE: quay.io/skopeo/stable:v1.22.2

@@ -22,4 +22,4 @@ RUN set -eux; \
       echo "ERROR: unsupported package manager in base image" >&2; \
       exit 1; \
     fi; \
-    python3 -c 'import yaml; print(yaml.__version__)'
+    python3 -c 'import yaml' >/dev/null

@@ -153,6 +153,17 @@ def test_skopeo_ref_url_adds_docker_prefix():
     assert result.stdout.strip() == "docker://registry/image:tag"
 
 
+def test_skopeo_tested_ref_for_accepts_registry_port():
+    result = run_bash(source_skopeo("tested_ref_for registry:5000/ns/image:tag hash"))
+    assert result.stdout.strip() == "registry:5000/ns/image:tag-tested-hash"
+
+
+def test_skopeo_tested_ref_for_rejects_untagged_registry_port():
+    result = run_bash(source_skopeo("tested_ref_for registry:5000/ns/image hash"), check=False)
+    assert result.returncode != 0
+    assert "must include a tag" in result.stderr
+
+
 def test_skopeo_mark_tested_noops_matching_marker(tmp_path):
     env, copy_log = fake_skopeo_env(tmp_path, {"registry/image:canon": "sha256:123", "registry/image:canon-tested-hash": "sha256:123"})
     result = run_bash(source_skopeo("mark_tested registry/image:canon registry/image:canon-tested-hash"), env=env)
@@ -249,8 +260,17 @@ def test_meta_write_build_env_includes_validation_marker_refs(tmp_path):
     app_env = output.read_text()
     assert "VALIDATION_HASH=" in base_env
     assert "TESTED_IMAGE_REF=" in base_env
+    assert "OCI_CREATED=" not in base_env
     assert "VALIDATION_HASH=" in app_env
     assert "TESTED_IMAGE_REF=" in app_env
+    assert "OCI_CREATED=" not in app_env
+
+
+def test_meta_validation_hashes_include_helper_scripts():
+    result = run_meta("validation_helper_paths")
+    paths = result.stdout.split()
+    assert "ci-pipelines/helpers/meta.sh" in paths
+    assert "ci-pipelines/helpers/skopeo.sh" in paths
 
 
 def generate_manual(*args, output):

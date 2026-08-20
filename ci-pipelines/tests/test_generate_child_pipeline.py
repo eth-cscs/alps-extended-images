@@ -104,6 +104,7 @@ def test_generate_missing_base_emits_build_tests_marker_publish(monkeypatch, gen
 
     assert mark == "mark-base-pytorch-cuda-26-06-py3-tested"
     assert "build-base-pytorch-cuda-26-06-py3" in child.data
+    assert "OCI_CREATED" not in child.data["build-base-pytorch-cuda-26-06-py3"]["variables"]
     assert child.data["test-base-pytorch-cuda-26-06-py3-env"]["needs"] == ["build-base-pytorch-cuda-26-06-py3"]
     assert child.data[mark]["needs"] == ["test-base-pytorch-cuda-26-06-py3-env"]
     assert child.data["publish-base-pytorch-cuda-26-06-py3"]["needs"] == [mark]
@@ -187,6 +188,7 @@ def test_generate_missing_app_emits_build_tests_marker_publish(monkeypatch, gen)
     gen.add_app(child, app, app_tests(), {app["BASE_IMAGE"]: None}, {app["BASE_IMAGE"]: True})
 
     assert "build-app-vllm-cuda" in child.data
+    assert "OCI_CREATED" not in child.data["build-app-vllm-cuda"]["variables"]
     assert child.data["test-app-vllm-cuda-vetnode"]["needs"] == ["build-app-vllm-cuda"]
     assert child.data["mark-app-vllm-cuda-tested"]["needs"] == ["test-app-vllm-cuda-vetnode"]
     assert child.data["publish-app-vllm-cuda"]["needs"] == ["mark-app-vllm-cuda-tested"]
@@ -334,6 +336,23 @@ def test_schema_app_rejects_unknown_runner(gen):
             ["cuda"],
             {"tests": {"cuda": [{"name": "smoke", "runner": "unknown", "script": ["true"]}]}},
         )
+
+
+def test_schema_app_rejects_extra_cuda_vetnode_fields(gen):
+    with pytest.raises(RuntimeError, match="cuda-vetnode app tests do not support: script, timeout"):
+        gen.validate_app_ci(
+            Path("app.yaml"),
+            ["cuda"],
+            {"tests": {"cuda": [{"name": "vetnode", "kind": "cuda-vetnode", "timeout": "1h", "script": ["true"]}]}},
+        )
+
+
+def test_schema_app_accepts_explicit_custom_kind(gen):
+    gen.validate_app_ci(
+        Path("app.yaml"),
+        ["cuda"],
+        {"tests": {"cuda": [{"name": "smoke", "kind": "custom", "runner": "cuda", "script": ["true"]}]}},
+    )
 
 
 def test_schema_current_repo_metadata_is_valid(gen):

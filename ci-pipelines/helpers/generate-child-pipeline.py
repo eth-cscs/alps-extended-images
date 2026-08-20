@@ -102,7 +102,12 @@ def img_digest(ref: str) -> str:
 
 
 def marker_valid(canon_ref: str, tested_ref: str) -> bool:
-    """A tested marker is valid only when it points to the canonical digest."""
+    """Return whether a tested marker points to the canonical digest.
+
+    A missing canonical digest is not fatal here: the generator uses False to
+    mean "schedule build/test/mark work" for images whose canonical ref does not
+    exist yet. Registry lookup failures still raise through img_digest().
+    """
     canon_digest = img_digest(canon_ref)
     marker_digest = img_digest(tested_ref)
     if marker_digest and canon_digest and marker_digest != canon_digest:
@@ -128,7 +133,7 @@ def helper_env(function: str, *args: str) -> dict[str, str]:
     out = run_bash(
         "source ci-pipelines/helpers/skopeo.sh && "
         "source ci-pipelines/helpers/meta.sh && "
-        f"tmp=$(mktemp) && {function} \"$tmp\" {quoted_args} && cat \"$tmp\" && rm -f \"$tmp\""
+        f"tmp=$(mktemp) && trap 'rm -f \"$tmp\"' EXIT && {function} \"$tmp\" {quoted_args} && cat \"$tmp\""
     )
     return load_env_text(out)
 
@@ -212,13 +217,16 @@ BASE_TEST_TEMPLATES = {
         "collectives": ".child-rocm-base-collectives-test-template",
     },
 }
+# Adding a new accelerator family requires registering its base test templates
+# here and its ref/hash plumbing in meta.sh.
 BASE_TEST_KINDS_BY_FAMILY = {
     family: set(templates)
     for family, templates in BASE_TEST_TEMPLATES.items()
 }
 
-APP_TEST_KINDS = {"", "cuda-vetnode"}
+APP_TEST_KINDS = {"custom", "cuda-vetnode"}
 APP_TEST_RUNNERS = {"cuda", "rocm"}
+APP_CUDA_VETNODE_KEYS = {"name", "kind"}
 
 
 def require_mapping(value: Any, context: str) -> dict[str, Any]:
@@ -238,8 +246,9 @@ def require_list(value: Any, context: str) -> list[Any]:
 def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
     """Validate one family base ci.yaml file."""
     family = cfg.get("family")
-    if family not in {"cuda", "rocm"}:
-        raise RuntimeError(f"{path}: family must be cuda or rocm")
+    if not isinstance(family, str) or family not in BASE_TEST_TEMPLATES:
+        supported = ", ".join(sorted(BASE_TEST_TEMPLATES))
+        raise RuntimeError(f"{path}: unsupported base family: {family!r}; supported families: {supported}")
     for idx, variant in enumerate(require_list(cfg.get("variants"), f"{path}: variants")):
         item = require_mapping(variant, f"{path}: variants[{idx}]")
         if not item.get("name") or not item.get("variant"):
@@ -267,12 +276,16 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
             item = require_mapping(test, f"{path}: tests.{variant}[{idx}]")
             if not item.get("name"):
                 raise RuntimeError(f"{path}: tests.{variant}[{idx}] must define name")
-            kind = str(item.get("kind", ""))
+            kind = str(item.get("kind", "custom"))
             if kind not in APP_TEST_KINDS:
                 raise RuntimeError(f"{path}: unsupported app test kind: {kind}")
             if kind == "cuda-vetnode":
                 if variant != "cuda":
                     raise RuntimeError(f"{path}: cuda-vetnode is only supported for cuda app tests")
+                extra_keys = set(item) - APP_CUDA_VETNODE_KEYS
+                if extra_keys:
+                    extras = ", ".join(sorted(extra_keys))
+                    raise RuntimeError(f"{path}: cuda-vetnode app tests do not support: {extras}")
                 continue
             runner = str(item.get("runner", variant))
             if runner not in APP_TEST_RUNNERS:
@@ -286,6 +299,8 @@ def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
     """Load base variants/tests from family-local ci.yaml files."""
     result = []
     for path in sorted((ROOT / "Alps-Images").glob("*/ci.yaml")):
+        if path.parent.name in {"apps", "common"}:
+            continue
         cfg = load_yaml(path)
         if "family" not in cfg:
             continue
@@ -345,7 +360,7 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], va
         build_vars = {
             key: value
             for key, value in base.items()
-            if key not in {"FAMILY", "NAME", "VARIANT", "TESTED_IMAGE_REF", "VALIDATION_HASH", "STABLE_IMAGE_REF", "GHCR_STABLE_IMAGE_REF"}
+            if key not in {"FAMILY", "NAME", "VARIANT", "TESTED_IMAGE_REF", "VALIDATION_HASH", "STABLE_IMAGE_REF", "GHCR_STABLE_IMAGE_REF", "OCI_CREATED"}
         }
         child.add_job(build, f".child-{base['FAMILY']}-base-build-template", variables=build_vars)
     if valid:
@@ -368,7 +383,7 @@ def add_app_test(child: Child, app: dict[str, str], test: dict[str, Any], needs:
     """Emit one generated app test job and return its name."""
     prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
     name = f"test-{prefix}-{slug(str(test['name']))}"
-    kind = str(test.get("kind", ""))
+    kind = str(test.get("kind", "custom"))
     runner = str(test.get("runner", app["FAMILY"]))
     if kind == "cuda-vetnode":
         child.add_job(name, ".child-cuda-app-vetnode-test-template", image=app["CANON_IMAGE_REF"], needs=needs)
@@ -417,7 +432,6 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
                 "BASE_IMAGE": app["BASE_IMAGE"],
                 "OCI_SOURCE": app["OCI_SOURCE"],
                 "OCI_REVISION": app["OCI_REVISION"],
-                "OCI_CREATED": app["OCI_CREATED"],
                 "OCI_DESCRIPTION": app["OCI_DESCRIPTION"],
                 "CSCS_ALPS_GIT_COMMIT_SHORT": app["CSCS_ALPS_GIT_COMMIT_SHORT"],
             },
