@@ -330,8 +330,20 @@ grpo:
     recompute_kv_cache_after_weight_updates: false
 
 loss_fn:
-  # Matches verl algorithm.kl_ctrl.kl_coef.
-  reference_policy_kl_penalty: 0.001
+  # ⚠️ PORT-FIDELITY FIX (2026-08-20): the verl source recipe NEVER used a
+  # reference policy.  verl only builds one when actor.use_kl_loss or
+  # algorithm.use_kl_in_reward is true — both default false, the recipe sets
+  # neither, and its kl_ctrl.kl_coef: 0.001 was dead config on the disabled
+  # reward-KL path (verl/trainer/ppo/utils.py need_reference_policy()).  Our
+  # earlier translation to 0.001 here ACCIDENTALLY ENABLED the reference
+  # machinery: a permanent pinned CPU copy of the reference weights
+  # (~95 GiB/node) plus a per-step pinned copy of the current weights for the
+  # model<->reference swap — the host-memory staircase that killed every
+  # multi-step run (see HANDOFF §8 and CACHING_HOST_ALLOCATOR_FINDINGS.md).
+  # 0 = faithful to verl AND skips the whole reference stack (NeMo-RL
+  # auto-skips ref logprobs when the penalty is 0, grpo.py:990).
+  # Override NRL_REFERENCE_KL_PENALTY to re-enable a KL leash.
+  reference_policy_kl_penalty: ${NRL_REFERENCE_KL_PENALTY:-0}
   # Required by async GRPO for off-policy correction
   # (matches verl rollout_correction.bypass_mode: True).
   use_importance_sampling_correction: true
