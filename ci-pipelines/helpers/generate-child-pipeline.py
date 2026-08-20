@@ -32,7 +32,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = ROOT / "generated-child-pipeline.yaml"
 DIGEST_CACHE: dict[str, str] = {}
-SAFE_SHELL_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def run_bash(script: str) -> str:
@@ -87,11 +86,28 @@ def load_env_text(text: str) -> dict[str, str]:
     return data
 
 
-def source_profile_value(profile: Path, key: str) -> str:
-    """Source a shell profile and print one variable value."""
-    if not SAFE_SHELL_NAME.fullmatch(key):
-        raise RuntimeError(f"unsafe shell variable name: {key!r}")
-    return run_bash(f"source {shell_quote(str(profile))} && printf '%s\\n' \"${{{key}:-}}\"")
+def app_variants_from_profile(profile: Path) -> list[str]:
+    """Parse APP_VARIANTS from profile.env without executing the profile."""
+    value = None
+    for line in profile.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        if not stripped.startswith("APP_VARIANTS="):
+            continue
+        raw_value = stripped.split("=", 1)[1]
+        try:
+            value = " ".join(shlex.split(raw_value, comments=True, posix=True))
+        except ValueError as exc:
+            raise RuntimeError(f"{profile}: failed to parse APP_VARIANTS: {exc}") from exc
+    if value is None:
+        raise RuntimeError(f"{profile}: APP_VARIANTS must be set")
+    variants = value.split()
+    if not variants:
+        raise RuntimeError(f"{profile}: APP_VARIANTS must not be empty")
+    return variants
 
 
 def img_digest(ref: str) -> str:
@@ -101,7 +117,7 @@ def img_digest(ref: str) -> str:
     return DIGEST_CACHE[ref]
 
 
-def marker_valid(canon_ref: str, tested_ref: str) -> bool:
+def tested_marker_matches_existing_canonical(canon_ref: str, tested_ref: str) -> bool:
     """Return whether a tested marker points to the canonical digest.
 
     A missing canonical digest is not fatal here: the generator uses False to
@@ -117,7 +133,7 @@ def marker_valid(canon_ref: str, tested_ref: str) -> bool:
     return bool(canon_digest and marker_digest and canon_digest == marker_digest)
 
 
-def publish_needed(image: dict[str, str]) -> bool:
+def stable_refs_need_publish_for_existing_canonical(image: dict[str, str]) -> bool:
     """Return true when either stable destination is missing or stale."""
     canon_digest = img_digest(image["CANON_IMAGE_REF"])
     if not canon_digest:
@@ -318,7 +334,7 @@ def discover_apps() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
     apps = []
     for profile in sorted((ROOT / "Alps-Images" / "apps").glob("*/profile.env")):
         app = profile.parent.name
-        variants = source_profile_value(profile, "APP_VARIANTS").split()
+        variants = app_variants_from_profile(profile)
         ci_file = profile.parent / "ci.yaml"
         cfg = load_yaml(ci_file)
         validate_app_ci(ci_file, variants, cfg)
@@ -336,7 +352,7 @@ def add_publish(child: Child, image: dict[str, str], needs: list[str], prefix: s
     force=True is used after validation work because publish must re-check the
     new tested marker and stable-tag policy at execution time.
     """
-    if not force and not publish_needed(image):
+    if not force and not stable_refs_need_publish_for_existing_canonical(image):
         return
     child.add_job(
         f"publish-{prefix}",
@@ -414,7 +430,7 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
     if not base_valid.get(base_ref, False) and base_ref not in base_marks:
         raise RuntimeError(f"base metadata missing for {app['NAME']}/{app['FAMILY']}: {base_ref}")
 
-    valid = marker_valid(app["CANON_IMAGE_REF"], app["TESTED_IMAGE_REF"])
+    valid = tested_marker_matches_existing_canonical(app["CANON_IMAGE_REF"], app["TESTED_IMAGE_REF"])
     if valid:
         add_publish(child, app, base_needs, prefix)
         return
@@ -453,7 +469,7 @@ def main() -> None:
     base_valid: dict[str, bool] = {}
     for base, tests in discover_bases():
         canon_ref = base["CANON_IMAGE_REF"]
-        valid = marker_valid(canon_ref, base["TESTED_IMAGE_REF"])
+        valid = tested_marker_matches_existing_canonical(canon_ref, base["TESTED_IMAGE_REF"])
         base_valid[canon_ref] = valid
         base_marks[canon_ref] = add_base(child, base, tests, valid)
     for app, tests in discover_apps():

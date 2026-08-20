@@ -14,7 +14,7 @@ _skopeo_login() {
   local user="${2:?username required}"
   local password="${3:?password required}"
 
-  skopeo login --username "${user}" --password "${password}" "${reg}" >/dev/null
+  printf '%s' "$password" | skopeo login --username "${user}" --password-stdin "${reg}" >/dev/null
 }
 
 skopeo_login() {

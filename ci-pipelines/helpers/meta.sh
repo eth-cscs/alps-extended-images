@@ -390,7 +390,7 @@ ngc_base_refs() {
   local name="${ngc_name}-cuda"
   local tag="${ngc_tag}-${ALPS_REV}"
   local h
-  h="$(content_hash "$hash_paths" "name tag CSCS_CI_ORIG_CLONE_URL")"
+  h="$(content_hash "$hash_paths" "name tag base_image_ref REMOVE_HPCX_DIRS NVCR_PREFIX CSCS_CI_ORIG_CLONE_URL")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
