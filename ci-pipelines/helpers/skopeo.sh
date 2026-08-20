@@ -14,7 +14,7 @@ _skopeo_login() {
   local user="${2:?username required}"
   local password="${3:?password required}"
 
-  echo "login to: ${reg} with user: ${user}"
+  echo "login to: ${reg}"
   skopeo login --username "${user}" --password "${password}" "${reg}" >/dev/null
 }
 
@@ -34,7 +34,7 @@ skopeo_login_ghcr() {
 
 # Print an image digest. Return an empty string only when the registry reports a
 # true missing-image condition. Auth, network, and other unexpected skopeo errors
-# fail closed so the generator does not skip required work based on uncertainty.
+# return non-zero so the generator stops instead of skipping required work.
 # usage: img_digest REF
 img_digest() {
   local ref="${1:?image ref required}"
@@ -49,7 +49,10 @@ img_digest() {
     return 0
   fi
 
-  if [[ "$output" == *"manifest unknown"* || "$output" == *"name unknown"* || "$output" == *"not found"* ]]; then
+  # Skopeo/JFrog do not guarantee one exit status for missing manifests. Only
+  # explicit registry missing-manifest/name messages count as cache misses; auth,
+  # network, and tool errors return non-zero so the generator stops.
+  if [[ "$output" == *"manifest unknown"* || "$output" == *"name unknown"* || "$output" == *"The named manifest is not known to the registry"* ]]; then
     return 0
   fi
 

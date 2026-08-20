@@ -82,6 +82,19 @@ def test_generate_no_work_emits_noop(tmp_path, monkeypatch, gen):
     assert data["no-work-required"] == {"extends": [".child-noop-template"]}
 
 
+def test_slug_rejects_empty_result(gen):
+    with pytest.raises(RuntimeError, match="slug produced empty string"):
+        gen.slug("___")
+
+
+def test_source_profile_value_rejects_unsafe_key(gen, tmp_path):
+    profile = tmp_path / "profile.env"
+    profile.write_text("APP_VARIANTS=cuda\n")
+
+    with pytest.raises(RuntimeError, match="unsafe shell variable name"):
+        gen.source_profile_value(profile, "APP_VARIANTS:-bad")
+
+
 def test_generate_missing_base_emits_build_tests_marker_publish(monkeypatch, gen):
     base = base_image()
     fake_registry(monkeypatch, gen, {})
@@ -139,6 +152,33 @@ def test_generate_valid_base_with_stale_stable_emits_publish_only(monkeypatch, g
     assert "mark-base-pytorch-cuda-26-06-py3-tested" not in child.data
 
 
+def test_publish_needed_false_when_canonical_missing(monkeypatch, gen):
+    base = base_image()
+    fake_registry(monkeypatch, gen, {})
+
+    assert not gen.publish_needed(base)
+
+
+def test_add_publish_respects_force(monkeypatch, gen):
+    base = base_image()
+    fake_registry(
+        monkeypatch,
+        gen,
+        {
+            base["CANON_IMAGE_REF"]: "sha256:base",
+            base["STABLE_IMAGE_REF"]: "sha256:base",
+            base["GHCR_STABLE_IMAGE_REF"]: "sha256:base",
+        },
+    )
+    child = gen.Child()
+
+    gen.add_publish(child, base, [], "base-pytorch", force=False)
+    assert "publish-base-pytorch" not in child.data
+
+    gen.add_publish(child, base, [], "base-pytorch", force=True)
+    assert child.data["publish-base-pytorch"]["needs"] == []
+
+
 def test_generate_missing_app_emits_build_tests_marker_publish(monkeypatch, gen):
     app = app_image()
     fake_registry(monkeypatch, gen, {})
@@ -166,6 +206,38 @@ def test_generate_app_waits_for_base_marker_when_base_revalidated(monkeypatch, g
     )
 
     assert child.data["build-app-vllm-cuda"]["needs"] == ["mark-base-pytorch-cuda-tested"]
+
+
+def test_generate_app_rejects_missing_base_metadata(monkeypatch, gen):
+    app = app_image(BASE_IMAGE="registry/missing-base:canon")
+    fake_registry(monkeypatch, gen, {})
+    child = gen.Child()
+
+    with pytest.raises(RuntimeError, match="base metadata missing"):
+        gen.add_app(child, app, app_tests(), {}, {})
+
+
+def test_generate_custom_app_test_propagates_fields(monkeypatch, gen):
+    app = app_image()
+    fake_registry(monkeypatch, gen, {})
+    child = gen.Child()
+    tests = [
+        {
+            "name": "ray-smoke",
+            "runner": "rocm",
+            "timeout": "30m",
+            "variables": {"SLURM_NTASKS": "2"},
+            "script": ["/opt/tests/vllm/ray_nccl_smoke.sh"],
+        }
+    ]
+
+    test_job = gen.add_app_test(child, app, tests[0], ["build-app-vllm-cuda"])
+
+    assert test_job == "test-app-vllm-cuda-ray-smoke"
+    assert child.data[test_job]["extends"] == [".child-rocm-custom-test-template"]
+    assert child.data[test_job]["timeout"] == "30m"
+    assert child.data[test_job]["variables"] == {"SLURM_NTASKS": "2"}
+    assert child.data[test_job]["script"] == ["/opt/tests/vllm/ray_nccl_smoke.sh"]
 
 
 def test_generate_app_has_no_base_need_when_base_already_valid(monkeypatch, gen):
