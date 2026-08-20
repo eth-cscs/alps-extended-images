@@ -1,18 +1,18 @@
 #!/bin/bash
 
-#SBATCH --nodes=8
+#SBATCH --nodes=16
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
-#SBATCH --time=5:00:00
+#SBATCH --time=12:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-0f334b540ccc7034" #alps7-dev-0f334b540ccc7034 image with megatron
 
-export MODEL_NAME="Apertus-8B-Instruct-2509"
+export MODEL_NAME="Apertus-v1.5-70B"
 export MODEL_REPO="swiss-ai"
 
-export PROJECT_NAME="async-grpo-gsm8k"
-export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
+export PROJECT_NAME="apertus-benchmarks"
+export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-fsdp2-async-${SLURM_JOB_NUM_NODES}n"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
@@ -22,8 +22,10 @@ export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLU
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
-export  ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
-export  TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
+
+
+export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
+export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -33,6 +35,7 @@ writable = true
 entrypoint = true
 [env]
 PMIX_MCA_psec = "native"
+HF_TOKEN = "$(cat ~/HF_TOKEN)"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
@@ -81,13 +84,21 @@ actor_rollout_ref:
 
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
+    # eager, not flash_attention_2/sdpa: Apertus-v1.5 instantiates a vision
+    # tokenizer submodule (Apertus1p5VisionTokenizerModel) even for this
+    # text-only GSM8K benchmark, and that submodule declares neither FA2 (run
+    # 3130014) nor SDPA (run 3130169) support — only the language-model
+    # backbone does. transformers' own error for the SDPA case points at
+    # eager as the fallback; it is the one implementation every model
+    # supports (no _supports_eager gate).
     override_config:
-      attn_implementation: flash_attention_2
+      attn_implementation: eager
     use_shm: false
 
   actor:
     strategy: fsdp2
-    ppo_mini_batch_size: 252 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
+    ppo_mini_batch_size: 48 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
+    ppo_micro_batch_size_per_gpu: 1
     use_rollout_log_probs: True   # required for fully-async log prob correctness
     use_dynamic_bsz: True
 
@@ -98,8 +109,8 @@ actor_rollout_ref:
     n_gpus_per_node: 4
     temperature: 1.0
     n: 16 #num responses per prompt 
-    tensor_model_parallel_size: 2
-    gpu_memory_utilization: 0.8 #don't set too high, otherwise the rollout will OOM, need to leave a buffer for NCCL comms.
+    tensor_model_parallel_size: 4
+    gpu_memory_utilization: 0.75
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
       backend: nccl # weight sync via NCCL broadcast
@@ -246,8 +257,130 @@ if __name__ == "__main__":
     prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
 EOF
 
-sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
+sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
+
+# The swiss-ai/transformers fork pinned below already registers some newer model
+# types (e.g. "qwen3_asr") that stock transformers does not. SGLang's own
+# compatibility shims (sglang/srt/configs/qwen3_asr.py) call
+# AutoConfig.register("qwen3_asr", ...) unconditionally on import (exist_ok
+# defaults to False), assuming the running transformers predates that type —
+# against this fork that now collides: ValueError: 'qwen3_asr' is already used
+# by a Transformers config, pick another name (run 3130211), raised inside the
+# FullyAsyncRollouter actor the first time it imports SGLang. Same
+# PYTHONPATH/sitecustomize.py mechanism as the GLM v1-separate-async script
+# (see CLAUDE.md) — applies cluster-wide, including inside Ray actors, without
+# touching verl or the fork's source.
+cat > "${TRAINING_CONFIG}/sitecustomize-autoconfig-register.py" <<- 'EOF'
+"""
+Make transformers.models.auto.configuration_auto._LazyConfigMapping.register
+tolerate re-registration of a model type that already exists.
+
+Injected at Python startup via PYTHONPATH — does not modify transformers or
+SGLang source. Must be staged as the process's actual "sitecustomize.py" on
+sys.path to be auto-loaded.
+
+Why: the swiss-ai/transformers fork used for Apertus-v1.5 already registers
+some newer model types (e.g. "qwen3_asr") that stock/older transformers
+releases do not. SGLang's compatibility shims for those same model types
+(e.g. sglang/srt/configs/qwen3_asr.py) call
+AutoConfig.register(model_type, config) with the default exist_ok=False,
+assuming the running transformers predates the type. Against this fork the
+type is already present, so the call raises ValueError instead of being a
+harmless no-op, crashing every process that imports SGLang (run 3130211).
+"""
+import sys
+
+_PATCHED: set = set()
+
+
+class _AutoConfigRegisterPatcher:
+    """sys.meta_path hook: patches the module immediately after it loads."""
+
+    _TARGET = "transformers.models.auto.configuration_auto"
+
+    def find_module(self, fullname, path=None):
+        if fullname == self._TARGET and fullname not in _PATCHED:
+            return self
+        return None
+
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            return sys.modules[fullname]
+        sys.meta_path[:] = [m for m in sys.meta_path if m is not self]
+        try:
+            import importlib
+            mod = importlib.import_module(fullname)
+        finally:
+            sys.meta_path.append(self)
+        _PATCHED.add(fullname)
+        _orig_register = mod._LazyConfigMapping.register
+
+        def _register(self, key, value, exist_ok=False):
+            return _orig_register(self, key, value, exist_ok=True)
+
+        mod._LazyConfigMapping.register = _register
+        print(
+            "[sitecustomize-autoconfig-register] patched "
+            "_LazyConfigMapping.register to tolerate duplicate model types",
+            flush=True,
+        )
+        return mod
+
+
+sys.meta_path.append(_AutoConfigRegisterPatcher())
+EOF
+sbcast -f ${TRAINING_CONFIG}/sitecustomize-autoconfig-register.py ${TRAINING_CONFIG}/sitecustomize-autoconfig-register.py
+
+# The image's pinned transformers==5.8.1 does not recognize model_type
+# "apertus1p5" (Apertus-v1.5's architecture is not merged into any mainline
+# transformers release yet). Build the swiss-ai fork commit the model card
+# points at into a wheel once, on a single node, and stash it on Lustre —
+# every node then does a plain wheel install (unzip + copy, no building, no
+# per-node network). Originally this sbcast the ~large source tarball to every
+# node directly, but run 3129881 hit "Bus error (core dumped)" from sbcast on
+# that tarball, leaving several nodes with a truncated archive
+# ("tar: Unexpected EOF") and a broken transformers install
+# ("No module named 'transformers.utils'"); nodes where tar did succeed still
+# built their own wheel independently inside the main srun — non-deterministic
+# (different sha256 per build) and at least one hit
+# "OSError: [Errno 116] Stale file handle" mid-install, the same Lustre
+# file-locking hazard as the model-config loader (see Known hazards in
+# CLAUDE.md). A single ~5MB wheel, built once, sidesteps all three.
+#
+# Also fetch a safetensors wheel meeting the fork's floor (>=0.8.0,
+# dependency_versions_table.py) alongside it: the image's pinned safetensors==0.7.0
+# fails transformers/dependency_versions_check.py at import time
+# ("ImportError: safetensors>=0.8.0 is required ... but found safetensors==0.7.0",
+# run 3129970) once --no-deps stops transformers from pulling it in itself.
+# safetensors has no torch/torchvision ABI coupling, so upgrading it doesn't risk
+# the ABI --no-deps is otherwise protecting (see the install step below).
+export SWISS_AI_TRANSFORMERS_SHA=3797303dda74844e3d1f8977ff5518bb91f818b4
+export SWISS_AI_WHEEL_DIR=${TRAINING_HOME}/wheels
+mkdir -p ${SWISS_AI_WHEEL_DIR}
+if ! ls ${SWISS_AI_WHEEL_DIR}/transformers-*.whl >/dev/null 2>&1 \
+    || ! ls ${SWISS_AI_WHEEL_DIR}/safetensors-*.whl >/dev/null 2>&1; then
+    echo "Building swiss-ai/transformers@${SWISS_AI_TRANSFORMERS_SHA} + safetensors wheels..."
+    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
+        --environment="${TRAINING_CONFIG}/env.toml" \
+        --container-writable bash -c '
+        set -e
+        curl -sfL "https://github.com/swiss-ai/transformers/archive/${SWISS_AI_TRANSFORMERS_SHA}.tar.gz" \
+            -o /tmp/swiss-ai-transformers.tar.gz
+        [ -s /tmp/swiss-ai-transformers.tar.gz ]
+        mkdir -p /tmp/swiss-ai-transformers
+        tar xzf /tmp/swiss-ai-transformers.tar.gz -C /tmp/swiss-ai-transformers --strip-components=1
+        pip wheel --no-deps -w /tmp/swiss-ai-wheel /tmp/swiss-ai-transformers
+        pip download --no-deps -d /tmp/swiss-ai-wheel "safetensors>=0.8.0"
+        cp /tmp/swiss-ai-wheel/transformers-*.whl /tmp/swiss-ai-wheel/safetensors-*.whl ${SWISS_AI_WHEEL_DIR}/
+    '
+    ls ${SWISS_AI_WHEEL_DIR}/transformers-*.whl >/dev/null 2>&1 \
+        && ls ${SWISS_AI_WHEEL_DIR}/safetensors-*.whl >/dev/null 2>&1 \
+        || { echo "FATAL: swiss-ai/transformers or safetensors wheel build failed"; exit 1; }
+else
+    echo "swiss-ai/transformers and safetensors wheels already present, skipping build."
+fi
+
 
 # Download model (skip if already present)
 if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
@@ -255,6 +388,7 @@ if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
+        hf auth login
         hf download ${MODEL_REPO}/${MODEL_NAME} \
             --local-dir ${TRAINING_HOME}/models/${MODEL_NAME} \
     '
@@ -281,7 +415,7 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
-export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key) 
+export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
 export RAY_memory_usage_threshold=0.99
@@ -292,15 +426,41 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
-# Patch flash attention NoneType bug for Qwen2 on this transformers version
-sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
-    /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
+
+# Upgrade Verl to v0.9.0.
+# The image clones with --branch ${VERL_REF} --depth 1, so no other ref is present
+# locally and the tag has to be fetched explicitly before it can be checked out.
+# verl is installed editable (pip install -e) from /workspace/verl, so the checkout
+# takes effect without reinstalling; -f discards any dirty state in the clone.
+export VERL_REF=v0.9.0
+git -C /workspace/verl fetch --depth 1 origin +refs/tags/${VERL_REF}:refs/tags/${VERL_REF} \
+    && git -C /workspace/verl checkout -f ${VERL_REF} \
+    || { echo "FATAL: could not check out verl ${VERL_REF}"; exit 1; }
+git -C /workspace/verl --no-pager log --oneline -1
 
 
 # Apply Verl fixes
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
 git fetch pr_origin Fix-fsdp-model-loading-on-async
 git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+
+
+# Install the swiss-ai transformers + safetensors wheels built once above (adds
+# the apertus1p5 architecture used by Apertus-v1.5; not yet in any mainline
+# transformers release). Plain wheel installs straight off Lustre: no building,
+# no per-node network, no isolated build env, so none of run 3129881 failure
+# modes apply here. --no-deps: the image already carries a torch/torchvision
+# pair whose ABI transformers pip installs are normally pinned against (see
+# torch_constraints.txt in the Containerfile); pulling in the
+# [torch,vision,audio] extras here could silently upgrade them. Those extras
+# are for Apertus-v1.5 image/audio inputs, unused by this text-only GSM8K
+# benchmark. safetensors is bumped alongside it to satisfy the forks
+# safetensors>=0.8.0 floor (dependency_versions_check.py rejects the images
+# pinned safetensors==0.7.0 at import time, run 3129970) — safetensors has no
+# torch/torchvision ABI coupling, so this does not carry the same risk.
+pip install --no-deps ${SWISS_AI_WHEEL_DIR}/transformers-*.whl ${SWISS_AI_WHEEL_DIR}/safetensors-*.whl
+python3 -c "import transformers, safetensors; print(\"transformers:\", transformers.__version__, transformers.__file__); print(\"safetensors:\", safetensors.__version__)"
+
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
@@ -321,6 +481,15 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
+# Stage the AutoConfig.register patch (sbcast to ${TRAINING_CONFIG} above) as
+# this node sitecustomize.py — Python only auto-loads a module literally
+# named "sitecustomize" found on sys.path. --ntasks-per-node=1 here, so there
+# is exactly one task per node and no cross-task race to guard against.
+export SITECUSTOMIZE_LOCAL=/tmp/verl_patches_${SLURM_JOB_ID}
+mkdir -p $SITECUSTOMIZE_LOCAL
+cp "${TRAINING_CONFIG}/sitecustomize-autoconfig-register.py" "$SITECUSTOMIZE_LOCAL/sitecustomize.py"
+export PYTHONPATH="${SITECUSTOMIZE_LOCAL}:${PYTHONPATH:-}"
+
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
@@ -330,7 +499,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
         --disable-usage-stats || true
-    
+
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then

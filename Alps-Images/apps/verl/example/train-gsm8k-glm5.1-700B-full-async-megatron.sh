@@ -1,19 +1,23 @@
 #!/bin/bash
 
-#SBATCH --nodes=8
+#SBATCH --nodes=80
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
-#SBATCH --time=5:00:00
+#SBATCH --time=12:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev"
+# Resolve the directory containing this script so patches/ is reachable inside
+# the container via the /users mount (e.g. /users/${USER}/.../example/patches/).
+export SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export MODEL_NAME="Apertus-8B-Instruct-2509"
-export MODEL_REPO="swiss-ai"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-0f334b540ccc7034" #alps7-dev-0f334b540ccc7034 image with megatron
+
+export MODEL_NAME="GLM-5.1"
+export MODEL_REPO="zai-org"
 
 export PROJECT_NAME="async-grpo-gsm8k"
-export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
-export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
+export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-megatron-async-${SLURM_JOB_NUM_NODES}n"
+export RUN_NAME="${EXPERIMENT_NAME}-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
@@ -22,8 +26,12 @@ export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLU
 mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
-export  ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
-export  TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
+
+
+# Rollout needs exactly 8 nodes for TP=32 (8 nodes × 4 GPUs = 32 GPUs, 1 replica).
+# Training gets the remaining 48 nodes (192 GPUs) for TP=4, PP=3, EP=8, DP=2.
+export ROLLOUT_NNODES=8
+export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -39,23 +47,16 @@ EOF
 
 cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
-  - ppo_trainer
+  - ppo_megatron_trainer
+  - override model_engine: megatron
   - override rollout@actor_rollout_ref.rollout: rollout
-  - override actor@actor_rollout_ref.actor: dp_actor
   - override data@data: legacy_data
   - _self_
 
 # ── Required by fully_async_main ──────────────────────────────────────────────
 async_training:
-  
-  # On Policy Settings
-  # staleness_threshold: 0
-  # trigger_parameter_sync_step: 1
-  
-  # Stream Pipeline Settings
-  staleness_threshold: 0.1 
+  staleness_threshold: 0.1
   trigger_parameter_sync_step: 2
-
   require_batches: 1
   partial_rollout: False
   use_trainer_do_validate: False
@@ -66,7 +67,7 @@ rollout:
   nnodes: ${ROLLOUT_NNODES}
   n_gpus_per_node: 4
   total_rollout_steps: 22419
-  test_freq: 10
+  test_freq: 0  # disable validation — greedy decode over 1319 samples hangs at 24min (cuEventSynchronize deadlock)
 # ──────────────────────────────────────────────────────────────────────────────
 
 data:
@@ -75,21 +76,45 @@ data:
   train_batch_size: 0    # must be 0 in fully-async mode
   gen_batch_size: 1      # must be 1 in fully-async mode
   return_raw_chat: True
+  max_response_length: 256  # reduced from 1024 — at ~10 tok/s for 744B TP=32, 1024 tokens takes 83min for 48 samples
 
 actor_rollout_ref:
   hybrid_engine: False
 
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
-    override_config:
-      attn_implementation: flash_attention_2
+    use_remove_padding: False  # DSA attention does not support THD packed-sequence format; use BSHD
     use_shm: false
+    trust_remote_code: True  # GLM-5.1 uses a custom TokenizersBackend tokenizer
 
   actor:
-    strategy: fsdp2
-    ppo_mini_batch_size: 252 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
+    # 72 training nodes x 4 GPUs = 288 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=3.
+    # Memory at optimizer step: M*(2 + 8/DP) + 11 GiB NCCL = 14.5*(2+2.67)+11 = 78.7 GiB < 95 GiB.
+    # DP=2 was insufficient: 6M+11 = 98 GiB > 95 GiB (4 optimizer tensors + param + grad).
+    # EP=8: EP=4 causes megatron-bridge to fail for experts 64-127 (unmapped).
+    # PP=3: 78 layers / 3 = 26 layers/stage.
+    optim:
+      lr_decay_steps: 22419  # must be positive at init; set_total_train_steps is called too late (after init_workers)
+    ppo_mini_batch_size: 24  # must be >= dp_size (DP=3 x EP=8 = 24)
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: 16384
     use_rollout_log_probs: True   # required for fully-async log prob correctness
     use_dynamic_bsz: True
+    megatron:
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 3
+      expert_model_parallel_size: 8
+      param_offload: True
+      grad_offload: True
+      optimizer_offload: True
+      vanilla_mbridge: False  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge
+      override_transformer_config:
+        recompute_granularity: full
+        recompute_method: uniform
+        recompute_num_layers: 1
+        use_cpu_initialization: True
+        moe_grouped_gemm: True
+        moe_permute_fusion: True
 
   rollout:
     name: sglang
@@ -97,15 +122,32 @@ actor_rollout_ref:
     load_format: dummy
     n_gpus_per_node: 4
     temperature: 1.0
-    n: 16 #num responses per prompt 
-    tensor_model_parallel_size: 2
-    gpu_memory_utilization: 0.8 #don't set too high, otherwise the rollout will OOM, need to leave a buffer for NCCL comms.
+    n: 1 #num responses per prompt — reduced from 16 for pipeline smoke test (GRPO advantages degenerate at n=1)
+    # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32 (one replica) — 700B needs all 32 GPUs to fit
+    tensor_model_parallel_size: 32
+    gpu_memory_utilization: 0.75
+    free_cache_engine: false  # keep KV cache alive across weight syncs — avoids engine rebuild + CUDA graph re-capture across TP=32 (8-node deadlock)
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
       backend: nccl # weight sync via NCCL broadcast
+      engine_kwargs:
+        nccl:
+          rebuild_group: false
+    engine_kwargs:
+      sglang:
+        watchdog_timeout: 300
+        disable_cuda_graph: true
+        max_running_requests: 128  # limit concurrent decode batch; keeps per-step latency and KV usage manageable
 
   ref:
     log_prob_use_dynamic_bsz: True
+    log_prob_max_token_len_per_gpu: 16384
+    megatron:
+      param_offload: True  # keep ref params on CPU when not computing log probs
+      tensor_model_parallel_size: 4
+      pipeline_model_parallel_size: 3
+      expert_model_parallel_size: 8
+      vanilla_mbridge: False  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge
 
 algorithm:
   adv_estimator: grpo
@@ -129,6 +171,8 @@ trainer:
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 50
+  test_freq: -1
+  val_before_train: false
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
@@ -179,10 +223,10 @@ def compute_reward(
     format_reward  = 0.1 if has_answer else 0.0
     outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Smooth length penalty starting at 350 words (~455 tokens), max -0.2 at 700 words.
-    # Keeps thinking chains well below the 1024-token hard cap so truncation stays rare.
+    # Smooth length penalty starting at 1000 words, max -0.2 at 2000 words.
+    # Kimi-K2.6 produces long thinking traces; penalise only runaway verbosity.
     words = len(solution_str.split())
-    length_penalty = -0.2 * min(1.0, max(0.0, (words - 350) / 350))
+    length_penalty = -0.2 * min(1.0, max(0.0, (words - 1000) / 1000))
 
     return outcome_reward + format_reward + length_penalty
 EOF
@@ -246,8 +290,9 @@ if __name__ == "__main__":
     prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
 EOF
 
-sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py 
+sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
+
 
 # Download model (skip if already present)
 if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
@@ -281,7 +326,7 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
-export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key) 
+export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
 export RAY_memory_usage_threshold=0.99
@@ -292,19 +337,109 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
-# Patch flash attention NoneType bug for Qwen2 on this transformers version
-sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is not None else None,/" \
-    /usr/local/lib/python3.12/dist-packages/transformers/integrations/flash_attention.py
+# Redirect pip cache to local tmpfs — ~/.cache/pip is on Lustre which causes
+# "Stale file handle" (ESTALE) errors during package downloads.
+export PIP_CACHE_DIR=/tmp/pip_cache_${SLURM_JOB_ID}
+export TMPDIR=/tmp
+mkdir -p $PIP_CACHE_DIR
 
 
-# Apply Verl fixes
-git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Fix-fsdp-model-loading-on-async
-git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+# Patch megatron-bridge safe_config_loader to skip filelock.
+# /dev/shm and /tmp on CSCS Alps do not support fcntl.flock in the container
+# (ENOLCK / ESTALE on every attempt). The lock is unnecessary because the config
+# files are written by localid=0 before any reader starts (purely read-only after that).
+#
+# We match line-by-line on the "with filelock." prefix rather than using a regex
+# that tries to parse the argument, because FileLock() arguments often contain
+# nested parens (e.g. os.path.join(...)) which break [^)]* patterns.
+python3 -c "
+import importlib.util
+spec = importlib.util.find_spec(\"megatron.bridge.models.hf_pretrained.safe_config_loader\")
+if not spec:
+    print(\"safe_config_loader not found — skipping patch\")
+else:
+    p = spec.origin
+    with open(p) as f:
+        lines = f.readlines()
+    if not any(\"import contextlib\" in l for l in lines):
+        lines.insert(0, \"import contextlib\n\")
+    new_lines = []
+    n_patched = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(\"with filelock.\") and stripped.endswith(\":\"):
+            indent = len(line) - len(line.lstrip())
+            new_lines.append(\" \" * indent + \"with contextlib.nullcontext():\n\")
+            n_patched += 1
+        else:
+            new_lines.append(line)
+    if n_patched:
+        with open(p, \"w\") as f:
+            f.writelines(new_lines)
+        print(f\"Patched {n_patched} filelock site(s) in {p}\")
+    else:
+        print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
+"
+
+# PR #7421: DSA (experimental_attention_variant=dsa) compatibility with mcore >= 0.16.2.
+# Upstream _run_core_attention no longer forwards the x/qr kwargs DSA requires; route
+# DSA instances through the verl patch_forward. Also injects a pure-PyTorch
+# Walsh-Hadamard fallback when fast_hadamard_transform is not installed.
+tmp=$(mktemp)
+curl -sL "https://github.com/verl-project/verl/pull/7421.patch" -o "$tmp"
+git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7421" \
+    || echo "PR #7421 already applied or not applicable, skipping"
+rm -f "$tmp"
+
+# PR #7422: Preserve load_format=dummy in disaggregated SGLang rollout.
+# A guard was silently overriding dummy to auto in non-hybrid rollout mode, causing
+# rollout workers to load weights from disk instead of receiving them via broadcast.
+tmp=$(mktemp)
+curl -sL "https://github.com/verl-project/verl/pull/7422.patch" -o "$tmp"
+git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7422" \
+    || echo "PR #7422 already applied or not applicable, skipping"
+rm -f "$tmp"
+
+# PR #7423: Fix NCCL deadlock in async disaggregated weight sync.
+# update_actor (thread-pool) and update_weights (event loop) both submit ops to the
+# same PP/EP NCCL communicators. A threading.Lock serialises them; entry and exit
+# barriers ensure all actors complete the weight-sync collective before any resumes
+# training, preventing seq-number mismatches across EP ranks.
+tmp=$(mktemp)
+curl -sL "https://github.com/verl-project/verl/pull/7423.patch" -o "$tmp"
+git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7423" \
+    || echo "PR #7423 already applied or not applicable, skipping"
+rm -f "$tmp"
+
+
+# Mirror model config files to local tmpfs to avoid Lustre metadata contention.
+# 96 training workers all calling AutoConfig.from_pretrained() simultaneously causes
+# ENOLCK / ESTALE on the Lustre MDS. Only local rank 0 does the copy; others wait.
+export MODEL_LOCAL=/tmp/glm_model_${SLURM_JOB_ID}
+if [ $SLURM_LOCALID -eq 0 ]; then
+    mkdir -p $MODEL_LOCAL
+    # Copy small config/tokenizer files locally
+    find ${TRAINING_HOME}/models/${MODEL_NAME} -maxdepth 1 -not -name "*.safetensors" -type f \
+        -exec cp {} $MODEL_LOCAL/ \; 2>/dev/null || true
+    # Symlink safetensors back to Lustre so megatron-bridge can still load weights
+    for f in ${TRAINING_HOME}/models/${MODEL_NAME}/*.safetensors; do
+        ln -sf "$f" "$MODEL_LOCAL/$(basename "$f")"
+    done 2>/dev/null || true
+    touch $MODEL_LOCAL/.ready
+fi
+until [ -f $MODEL_LOCAL/.ready ]; do sleep 1; done
+
+# Patch the YAML on the head node to point at the local model dir
+if [ $SLURM_PROCID -eq 0 ]; then
+    sed -i "s|${TRAINING_HOME}/models/${MODEL_NAME}|${MODEL_LOCAL}|g" ${TRAINING_CONFIG}/grpo_gsm8k.yaml
+fi
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
 mkdir -p $FLASHINFER_WORKSPACE_BASE
+
+export TRITON_CACHE_DIR=/tmp/triton_${SLURM_JOB_ID}
+mkdir -p $TRITON_CACHE_DIR
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
 python3 -c "
@@ -321,6 +456,16 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
+# Inject debug instrumentation patches via sitecustomize.py.
+# patches/ lives next to this script on /users (mounted in the container).
+# sitecustomize.py is executed at Python startup for every process including
+# Ray workers, so the patches apply cluster-wide without modifying verl source.
+# Remove this line to disable all instrumentation.
+export PYTHONPATH="${SCRIPT_DIR}/patches:${PYTHONPATH:-}"
+
+# Required for Megatron communication/computation overlapping
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
@@ -330,7 +475,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
         --disable-usage-stats || true
-    
+
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
