@@ -122,6 +122,29 @@ WORKDIR "${NEMORL_DIR}"
 # pinned versions.
 RUN uv venv --seed "${UV_PROJECT_ENVIRONMENT}"
 
+# RELOCK escape hatch (used by branches whose pyproject changed but whose
+# committed uv.lock is stale, e.g. apertus-stack swapping in the swiss-ai
+# forks — see NeMoRL/APERTUS_STACK.md).  Build once with
+#   --build-arg RELOCK=1
+# then EXTRACT the fresh lock from the image and commit it to the branch:
+#   podman create --name relock <image>
+#   podman cp relock:/workdir/nemo_rl/uv.lock uv.lock && podman rm relock
+# This is MANDATORY, not cosmetic: at runtime the driver checks the branch
+# out inside the container, and if the committed lock differs from the one
+# the venvs here were built from, uv re-resolves into the enroot overlay
+# (or fails offline).  Subsequent builds run WITHOUT the arg as pure
+# consumers of the committed lock.  Every `uv sync --frozen` below uses
+# uv.lock verbatim, so with RELOCK the whole image is built from the
+# fresh resolution.  ⚠️ Layer-cache trap: the clone step above caches by
+# command text — when rebuilding a branch whose HEAD moved, bust the cache
+# (e.g. `--no-cache`), or `git switch` silently gives you the OLD commit.
+ARG RELOCK=
+RUN if [[ -n "${RELOCK:-}" ]]; then \
+        UV_OFFLINE= uv lock ; \
+    else \
+        echo "Skipping relock (RELOCK not set): uv.lock consumed as committed" ; \
+    fi
+
 # `--no-install-project` installs only the dependencies listed in
 # pyproject.toml, not the nemo-rl package itself. This mirrors NeMo-RL's
 # upstream Dockerfile: the heavy dependency syncs are done first (warming the
