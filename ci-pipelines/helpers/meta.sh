@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Depends on skopeo.sh being sourced (for img_exists),
+# Depends on skopeo.sh being sourced for registry/marker helpers,
 # and IMAGE_PREFIX being set in CI variables.
 
-# Iterate paths
-_paths_iter() {
-  # usage: _paths_iter "path1 path2 ..."
-  local paths="${1:-}"
-  # split on whitespace
-  for p in $paths; do
-    printf '%s\n' "$p"
-  done
-}
+# Canonical ref and hash helpers shared by CI and manual builds.
+#
+# Tag model:
+# - canonical tags include a deterministic content hash and are build outputs;
+# - tested marker tags prove a canonical digest passed the current validation;
+# - stable tags are promotion targets and must never be used as app build bases.
+#
+# Content hashes intentionally exclude timestamps and commit SHAs. OCI labels may
+# carry CI metadata, but refs should only change when logical build inputs change.
 
 # Emits sha256sum lines for all files under paths in stable order.
-# usage: hash_paths_stream "path1 path2 ..."
+# usage: hash_paths_stream PATH...
 hash_paths_stream() {
-  local paths="${1:?paths required}"
+  [[ "$#" -gt 0 ]] || { echo "ERROR: paths required" >&2; return 1; }
+  local path
 
   # Expand directories to files, keep a stable list, then hash.
   # sort -u ensures stable uniqueness if two roots overlap.
-  _paths_iter "$paths" | while read -r p; do
-    if [[ -d "$p" ]]; then
-      find "$p" -type f -print
+  for path in "$@"; do
+    if [[ -d "$path" ]]; then
+      find "$path" -type f -print0
     else
-      printf '%s\n' "$p"
+      printf '%s\0' "$path"
     fi
-  done | sed '/^$/d' | sort -u | while read -r f; do
-    [[ -f "$f" ]] || continue
-    sha256sum "$f"
-  done
+  done | sort -zu | xargs -0 -r sha256sum
 }
 
 # usage: vars_blob "VAR1 VAR2 ..."
@@ -41,14 +39,161 @@ vars_blob() {
   done | sort
 }
 
-# usage: content_hash "paths..." "vars..."
-content_hash() {
-  local paths="${1:?paths required}"
-  local vars_to_hash="${2:?vars required}"
+# Hash file inputs and selected variables into the short tag hash format used by
+# both content hashes and validation hashes.
+# usage: short_input_hash "vars..." PATH...
+short_input_hash() {
+  local vars_to_hash="${1:-}"
+  shift || true
+  [[ "$#" -gt 0 ]] || { echo "ERROR: paths required" >&2; return 1; }
+
   {
-    hash_paths_stream "$paths"
-    vars_blob "$vars_to_hash"
-  } | sha256sum | awk '{print $1}' | cut -c1-16
+    hash_paths_stream "$@"
+    if [[ -n "$vars_to_hash" ]]; then
+      vars_blob "$vars_to_hash"
+    fi
+  } | sha256sum | awk '{print $1}' | cut -c1-32
+}
+
+# Hash content that affects image build output. The stream includes file hashes
+# in stable path order and selected logical variables, then truncates the sha256
+# for tag readability.
+# usage: content_hash "vars..." PATH...
+content_hash() {
+  local vars_to_hash="${1:?vars required}"
+  shift
+  short_input_hash "$vars_to_hash" "$@"
+}
+
+# usage: validation_hash "vars..." PATH...
+validation_hash() {
+  local vars_to_hash="${1:-}"
+  shift || true
+  short_input_hash "$vars_to_hash" "$@"
+}
+
+trim_string() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+profile_value() {
+  local profile_file="${1:?profile file required}"
+  local key="${2:?profile key required}"
+  local line stripped name value first suffix
+
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "ERROR: unsafe profile key: $key" >&2; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    stripped="$(trim_string "$line")"
+    [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+    if [[ "$stripped" == export[[:space:]]* ]]; then
+      stripped="$(trim_string "${stripped#export}")"
+    fi
+    [[ "$stripped" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+    name="${BASH_REMATCH[1]}"
+    [[ "$name" == "$key" ]] || continue
+    value="$(trim_string "${BASH_REMATCH[2]}")"
+    first="${value:0:1}"
+    if [[ "$first" == '"' ]]; then
+      value="${value#\"}"
+      [[ "$value" == *\"* ]] || { echo "ERROR: unterminated double-quoted value for $key in $profile_file" >&2; return 1; }
+      suffix="${value#*\"}"
+      value="${value%%\"*}"
+      suffix="$(trim_string "$suffix")"
+      [[ -z "$suffix" || "$suffix" == \#* ]] || { echo "ERROR: unexpected content after quoted value for $key in $profile_file" >&2; return 1; }
+    elif [[ "$first" == "'" ]]; then
+      value="${value#\'}"
+      [[ "$value" == *\'* ]] || { echo "ERROR: unterminated single-quoted value for $key in $profile_file" >&2; return 1; }
+      suffix="${value#*\'}"
+      value="${value%%\'*}"
+      suffix="$(trim_string "$suffix")"
+      [[ -z "$suffix" || "$suffix" == \#* ]] || { echo "ERROR: unexpected content after quoted value for $key in $profile_file" >&2; return 1; }
+    else
+      value="${value%%#*}"
+      value="$(trim_string "$value")"
+    fi
+    printf '%s\n' "$value"
+    return 0
+  done < "$profile_file"
+}
+# Validation hashes are separate from image content hashes. They cover test
+# declarations and the templates/helpers that implement testing. This lets CI
+# re-test an unchanged canonical image when validation logic changes, without
+# forcing a rebuild of the image itself.
+validation_helper_paths() {
+  printf '%s\n' \
+    "ci-pipelines/child-templates.yaml" \
+    "ci-pipelines/helpers/generate-child-pipeline.py" \
+    "ci-pipelines/helpers/meta.sh" \
+    "ci-pipelines/helpers/skopeo.sh" \
+    "ci-pipelines/helpers/vetnode-config.yaml"
+}
+
+base_validation_hash() {
+  local family="${1:?family required}"
+  local name="${2:?name required}"
+  local variant="${3:?variant required}"
+  local ci_file
+
+  case "$family" in
+    cuda) ci_file="Alps-Images/NGC/ci.yaml" ;;
+    rocm) ci_file="Alps-Images/ROCm/ci.yaml" ;;
+    *) echo "ERROR: unsupported base family for validation hash: $family" >&2; return 1 ;;
+  esac
+
+  local -a helper_paths
+  mapfile -t helper_paths < <(validation_helper_paths)
+  local -a paths=("$ci_file" "${helper_paths[@]}")
+  validation_hash "family name variant" "${paths[@]}"
+}
+
+app_validation_hash() {
+  local app_name="${1:?app name required}"
+  local app_variant="${2:?app variant required}"
+  local app_dir="Alps-Images/apps/${app_name}"
+  local ci_file="${app_dir}/ci.yaml"
+  local profile_file="${app_dir}/profile.env"
+  local -a helper_paths
+  mapfile -t helper_paths < <(validation_helper_paths)
+  local -a paths=("$ci_file" "${helper_paths[@]}")
+
+  [[ -f "$ci_file" ]] || { echo "ERROR: missing $ci_file" >&2; return 1; }
+  [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
+
+  local variant_upper="${app_variant^^}"
+  local test_dir_var="${variant_upper}_TEST_DIR"
+  local patch_dir_var="${variant_upper}_PATCH_DIR"
+  local app_variants common_test_dir common_patch_dir test_dir_rel patch_dir_rel declared_variant
+  app_variants="$(profile_value "$profile_file" APP_VARIANTS)"
+  common_test_dir="$(profile_value "$profile_file" COMMON_TEST_DIR)"
+  common_patch_dir="$(profile_value "$profile_file" COMMON_PATCH_DIR)"
+  test_dir_rel="$(profile_value "$profile_file" "$test_dir_var")"
+  patch_dir_rel="$(profile_value "$profile_file" "$patch_dir_var")"
+
+  for declared_variant in $app_variants; do
+    validate_app_variant_name "$declared_variant" "declared app variant in ${profile_file}"
+  done
+  case " ${app_variants} " in
+    *" ${app_variant} "*) ;;
+    *) echo "ERROR: app variant ${app_variant} is not declared in ${profile_file}" >&2; return 1;;
+  esac
+
+  if [[ -n "$common_test_dir" ]]; then
+    paths+=("${app_dir}/${common_test_dir}")
+  fi
+  if [[ -n "$test_dir_rel" ]]; then
+    paths+=("${app_dir}/${test_dir_rel}")
+  fi
+  if [[ -n "$common_patch_dir" ]]; then
+    paths+=("${app_dir}/${common_patch_dir}")
+  fi
+  if [[ -n "$patch_dir_rel" ]]; then
+    paths+=("${app_dir}/${patch_dir_rel}")
+  fi
+
+  validation_hash "app_name app_variant" "${paths[@]}"
 }
 
 # usage: canon_tag_for TAG HASH
@@ -60,6 +205,18 @@ canon_tag_for() {
 img_ref() {
   : "${IMAGE_PREFIX:?IMAGE_PREFIX must be set}"
   printf '%s/%s:%s\n' "$IMAGE_PREFIX" "$1" "$2"
+}
+
+# usage: image_refs NAME TAG HASH
+# Returns: CANON_REF STABLE_REF
+image_refs() {
+  local name="${1:?name required}"
+  local tag="${2:?tag required}"
+  local hash="${3:?hash required}"
+  local canon_tag
+
+  canon_tag="$(canon_tag_for "$tag" "$hash")"
+  printf '%s %s\n' "$(img_ref "$name" "$canon_tag")" "$(img_ref "$name" "$tag")"
 }
 
 # Parse BASE_IMAGE like:
@@ -83,18 +240,20 @@ parse_base_image() {
   esac
 }
 
-load_base_ref_vars() {
+base_canonical_ref() {
   local family="${1:?family required}"
   local name="${2:?name required}"
   local variant="${3:?variant required}"
+  local -a fields
 
   case "$family" in
     ngc)
-      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
+      read -r -a fields < <(ngc_base_refs "$name" "$variant")
+      printf '%s\n' "${fields[3]}"
       ;;
     rocm)
-      REMOVE_HPCX_DIRS_B64=""
-      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
+      read -r -a fields < <(rocm_base_refs "$name" "$variant")
+      printf '%s\n' "${fields[2]}"
       ;;
     *)
       echo "ERROR: unsupported base image family: $family" >&2
@@ -196,13 +355,12 @@ EOF
 }
 
 # Usage: rocm_base_refs NAME ROCM_VARIANT
-# Returns: BASE_IMAGE_REF DOCKERFILE CANON_REF TEST_REF STABLE_REF
+# Returns: BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF
 rocm_base_refs() {
   local rocm_name="${1:?rocm_name required}"       # e.g. pytorch
   local rocm_variant="${2:?rocm_variant required}" # e.g. rocm7.14-ubuntu24.04-py3.12-torch2.11
 
   : "${ALPS_REV:?ALPS_REV must be set}"
-  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
   : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local image_dir="Alps-Images/ROCm/${rocm_name}-${rocm_variant}"
@@ -231,18 +389,16 @@ rocm_base_refs() {
   local base_image_ref
   base_image_ref="$(rocm_base_image_ref "$rocm_name" "$rocm_variant")"
 
-  local hash_paths="$dockerfile $rocm_installer $rocm_components $rocm_runtime_env $common_dir $patches_dir $image_dir"
+  local -a hash_paths=("$dockerfile" "$rocm_installer" "$rocm_components" "$rocm_runtime_env" "$common_dir" "$patches_dir" "$image_dir")
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL")"
-  local canon_tag="$(canon_tag_for "$tag" "$h")"
+  local h
+  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  local canon_ref stable_ref
+  read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
-  local canon_ref="$(img_ref "$name" "$canon_tag")"
-  local test_ref="$(img_ref "$name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
-  local stable_ref="$(img_ref "$name" "$tag")"
-
-  printf '%s %s %s %s %s\n' \
-    "$base_image_ref" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+  printf '%s %s %s %s\n' \
+    "$base_image_ref" "$dockerfile" "$canon_ref" "$stable_ref"
 }
 
 # Usage: ngc_base_refs NGC_NAME NGC_TAG
@@ -251,7 +407,6 @@ ngc_base_refs() {
   local ngc_tag="${2:?ngc_tag required}"     # e.g. 25.12-py3
 
   : "${ALPS_REV:?ALPS_REV must be set}"
-  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
   : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local image_dir="Alps-Images/NGC/${ngc_name}-${ngc_tag}"
@@ -279,8 +434,7 @@ ngc_base_refs() {
   source "$profile_file"
   REMOVE_HPCX_DIRS_B64="$(printf '%s' "$REMOVE_HPCX_DIRS" | base64 -w0)"
   # Keep the space-separated helper record parseable when the override is empty.
-  # Command substitution strips the decoded newline, yielding an empty value in CI.
-  [[ -n "$REMOVE_HPCX_DIRS_B64" ]] || REMOVE_HPCX_DIRS_B64="Cg=="
+  [[ -n "$REMOVE_HPCX_DIRS_B64" ]] || REMOVE_HPCX_DIRS_B64="__EMPTY__"
 
   # Some nvcr images have a different repo structure, e.g. physicsnemo:
   # nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
@@ -292,18 +446,16 @@ ngc_base_refs() {
   local base_image_ref="jfrog.svc.cscs.ch/nvcr/${NVCR_PREFIX}/${ngc_name}:${ngc_tag}"
 
   # Compute canonical tag from hashed content
-  local hash_paths="$dockerfile $ngc_installer $ngc_components $ngc_runtime_env $common_dir $patches_dir $image_dir"
+  local -a hash_paths=("$dockerfile" "$ngc_installer" "$ngc_components" "$ngc_runtime_env" "$common_dir" "$patches_dir" "$image_dir")
   local name="${ngc_name}-cuda"
   local tag="${ngc_tag}-${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "name tag CSCS_CI_ORIG_CLONE_URL")"
-  local canon_tag="$(canon_tag_for "$tag" "$h")"
+  local h
+  h="$(content_hash "name tag base_image_ref REMOVE_HPCX_DIRS NVCR_PREFIX CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  local canon_ref stable_ref
+  read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
-  local canon_ref="$(img_ref "$name" "$canon_tag")"
-  local test_ref="$(img_ref "$name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
-  local stable_ref="$(img_ref "$name" "$tag")"
-
-  printf '%s %s %s %s %s %s\n' \
-    "$base_image_ref" "$REMOVE_HPCX_DIRS_B64" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+  printf '%s %s %s %s %s\n' \
+    "$base_image_ref" "$REMOVE_HPCX_DIRS_B64" "$dockerfile" "$canon_ref" "$stable_ref"
 }
 
 validate_app_variant_name() {
@@ -316,41 +468,117 @@ validate_app_variant_name() {
   }
 }
 
+write_base_build_env() {
+  local output_file="${1:?output file required}"
+  local family="${2:?family required}"
+  local name="${3:?name required}"
+  local variant="${4:?variant required}"
+  local base_image_ref dockerfile canon_image_ref stable_image_ref tested_image_ref image_description validation_hash_value
+  local family_variant_dir="" family_dotenv=""
+
+  : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
+  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
+
+  case "$family" in
+    cuda|ngc)
+      read -r base_image_ref REMOVE_HPCX_DIRS_B64 dockerfile canon_image_ref stable_image_ref < <(ngc_base_refs "$name" "$variant")
+      local remove_hpcx_dirs
+      if [[ "$REMOVE_HPCX_DIRS_B64" == "__EMPTY__" ]]; then
+        remove_hpcx_dirs=""
+      else
+        remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
+      fi
+      family="cuda"
+      image_description="This image extends ${base_image_ref} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
+      family_variant_dir="NGC_VARIANT_DIR=${name}-${variant}"
+      family_dotenv="REMOVE_HPCX_DIRS=${remove_hpcx_dirs}"
+      ;;
+    rocm)
+      read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(rocm_base_refs "$name" "$variant")
+      local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
+      local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
+      profile_file="$(rocm_profile_file "$name" "$variant")"
+      load_rocm_profile "$profile_file"
+      ROCM_VERSION="$(rocm_version_from_variant "$variant")"
+      image_description="This image extends ${base_image_ref} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
+      family_dotenv="$(rocm_base_dotenv "${name}-${variant}")"
+      ;;
+    *)
+      echo "ERROR: unsupported base family: $family" >&2
+      return 1
+      ;;
+  esac
+
+  # The generated child pipeline consumes one env record per variant. Keeping
+  # this assembly in shell preserves identical canonical refs between CI,
+  # publishing, and manual-build script generation.
+  validation_hash_value="$(base_validation_hash "$family" "$name" "$variant")"
+  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash_value")"
+
+  {
+    printf '%s\n' \
+      "FAMILY=$family" \
+      "NAME=$name" \
+      "VARIANT=$variant" \
+      "DOCKERFILE=$dockerfile" \
+      "CANON_IMAGE_REF=$canon_image_ref" \
+      "STABLE_IMAGE_REF=$stable_image_ref" \
+      "TESTED_IMAGE_REF=$tested_image_ref" \
+      "VALIDATION_HASH=$validation_hash_value" \
+      "BASE_IMAGE=$base_image_ref" \
+      "$family_variant_dir"
+    printf '%s\n' "$family_dotenv"
+    # shellcheck source=Alps-Images/common/alps-stack-versions.env
+    source Alps-Images/common/alps-stack-versions.env
+    vars_blob "BOOST_VER BOOST_BUILD_JOBS ALPS_BUILD_JOBS ALPS_CMAKE_BUILD_JOBS XPMEM_REF CASSINI_HEADERS_VERSION CXI_DRIVER_VERSION LIBCXI_VERSION LIBFABRIC_COMMIT LIBFABRIC_PATCH UCX_VERSION UCC_VERSION OMPI_VER AWS_OFI_NCCL_REPO AWS_OFI_NCCL_COMMIT AWS_OFI_NCCL_PATCH OSU_VERSION"
+    printf '%s\n' \
+      "OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}" \
+      "OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \
+      "OCI_DESCRIPTION=$image_description" \
+      "CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}" \
+      "GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}"
+  } | sed '/^$/d' > "$output_file"
+}
+
 write_app_build_env() {
   local output_file="${1:?output file required}"
   local app_name="${2:?app name required}"
   local app_variant="${3:?app variant required}"
-  local base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref image_description
+  local base_image_ref dockerfile canon_image_ref stable_image_ref tested_image_ref image_description validation_hash_value
 
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
+  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
 
-  read -r base_image_ref dockerfile canon_image_ref test_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
+  # App canonical hashes include the canonical base ref, so app images rebuild
+  # automatically when their selected base content changes.
+  read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
+  validation_hash_value="$(app_validation_hash "$app_name" "$app_variant")"
+  tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash_value")"
   image_description="This image extends ${base_image_ref} with application software for Alps."
 
   cat > "${output_file}" <<EOF
 DOCKERFILE=$dockerfile
 CANON_IMAGE_REF=$canon_image_ref
-TEST_IMAGE_REF=$test_image_ref
 STABLE_IMAGE_REF=$stable_image_ref
+TESTED_IMAGE_REF=$tested_image_ref
+VALIDATION_HASH=$validation_hash_value
 BASE_IMAGE=$base_image_ref
 OCI_SOURCE=${CSCS_CI_ORIG_CLONE_URL}
 OCI_REVISION=${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}
-OCI_CREATED=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 OCI_DESCRIPTION=$image_description
 CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}
-GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#$IMAGE_PREFIX}
+GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}
 EOF
 }
 
 # Usage: app_refs APP_NAME APP_VARIANT
 # Returns a space-separated record:
-#   BASE_IMAGE_REF DOCKERFILE CANON_REF TEST_REF STABLE_REF
+#   BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF
 app_refs() {
   local app_name="${1:?name required}"       # e.g. apertus-2
   local app_variant="${2:?app variant required}" # e.g. cuda
 
   : "${ALPS_REV:?ALPS_REV must be set}"
-  : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
   : "${CSCS_CI_ORIG_CLONE_URL:?CSCS_CI_ORIG_CLONE_URL must be set}"
 
   local app_dir="Alps-Images/apps/${app_name}"
@@ -359,87 +587,87 @@ app_refs() {
   local sources_dir="${app_dir}/sources"
   validate_app_variant_name "$app_variant" "requested app variant"
   local variant_upper="${app_variant^^}"
-  local APP_VARIANTS=""
-  local COMMON_CONTAINERFILE=""
-  local COMMON_TEST_DIR=""
-  local COMMON_PATCH_DIR=""
   local base_image_var="${variant_upper}_BASE_IMAGE"
   local dockerfile_var="${variant_upper}_CONTAINERFILE"
   local test_dir_var="${variant_upper}_TEST_DIR"
   local patch_dir_var="${variant_upper}_PATCH_DIR"
-  local "$base_image_var" "$dockerfile_var" "$test_dir_var" "$patch_dir_var"
 
   [[ -d "$app_dir" ]]      || { echo "ERROR: missing $app_dir" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
 
-  # Load variant metadata from profile file.
-  # shellcheck disable=SC1090
-  source "$profile_file"
+  local app_variants common_containerfile common_test_dir common_patch_dir declared_variant
+  app_variants="$(profile_value "$profile_file" APP_VARIANTS)"
+  common_containerfile="$(profile_value "$profile_file" COMMON_CONTAINERFILE)"
+  common_test_dir="$(profile_value "$profile_file" COMMON_TEST_DIR)"
+  common_patch_dir="$(profile_value "$profile_file" COMMON_PATCH_DIR)"
 
-  local declared_variant
-  for declared_variant in $APP_VARIANTS; do
+  for declared_variant in $app_variants; do
     validate_app_variant_name "$declared_variant" "declared app variant in ${profile_file}"
   done
 
-  case " ${APP_VARIANTS} " in
+  case " ${app_variants} " in
     *" ${app_variant} "*) ;;
     *) echo "ERROR: app variant ${app_variant} is not declared in ${profile_file}" >&2; return 1;;
   esac
 
-  local base_image="${!base_image_var-}"
-  local dockerfile_rel="${!dockerfile_var:-${COMMON_CONTAINERFILE:-Containerfile}}"
-  local test_dir_rel="${!test_dir_var-}"
-  local patch_dir_rel="${!patch_dir_var-}"
-  local dockerfile test_dirs="" patch_dirs=""
+  local base_image
+  local dockerfile_rel
+  local test_dir_rel
+  local patch_dir_rel
+  base_image="$(profile_value "$profile_file" "$base_image_var")"
+  dockerfile_rel="$(profile_value "$profile_file" "$dockerfile_var")"
+  test_dir_rel="$(profile_value "$profile_file" "$test_dir_var")"
+  patch_dir_rel="$(profile_value "$profile_file" "$patch_dir_var")"
+  dockerfile_rel="${dockerfile_rel:-${common_containerfile:-Containerfile}}"
+  local dockerfile
+  local -a test_dirs=() patch_dirs=()
 
   [[ -n "$base_image" ]] || { echo "ERROR: ${base_image_var} must be set in ${profile_file}" >&2; return 1; }
   dockerfile="${app_dir}/${dockerfile_rel}"
   [[ -f "$dockerfile" ]] || { echo "ERROR: missing $dockerfile" >&2; return 1; }
 
-  if [[ -n "$COMMON_TEST_DIR" ]]; then
-    local common_test_dir="${app_dir}/${COMMON_TEST_DIR}"
-    [[ -d "$common_test_dir" ]] || { echo "ERROR: missing declared common test dir $common_test_dir" >&2; return 1; }
-    test_dirs="$test_dirs $common_test_dir"
+  if [[ -n "$common_test_dir" ]]; then
+    local common_test_path="${app_dir}/${common_test_dir}"
+    [[ -d "$common_test_path" ]] || { echo "ERROR: missing declared common test dir $common_test_path" >&2; return 1; }
+    test_dirs+=("$common_test_path")
   fi
   if [[ -n "$test_dir_rel" ]]; then
     local test_dir="${app_dir}/${test_dir_rel}"
     [[ -d "$test_dir" ]] || { echo "ERROR: missing declared test dir $test_dir" >&2; return 1; }
-    test_dirs="$test_dirs $test_dir"
+    test_dirs+=("$test_dir")
   fi
-  if [[ -n "$COMMON_PATCH_DIR" ]]; then
-    local common_patch_dir="${app_dir}/${COMMON_PATCH_DIR}"
-    [[ -d "$common_patch_dir" ]] || { echo "ERROR: missing declared common patch dir $common_patch_dir" >&2; return 1; }
-    patch_dirs="$patch_dirs $common_patch_dir"
+  if [[ -n "$common_patch_dir" ]]; then
+    local common_patch_path="${app_dir}/${common_patch_dir}"
+    [[ -d "$common_patch_path" ]] || { echo "ERROR: missing declared common patch dir $common_patch_path" >&2; return 1; }
+    patch_dirs+=("$common_patch_path")
   fi
   if [[ -n "$patch_dir_rel" ]]; then
     local patch_dir="${app_dir}/${patch_dir_rel}"
     [[ -d "$patch_dir" ]] || { echo "ERROR: missing declared patch dir $patch_dir" >&2; return 1; }
-    patch_dirs="$patch_dirs $patch_dir"
+    patch_dirs+=("$patch_dir")
   fi
 
   # Compute canonical ref of base
   local base_family base_name base_variant
   read -r base_family base_name base_variant < <(parse_base_image "$base_image")
-  local BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF
-  load_base_ref_vars "$base_family" "$base_name" "$base_variant"
-  local base_canon_ref="$CANON_IMAGE_REF"
+  local base_canon_ref
+  base_canon_ref="$(base_canonical_ref "$base_family" "$base_name" "$base_variant")"
 
   # Compute canonical tag from hashed content
-  local hash_paths="$dockerfile $profile_file $patch_dirs $test_dirs"
+  local -a hash_paths=("$dockerfile" "$profile_file" "${patch_dirs[@]}" "${test_dirs[@]}")
   if [[ -d "$sources_dir" ]]; then
-    hash_paths="$hash_paths $sources_dir"
+    hash_paths+=("$sources_dir")
   fi
   if grep -Fq "$package_helpers" "$dockerfile"; then
     [[ -f "$package_helpers" ]] || { echo "ERROR: missing $package_helpers" >&2; return 1; }
-    hash_paths="$hash_paths $package_helpers"
+    hash_paths+=("$package_helpers")
   fi
   local image_name="${app_name}-${app_variant}"
   local tag="${ALPS_REV}"
-  local h="$(content_hash "$hash_paths" "app_name app_variant image_name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL")"
-  local canon_tag="$(canon_tag_for "$tag" "$h")"
-  local canon_ref="$(img_ref "$image_name" "$canon_tag")"
-  local test_ref="$(img_ref "$image_name" "${tag}-${CI_COMMIT_SHORT_SHA}")"
-  local stable_ref="$(img_ref "$image_name" "$tag")"
+  local h
+  h="$(content_hash "app_name app_variant image_name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  local canon_ref stable_ref
+  read -r canon_ref stable_ref < <(image_refs "$image_name" "$tag" "$h")
 
-  printf '%s %s %s %s %s\n' "$base_canon_ref" "$dockerfile" "$canon_ref" "$test_ref" "$stable_ref"
+  printf '%s %s %s %s\n' "$base_canon_ref" "$dockerfile" "$canon_ref" "$stable_ref"
 }

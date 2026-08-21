@@ -1,0 +1,146 @@
+name: preflight
+
+# Fast GitHub-side preflight for logic that does not require CSCS infrastructure.
+# These checks exercise the child-pipeline generator, metadata validation, shell
+# helpers, CI YAML syntax, and manual-build script generation with mocked registry
+# state. They are meant to catch cheap regressions before the GitLab/CSCS pipeline
+# spends runner time. GitLab/CSCS CI remains authoritative for real child-pipeline
+# creation, included template resolution, CSCS runners, Slurm tests, image builds,
+# registry authentication, validation markers, and publish promotion.
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  # PRs also receive push events for the same branch. This gate keeps the cheap
+  # preflight useful on branch pushes while skipping duplicate runs for the same
+  # content.
+  deduplicate:
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip.outputs.should_skip }}
+    steps:
+      - id: skip
+        uses: fkirc/skip-duplicate-actions@b974a9395958c231af965b70070979a577efa578 # v5
+        with:
+          concurrent_skipping: same_content_newer
+          skip_after_successful_duplicate: 'true'
+
+  preflight:
+    needs: deduplicate
+    if: needs.deduplicate.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Python and pytest
+        run: |
+          # Generator/schema tests use mocked digest lookups; shell-helper tests
+          # use a fake skopeo executable, so no credentials or CSCS runners are needed.
+          python -m py_compile ci-pipelines/helpers/generate-child-pipeline.py
+          uvx --with pyyaml pytest ci-pipelines/tests
+
+      - name: Shell syntax
+        # Catch syntax errors in tracked shell scripts, including sourced helpers.
+        run: git ls-files '*.sh' | xargs -r -n1 bash -n
+
+      - name: ShellCheck
+        run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh
+
+      - name: CI YAML and embedded shell syntax
+        run: |
+          # Parse the static CI YAML files and syntax-check literal shell snippets
+          # embedded in script/before_script entries.
+          uv run --with pyyaml python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          import yaml
+
+          for path in [
+              'ci-pipelines/build-alps-extended-images.yaml',
+              'ci-pipelines/build-ci-generator-image.yaml',
+              'ci-pipelines/child-templates.yaml',
+          ]:
+              data = yaml.safe_load(Path(path).read_text())
+              for job in data.values():
+                  if not isinstance(job, dict):
+                      continue
+                  for key in ('before_script', 'script'):
+                      for script in job.get(key) or []:
+                          if isinstance(script, str):
+                              subprocess.run(['bash', '-n'], input=script, text=True, check=True)
+          PY
+
+      - name: Generated child pipeline smoke
+        run: |
+          # Run the real generator with a fake skopeo that reports every image as
+          # missing, then parse the generated child pipeline. This exercises the
+          # metadata-to-YAML path without registry credentials.
+          tmp_bin="$(mktemp -d)"
+          trap 'rm -rf "$tmp_bin" generated-child-pipeline.yaml' EXIT
+          cat > "$tmp_bin/skopeo" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "${1:-}" in
+            inspect)
+              echo "manifest unknown" >&2
+              exit 1
+              ;;
+            login)
+              exit 0
+              ;;
+            *)
+              echo "unsupported fake skopeo call: $*" >&2
+              exit 2
+              ;;
+          esac
+          SH
+          chmod +x "$tmp_bin/skopeo"
+          export PATH="$tmp_bin:$PATH"
+          export IMAGE_PREFIX=localhost/alps-images
+          export GHCR_IMAGE_PREFIX=localhost/ghcr
+          export ALPS_REV=alps7-dev
+          export CI_COMMIT_SHORT_SHA=abc123
+          export CI_COMMIT_SHA=abc123
+          export CSCS_CI_ORIG_CLONE_URL=https://example.invalid/repo.git
+          uv run --with pyyaml python ci-pipelines/helpers/generate-child-pipeline.py
+          uv run --with pyyaml python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          data = yaml.safe_load(Path('generated-child-pipeline.yaml').read_text())
+          assert isinstance(data, dict)
+          assert data.get('include')
+          assert any(name.startswith('build-base-') for name in data)
+          assert any(name.startswith('build-app-') for name in data)
+          PY
+
+      - name: Manual-build smoke
+        run: |
+          # Generate representative manual build scripts and syntax-check them.
+          # This verifies manual-build still matches the current meta.sh ref API.
+          export IMAGE_PREFIX=localhost/alps-images
+          export ALPS_REV=alps7-dev
+          export CI_COMMIT_SHORT_SHA=abc123
+          export CI_COMMIT_SHA=abc123
+          export CSCS_CI_ORIG_CLONE_URL=https://example.invalid/repo.git
+          manual-build/manual-build.sh base cuda pytorch 25.12-py3 /tmp/manual-base-cuda.sh
+          manual-build/manual-build.sh base rocm pytorch rocm7.14-ubuntu24.04-py3.12-torch2.11 /tmp/manual-base-rocm.sh
+          manual-build/manual-build.sh app vllm cuda /tmp/manual-app-cuda.sh
+          manual-build/manual-build.sh app vllm rocm /tmp/manual-app-rocm.sh
+          bash -n /tmp/manual-base-cuda.sh
+          bash -n /tmp/manual-base-rocm.sh
+          bash -n /tmp/manual-app-cuda.sh
+          bash -n /tmp/manual-app-rocm.sh

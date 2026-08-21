@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE=quay.io/skopeo/stable:v1.22.2
+FROM ${BASE_IMAGE}
+
+LABEL org.opencontainers.image.title="Alps CI generator"
+LABEL org.opencontainers.image.description="Python, PyYAML, and skopeo runtime for generating Alps Extended Images child pipelines"
+LABEL org.opencontainers.image.vendor="CSCS"
+
+RUN set -eux; \
+    if command -v apt-get >/dev/null 2>&1; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends bash ca-certificates python3 python3-yaml; \
+      rm -rf /var/lib/apt/lists/*; \
+    elif command -v dnf >/dev/null 2>&1; then \
+      dnf install -y bash ca-certificates python3 python3-pyyaml; \
+      dnf clean all; \
+    elif command -v microdnf >/dev/null 2>&1; then \
+      microdnf install -y bash ca-certificates python3 python3-pyyaml; \
+      microdnf clean all; \
+    else \
+      echo "ERROR: unsupported package manager in base image" >&2; \
+      exit 1; \
+    fi; \
+    python3 -c 'import yaml' >/dev/null

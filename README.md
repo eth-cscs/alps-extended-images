@@ -85,24 +85,19 @@ Runtime environment fragments configure Slingshot-based collective communication
 
 ## CI/CD Pipeline
 
-The GitLab CI pipeline (`ci-pipelines/build-alps-extended-images.yaml`) runs five stages:
+The GitLab entry point is `ci-pipelines/build-alps-extended-images.yaml`. It generates a child pipeline at runtime because the required work depends on registry state: missing canonical images are built, images without a current tested marker are validated, and validated images with stale or missing stable refs are published. If all images are current, the child pipeline contains only a lightweight `no-work-required` job.
 
-1. **build-base** — builds CUDA and ROCm HPC-extended base images; uses content hashing to skip unchanged variants
-2. **test-base** — validates base images on Slurm allocations:
-   - environment variable checks (FI_PROVIDER, NCCL settings)
-   - collective benchmarks (NCCL alltoall, NVSHMEM latency, OSU bandwidth)
-   - hardware verification via the `vetnode` framework for CUDA images
-   - ROCm/PyTorch GPU smoke checks and RCCL/OSU collectives for ROCm images
-3. **build-apps** — builds application images on top of canonical base image refs
-4. **test-apps** — runs end-to-end workload tests:
-   - `apertus-1p5-cuda`: Megatron pretraining (2 nodes, 8 GPUs)
-   - `apertus-2-cuda`: perplexity garden and DeepEP benchmarks
-   - `vllm-cuda` and `vllm-rocm`: 2-node Ray/NCCL or Ray/RCCL all-reduce
-   - `verl-cuda`: async RL benchmark (4 nodes, 4 tasks)
-   - app image vetnode coverage for all app images in the CI matrix
-5. **publish** — promotes all tested images to stable registries; overwrites are blocked on existing stable tags
+The generated child pipeline can contain these stages:
 
-**Image tagging strategy:** each image name encodes a SHA256 hash of its source files, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds. App hashes include the app accelerator variant, canonical base image ref, selected app Containerfile, `profile.env`, optional declared tests, optional declared app-local patches, and copied shared helper inputs when present.
+1. **build-base** — builds missing CUDA and ROCm HPC-extended canonical base images
+2. **test-base** — validates base images on Slurm allocations with environment checks, collective benchmarks, CUDA `vetnode`, and ROCm/PyTorch smoke tests
+3. **mark-base-tested** — creates tested-marker tags for base images that passed the current validation
+4. **build-apps** — builds missing application images on top of validated canonical base image refs
+5. **test-apps** — runs app workload tests and app `vetnode` coverage declared in app-local `ci.yaml` files
+6. **mark-app-tested** — creates tested-marker tags for app images that passed the current validation
+7. **publish** — promotes validated images to stable JFrog and GHCR refs while preserving stable-tag immutability rules
+
+**Image tagging strategy:** canonical image tags include deterministic content hashes, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds. App hashes include the app accelerator variant, canonical base image ref, selected app Containerfile, `profile.env`, optional declared tests, optional declared app-local patches, and copied shared helper inputs when present. Tested-marker tags have the form `<canonical-tag>-tested-<validation-hash>` and are valid only when they point to the same digest as the canonical image.
 
 ## Manual Builds
 

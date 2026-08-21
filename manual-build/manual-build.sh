@@ -13,6 +13,7 @@ derivation as CI. If OUTPUT is omitted, the script is written to stdout.
 Environment overrides:
   IMAGE_PREFIX              default: localhost/alps-images
   ALPS_REV                  default: parsed from CI YAML
+  CI_COMMIT_SHA             default: current git SHA
   CI_COMMIT_SHORT_SHA       default: current git short SHA
   CSCS_CI_ORIG_CLONE_URL    default: current branch remote URL or local path
 EOF
@@ -41,6 +42,8 @@ default_remote_url() {
   printf '%s\n' "$root"
 }
 
+# Parse ALPS_REV from the simple top-level `variables:` mapping used by this
+# repo's GitLab CI YAML. This intentionally supports only scalar one-line values.
 default_alps_rev() {
   local root="${1:?root required}"
   local ci_yaml="${root}/ci-pipelines/build-alps-extended-images.yaml"
@@ -96,10 +99,11 @@ emit_base_script() {
   local root image_description variant_dir family_build_args
   root="$(repo_root)"
 
+  source "$root/ci-pipelines/helpers/skopeo.sh"
   source "$root/ci-pipelines/helpers/meta.sh"
   case "$family" in
-    ngc)
-      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
+    cuda|ngc)
+      read -r BASE_IMAGE_REF REMOVE_HPCX_DIRS_B64 DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(ngc_base_refs "$name" "$variant")
       local remove_hpcx_dirs
       remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
       variant_dir="${name}-${variant}"
@@ -109,7 +113,7 @@ emit_base_script() {
 "
       ;;
     rocm)
-      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
+      read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(rocm_base_refs "$name" "$variant")
       variant_dir="${name}-${variant}"
       local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
@@ -121,6 +125,7 @@ emit_base_script() {
       ;;
     *)
       printf 'ERROR: unsupported base image family for manual builds: %s\n' "$family" >&2
+      printf 'Supported families: cuda, ngc, rocm\n' >&2
       return 1
       ;;
   esac
@@ -138,7 +143,7 @@ podman build --format docker \\
   --build-arg BASE_IMAGE="$BASE_IMAGE_REF" \\
 ${family_build_args}  --build-arg OCI_SOURCE="$CSCS_CI_ORIG_CLONE_URL" \\
   --build-arg OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \\
-  --build-arg OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
+  --build-arg OCI_CREATED="\$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
   --build-arg OCI_DESCRIPTION="$image_description" \\
   --build-arg CSCS_ALPS_GIT_COMMIT_SHORT="$CI_COMMIT_SHORT_SHA" \\
   .
@@ -154,8 +159,9 @@ emit_app_script() {
   local root image_description
   root="$(repo_root)"
 
+  source "$root/ci-pipelines/helpers/skopeo.sh"
   source "$root/ci-pipelines/helpers/meta.sh"
-  read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF TEST_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$app_name" "$app_variant")
+  read -r BASE_IMAGE_REF DOCKERFILE CANON_IMAGE_REF STABLE_IMAGE_REF < <(app_refs "$app_name" "$app_variant")
   image_description="This image extends ${BASE_IMAGE_REF} with application software for Alps."
 
   cat <<EOF
@@ -171,7 +177,7 @@ podman build --format docker \\
   --build-arg BASE_IMAGE="$BASE_IMAGE_REF" \\
   --build-arg OCI_SOURCE="$CSCS_CI_ORIG_CLONE_URL" \\
   --build-arg OCI_REVISION="${CI_COMMIT_SHA:-$CI_COMMIT_SHORT_SHA}" \\
-  --build-arg OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
+  --build-arg OCI_CREATED="\$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \\
   --build-arg OCI_DESCRIPTION="$image_description" \\
   --build-arg CSCS_ALPS_GIT_COMMIT_SHORT="$CI_COMMIT_SHORT_SHA" \\
   .
