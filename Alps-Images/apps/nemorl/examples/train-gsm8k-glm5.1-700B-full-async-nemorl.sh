@@ -199,6 +199,19 @@ NCCL_DEBUG_SUBSYS = "INIT,NET"
 # NVLS only speeds up large all-reduces on the NVLink domain; TP=4
 # all-reduces at 2k tokens lose little.
 NCCL_NVLS_ENABLE = "0"
+# STEP-2 WEDGE FIX (slurm-3129449/3129890/3132942 — deterministic NCCL
+# watchdog wedge at step-2 training, memory exonerated by the KL-free run:
+# worst node 64 GiB Shmem / 231 GiB avail and it STILL hung).  On Hopper
+# with TP>1 + sequence_parallel (non-FSDP), Megatron-LM MANDATES
+# CUDA_DEVICE_MAX_CONNECTIONS=1 — its launcher asserts on it — so that
+# comm kernels launch in enqueue order and concurrent collectives cannot
+# interleave differently across ranks (= deadlock).  NeMo-RL drives
+# megatron-core directly and skips that validation; TransformerEngine
+# warned about the missing setting on all 384 ranks in every run.  Step 2
+# is where the DDP overlap machinery (overlap_grad_reduce +
+# overlap_param_gather) first runs fully concurrent.  verl exports this
+# for every job unconditionally (verl/trainer/constants_ppo.py).
+CUDA_DEVICE_MAX_CONNECTIONS = "1"
 # Post-step weight-broadcast staging (slurm-3062482): the packed refit
 # broadcast (nemo_rl/utils/packed_tensor.py) targets 2% of GPU memory
 # (~1.9 GB) per bucket, overshoots by up to one tensor, and double-buffers
