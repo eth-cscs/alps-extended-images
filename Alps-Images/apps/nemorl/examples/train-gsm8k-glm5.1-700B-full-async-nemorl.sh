@@ -343,20 +343,22 @@ grpo:
     recompute_kv_cache_after_weight_updates: false
 
 loss_fn:
-  # ⚠️ PORT-FIDELITY FIX (2026-08-20): the verl source recipe NEVER used a
-  # reference policy.  verl only builds one when actor.use_kl_loss or
-  # algorithm.use_kl_in_reward is true — both default false, the recipe sets
-  # neither, and its kl_ctrl.kl_coef: 0.001 was dead config on the disabled
-  # reward-KL path (verl/trainer/ppo/utils.py need_reference_policy()).  Our
-  # earlier translation to 0.001 here ACCIDENTALLY ENABLED the reference
-  # machinery: a permanent pinned CPU copy of the reference weights
-  # (~95 GiB/node) plus a per-step pinned copy of the current weights for the
-  # model<->reference swap — the host-memory staircase that killed every
-  # multi-step run (see HANDOFF §8 and CACHING_HOST_ALLOCATOR_FINDINGS.md).
-  # 0 = faithful to verl AND skips the whole reference stack (NeMo-RL
-  # auto-skips ref logprobs when the penalty is 0, grpo.py:990).
-  # Override NRL_REFERENCE_KL_PENALTY to re-enable a KL leash.
-  reference_policy_kl_penalty: ${NRL_REFERENCE_KL_PENALTY:-0}
+  # ⚠️ KL DELIBERATELY ON (Philip, 2026-08-21) — this is a VALIDATION
+  # campaign, not a training campaign.  The reference machinery this enables
+  # (permanent pinned CPU copy of the reference weights ~95 GiB/node + a
+  # per-step pinned copy of the current weights for the model<->reference
+  # swap) is the exact leak surface behind the host-memory staircase that
+  # killed every multi-step run (HANDOFF §8, CACHING_HOST_ALLOCATOR_
+  # FINDINGS.md), and our fork's sync+flush fixes can only be validated
+  # with the surface PRESENT.  Historical facts, for the record:
+  #   - the verl source recipe never built a reference policy at all (its
+  #     kl_coef 0.001 was dead config), so 0.001 here is NOT verl parity;
+  #   - with the penalty set to 0 (reference stack skipped entirely),
+  #     slurm-3137950 ran 4+ hours / 15+ steps flawlessly — 7x the
+  #     previous all-time record.  That is the known-good escape hatch if
+  #     this machinery ever needs to be taken out of the equation again —
+  #     edit this line to 0; there is intentionally no env override.
+  reference_policy_kl_penalty: 0.001
   # Required by async GRPO for off-policy correction
   # (matches verl rollout_correction.bypass_mode: True).
   use_importance_sampling_correction: true
