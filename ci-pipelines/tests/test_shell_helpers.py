@@ -229,7 +229,7 @@ def test_meta_base_refs_return_expected_fields():
 def test_meta_app_refs_use_canonical_base_ref():
     fields = run_meta("app_refs vllm cuda").stdout.split()
     assert len(fields) == 4
-    assert re.match(r"localhost/alps-images/pytorch-cuda:26\.02-py3-alps7-dev-[0-9a-f]{16}$", fields[0])
+    assert re.match(r"localhost/alps-images/pytorch-cuda:26\.02-py3-alps7-dev-[0-9a-f]{32}$", fields[0])
 
 
 def test_meta_parse_base_image_rejects_unsupported_format():
@@ -255,6 +255,15 @@ def test_meta_validate_rocm_profile_rejects_invalid_rebuild_flag(tmp_path):
     result = run_meta(f"load_rocm_profile {profile}", check=False)
     assert result.returncode != 0
     assert "ROCM_REBUILD_RCCL must be 0 or 1" in result.stderr
+
+
+def test_meta_profile_value_accepts_quoted_value_with_inline_comment(tmp_path):
+    profile = tmp_path / "profile.env"
+    profile.write_text('APP_VARIANTS="cuda rocm" # supported variants\n')
+
+    result = run_meta(f"profile_value {profile} APP_VARIANTS")
+
+    assert result.stdout.strip() == "cuda rocm"
 
 
 def test_meta_refs_are_deterministic():
@@ -283,6 +292,20 @@ def test_meta_ngc_canonical_ref_changes_with_profile_inputs():
 
     assert baseline[3] != changed_remove_hpcx[3]
     assert baseline[3] != changed_nvcr_prefix[3]
+
+
+def test_meta_app_profile_is_not_executed(tmp_path):
+    profile = ROOT / "Alps-Images" / "apps" / "vllm" / "profile.env"
+    marker = tmp_path / "profile-executed"
+    original = profile.read_text()
+    try:
+        profile.write_text(original + f"\ntouch {marker}\n")
+        run_meta("app_refs vllm cuda")
+        run_meta("app_validation_hash vllm cuda")
+    finally:
+        profile.write_text(original)
+
+    assert not marker.exists()
 
 
 def test_meta_write_build_env_includes_validation_marker_refs(tmp_path):
@@ -328,10 +351,10 @@ def test_manual_build_generates_valid_rocm_base_script(tmp_path):
 def test_manual_build_generates_valid_cuda_app_script(tmp_path):
     script = generate_manual("app", "vllm", "cuda", output=tmp_path / "app-cuda.sh")
     assert "Alps-Images/apps/vllm/Containerfile" in script
-    assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-cuda:.*-[0-9a-f]{16}"', script)
+    assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-cuda:.*-[0-9a-f]{32}"', script)
 
 
 def test_manual_build_generates_valid_rocm_app_script(tmp_path):
     script = generate_manual("app", "vllm", "rocm", output=tmp_path / "app-rocm.sh")
     assert "Alps-Images/apps/vllm/Containerfile.rocm" in script
-    assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-rocm:.*-[0-9a-f]{16}"', script)
+    assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-rocm:.*-[0-9a-f]{32}"', script)

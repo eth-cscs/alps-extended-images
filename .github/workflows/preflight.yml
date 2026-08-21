@@ -83,6 +83,50 @@ jobs:
                               subprocess.run(['bash', '-n'], input=script, text=True, check=True)
           PY
 
+      - name: Generated child pipeline smoke
+        run: |
+          # Run the real generator with a fake skopeo that reports every image as
+          # missing, then parse the generated child pipeline. This exercises the
+          # metadata-to-YAML path without registry credentials.
+          tmp_bin="$(mktemp -d)"
+          trap 'rm -rf "$tmp_bin" generated-child-pipeline.yaml' EXIT
+          cat > "$tmp_bin/skopeo" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          case "${1:-}" in
+            inspect)
+              echo "manifest unknown" >&2
+              exit 1
+              ;;
+            login)
+              exit 0
+              ;;
+            *)
+              echo "unsupported fake skopeo call: $*" >&2
+              exit 2
+              ;;
+          esac
+          SH
+          chmod +x "$tmp_bin/skopeo"
+          export PATH="$tmp_bin:$PATH"
+          export IMAGE_PREFIX=localhost/alps-images
+          export GHCR_IMAGE_PREFIX=localhost/ghcr
+          export ALPS_REV=alps7-dev
+          export CI_COMMIT_SHORT_SHA=abc123
+          export CI_COMMIT_SHA=abc123
+          export CSCS_CI_ORIG_CLONE_URL=https://example.invalid/repo.git
+          python3 ci-pipelines/helpers/generate-child-pipeline.py
+          uv run --with pyyaml python - <<'PY'
+          from pathlib import Path
+          import yaml
+
+          data = yaml.safe_load(Path('generated-child-pipeline.yaml').read_text())
+          assert isinstance(data, dict)
+          assert data.get('include')
+          assert any(name.startswith('build-base-') for name in data)
+          assert any(name.startswith('build-app-') for name in data)
+          PY
+
       - name: Manual-build smoke
         run: |
           # Generate representative manual build scripts and syntax-check them.

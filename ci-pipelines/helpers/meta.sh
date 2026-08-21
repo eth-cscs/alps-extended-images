@@ -52,7 +52,7 @@ short_input_hash() {
     if [[ -n "$vars_to_hash" ]]; then
       vars_blob "$vars_to_hash"
     fi
-  } | sha256sum | awk '{print $1}' | cut -c1-16
+  } | sha256sum | awk '{print $1}' | cut -c1-32
 }
 
 # Hash content that affects image build output. The stream includes file hashes
@@ -72,6 +72,52 @@ validation_hash() {
   short_input_hash "$vars_to_hash" "$@"
 }
 
+trim_string() {
+  local value="${1:-}"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s\n' "$value"
+}
+
+profile_value() {
+  local profile_file="${1:?profile file required}"
+  local key="${2:?profile key required}"
+  local line stripped name value first suffix
+
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "ERROR: unsafe profile key: $key" >&2; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    stripped="$(trim_string "$line")"
+    [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+    if [[ "$stripped" == export[[:space:]]* ]]; then
+      stripped="$(trim_string "${stripped#export}")"
+    fi
+    [[ "$stripped" =~ ^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]] || continue
+    name="${BASH_REMATCH[1]}"
+    [[ "$name" == "$key" ]] || continue
+    value="$(trim_string "${BASH_REMATCH[2]}")"
+    first="${value:0:1}"
+    if [[ "$first" == '"' ]]; then
+      value="${value#\"}"
+      [[ "$value" == *\"* ]] || { echo "ERROR: unterminated double-quoted value for $key in $profile_file" >&2; return 1; }
+      suffix="${value#*\"}"
+      value="${value%%\"*}"
+      suffix="$(trim_string "$suffix")"
+      [[ -z "$suffix" || "$suffix" == \#* ]] || { echo "ERROR: unexpected content after quoted value for $key in $profile_file" >&2; return 1; }
+    elif [[ "$first" == "'" ]]; then
+      value="${value#\'}"
+      [[ "$value" == *\'* ]] || { echo "ERROR: unterminated single-quoted value for $key in $profile_file" >&2; return 1; }
+      suffix="${value#*\'}"
+      value="${value%%\'*}"
+      suffix="$(trim_string "$suffix")"
+      [[ -z "$suffix" || "$suffix" == \#* ]] || { echo "ERROR: unexpected content after quoted value for $key in $profile_file" >&2; return 1; }
+    else
+      value="${value%%#*}"
+      value="$(trim_string "$value")"
+    fi
+    printf '%s\n' "$value"
+    return 0
+  done < "$profile_file"
+}
 # Validation hashes are separate from image content hashes. They cover test
 # declarations and the templates/helpers that implement testing. This lets CI
 # re-test an unchanged canonical image when validation logic changes, without
@@ -116,25 +162,35 @@ app_validation_hash() {
   [[ -f "$ci_file" ]] || { echo "ERROR: missing $ci_file" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
 
-  local APP_VARIANTS="" COMMON_TEST_DIR="" COMMON_PATCH_DIR=""
   local variant_upper="${app_variant^^}"
   local test_dir_var="${variant_upper}_TEST_DIR"
   local patch_dir_var="${variant_upper}_PATCH_DIR"
-  local "$test_dir_var" "$patch_dir_var"
-  # shellcheck disable=SC1090
-  source "$profile_file"
+  local app_variants common_test_dir common_patch_dir test_dir_rel patch_dir_rel declared_variant
+  app_variants="$(profile_value "$profile_file" APP_VARIANTS)"
+  common_test_dir="$(profile_value "$profile_file" COMMON_TEST_DIR)"
+  common_patch_dir="$(profile_value "$profile_file" COMMON_PATCH_DIR)"
+  test_dir_rel="$(profile_value "$profile_file" "$test_dir_var")"
+  patch_dir_rel="$(profile_value "$profile_file" "$patch_dir_var")"
 
-  if [[ -n "$COMMON_TEST_DIR" ]]; then
-    paths+=("${app_dir}/${COMMON_TEST_DIR}")
+  for declared_variant in $app_variants; do
+    validate_app_variant_name "$declared_variant" "declared app variant in ${profile_file}"
+  done
+  case " ${app_variants} " in
+    *" ${app_variant} "*) ;;
+    *) echo "ERROR: app variant ${app_variant} is not declared in ${profile_file}" >&2; return 1;;
+  esac
+
+  if [[ -n "$common_test_dir" ]]; then
+    paths+=("${app_dir}/${common_test_dir}")
   fi
-  if [[ -n "${!test_dir_var-}" ]]; then
-    paths+=("${app_dir}/${!test_dir_var}")
+  if [[ -n "$test_dir_rel" ]]; then
+    paths+=("${app_dir}/${test_dir_rel}")
   fi
-  if [[ -n "$COMMON_PATCH_DIR" ]]; then
-    paths+=("${app_dir}/${COMMON_PATCH_DIR}")
+  if [[ -n "$common_patch_dir" ]]; then
+    paths+=("${app_dir}/${common_patch_dir}")
   fi
-  if [[ -n "${!patch_dir_var-}" ]]; then
-    paths+=("${app_dir}/${!patch_dir_var}")
+  if [[ -n "$patch_dir_rel" ]]; then
+    paths+=("${app_dir}/${patch_dir_rel}")
   fi
 
   validation_hash "app_name app_variant" "${paths[@]}"
@@ -378,8 +434,7 @@ ngc_base_refs() {
   source "$profile_file"
   REMOVE_HPCX_DIRS_B64="$(printf '%s' "$REMOVE_HPCX_DIRS" | base64 -w0)"
   # Keep the space-separated helper record parseable when the override is empty.
-  # Command substitution strips the decoded newline, yielding an empty value in CI.
-  [[ -n "$REMOVE_HPCX_DIRS_B64" ]] || REMOVE_HPCX_DIRS_B64="Cg=="
+  [[ -n "$REMOVE_HPCX_DIRS_B64" ]] || REMOVE_HPCX_DIRS_B64="__EMPTY__"
 
   # Some nvcr images have a different repo structure, e.g. physicsnemo:
   # nvcr.io/nvidia/physicsnemo/physicsnemo:25.11
@@ -428,7 +483,11 @@ write_base_build_env() {
     cuda|ngc)
       read -r base_image_ref REMOVE_HPCX_DIRS_B64 dockerfile canon_image_ref stable_image_ref < <(ngc_base_refs "$name" "$variant")
       local remove_hpcx_dirs
-      remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
+      if [[ "$REMOVE_HPCX_DIRS_B64" == "__EMPTY__" ]]; then
+        remove_hpcx_dirs=""
+      else
+        remove_hpcx_dirs="$(printf '%s' "$REMOVE_HPCX_DIRS_B64" | base64 -d)"
+      fi
       family="cuda"
       image_description="This image extends ${base_image_ref} with a fully-optimized HPC networking stack tailored for the Alps supercomputer (legacy HPC-X components might be replaced)."
       family_variant_dir="NGC_VARIANT_DIR=${name}-${variant}"
@@ -528,37 +587,38 @@ app_refs() {
   local sources_dir="${app_dir}/sources"
   validate_app_variant_name "$app_variant" "requested app variant"
   local variant_upper="${app_variant^^}"
-  local APP_VARIANTS=""
-  local COMMON_CONTAINERFILE=""
-  local COMMON_TEST_DIR=""
-  local COMMON_PATCH_DIR=""
   local base_image_var="${variant_upper}_BASE_IMAGE"
   local dockerfile_var="${variant_upper}_CONTAINERFILE"
   local test_dir_var="${variant_upper}_TEST_DIR"
   local patch_dir_var="${variant_upper}_PATCH_DIR"
-  local "$base_image_var" "$dockerfile_var" "$test_dir_var" "$patch_dir_var"
 
   [[ -d "$app_dir" ]]      || { echo "ERROR: missing $app_dir" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
 
-  # Load variant metadata from profile file.
-  # shellcheck disable=SC1090
-  source "$profile_file"
+  local app_variants common_containerfile common_test_dir common_patch_dir declared_variant
+  app_variants="$(profile_value "$profile_file" APP_VARIANTS)"
+  common_containerfile="$(profile_value "$profile_file" COMMON_CONTAINERFILE)"
+  common_test_dir="$(profile_value "$profile_file" COMMON_TEST_DIR)"
+  common_patch_dir="$(profile_value "$profile_file" COMMON_PATCH_DIR)"
 
-  local declared_variant
-  for declared_variant in $APP_VARIANTS; do
+  for declared_variant in $app_variants; do
     validate_app_variant_name "$declared_variant" "declared app variant in ${profile_file}"
   done
 
-  case " ${APP_VARIANTS} " in
+  case " ${app_variants} " in
     *" ${app_variant} "*) ;;
     *) echo "ERROR: app variant ${app_variant} is not declared in ${profile_file}" >&2; return 1;;
   esac
 
-  local base_image="${!base_image_var-}"
-  local dockerfile_rel="${!dockerfile_var:-${COMMON_CONTAINERFILE:-Containerfile}}"
-  local test_dir_rel="${!test_dir_var-}"
-  local patch_dir_rel="${!patch_dir_var-}"
+  local base_image
+  local dockerfile_rel
+  local test_dir_rel
+  local patch_dir_rel
+  base_image="$(profile_value "$profile_file" "$base_image_var")"
+  dockerfile_rel="$(profile_value "$profile_file" "$dockerfile_var")"
+  test_dir_rel="$(profile_value "$profile_file" "$test_dir_var")"
+  patch_dir_rel="$(profile_value "$profile_file" "$patch_dir_var")"
+  dockerfile_rel="${dockerfile_rel:-${common_containerfile:-Containerfile}}"
   local dockerfile
   local -a test_dirs=() patch_dirs=()
 
@@ -566,20 +626,20 @@ app_refs() {
   dockerfile="${app_dir}/${dockerfile_rel}"
   [[ -f "$dockerfile" ]] || { echo "ERROR: missing $dockerfile" >&2; return 1; }
 
-  if [[ -n "$COMMON_TEST_DIR" ]]; then
-    local common_test_dir="${app_dir}/${COMMON_TEST_DIR}"
-    [[ -d "$common_test_dir" ]] || { echo "ERROR: missing declared common test dir $common_test_dir" >&2; return 1; }
-    test_dirs+=("$common_test_dir")
+  if [[ -n "$common_test_dir" ]]; then
+    local common_test_path="${app_dir}/${common_test_dir}"
+    [[ -d "$common_test_path" ]] || { echo "ERROR: missing declared common test dir $common_test_path" >&2; return 1; }
+    test_dirs+=("$common_test_path")
   fi
   if [[ -n "$test_dir_rel" ]]; then
     local test_dir="${app_dir}/${test_dir_rel}"
     [[ -d "$test_dir" ]] || { echo "ERROR: missing declared test dir $test_dir" >&2; return 1; }
     test_dirs+=("$test_dir")
   fi
-  if [[ -n "$COMMON_PATCH_DIR" ]]; then
-    local common_patch_dir="${app_dir}/${COMMON_PATCH_DIR}"
-    [[ -d "$common_patch_dir" ]] || { echo "ERROR: missing declared common patch dir $common_patch_dir" >&2; return 1; }
-    patch_dirs+=("$common_patch_dir")
+  if [[ -n "$common_patch_dir" ]]; then
+    local common_patch_path="${app_dir}/${common_patch_dir}"
+    [[ -d "$common_patch_path" ]] || { echo "ERROR: missing declared common patch dir $common_patch_path" >&2; return 1; }
+    patch_dirs+=("$common_patch_path")
   fi
   if [[ -n "$patch_dir_rel" ]]; then
     local patch_dir="${app_dir}/${patch_dir_rel}"

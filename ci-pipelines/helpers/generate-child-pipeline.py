@@ -117,14 +117,15 @@ def img_digest(ref: str) -> str:
     return DIGEST_CACHE[ref]
 
 
-def tested_marker_matches_existing_canonical(canon_ref: str, tested_ref: str) -> bool:
+def tested_marker_matches_existing_canonical(canon_ref: str, tested_ref: str, canon_digest: str | None = None) -> bool:
     """Return whether a tested marker points to the canonical digest.
 
     A missing canonical digest is not fatal here: the generator uses False to
     mean "schedule build/test/mark work" for images whose canonical ref does not
     exist yet. Registry lookup failures still raise through img_digest().
     """
-    canon_digest = img_digest(canon_ref)
+    if canon_digest is None:
+        canon_digest = img_digest(canon_ref)
     marker_digest = img_digest(tested_ref)
     if marker_digest and canon_digest and marker_digest != canon_digest:
         raise RuntimeError(
@@ -219,7 +220,7 @@ class Child:
         """Write the generated child pipeline YAML."""
         if not self.jobs:
             self.add_noop()
-        OUTPUT.write_text(yaml.safe_dump(self.data, sort_keys=False, width=120), encoding="utf-8")
+        OUTPUT.write_text(yaml.safe_dump(self.data, sort_keys=False, width=float("inf")), encoding="utf-8")
 
 
 BASE_TEST_TEMPLATES = {
@@ -367,11 +368,11 @@ def add_publish(child: Child, image: dict[str, str], needs: list[str], prefix: s
     )
 
 
-def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], valid: bool) -> str | None:
+def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], valid: bool, canon_digest: str | None = None) -> str | None:
     """Emit the minimal build/test/mark/publish graph for one base image."""
     prefix = slug(f"base-{base['NAME']}-{base['FAMILY']}-{base['VARIANT']}")
     build = f"build-{prefix}"
-    exists = bool(img_digest(base["CANON_IMAGE_REF"]))
+    exists = bool(canon_digest if canon_digest is not None else img_digest(base["CANON_IMAGE_REF"]))
     if not exists:
         build_vars = {
             key: value
@@ -469,9 +470,10 @@ def main() -> None:
     base_valid: dict[str, bool] = {}
     for base, tests in discover_bases():
         canon_ref = base["CANON_IMAGE_REF"]
-        valid = tested_marker_matches_existing_canonical(canon_ref, base["TESTED_IMAGE_REF"])
+        canon_digest = img_digest(canon_ref)
+        valid = tested_marker_matches_existing_canonical(canon_ref, base["TESTED_IMAGE_REF"], canon_digest=canon_digest)
         base_valid[canon_ref] = valid
-        base_marks[canon_ref] = add_base(child, base, tests, valid)
+        base_marks[canon_ref] = add_base(child, base, tests, valid, canon_digest)
     for app, tests in discover_apps():
         add_app(child, app, tests, base_marks, base_valid)
     child.write()

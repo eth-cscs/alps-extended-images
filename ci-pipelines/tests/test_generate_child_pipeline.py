@@ -82,6 +82,20 @@ def test_generate_no_work_emits_noop(tmp_path, monkeypatch, gen):
     assert data["no-work-required"] == {"extends": [".child-noop-template"]}
 
 
+def test_child_write_does_not_fold_long_values(tmp_path, monkeypatch, gen):
+    output = tmp_path / "child.yaml"
+    long_value = " ".join(["value"] * 80)
+    monkeypatch.setattr(gen, "OUTPUT", output)
+    child = gen.Child()
+    child.add_job("long-value-job", ".template", variables={"LONG_VALUE": long_value})
+
+    child.write()
+
+    generated = output.read_text()
+    assert f"LONG_VALUE: {long_value}" in generated
+    assert yaml.safe_load(generated)["long-value-job"]["variables"]["LONG_VALUE"] == long_value
+
+
 def test_main_generates_base_and_app_graph(tmp_path, monkeypatch, gen):
     output = tmp_path / "child.yaml"
     base = base_image()
