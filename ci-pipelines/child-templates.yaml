@@ -51,7 +51,7 @@ include:
 # `image:` to the canonical ref and only appear when validation is missing/stale.
 .child-slurm-template:
   variables:
-    USE_MPI: NO
+    USE_MPI: "NO"
     SLURM_MPI_TYPE: pmix
     SLURM_NETWORK: disable_rdzv_get
     PMIX_MCA_psec: native
@@ -220,7 +220,7 @@ include:
       done_file="$tmp_dir/setup-done-${SLURM_NODEID}-${SLURM_JOB_ID}"
       cd "$tmp_dir"
       if [ "$SLURM_LOCALID" -eq 0 ]; then
-        python -m venv --system-site-packages "$venv"
+        python3 -m venv --system-site-packages "$venv"
         source "$venv/bin/activate"
         pip install --no-cache-dir --index-url "https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" vetnode
         vetnode setup "$config"
@@ -232,6 +232,10 @@ include:
             sleep 1
             ((remaining--))
         done
+        if [ "$remaining" -le 0 ]; then
+          echo "ERROR: timed out waiting for vetnode setup on $(hostname)" >&2
+          exit 1
+        fi
       fi
     - echo "[image-vet] diagnose"
     - source "$venv/bin/activate"

@@ -30,6 +30,7 @@ def fake_skopeo_env(tmp_path, digests):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     copy_log = tmp_path / "copy.log"
+    login_log = tmp_path / "login.log"
     skopeo = bin_dir / "skopeo"
     skopeo.write_text(
         r"""#!/usr/bin/env python3
@@ -40,6 +41,9 @@ import sys
 args = sys.argv[1:]
 digests = json.loads(os.environ.get('FAKE_SKOPEO_DIGESTS', '{}'))
 if args[0] == 'login':
+    with open(os.environ['FAKE_SKOPEO_LOGIN_LOG'], 'a', encoding='utf-8') as handle:
+        handle.write('ARGS=' + ' '.join(args[1:]) + '\n')
+        handle.write('STDIN=' + sys.stdin.read() + '\n')
     raise SystemExit(0)
 if args[0] == 'inspect':
     ref = args[-1]
@@ -70,6 +74,7 @@ raise SystemExit(2)
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_SKOPEO_DIGESTS": json.dumps(digests),
         "FAKE_SKOPEO_COPY_LOG": str(copy_log),
+        "FAKE_SKOPEO_LOGIN_LOG": str(login_log),
     }, copy_log
 
 
@@ -113,6 +118,18 @@ def test_skopeo_img_digest_fails_closed_on_unexpected_error(tmp_path):
     result = run_bash(source_skopeo("img_digest registry/private:tag"), env=env, check=False)
     assert result.returncode != 0
     assert "failed to inspect image" in result.stderr
+
+
+def test_skopeo_login_passes_password_on_stdin(tmp_path):
+    env, _ = fake_skopeo_env(tmp_path, {})
+    env.update({"IMAGE_PREFIX": "registry.example/ns", "JFROG_USER": "user", "JFROG_KEY": "secret-token"})
+
+    run_bash(source_skopeo("skopeo_login"), env=env)
+
+    login_log = Path(env["FAKE_SKOPEO_LOGIN_LOG"]).read_text()
+    assert "--password-stdin" in login_log
+    assert "--password secret-token" not in login_log
+    assert "STDIN=secret-token" in login_log
 
 
 def test_skopeo_require_tested_marker_valid_requires_marker_exists(tmp_path):
@@ -250,6 +267,22 @@ def test_meta_commit_sha_does_not_change_canonical_refs():
     first = run_meta("ngc_base_refs pytorch 25.12-py3", CI_COMMIT_SHORT_SHA="one", CI_COMMIT_SHA="one").stdout
     second = run_meta("ngc_base_refs pytorch 25.12-py3", CI_COMMIT_SHORT_SHA="two", CI_COMMIT_SHA="two").stdout
     assert first == second
+
+
+def test_meta_ngc_canonical_ref_changes_with_profile_inputs():
+    profile = ROOT / "Alps-Images" / "NGC" / "pytorch-25.12-py3" / "profile.env"
+    original = profile.read_text()
+    baseline = run_meta("ngc_base_refs pytorch 25.12-py3").stdout.split()
+    try:
+        profile.write_text(original + '\nREMOVE_HPCX_DIRS="${REMOVE_HPCX_DIRS} /tmp/extra-hpcx"\n')
+        changed_remove_hpcx = run_meta("ngc_base_refs pytorch 25.12-py3").stdout.split()
+        profile.write_text(original + '\nNVCR_PREFIX=custom\n')
+        changed_nvcr_prefix = run_meta("ngc_base_refs pytorch 25.12-py3").stdout.split()
+    finally:
+        profile.write_text(original)
+
+    assert baseline[3] != changed_remove_hpcx[3]
+    assert baseline[3] != changed_nvcr_prefix[3]
 
 
 def test_meta_write_build_env_includes_validation_marker_refs(tmp_path):

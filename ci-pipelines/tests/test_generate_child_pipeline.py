@@ -82,17 +82,37 @@ def test_generate_no_work_emits_noop(tmp_path, monkeypatch, gen):
     assert data["no-work-required"] == {"extends": [".child-noop-template"]}
 
 
+def test_main_generates_base_and_app_graph(tmp_path, monkeypatch, gen):
+    output = tmp_path / "child.yaml"
+    base = base_image()
+    app = app_image(BASE_IMAGE=base["CANON_IMAGE_REF"])
+    monkeypatch.setattr(gen, "OUTPUT", output)
+    monkeypatch.setattr(gen, "discover_bases", lambda: [(base, base_tests())])
+    monkeypatch.setattr(gen, "discover_apps", lambda: [(app, app_tests())])
+    fake_registry(monkeypatch, gen, {})
+
+    gen.main()
+
+    data = yaml.safe_load(output.read_text())
+    assert "build-base-pytorch-cuda-26-06-py3" in data
+    assert data["mark-base-pytorch-cuda-26-06-py3-tested"]["needs"] == ["test-base-pytorch-cuda-26-06-py3-env"]
+    assert data["build-app-vllm-cuda"]["needs"] == ["mark-base-pytorch-cuda-26-06-py3-tested"]
+    assert data["mark-app-vllm-cuda-tested"]["needs"] == ["test-app-vllm-cuda-vetnode"]
+    assert data["publish-app-vllm-cuda"]["needs"] == ["mark-app-vllm-cuda-tested"]
+
+
 def test_slug_rejects_empty_result(gen):
     with pytest.raises(RuntimeError, match="slug produced empty string"):
         gen.slug("___")
 
 
-def test_source_profile_value_rejects_unsafe_key(gen, tmp_path):
+def test_app_variants_from_profile_parses_without_executing(gen, tmp_path):
     profile = tmp_path / "profile.env"
-    profile.write_text("APP_VARIANTS=cuda\n")
+    marker = tmp_path / "executed"
+    profile.write_text(f'APP_VARIANTS="cuda rocm"\ntouch {marker}\n')
 
-    with pytest.raises(RuntimeError, match="unsafe shell variable name"):
-        gen.source_profile_value(profile, "APP_VARIANTS:-bad")
+    assert gen.app_variants_from_profile(profile) == ["cuda", "rocm"]
+    assert not marker.exists()
 
 
 def test_generate_missing_base_emits_build_tests_marker_publish(monkeypatch, gen):
@@ -153,11 +173,18 @@ def test_generate_valid_base_with_stale_stable_emits_publish_only(monkeypatch, g
     assert "mark-base-pytorch-cuda-26-06-py3-tested" not in child.data
 
 
-def test_publish_needed_false_when_canonical_missing(monkeypatch, gen):
+def test_stable_publish_check_false_when_canonical_missing(monkeypatch, gen):
     base = base_image()
     fake_registry(monkeypatch, gen, {})
 
-    assert not gen.publish_needed(base)
+    assert not gen.stable_refs_need_publish_for_existing_canonical(base)
+
+
+def test_tested_marker_check_false_when_canonical_missing(monkeypatch, gen):
+    base = base_image()
+    fake_registry(monkeypatch, gen, {base["TESTED_IMAGE_REF"]: "sha256:base"})
+
+    assert not gen.tested_marker_matches_existing_canonical(base["CANON_IMAGE_REF"], base["TESTED_IMAGE_REF"])
 
 
 def test_add_publish_respects_force(monkeypatch, gen):
@@ -276,7 +303,7 @@ def test_generate_marker_mismatch_fails_closed(monkeypatch, gen):
     fake_registry(monkeypatch, gen, {base["CANON_IMAGE_REF"]: "sha256:new", base["TESTED_IMAGE_REF"]: "sha256:old"})
 
     with pytest.raises(RuntimeError, match="tested marker digest mismatch"):
-        gen.marker_valid(base["CANON_IMAGE_REF"], base["TESTED_IMAGE_REF"])
+        gen.tested_marker_matches_existing_canonical(base["CANON_IMAGE_REF"], base["TESTED_IMAGE_REF"])
 
 
 def test_generate_needs_reference_existing_jobs(monkeypatch, gen):
@@ -359,5 +386,5 @@ def test_schema_current_repo_metadata_is_valid(gen):
     for path in [ROOT / "Alps-Images" / "NGC" / "ci.yaml", ROOT / "Alps-Images" / "ROCm" / "ci.yaml"]:
         gen.validate_base_ci(path, gen.load_yaml(path))
     for path in sorted((ROOT / "Alps-Images" / "apps").glob("*/ci.yaml")):
-        variants = gen.source_profile_value(path.parent / "profile.env", "APP_VARIANTS").split()
+        variants = gen.app_variants_from_profile(path.parent / "profile.env")
         gen.validate_app_ci(path, variants, gen.load_yaml(path))
