@@ -80,8 +80,10 @@ ENV BASH_ENV=/opt/alps/env/source-alps-env.sh
 #
 # defvar cannot set this: slurm/enroot passes the host LD_LIBRARY_PATH (empty)
 # into the container, so defvar sees it as already set and preserves the empty
-# value.  OCI ENV is authoritative because enroot does not override it.
-ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/_rocm_sdk_devel/lib:/opt/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:/opt/venv/lib/python3.12/site-packages/_rocm_sdk_libraries/lib"
+# value.  OCI ENV is authoritative because enroot does not override it.  These
+# stable paths are symlinks created from Python-discovered ROCm SDK wheel paths
+# by install-alps-rocm-components.sh, so they do not encode the Python version.
+ENV LD_LIBRARY_PATH="/opt/alps/rocm-sdk-library-path/devel:/opt/alps/rocm-sdk-library-path/core:/opt/alps/rocm-sdk-library-path/libraries"
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
