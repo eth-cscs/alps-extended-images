@@ -145,6 +145,23 @@ RUN if [[ ! -f uv.lock || -n "${RELOCK:-}" ]]; then \
         sha256sum uv.lock ; \
     fi
 
+# Source-build discipline (added after slurm-3132948: the swiss vllm fork's
+# 391-object CUDA build at ninja's default parallelism = nproc = 288 OOMed
+# the diskless GH200 build node — 112 oom_kill events; the killed compilers
+# left truncated /tmp .s files, which `as` reported as garbage "unknown
+# mnemonic" errors.  Diagnosis note for posterity: 'yte'/'ne'/'cfa_offset'
+# mnemonics = .byte/.bne/.cfi_def_cfa_offset with chunks missing — that
+# pattern means CORRUPTED INTERMEDIATES, not a toolchain problem.)
+# - MAX_JOBS caps ninja parallelism; honored by vllm's setup.py and by
+#   TE/flash-attn/DeepEP builds alike.  32 nvcc pipelines x a few GB fits
+#   comfortably in the 480 GB node.
+# - TORCH_CUDA_ARCH_LIST=9.0a builds ONLY the GH200 arch (drops the
+#   sm100/sm103/sm120 kernels this image can never run) — less memory,
+#   much shorter build.  Deliberately a persistent ENV: at runtime it also
+#   pins JIT paths (flashinfer, torch cpp_extension) to the right arch.
+ENV MAX_JOBS=32
+ENV TORCH_CUDA_ARCH_LIST=9.0a
+
 # `--no-install-project` installs only the dependencies listed in
 # pyproject.toml, not the nemo-rl package itself. This mirrors NeMo-RL's
 # upstream Dockerfile: the heavy dependency syncs are done first (warming the
