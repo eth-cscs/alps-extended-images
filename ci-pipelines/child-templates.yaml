@@ -318,8 +318,8 @@ include:
   stage: publish
   extends: [.container-runner-lightweight-gh200, .child-skopeo-template]
   variables:
-    KUBERNETES_MEMORY_REQUEST: '128Gi'
-    KUBERNETES_MEMORY_LIMIT: '128Gi'
+    KUBERNETES_MEMORY_REQUEST: '4Gi'
+    KUBERNETES_MEMORY_LIMIT: '4Gi'
   script:
     - |
       set -euo pipefail
