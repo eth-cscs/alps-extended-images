@@ -197,6 +197,14 @@ RUN uv sync --frozen
 # because NRL_CONTAINER=1 is set, also creates
 # /usr/local/bin/python-<ClassName> wrapper scripts for frozen-env use.
 #
+
+# Create them each in a separate call, such that they enter the cache individually.
+RUN uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer
+RUN uv run nemo_rl/utils/prefetch_venvs.py AsyncTrajectoryCollector
+RUN uv run nemo_rl/utils/prefetch_venvs.py vllm
+RUN uv run nemo_rl/utils/prefetch_venvs.py megatron
+RUN uv run nemo_rl/utils/prefetch_venvs.py dtensor 
+
 # Filter list: AsyncTrajectoryCollector added (it was runtime-built on every
 # node before — ~9 GB copied into the tmpfs overlay per node with the old
 # default hardlink mode, see HANDOFF.md §8 / slurm-3071878); dtensor RE-ADDED
