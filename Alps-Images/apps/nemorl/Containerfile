@@ -1,0 +1,249 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Where are we working
+ARG WORK_DIR="/workdir"
+ARG NEMORL_DIR="${WORK_DIR}/nemo_rl"
+
+#ARG NEMORL_URL="https://github.com/NVIDIA-NeMo/RL.git"
+#ARG NEMORL_COMMIT="89f4d1f857a369b1d565c97b7b4a12c1697bb68b"
+ARG NEMORL_URL="https://github.com/philip-paul-mueller/RL.git"
+# Build against the upstream-merged branch (Python 3.13.14, new uv.lock)
+# with: --build-arg NEMORL_COMMIT=glm51-megatron-fsdp-wiring_merged
+ARG NEMORL_COMMIT="glm51-megatron-fsdp-wiring"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+# Install uv at /usr/local/bin in case the root home directory is bind mounted
+# We need `uv` because the NeMoRL repo makes heavy use of it.
+# MUST match the uv that wrote the branch uv.lock — upstream docker/Dockerfile
+# pins 0.11.28 on current main.  A different uv (e.g. 0.12.x) re-validates
+# the lock with new rules and errors "lockfile needs to be updated" even
+# though nothing changed.
+ARG UV_VERSION=0.11.28
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | XDG_BIN_HOME=/usr/local/bin sh
+
+# This will ensure that the venv is build at a static location.
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
+
+# Let's put the cache at a specific well known location.
+# INVARIANT: never prune/remove this cache from the image — every venv
+# (the prefetched ones below AND any venv built at runtime) is a symlink
+# farm resolving into it.  Removing it breaks them all.
+ENV UV_CACHE_DIR="/opt/uv_cache"
+
+# Ensure that uv uses symlinks by default
+ENV UV_LINK_MODE="symlink"
+
+# Disable Ray's built-in uv-run runtime-env creation (ray>=2.47). NeMo-RL has
+# its own per-node venv creator (nemo_rl/utils/venvs.py) that runs once per
+# node; Ray's default runs once per task and causes severe contention with our
+# large, occasionally-compiled dependencies. See NeMoRL/docker/Dockerfile:105.
+ENV RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+ENV RAY_USAGE_STATS_ENABLED=0
+
+# Per-actor venvs (Workers, Generators, ReplayBuffer, etc.) are created at
+# runtime by nemo_rl/utils/venvs.py and nemo_rl/utils/prefetch_venvs.py. The
+# default location is <git_root>/venvs, i.e. /workdir/nemo_rl/venvs — which is
+# inside the bind-mounted source tree and would be shadowed at runtime. Pin
+# them to a stable, non-mounted path so prefetched venvs survive. We also
+# set NEMO_GYM_VENV_DIR (defaults to <git_root>/gym_venvs otherwise) for the
+# same reason.
+ENV NEMO_RL_VENV_DIR="/opt/ray_venvs"
+ENV NEMO_GYM_VENV_DIR="/opt/gym_venvs"
+
+# Mark that we are in a container. nemo_rl/utils/prefetch_venvs.py's
+# create_frozen_environment_symlinks() only runs when NRL_CONTAINER is set,
+# and creates /usr/local/bin/python-<ClassName> wrappers for frozen-env use.
+ENV NRL_CONTAINER=1
+
+# This environment variables are important for building.
+ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
+
+# The base exports also 8.0 which leads to failure to build certain components.
+ENV TORCH_CUDA_ARCH_LIST="9.0"
+
+# Already exported in the base.
+#ENV CUDA_PATH="/usr/local/cuda-13.1/"
+
+# Needed for installation of `DeepGEMM`.
+# NOTE: In the `nemo` container one must override `PYTHONPATH`, here it might not be needed.
+ARG DEEP_GEMM_SCRIPTS="${WORK_DIR}/deep_gemm_patch"
+ENV PYTHONPATH="${DEEP_GEMM_SCRIPTS}:"
+
+# Now pulling NeMoRL
+WORKDIR "${WORK_DIR}"
+
+# Clone Nemo and check out the last known PATH.
+RUN git clone "${NEMORL_URL}" "${NEMORL_DIR}"  		&& \
+	cd "${NEMORL_DIR}" 				&& \
+	git switch "${NEMORL_COMMIT}"			&& \
+	git submodule update --init --recursive
+
+# Now we need to download `DeepGEMM` to extract the patches for building it.
+# NOTE: The commit that NeMoRL's `pyproject.toml` file references, `67fc64863d43521080bf2005e6528d0fceee9510`does not exist in the
+#	_official_ repo, but in a fork. For some reason `uv` manages to find it, `git-ls-remote` also finds it. But we are using
+#	a commit that also works.
+RUN git clone --depth 1 https://github.com/deepseek-ai/DeepGEMM.git 	&& \
+	mkdir -p "${DEEP_GEMM_SCRIPTS}"					&& \
+	cp -r DeepGEMM/scripts "${DEEP_GEMM_SCRIPTS}"			&& \
+	rm -rf DeepGEMM
+
+# Now we move into the NeMoRL folder.
+WORKDIR "${NEMORL_DIR}"
+
+# Now install NeMoRL.
+# - The venv of NeMoRL is located at `${UV_PROJECT_ENVIRONMENT}`
+# - Some additional components are installed inside the `venvs` folder of the project.
+#
+# NOTE: `uv venv --system-site-packages` would be appealing here because the
+# base image (ngc-pytorch) already ships torch + CUDA, letting us skip
+# re-downloading them. In practice it does NOT work: the torch/CUDA versions in
+# the base image differ from the ones NeMo-RL pins in pyproject.toml, so both
+# copies end up on the path with the system one winning — leading to subtle
+# ABI mismatches and import errors. We therefore create a fully self-contained
+# venv (the default, no --system-site-packages) and let `uv sync` install the
+# pinned versions.
+RUN uv venv --seed "${UV_PROJECT_ENVIRONMENT}"
+
+# Lock generation for LOCKLESS branches (currently apertus-stack — see
+# NeMoRL/APERTUS_STACK.md): such branches delete + .gitignore uv.lock by
+# design (pyproject is authoritative; the lock is a build artifact,
+# because only this build container has the uv version + aarch64/CUDA
+# torch that the vllm fork's dynamic metadata needs).  If the checkout
+# ships no uv.lock, generate it here so every `uv sync --frozen` below
+# consumes the fresh resolution; branches that DO commit a lock are
+# consumed verbatim as before.  RELOCK=1 forces regeneration either way.
+# The sha256 is printed so a running image can be matched to its build
+# log (the generated lock itself lives at ${NEMORL_DIR}/uv.lock in the
+# image).  ⚠️ Layer-cache trap: the clone step above caches by command
+# text — when rebuilding a branch whose HEAD moved, bust the cache
+# (e.g. `--no-cache`), or `git switch` silently gives you the OLD commit.
+ARG RELOCK=
+RUN if [[ ! -f uv.lock || -n "${RELOCK:-}" ]]; then \
+        echo "Generating uv.lock (lockless branch or RELOCK=1)" && \
+        UV_OFFLINE=0 uv lock && \
+        sha256sum uv.lock ; \
+    else \
+        echo "Committed uv.lock found: consumed verbatim" && \
+        sha256sum uv.lock ; \
+    fi
+
+# Source-build discipline (added after slurm-3132948: the swiss vllm fork's
+# 391-object CUDA build at ninja's default parallelism = nproc = 288 OOMed
+# the diskless GH200 build node — 112 oom_kill events; the killed compilers
+# left truncated /tmp .s files, which `as` reported as garbage "unknown
+# mnemonic" errors.  Diagnosis note for posterity: 'yte'/'ne'/'cfa_offset'
+# mnemonics = .byte/.bne/.cfi_def_cfa_offset with chunks missing — that
+# pattern means CORRUPTED INTERMEDIATES, not a toolchain problem.)
+# - MAX_JOBS caps ninja parallelism; honored by vllm's setup.py and by
+#   TE/flash-attn/DeepEP builds alike.  32 nvcc pipelines x a few GB fits
+#   comfortably in the 480 GB node.
+# - TORCH_CUDA_ARCH_LIST=9.0a builds ONLY the GH200 arch (drops the
+#   sm100/sm103/sm120 kernels this image can never run) — less memory,
+#   much shorter build.  Deliberately a persistent ENV: at runtime it also
+#   pins JIT paths (flashinfer, torch cpp_extension) to the right arch.
+ENV MAX_JOBS=32
+ENV TORCH_CUDA_ARCH_LIST=9.0a
+
+# `--no-install-project` installs only the dependencies listed in
+# pyproject.toml, not the nemo-rl package itself. This mirrors NeMo-RL's
+# upstream Dockerfile: the heavy dependency syncs are done first (warming the
+# uv cache), and the project itself is installed in a final step below once
+# the full source is present. See NeMoRL/docker/Dockerfile:183.
+# Link mode is NOT passed per command: the global UV_LINK_MODE=symlink (ENV
+# above) governs every sync here and at runtime — one source of truth.
+# --frozen (not --locked), mirroring upstream: install exactly what the
+# committed lock says without re-validating it against pyproject — the
+# upstream lock does not pass strict validation (extras warnings) and
+# upstream itself builds with --frozen.  Deliberately NOT ported: the
+# sglang extra (unused backend) and the aiohttp CVE cache prune (our
+# venvs are SYMLINK farms into the cache; pruning breaks them).
+RUN uv sync --frozen --no-install-project
+
+# Now we perform the "install" of the helper, this will pull them into the cache such that they
+#  are installed faster when they are needed.
+RUN uv sync --frozen --extra vllm --no-install-project
+RUN uv sync --frozen --extra mcore --no-install-project
+RUN uv sync --frozen --extra automodel --no-install-project
+RUN uv sync --frozen --extra modelopt --no-install-project
+RUN uv sync --frozen --all-groups --no-install-project
+
+# The NeMo Dockerfile also removes some files related to ray, we do not do that.
+# Furthermore, we will now install the project in full, i.e. without `--no-install-project`.
+RUN uv sync --frozen
+
+# Prefetch the per-actor venvs at build time so Ray doesn't create them on
+# the first launch of every actor. Mirrors NeMoRL/docker/Dockerfile:276.
+# `prefetch_venvs.py` imports nemo_rl and reads
+# ACTOR_ENVIRONMENT_REGISTRY, so it must run AFTER the project install above.
+# It creates venvs under NEMO_RL_VENV_DIR (set above to /opt/ray_venvs) and,
+# because NRL_CONTAINER=1 is set, also creates
+# /usr/local/bin/python-<ClassName> wrapper scripts for frozen-env use.
+#
+
+# Create them each in a separate call, such that they enter the cache individually.
+RUN uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer
+RUN uv run nemo_rl/utils/prefetch_venvs.py AsyncTrajectoryCollector
+RUN uv run nemo_rl/utils/prefetch_venvs.py vllm
+RUN uv run nemo_rl/utils/prefetch_venvs.py megatron
+RUN uv run nemo_rl/utils/prefetch_venvs.py dtensor 
+
+# Filter list: AsyncTrajectoryCollector added (it was runtime-built on every
+# node before — ~9 GB copied into the tmpfs overlay per node with the old
+# default hardlink mode, see HANDOFF.md §8 / slurm-3071878); dtensor RE-ADDED
+# 2026-08-19 for the Apertus dtensor/FSDP2 runs (DTensorPolicyWorkerV2 →
+# automodel venv; the automodel extra is cached by the syncs above anyway, so
+# this only adds a symlink farm).  ReplayBuffer may report "uses system Python" in the
+# build log — that is fine, such actors need no venv.
+#
+# Skip with: --build-arg SKIP_PREFETCH_VENVS=1
+ARG SKIP_PREFETCH_VENVS=
+RUN if [[ -z "${SKIP_PREFETCH_VENVS:-}" ]]; then \
+        uv run nemo_rl/utils/prefetch_venvs.py ReplayBuffer AsyncTrajectoryCollector vllm megatron dtensor ; \
+    else \
+        echo "Skipping venv prefetch (SKIP_PREFETCH_VENVS set)"; \
+    fi
+
+# py-spy in the base python: lets the driver / an interactive shell take
+# PYTHON-level stack dumps of hung or leaking workers (the init-hang of
+# 3046402/3079454/3113822 leaves no other trace).
+RUN python3 -m pip install --no-cache-dir py-spy
+
+# ---------------------------------------------------------------------------
+# Runtime hardening: uv serves everything FROM THE BAKED CACHE.
+#
+# slurm-3110935 showed ~55 GB/node of silent runtime installs into the tmpfs
+# overlay (32.8 GB uv-cache writes incl. an 8.9 GB flashinfer_jit_cache wheel
+# downloaded mid-job, 7.6 GB pip'd into the system python).  With UV_OFFLINE
+# any dependency missing from the image cache fails IMMEDIATELY with the
+# package name instead of spending RAM and network per node per run — the
+# failure message tells us exactly what to bake below.
+#
+# These ENVs are placed AFTER every build-time uv/pip step, so the build
+# itself stays online.  To debug online inside a running container:
+#   UV_OFFLINE=0 uv ...
+#
+# KNOWN GAP TO BAKE (add explicit warm steps here as offline runs name them):
+#   - flashinfer_jit_cache (+cu130 wheel, ~8.9 GB) — resolved at runtime on
+#     GH200 but not cached by the build-time prefetch (suspected environment
+#     -marker mismatch between build machine and node).
+# ---------------------------------------------------------------------------
+ENV UV_OFFLINE=1
+ENV PIP_NO_INDEX=1
