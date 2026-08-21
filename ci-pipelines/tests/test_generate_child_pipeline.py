@@ -82,6 +82,25 @@ def test_generate_no_work_emits_noop(tmp_path, monkeypatch, gen):
     assert data["no-work-required"] == {"extends": [".child-noop-template"]}
 
 
+def test_main_generates_base_and_app_graph(tmp_path, monkeypatch, gen):
+    output = tmp_path / "child.yaml"
+    base = base_image()
+    app = app_image(BASE_IMAGE=base["CANON_IMAGE_REF"])
+    monkeypatch.setattr(gen, "OUTPUT", output)
+    monkeypatch.setattr(gen, "discover_bases", lambda: [(base, base_tests())])
+    monkeypatch.setattr(gen, "discover_apps", lambda: [(app, app_tests())])
+    fake_registry(monkeypatch, gen, {})
+
+    gen.main()
+
+    data = yaml.safe_load(output.read_text())
+    assert "build-base-pytorch-cuda-26-06-py3" in data
+    assert data["mark-base-pytorch-cuda-26-06-py3-tested"]["needs"] == ["test-base-pytorch-cuda-26-06-py3-env"]
+    assert data["build-app-vllm-cuda"]["needs"] == ["mark-base-pytorch-cuda-26-06-py3-tested"]
+    assert data["mark-app-vllm-cuda-tested"]["needs"] == ["test-app-vllm-cuda-vetnode"]
+    assert data["publish-app-vllm-cuda"]["needs"] == ["mark-app-vllm-cuda-tested"]
+
+
 def test_slug_rejects_empty_result(gen):
     with pytest.raises(RuntimeError, match="slug produced empty string"):
         gen.slug("___")

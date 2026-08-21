@@ -71,7 +71,7 @@ variables:
   GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
   ALPS_REV: alps7-dev
   # Bootstrap generator runtime built by ci-pipelines/build-ci-generator-image.yaml.
-  CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator@sha256:5cb4e62443f8025674283a48c67918899d529e1e024646eb4b20f99f8cccb807
+  CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator@sha256:b2a46cf6aff2235c86fc40d878c03617f8148aa8c71b8eed833f068845937758
 
 .generator-template:
   image: $CI_GENERATOR_IMAGE

@@ -70,7 +70,7 @@ def slug(value: str) -> str:
 
 def load_yaml(path: Path) -> dict[str, Any]:
     """Load a YAML mapping from path."""
-    data = yaml.safe_load(path.read_text())
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise RuntimeError(f"expected mapping in {path}")
     return data
@@ -89,7 +89,7 @@ def load_env_text(text: str) -> dict[str, str]:
 def app_variants_from_profile(profile: Path) -> list[str]:
     """Parse APP_VARIANTS from profile.env without executing the profile."""
     value = None
-    for line in profile.read_text().splitlines():
+    for line in profile.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -219,7 +219,7 @@ class Child:
         """Write the generated child pipeline YAML."""
         if not self.jobs:
             self.add_noop()
-        OUTPUT.write_text(yaml.safe_dump(self.data, sort_keys=False, width=120))
+        OUTPUT.write_text(yaml.safe_dump(self.data, sort_keys=False, width=120), encoding="utf-8")
 
 
 BASE_TEST_TEMPLATES = {
