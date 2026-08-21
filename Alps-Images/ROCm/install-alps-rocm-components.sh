@@ -93,8 +93,121 @@ PY
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
     register_rocm_sdk_ldconfig
+    install_rocm_sdk_library_path_links
+    install_amdsmi_python
+    register_amdsmi_ldconfig
+    smoke_check_amdsmi_python
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
+}
+
+install_amdsmi_python() {
+    local candidate amdsmi_src=""
+
+    for candidate in \
+        "${ROCM_CORE_PREFIX:-}/share/amd_smi" \
+        "${ROCM_CORE_DIR:-}/_rocm_sdk_core/share/amd_smi" \
+        "${ROCM_SDK_ROOT:-}/share/amd_smi"; do
+        [[ -d "${candidate}" ]] || continue
+        amdsmi_src="${candidate}"
+        break
+    done
+
+    [[ -n "${amdsmi_src}" ]] || die "Could not find AMD SMI Python sources in ROCm Core SDK"
+    "${ROCM_PYTHON}" -m pip install --no-cache-dir --no-deps "${amdsmi_src}"
+    check_amdsmi_python_version
+}
+
+check_amdsmi_python_version() {
+    ROCM_EXPECTED_VERSION="${ROCM_VERSION}" \
+        ROCM_EXPECTED_COMMIT="${ROCM_SYSTEMS_COMMIT:-}" \
+        "${ROCM_PYTHON}" - <<'PY'
+import os
+from importlib.metadata import PackageNotFoundError, version
+
+for dist_name in ("amdsmi", "amd-smi"):
+    try:
+        installed = version(dist_name)
+        break
+    except PackageNotFoundError:
+        continue
+else:
+    raise SystemExit("amdsmi distribution was not installed")
+
+expected_commit = os.environ.get("ROCM_EXPECTED_COMMIT", "")
+if expected_commit:
+    expected_local = expected_commit[:8]
+    local_version = installed.split("+", 1)[1] if "+" in installed else ""
+    if local_version != expected_local:
+        raise SystemExit(
+            f"amdsmi version {installed} does not match ROCm Systems commit "
+            f"{expected_commit}"
+        )
+
+print(
+    f"amdsmi Python package version: {installed} "
+    f"(ROCm SDK {os.environ['ROCM_EXPECTED_VERSION']})"
+)
+PY
+}
+
+smoke_check_amdsmi_python() {
+    "${ROCM_PYTHON}" - <<'PY'
+import amdsmi
+
+print("amdsmi import ok")
+try:
+    amdsmi.amdsmi_init()
+except Exception as exc:
+    print(f"amdsmi init skipped without visible ROCm devices: {exc}")
+else:
+    try:
+        handles = amdsmi.amdsmi_get_processor_handles()
+        print(f"amdsmi device count: {len(handles)}")
+    finally:
+        shutdown = getattr(amdsmi, "amdsmi_shut_down", None)
+        if shutdown is not None:
+            shutdown()
+PY
+}
+
+register_amdsmi_ldconfig() {
+    local conf="/etc/ld.so.conf.d/99-alps-rocm-amdsmi.conf"
+    local amdsmi_lib=""
+    local candidate libdir
+
+    while IFS= read -r candidate; do
+        [[ -n "${candidate}" ]] || continue
+        for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
+            [[ -d "${libdir}" ]] || continue
+            if compgen -G "${libdir}/libamd_smi.so*" >/dev/null; then
+                amdsmi_lib="${libdir}"
+                break 2
+            fi
+        done
+    done < <(rocm_sdk_prefix_candidates)
+
+    # Fallback: search the Python environment for the library.
+    if [[ -z "${amdsmi_lib}" ]]; then
+        local site_pkgs
+        site_pkgs="$("${ROCM_PYTHON}" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
+        if [[ -n "${site_pkgs}" && -d "${site_pkgs}" ]]; then
+            amdsmi_lib="$(find "${site_pkgs}" -maxdepth 3 \
+                \( -type f -o -type l \) -name 'libamd_smi.so*' -printf '%h\n' 2>/dev/null | head -n1 || true)"
+        fi
+    fi
+
+    [[ -n "${amdsmi_lib}" ]] || die "libamd_smi.so not found after installing amdsmi"
+
+    if [[ ! -f "${conf}" ]] || ! grep -Fxq "${amdsmi_lib}" "${conf}"; then
+        {
+            [[ -s "${conf}" ]] && printf '\n'
+            printf '%s\n' "${amdsmi_lib}"
+        } >> "${conf}"
+    fi
+
+    ldconfig
+    echo "Registered amdsmi library directory: ${amdsmi_lib}"
 }
 
 persist_rocm_sdk_env() {
@@ -112,6 +225,9 @@ persist_rocm_sdk_env() {
         printf 'export ROCM_DEVEL_DIR=%q\n' "${ROCM_DEVEL_DIR}"
         printf 'export ROCM_DEVEL_PREFIX=%q\n' "${ROCM_DEVEL_PREFIX}"
         printf 'export ROCM_BUILD_PREFIX=%q\n' "${ROCM_BUILD_PREFIX}"
+        if [[ -n "${ROCM_SDK_LD_LIBRARY_PATH:-}" ]]; then
+            printf 'export ROCM_SDK_LD_LIBRARY_PATH=%q\n' "${ROCM_SDK_LD_LIBRARY_PATH}"
+        fi
         if [[ -n "${RCCL_PREFIX:-}" ]]; then
             printf 'export RCCL_PREFIX=%q\n' "${RCCL_PREFIX}"
         fi
@@ -124,8 +240,8 @@ persist_rocm_sdk_env() {
     } > /opt/alps/env/alps-rocm-build.env
 }
 
-rocm_sdk_ldconfig_dirs() {
-    local candidate libdir seen=""
+rocm_sdk_prefix_candidates() {
+    local candidate seen=""
 
     for candidate in \
         "${ROCM_BUILD_PREFIX:-}" \
@@ -136,6 +252,21 @@ rocm_sdk_ldconfig_dirs() {
         "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
         "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
         "${ROCM_LIBRARIES_DIR:-}/_rocm_sdk_libraries"; do
+        [[ -n "${candidate}" ]] || continue
+        case " ${seen} " in
+            *" ${candidate} "*) ;;
+            *)
+                seen+=" ${candidate}"
+                printf '%s\n' "${candidate}"
+                ;;
+        esac
+    done
+}
+
+rocm_sdk_ldconfig_dirs() {
+    local candidate libdir seen=""
+
+    while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
         for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
             [[ -d "${libdir}" ]] || continue
@@ -148,7 +279,38 @@ rocm_sdk_ldconfig_dirs() {
                     ;;
             esac
         done
+    done < <(rocm_sdk_prefix_candidates)
+}
+
+install_rocm_sdk_library_path_links() {
+    local link_root="/opt/alps/rocm-sdk-library-path"
+    local entry name prefix libdir candidate
+    local entries=(
+        "devel:${ROCM_DEVEL_PREFIX:-}"
+        "core:${ROCM_CORE_PREFIX:-}"
+        "libraries:${ROCM_LIBRARIES_PREFIX:-}"
+    )
+
+    rm -rf "${link_root}"
+    install -d "${link_root}"
+
+    for entry in "${entries[@]}"; do
+        name="${entry%%:*}"
+        prefix="${entry#*:}"
+        libdir=""
+        [[ -n "${prefix}" ]] || die "ROCm SDK ${name} prefix is empty"
+        for candidate in "${prefix}/lib" "${prefix}/lib64" "${prefix}"; do
+            [[ -d "${candidate}" ]] || continue
+            compgen -G "${candidate}/*.so*" >/dev/null || continue
+            libdir="${candidate}"
+            break
+        done
+        [[ -n "${libdir}" ]] || die "No ROCm SDK library directory found under ${prefix}"
+        ln -s "${libdir}" "${link_root}/${name}"
     done
+
+    export ROCM_SDK_LD_LIBRARY_PATH="${link_root}/devel:${link_root}/core:${link_root}/libraries"
+    export LD_LIBRARY_PATH="${ROCM_SDK_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 }
 
 register_rocm_sdk_ldconfig() {
@@ -176,6 +338,9 @@ load_rocm_sdk_env() {
     export ROCM_PATH="${ROCM_BUILD_PREFIX}"
     export HIP_PATH="${ROCM_BUILD_PREFIX}"
     export PATH="${ROCM_SDK_BIN}:${PATH}"
+    if [[ -n "${ROCM_SDK_LD_LIBRARY_PATH:-}" ]]; then
+        export LD_LIBRARY_PATH="${ROCM_SDK_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+    fi
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
     if [[ -n "${RCCL_PREFIX:-}" ]]; then
         export CMAKE_PREFIX_PATH="${RCCL_PREFIX}:${RCCL_LIB_DIR:-}:${RCCL_INCLUDE_DIR:-}:${CMAKE_PREFIX_PATH}"
@@ -184,15 +349,7 @@ load_rocm_sdk_env() {
 
 discover_rocm_build_prefix() {
     local candidate libdir
-    for candidate in \
-        "${ROCM_BUILD_PREFIX:-}" \
-        "${ROCM_DEVEL_PREFIX:-}" \
-        "${ROCM_CORE_PREFIX:-}" \
-        "${ROCM_SDK_ROOT:-}" \
-        "${ROCM_LIBRARIES_PREFIX:-}" \
-        "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
-        "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
-        "${ROCM_LIBRARIES_DIR:-}/_rocm_sdk_libraries"; do
+    while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
         [[ -f "${candidate}/include/hip/hip_runtime_api.h" ]] || continue
         [[ -f "${candidate}/include/hip/hip_runtime.h" ]] || continue
@@ -210,7 +367,7 @@ discover_rocm_build_prefix() {
             printf '%s\n' "${candidate}"
             return 0
         fi
-    done
+    done < <(rocm_sdk_prefix_candidates)
     return 1
 }
 

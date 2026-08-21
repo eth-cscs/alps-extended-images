@@ -20,7 +20,7 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_REF="v0.25.1"
+ARG VLLM_REF="v0.27.1"
 ARG VLLM_TARGET_DEVICE="cuda"
 ARG VLLM_CUDA_ARCH_LIST="9.0"
 ARG VLLM_TORCH_CUDA_ARCH_LIST="9.0"
@@ -77,7 +77,7 @@ RUN set -eux; \
     cd /tmp/vllm; \
     git checkout -q "${VLLM_REF}"; \
     git submodule update --init --recursive; \
-    for patch_file in /opt/alps-vllm-patches/*.patch; do git apply "${patch_file}"; done; \
+    for patch_file in /opt/alps-vllm-patches/*.patch; do echo "Checking vLLM patch: ${patch_file}"; git apply --check "${patch_file}"; git apply --verbose "${patch_file}"; done; \
     grep -n 'CUDA_ARCH_LIST' CMakeLists.txt; \
     python use_existing_torch.py --prefix || python use_existing_torch.py; \
     if [ -z "${VLLM_VERSION_OVERRIDE}" ] && [[ "${VLLM_REF}" == v[0-9]* ]]; then \

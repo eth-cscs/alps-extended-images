@@ -16,7 +16,7 @@ diff --git a/csrc/libtorch_stable/cuda_view.cu b/csrc/libtorch_stable/cuda_view.
 index 7bf826747..1526532c1 100644
 --- a/csrc/libtorch_stable/cuda_view.cu
 +++ b/csrc/libtorch_stable/cuda_view.cu
-@@ -8,7 +8,31 @@
+@@ -8,7 +8,35 @@
  #include <cuda_runtime.h>
  
  #include <array>
@@ -26,6 +26,10 @@ index 7bf826747..1526532c1 100644
 +#include <vector>
 +
 +namespace {
++// Torch 2.11 stable::from_blob no longer accepts deleters in this path.
++// Keep UVA backing storage process-lifetime to avoid dangling CUDA views. This
++// intentionally leaks one entry per call and is acceptable only as a narrow
++// compatibility shim for the pinned vLLM ref.
 +struct UvaLifetimeRegistry {
 +  std::mutex mutex;
 +  std::vector<torch::stable::Tensor> cpu_tensors;
@@ -48,8 +52,10 @@ index 7bf826747..1526532c1 100644
  
  // This function assumes that `cpu_tensor` is a CPU tensor,
  // and that UVA (Unified Virtual Addressing) is enabled.
-@@ -17,7 +41,7 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+@@ -17,7 +45,9 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
    STD_TORCH_CHECK(cpu_tensor.device().is_cpu(), "Input tensor must be on CPU");
++  STD_TORCH_CHECK(cpu_tensor.layout() == torch::headeronly::Layout::Strided,
++                  "Only strided CPU tensors are supported");
  
    const auto dtype = cpu_tensor.scalar_type();
 -  const auto layout = cpu_tensor.layout();
@@ -57,7 +63,7 @@ index 7bf826747..1526532c1 100644
    const torch::stable::Device cuda_dev(torch::headeronly::DeviceType::CUDA);
  
    // handle empty tensor
-@@ -38,9 +62,13 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+@@ -38,9 +68,13 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
      STD_TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
                      cudaGetErrorString(err));
  
@@ -74,7 +80,7 @@ index 7bf826747..1526532c1 100644
    }
  
    // If CPU tensor is not pinned, allocate a new pinned memory buffer.
-@@ -52,25 +80,26 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+@@ -52,25 +86,26 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
    if (err != cudaSuccess) {
      STD_TORCH_CHECK(false, "cudaHostAlloc failed: ", cudaGetErrorString(err));
    }
