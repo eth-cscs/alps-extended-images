@@ -14,7 +14,7 @@ allowed-tools:
 
 Arguments passed: `$ARGUMENTS` (typically a script path, optionally with notes like an expected failure window, e.g. `Alps-Images/apps/verl/apertus-benchmarks/rl-bench-apertus-v1.5-70B-full-async.sh prior attempts failed within ~20 min`).
 
-The actual submission and monitoring is done by the `firecrest-job` subagent (`~/.claude/agents/firecrest-job.md`) — this skill's job is to resolve which script, confirm before spending real cluster allocation, and dispatch with a well-scoped prompt. Do not reimplement the FirecREST calls here.
+The actual submission and monitoring is done by the `train-launcher` subagent (`~/.claude/agents/train-launcher.md`) — this skill's job is to resolve which script, confirm before spending real cluster allocation, and dispatch with a well-scoped prompt. Do not reimplement the FirecREST calls here.
 
 ## Steps
 
@@ -27,7 +27,7 @@ The actual submission and monitoring is done by the `firecrest-job` subagent (`~
 
    Use `AskUserQuestion` (or plain confirmation if the user already clearly authorized this exact script earlier in the conversation — don't ask twice for the same submission). Do not proceed without a yes.
 
-3. **Dispatch to the `firecrest-job` agent** (`Agent` tool, `subagent_type: "firecrest-job"`) with a self-contained prompt that includes:
+3. **Dispatch to the `train-launcher` agent** (`Agent` tool, `subagent_type: "train-launcher"`) with a self-contained prompt that includes:
    - The resolved script path (absolute)
    - Any context worth knowing: what past attempts of this same script have looked like (did they fail fast? at what point? what were prior errors?) — this shapes how long the agent should watch before giving up
    - Any non-default poll-window the user wants
@@ -36,4 +36,4 @@ The actual submission and monitoring is done by the `firecrest-job` subagent (`~
 
 ## Resuming an existing monitor
 
-If the user asks to keep watching a job you (or a prior turn) already dispatched, resume that same agent via `SendMessage` to its name/id rather than launching a fresh `firecrest-job` dispatch — a fresh dispatch has no memory of the job id or prior context, and dispatching two monitors for the same job risks confusing, duplicate polling (this happened once — see the "Background polling" section of the `firecrest-job` agent definition for how that was fixed).
+If the user asks to keep watching a job you (or a prior turn) already dispatched, resume that same agent via `SendMessage` to its name/id rather than launching a fresh `train-launcher` dispatch — a fresh dispatch has no memory of the job id or prior context, and dispatching two monitors for the same job risks confusing, duplicate polling (this happened once — see the "Background polling" section of the `train-launcher` agent definition for how that was fixed).
