@@ -167,7 +167,10 @@ else:
     finally:
         shutdown = getattr(amdsmi, "amdsmi_shut_down", None)
         if shutdown is not None:
-            shutdown()
+            try:
+                shutdown()
+            except Exception:
+                pass
 PY
 }
 
@@ -317,18 +320,37 @@ patched = """            if raw_cnt < 0:
             if raw_cnt == 0:
                 return -1
 """
-if patched in text:
-    print(f"PyTorch ROCm amdsmi device_count fallback already patched: {path}")
-    raise SystemExit(0)
+fallback_already_patched = patched in text
 
 old = """            if raw_cnt <= 0:
                 return raw_cnt
 """
-if old not in text:
+if old in text:
+    text = text.replace(old, patched, 1)
+elif not fallback_already_patched:
     raise SystemExit(f"could not patch {path}: amdsmi raw-count marker not found")
 
-path.write_text(text.replace(old, patched, 1))
-print(f"Patched PyTorch ROCm amdsmi device_count fallback: {path}")
+shutdown_patched = """    try:
+        socket_handles = amdsmi.amdsmi_get_processor_handles()
+        return len(socket_handles)
+    finally:
+        shutdown = getattr(amdsmi, "amdsmi_shut_down", None)
+        if shutdown is not None:
+            try:
+                shutdown()
+            except Exception:
+                pass
+"""
+if shutdown_patched not in text:
+    shutdown_old = """    socket_handles = amdsmi.amdsmi_get_processor_handles()
+    return len(socket_handles)
+"""
+    if shutdown_old not in text:
+        raise SystemExit(f"could not patch {path}: amdsmi shutdown marker not found")
+    text = text.replace(shutdown_old, shutdown_patched, 1)
+
+path.write_text(text)
+print(f"Patched PyTorch ROCm amdsmi device_count fallback/shutdown: {path}")
 PY
 }
 
