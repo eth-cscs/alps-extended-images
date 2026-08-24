@@ -52,10 +52,8 @@ index 7bf826747..1526532c1 100644
  
  // This function assumes that `cpu_tensor` is a CPU tensor,
  // and that UVA (Unified Virtual Addressing) is enabled.
-@@ -17,7 +45,9 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+@@ -17,7 +45,7 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
    STD_TORCH_CHECK(cpu_tensor.device().is_cpu(), "Input tensor must be on CPU");
-+  STD_TORCH_CHECK(cpu_tensor.layout() == torch::headeronly::Layout::Strided,
-+                  "Only strided CPU tensors are supported");
  
    const auto dtype = cpu_tensor.scalar_type();
 -  const auto layout = cpu_tensor.layout();
@@ -63,7 +61,7 @@ index 7bf826747..1526532c1 100644
    const torch::stable::Device cuda_dev(torch::headeronly::DeviceType::CUDA);
  
    // handle empty tensor
-@@ -38,9 +68,13 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+@@ -38,9 +66,13 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
      STD_TORCH_CHECK(err == cudaSuccess, "cudaHostGetDevicePointer failed: ",
                      cudaGetErrorString(err));
  
@@ -80,7 +78,7 @@ index 7bf826747..1526532c1 100644
    }
  
    // If CPU tensor is not pinned, allocate a new pinned memory buffer.
-@@ -52,25 +86,26 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
+@@ -52,25 +84,26 @@ torch::stable::Tensor get_cuda_view_from_cpu_tensor(
    if (err != cudaSuccess) {
      STD_TORCH_CHECK(false, "cudaHostAlloc failed: ", cudaGetErrorString(err));
    }
