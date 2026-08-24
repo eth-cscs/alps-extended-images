@@ -95,6 +95,7 @@ PY
     register_rocm_sdk_ldconfig
     install_amdsmi_python
     link_amdsmi_package_library
+    patch_torch_rocm_amdsmi_device_count
     smoke_check_amdsmi_python
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
@@ -287,6 +288,48 @@ PY
 
     echo "Linked amdsmi package library: ${amdsmi_pkg_dir}/libamd_smi.so -> ${amdsmi_lib}"
     echo "Patched amdsmi dependency preload: ${preload_file}"
+}
+
+
+patch_torch_rocm_amdsmi_device_count() {
+    "${ROCM_PYTHON}" - <<'PY'
+import site
+from pathlib import Path
+
+roots = [Path(p) for p in site.getsitepackages()]
+user_site = site.getusersitepackages()
+if user_site:
+    roots.append(Path(user_site))
+
+for root in roots:
+    path = root / "torch" / "cuda" / "__init__.py"
+    if path.exists():
+        break
+else:
+    print("PyTorch CUDA module not found; skipping ROCm amdsmi device_count patch")
+    raise SystemExit(0)
+
+text = path.read_text()
+patched = """            if raw_cnt < 0:
+                return raw_cnt
+            # On some containerized ROCm systems, amdsmi can initialize but see
+            # zero GPUs while the HIP runtime sees the allocated devices.
+            if raw_cnt == 0:
+                return -1
+"""
+if patched in text:
+    print(f"PyTorch ROCm amdsmi device_count fallback already patched: {path}")
+    raise SystemExit(0)
+
+old = """            if raw_cnt <= 0:
+                return raw_cnt
+"""
+if old not in text:
+    raise SystemExit(f"could not patch {path}: amdsmi raw-count marker not found")
+
+path.write_text(text.replace(old, patched, 1))
+print(f"Patched PyTorch ROCm amdsmi device_count fallback: {path}")
+PY
 }
 
 persist_rocm_sdk_env() {
