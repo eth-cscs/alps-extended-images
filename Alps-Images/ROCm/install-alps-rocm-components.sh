@@ -211,8 +211,8 @@ register_amdsmi_ldconfig() {
 }
 
 link_amdsmi_package_library() {
-    local amdsmi_pkg_dir amdsmi_lib=""
-    local candidate lib
+    local amdsmi_pkg_dir amdsmi_lib="" wrapper preload_file
+    local candidate lib sysdeps_dir sysdeps_dirs=()
 
     amdsmi_pkg_dir="$(${ROCM_PYTHON} - <<'PY'
 import importlib.util
@@ -229,14 +229,65 @@ PY
         [[ -n "${candidate}" ]] || continue
         lib="$(find "${candidate}" -maxdepth 2 \
             \( -type f -o -type l \) -name 'libamd_smi.so*' -print -quit 2>/dev/null || true)"
-        [[ -n "${lib}" ]] || continue
-        amdsmi_lib="${lib}"
-        break
+        if [[ -n "${lib}" && -z "${amdsmi_lib}" ]]; then
+            amdsmi_lib="${lib}"
+        fi
+        for sysdeps_dir in "${candidate}/lib/rocm_sysdeps/lib" "${candidate}/lib64/rocm_sysdeps/lib"; do
+            [[ -d "${sysdeps_dir}" ]] || continue
+            compgen -G "${sysdeps_dir}/librocm_sysdeps_*.so*" >/dev/null || continue
+            sysdeps_dirs+=("${sysdeps_dir}")
+        done
     done < <(rocm_sdk_prefix_candidates)
     [[ -n "${amdsmi_lib}" ]] || die "libamd_smi.so* not found after installing amdsmi"
+    [[ "${#sysdeps_dirs[@]}" -gt 0 ]] || die "ROCm sysdeps libraries not found for amdsmi"
 
     ln -sf "${amdsmi_lib}" "${amdsmi_pkg_dir}/libamd_smi.so"
+
+    preload_file="${amdsmi_pkg_dir}/_alps_amdsmi_preload.py"
+    {
+        printf 'import ctypes\n'
+        printf 'from pathlib import Path\n\n'
+        printf '_SYSDEPS_DIRS = (\n'
+        for sysdeps_dir in "${sysdeps_dirs[@]}"; do
+            printf '    "%s",\n' "${sysdeps_dir}"
+        done
+        printf ')\n'
+        printf '_REQUIRED = (\n'
+        printf '    "librocm_sysdeps_nl_3.so.200",\n'
+        printf '    "librocm_sysdeps_mnl.so.0",\n'
+        printf '    "librocm_sysdeps_nl_genl_3.so.200",\n'
+        printf ')\n\n'
+        printf 'def preload_amdsmi_dependencies():\n'
+        printf '    for name in _REQUIRED:\n'
+        printf '        for directory in _SYSDEPS_DIRS:\n'
+        printf '            path = Path(directory) / name\n'
+        printf '            if path.exists():\n'
+        printf '                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)\n'
+        printf '                break\n'
+    } > "${preload_file}"
+
+    wrapper="${amdsmi_pkg_dir}/amdsmi_wrapper.py"
+    [[ -f "${wrapper}" ]] || die "amdsmi wrapper not found: ${wrapper}"
+    "${ROCM_PYTHON}" - "${wrapper}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+if "_alps_amdsmi_preload" not in text:
+    marker = "import ctypes\n"
+    replacement = (
+        marker
+        + "from ._alps_amdsmi_preload import preload_amdsmi_dependencies\n"
+        + "preload_amdsmi_dependencies()\n"
+    )
+    if marker not in text:
+        raise SystemExit(f"could not patch {path}: import marker not found")
+    path.write_text(text.replace(marker, replacement, 1))
+PY
+
     echo "Linked amdsmi package library: ${amdsmi_pkg_dir}/libamd_smi.so -> ${amdsmi_lib}"
+    echo "Patched amdsmi dependency preload: ${preload_file}"
 }
 
 persist_rocm_sdk_env() {
@@ -254,9 +305,6 @@ persist_rocm_sdk_env() {
         printf 'export ROCM_DEVEL_DIR=%q\n' "${ROCM_DEVEL_DIR}"
         printf 'export ROCM_DEVEL_PREFIX=%q\n' "${ROCM_DEVEL_PREFIX}"
         printf 'export ROCM_BUILD_PREFIX=%q\n' "${ROCM_BUILD_PREFIX}"
-        if [[ -n "${ROCM_SDK_LD_LIBRARY_PATH:-}" ]]; then
-            printf 'export ROCM_SDK_LD_LIBRARY_PATH=%q\n' "${ROCM_SDK_LD_LIBRARY_PATH}"
-        fi
         if [[ -n "${RCCL_PREFIX:-}" ]]; then
             printf 'export RCCL_PREFIX=%q\n' "${RCCL_PREFIX}"
         fi
@@ -297,12 +345,7 @@ rocm_sdk_ldconfig_dirs() {
 
     while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
-        for libdir in \
-            "${candidate}" \
-            "${candidate}/lib" \
-            "${candidate}/lib64" \
-            "${candidate}/lib/rocm_sysdeps/lib" \
-            "${candidate}/lib64/rocm_sysdeps/lib"; do
+        for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
             [[ -d "${libdir}" ]] || continue
             compgen -G "${libdir}/*.so*" >/dev/null || continue
             case " ${seen} " in
