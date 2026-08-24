@@ -93,9 +93,9 @@ PY
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
     register_rocm_sdk_ldconfig
-    install_rocm_sdk_library_path_links
     install_amdsmi_python
     register_amdsmi_ldconfig
+    link_amdsmi_package_library
     smoke_check_amdsmi_python
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
@@ -210,6 +210,35 @@ register_amdsmi_ldconfig() {
     echo "Registered amdsmi library directory: ${amdsmi_lib}"
 }
 
+link_amdsmi_package_library() {
+    local amdsmi_pkg_dir amdsmi_lib=""
+    local candidate lib
+
+    amdsmi_pkg_dir="$(${ROCM_PYTHON} - <<'PY'
+import importlib.util
+
+spec = importlib.util.find_spec("amdsmi")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("amdsmi package was not found")
+print(next(iter(spec.submodule_search_locations)))
+PY
+)"
+    [[ -d "${amdsmi_pkg_dir}" ]] || die "amdsmi package directory not found: ${amdsmi_pkg_dir}"
+
+    while IFS= read -r candidate; do
+        [[ -n "${candidate}" ]] || continue
+        lib="$(find "${candidate}" -maxdepth 2 \
+            \( -type f -o -type l \) -name 'libamd_smi.so*' -print -quit 2>/dev/null || true)"
+        [[ -n "${lib}" ]] || continue
+        amdsmi_lib="${lib}"
+        break
+    done < <(rocm_sdk_prefix_candidates)
+    [[ -n "${amdsmi_lib}" ]] || die "libamd_smi.so* not found after installing amdsmi"
+
+    ln -sf "${amdsmi_lib}" "${amdsmi_pkg_dir}/libamd_smi.so"
+    echo "Linked amdsmi package library: ${amdsmi_pkg_dir}/libamd_smi.so -> ${amdsmi_lib}"
+}
+
 persist_rocm_sdk_env() {
     install -d /opt/alps/env
     {
@@ -268,7 +297,12 @@ rocm_sdk_ldconfig_dirs() {
 
     while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
-        for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
+        for libdir in \
+            "${candidate}" \
+            "${candidate}/lib" \
+            "${candidate}/lib64" \
+            "${candidate}/lib/rocm_sysdeps/lib" \
+            "${candidate}/lib64/rocm_sysdeps/lib"; do
             [[ -d "${libdir}" ]] || continue
             compgen -G "${libdir}/*.so*" >/dev/null || continue
             case " ${seen} " in
@@ -280,37 +314,6 @@ rocm_sdk_ldconfig_dirs() {
             esac
         done
     done < <(rocm_sdk_prefix_candidates)
-}
-
-install_rocm_sdk_library_path_links() {
-    local link_root="/opt/alps/rocm-sdk-library-path"
-    local entry name prefix libdir candidate
-    local entries=(
-        "devel:${ROCM_DEVEL_PREFIX:-}"
-        "core:${ROCM_CORE_PREFIX:-}"
-        "libraries:${ROCM_LIBRARIES_PREFIX:-}"
-    )
-
-    rm -rf "${link_root}"
-    install -d "${link_root}"
-
-    for entry in "${entries[@]}"; do
-        name="${entry%%:*}"
-        prefix="${entry#*:}"
-        libdir=""
-        [[ -n "${prefix}" ]] || die "ROCm SDK ${name} prefix is empty"
-        for candidate in "${prefix}/lib" "${prefix}/lib64" "${prefix}"; do
-            [[ -d "${candidate}" ]] || continue
-            compgen -G "${candidate}/*.so*" >/dev/null || continue
-            libdir="${candidate}"
-            break
-        done
-        [[ -n "${libdir}" ]] || die "No ROCm SDK library directory found under ${prefix}"
-        ln -s "${libdir}" "${link_root}/${name}"
-    done
-
-    export ROCM_SDK_LD_LIBRARY_PATH="${link_root}/devel:${link_root}/core:${link_root}/libraries"
-    export LD_LIBRARY_PATH="${ROCM_SDK_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 }
 
 register_rocm_sdk_ldconfig() {
@@ -338,9 +341,6 @@ load_rocm_sdk_env() {
     export ROCM_PATH="${ROCM_BUILD_PREFIX}"
     export HIP_PATH="${ROCM_BUILD_PREFIX}"
     export PATH="${ROCM_SDK_BIN}:${PATH}"
-    if [[ -n "${ROCM_SDK_LD_LIBRARY_PATH:-}" ]]; then
-        export LD_LIBRARY_PATH="${ROCM_SDK_LD_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
-    fi
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
     if [[ -n "${RCCL_PREFIX:-}" ]]; then
         export CMAKE_PREFIX_PATH="${RCCL_PREFIX}:${RCCL_LIB_DIR:-}:${RCCL_INCLUDE_DIR:-}:${CMAKE_PREFIX_PATH}"

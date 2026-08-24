@@ -267,13 +267,7 @@ include:
       /opt/venv/bin/python - <<'PY'
       import torch
       assert torch.cuda.is_available(), "ROCm device is not visible to PyTorch"
-      device_count = torch.cuda.device_count()
-      assert device_count > 0, "PyTorch reports ROCm available but no devices are enumerated"
-      print(f"torch ROCm device count: {device_count}")
-      try:
-          print(torch.cuda.get_device_name(0))
-      except AssertionError as exc:
-          print(f"torch ROCm device name unavailable: {exc}")
+      print(torch.cuda.get_device_name(0))
       PY
   variables:
     SLURM_JOB_NUM_NODES: 1

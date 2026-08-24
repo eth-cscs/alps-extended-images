@@ -73,17 +73,6 @@ RUN set -eux; \
       /opt/alps/env/alps-runtime.rocm.env
 
 ENV BASH_ENV=/opt/alps/env/source-alps-env.sh
-# ldconfig indexes libraries by ELF SONAME (e.g. libamd_smi.so.26), not by
-# development symlink names (e.g. libamd_smi.so).  Python ctypes.CDLL()
-# calls dlopen() which resolves bare names by searching LD_LIBRARY_PATH first,
-# so the ROCm SDK library directories must be on LD_LIBRARY_PATH at runtime.
-#
-# defvar cannot set this: slurm/enroot passes the host LD_LIBRARY_PATH (empty)
-# into the container, so defvar sees it as already set and preserves the empty
-# value.  OCI ENV is authoritative because enroot does not override it.  These
-# stable paths are symlinks created from Python-discovered ROCm SDK wheel paths
-# by install-alps-rocm-components.sh, so they do not encode the Python version.
-ENV LD_LIBRARY_PATH="/opt/alps/rocm-sdk-library-path/devel:/opt/alps/rocm-sdk-library-path/core:/opt/alps/rocm-sdk-library-path/libraries"
 
 COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
 COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
