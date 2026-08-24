@@ -94,7 +94,6 @@ PY
 
     register_rocm_sdk_ldconfig
     install_amdsmi_python
-    register_amdsmi_ldconfig
     link_amdsmi_package_library
     smoke_check_amdsmi_python
     persist_rocm_sdk_env
