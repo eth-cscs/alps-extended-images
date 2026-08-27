@@ -95,7 +95,7 @@ PY
     register_rocm_sdk_ldconfig
     install_amdsmi_python
     link_amdsmi_package_library
-    patch_torch_rocm_amdsmi_device_count
+    patch_torch_rocm_disable_implicit_amdsmi
     smoke_check_amdsmi_python
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
@@ -172,45 +172,6 @@ else:
             except Exception:
                 pass
 PY
-}
-
-register_amdsmi_ldconfig() {
-    local conf="/etc/ld.so.conf.d/99-alps-rocm-amdsmi.conf"
-    local amdsmi_lib=""
-    local candidate libdir
-
-    while IFS= read -r candidate; do
-        [[ -n "${candidate}" ]] || continue
-        for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
-            [[ -d "${libdir}" ]] || continue
-            if compgen -G "${libdir}/libamd_smi.so*" >/dev/null; then
-                amdsmi_lib="${libdir}"
-                break 2
-            fi
-        done
-    done < <(rocm_sdk_prefix_candidates)
-
-    # Fallback: search the Python environment for the library.
-    if [[ -z "${amdsmi_lib}" ]]; then
-        local site_pkgs
-        site_pkgs="$("${ROCM_PYTHON}" -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
-        if [[ -n "${site_pkgs}" && -d "${site_pkgs}" ]]; then
-            amdsmi_lib="$(find "${site_pkgs}" -maxdepth 3 \
-                \( -type f -o -type l \) -name 'libamd_smi.so*' -printf '%h\n' 2>/dev/null | head -n1 || true)"
-        fi
-    fi
-
-    [[ -n "${amdsmi_lib}" ]] || die "libamd_smi.so not found after installing amdsmi"
-
-    if [[ ! -f "${conf}" ]] || ! grep -Fxq "${amdsmi_lib}" "${conf}"; then
-        {
-            [[ -s "${conf}" ]] && printf '\n'
-            printf '%s\n' "${amdsmi_lib}"
-        } >> "${conf}"
-    fi
-
-    ldconfig
-    echo "Registered amdsmi library directory: ${amdsmi_lib}"
 }
 
 link_amdsmi_package_library() {
@@ -294,7 +255,7 @@ PY
 }
 
 
-patch_torch_rocm_amdsmi_device_count() {
+patch_torch_rocm_disable_implicit_amdsmi() {
     "${ROCM_PYTHON}" - <<'PY'
 import site
 from pathlib import Path
@@ -309,48 +270,30 @@ for root in roots:
     if path.exists():
         break
 else:
-    print("PyTorch CUDA module not found; skipping ROCm amdsmi device_count patch")
+    print("PyTorch CUDA module not found; skipping ROCm amdsmi import patch")
     raise SystemExit(0)
 
 text = path.read_text()
-patched = """            if raw_cnt < 0:
-                return raw_cnt
-            # On some containerized ROCm systems, amdsmi can initialize but see
-            # zero GPUs while the HIP runtime sees the allocated devices.
-            if raw_cnt == 0:
-                return -1
+patched = """        else:
+            raise ModuleNotFoundError(
+                "amdsmi auto-import disabled in Alps ROCm images"
+            )
+            import ctypes
+            from pathlib import Path
 """
-fallback_already_patched = patched in text
+if patched in text:
+    print(f"PyTorch ROCm amdsmi auto-import already disabled: {path}")
+    raise SystemExit(0)
 
-old = """            if raw_cnt <= 0:
-                return raw_cnt
+old = """        else:
+            import ctypes
+            from pathlib import Path
 """
-if old in text:
-    text = text.replace(old, patched, 1)
-elif not fallback_already_patched:
-    raise SystemExit(f"could not patch {path}: amdsmi raw-count marker not found")
+if old not in text:
+    raise SystemExit(f"could not patch {path}: amdsmi auto-import marker not found")
 
-shutdown_patched = """    try:
-        socket_handles = amdsmi.amdsmi_get_processor_handles()
-        return len(socket_handles)
-    finally:
-        shutdown = getattr(amdsmi, "amdsmi_shut_down", None)
-        if shutdown is not None:
-            try:
-                shutdown()
-            except Exception:
-                pass
-"""
-if shutdown_patched not in text:
-    shutdown_old = """    socket_handles = amdsmi.amdsmi_get_processor_handles()
-    return len(socket_handles)
-"""
-    if shutdown_old not in text:
-        raise SystemExit(f"could not patch {path}: amdsmi shutdown marker not found")
-    text = text.replace(shutdown_old, shutdown_patched, 1)
-
-path.write_text(text)
-print(f"Patched PyTorch ROCm amdsmi device_count fallback/shutdown: {path}")
+path.write_text(text.replace(old, patched, 1))
+print(f"Disabled PyTorch ROCm amdsmi auto-import: {path}")
 PY
 }
 
