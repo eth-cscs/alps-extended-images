@@ -265,9 +265,34 @@ include:
       test -n "${ROCM_VERSION:-}"
       test -n "${RCCL_VERSION:-}"
       /opt/venv/bin/python - <<'PY'
+      import os
+      import sys
+      from pathlib import Path
+
       import torch
-      assert torch.cuda.is_available(), "ROCm device is not visible to PyTorch"
-      print(torch.cuda.get_device_name(0))
+
+      for name in (
+          "CUDA_VISIBLE_DEVICES",
+          "HIP_VISIBLE_DEVICES",
+          "ROCR_VISIBLE_DEVICES",
+          "GPU_DEVICE_ORDINAL",
+          "SLURM_JOB_GPUS",
+          "SLURM_STEP_GPUS",
+          "SLURM_LOCALID",
+      ):
+          print(f"{name}={os.environ.get(name, '<unset>')}", flush=True)
+      print(f"/dev/kfd exists={Path('/dev/kfd').exists()}", flush=True)
+      print(f"/dev/dri entries={sorted(p.name for p in Path('/dev/dri').glob('*')) if Path('/dev/dri').exists() else '<missing>'}", flush=True)
+      print(f"torch.version.hip={torch.version.hip}", flush=True)
+
+      available = torch.cuda.is_available()
+      count = torch.cuda.device_count()
+      print(f"torch.cuda.is_available={available}", flush=True)
+      print(f"torch.cuda.device_count={count}", flush=True)
+      if not available or count < 1:
+          print("ROCm device is not visible to PyTorch", file=sys.stderr, flush=True)
+          sys.exit(1)
+      print(torch.cuda.get_device_name(0), flush=True)
       PY
   variables:
     SLURM_JOB_NUM_NODES: 1
