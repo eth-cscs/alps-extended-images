@@ -22,7 +22,8 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 
-ARG VERL_REF="v0.8.0"
+# v0.9.0: adds verl/trainer/ppo/v1 (the V1 separate-async trainer) + TransferQueue integration
+ARG VERL_REF="v0.9.0"
 
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
@@ -58,13 +59,6 @@ ENV SRC_DIR=/workspace/src \
 WORKDIR ${SRC_DIR}
 
 
-#RUN git clone https://github.com/nickjbrowning/XIELU.git ;\
-#    cd XIELU ;\
-#    git submodule update --init --recursive ;\
-#    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
-#RUN source /opt/alps/package-helpers.sh && pip_install python --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
-
-
 WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
@@ -78,9 +72,10 @@ RUN set -eux; \
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python -U "ray[data,train,tune,serve]"
+
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    pip_install python "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
+    pip_install python "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.7
 RUN pip uninstall kernels -y --break-system-packages
 
 RUN set -eux; \
@@ -94,14 +89,15 @@ RUN set -eux; \
 
 RUN pip install "PyYAML>=6.0.2" --ignore-installed
 
-# megatron-core[dev,mlm] (pulled by megatron-bridge>=0.5.1) requires fast-hadamard-transform,
+# megatron-core[dev,mlm] (pulled by megatron-bridge) requires fast-hadamard-transform,
 # a CUDA extension with no aarch64 wheel and a broken source tarball (missing csrc/*.cpp).
 # Pin it to a local no-op stub via PEP 508 direct reference so pip's resolver satisfies
 # the transitive dependency without ever attempting to download or compile it.
 RUN mkdir -p /tmp/fht && \
     printf '[project]\nname = "fast-hadamard-transform"\nversion = "1.1.0"\n' > /tmp/fht/pyproject.toml
+
 RUN pip install -c /tmp/torch_constraints.txt \
-        "megatron-bridge>=0.5.1" "megatron-core>=0.17.0" "nvidia-resiliency-ext>=0.6.0" \
+        "megatron-bridge==0.6.1" "megatron-core==0.19.0" "nvidia-resiliency-ext>=0.6.0" \
         "fast-hadamard-transform @ file:///tmp/fht"
 RUN python -c "import torchvision, torch; print('After megatron-bridge — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
