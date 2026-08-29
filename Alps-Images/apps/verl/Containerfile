@@ -116,7 +116,15 @@ RUN pip install -c /tmp/torch_constraints.txt "opentelemetry-sdk>=1.43.0"
 RUN pip install -c /tmp/torch_constraints.txt "transformers==5.8.1" "timm==1.0.16"
 RUN python -c "import torchvision, torch; print('After transformers/timm — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
-RUN pip install -c /tmp/torch_constraints.txt "flashinfer_cubin==0.6.12" "flashinfer_python[cu13]==0.6.12"
+# flashinfer 0.6.12 -> 0.6.14: sglang 0.5.16 pins flashinfer_python[cu13]==0.6.14; the stale
+# 0.6.12 (from 2026-07-27, predates the sglang[all] bump) hung sglang's MLA/DSA decode plan()
+# at TP=32 (run 3209484, ~step 13). flashinfer 0.6.14 hard-raises at import unless flashinfer_cubin
+# is the *exact* same version (run 3214410). flashinfer_cubin/jit-cache are NOT fully published to
+# PyPI (PyPI stops at cubin 0.6.13) -- the real distribution channel is https://flashinfer.ai/whl
+# (GitHub release assets), per flashinfer's install docs; flashinfer_cubin-0.6.14 lives there.
+# Install the matched 0.6.14 pair from that index -> clean AOT, no version-check bypass.
+RUN pip install -c /tmp/torch_constraints.txt --extra-index-url https://flashinfer.ai/whl \
+        "flashinfer_cubin==0.6.14" "flashinfer_python[cu13]==0.6.14"
 
 # Tests shipped with the image
 COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
