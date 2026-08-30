@@ -32,9 +32,17 @@ COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 #Note: disable vllm installation for now, as it causes issues. To re-enable consider using the ngc vllm base image.
 #RUN source /opt/alps/package-helpers.sh && pip_install python vllm --extra-index-url https://download.pytorch.org/whl/cu131
 
+# sglang pinned to 0.5.16 (was unpinned -> resolved to whatever was latest, 0.5.17/0.5.18 by
+# 2026-08). 0.5.16 is the version every GLM-5.1 recipe piece is validated against and, crucially,
+# the only recent sglang whose own flashinfer requirement (flashinfer_python[cu13]==0.6.14)
+# matches the flashinfer pin below -- 0.5.17 wants 0.6.15.post1, 0.5.18 wants 0.6.17, so leaving
+# sglang unpinned reintroduces the exact python-vs-required flashinfer skew that caused run
+# 3209484's TP=32 MLA plan() hang. The verl-vs-sglang import-drift source patches
+# (r3-sglang-routed-experts-import-fix, delta-sharded-localserializedtensor-import-fix) also
+# target 0.5.16's module layout. Bump this + the flashinfer pin together, deliberately, tested.
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    pip_install python sglang[all]
+    pip_install python "sglang[all]==0.5.16"
 
 # Capture the exact torch + torchvision versions that sglang chose.
 # sglang pins its own deps, so this pair is guaranteed ABI-compatible.
@@ -125,6 +133,20 @@ RUN python -c "import torchvision, torch; print('After transformers/timm — tor
 # Install the matched 0.6.14 pair from that index -> clean AOT, no version-check bypass.
 RUN pip install -c /tmp/torch_constraints.txt --extra-index-url https://flashinfer.ai/whl \
         "flashinfer_cubin==0.6.14" "flashinfer_python[cu13]==0.6.14"
+
+# transformer-engine rebuild — MUST be last (after every step that can move torch).
+# sglang[all] pins torch to 2.11.0, which is newer than the NGC base image's bundled torch, so
+# the base's prebuilt transformer_engine_torch C++ bindings fail to load against it
+# (`undefined symbol: _ZN3c104impl3cow23materialize_cow_storageERNS_11StorageImplE`, run 3235127)
+# -> `import megatron.core` fails cluster-wide -> verl has no `megatron` engine backend
+# -> AssertionError: Unknown backend: megatron. transformer_engine_torch ships only as an sdist,
+# so this is a source build against the now-final torch (uses the base image's CUDA toolkit +
+# ninja; ~20-40 min). `core_cu13` matches this image's CUDA 13 stack and megatron-core 0.19's own
+# `te` extra spec. The second RUN is a hard build-time gate: if TE / megatron.core still do not
+# import, the image build FAILS here instead of shipping another broken image.
+RUN pip install -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall \
+        "transformer-engine[core-cu13,pytorch]"
+RUN python -c "import importlib.metadata as m, torch, transformer_engine.pytorch, megatron.core; print('OK torch', torch.__version__, '| transformer-engine', m.version('transformer-engine'), '| megatron.core imports')"
 
 # Tests shipped with the image
 COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
