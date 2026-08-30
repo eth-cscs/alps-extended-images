@@ -135,25 +135,38 @@ RUN pip install -c /tmp/torch_constraints.txt --extra-index-url https://flashinf
         "flashinfer_cubin==0.6.14" "flashinfer_python[cu13]==0.6.14"
 
 # transformer-engine rebuild — MUST be last (after every step that can move torch).
-# sglang[all] pins torch to 2.11.0, which is newer than the NGC base image's bundled torch, so
-# the base's prebuilt transformer_engine_torch C++ bindings fail to load against it
+# sglang[all] pins torch to the stable 2.11.0 PyPI wheel, which is ABI-different from the NGC base
+# image's bundled torch 2.11.0a0, so the base's prebuilt transformer_engine_torch C++ bindings
+# fail to load against it
 # (`undefined symbol: _ZN3c104impl3cow23materialize_cow_storageERNS_11StorageImplE`, run 3235127)
 # -> `import megatron.core` fails cluster-wide -> verl has no `megatron` engine backend
 # -> AssertionError: Unknown backend: megatron. transformer_engine_torch ships only as an sdist,
 # so this is a source build against the now-final torch (uses the base image's CUDA toolkit +
-# ninja; ~20-40 min). `core-cu13` matches this image's CUDA 13 stack and megatron-core 0.19's own
-# `te` extra spec.
-RUN pip install -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall \
-        "transformer-engine[core-cu13,pytorch]"
+# ninja; ~20-40 min).
+#
+# PIN to ==2.12.0 — the exact TE version NGC pytorch-cuda:26.02-py3 bundles. An UNPINNED install
+# resolves to the latest (2.18.0), whose cutlass flash-attn backend does
+# `from cutlass.utils import block_copy` — a symbol the base image's older bundled
+# nvidia-cutlass-dsl does not have -> `ImportError: cannot import name 'block_copy'` ->
+# `import megatron.core` fails -> same `Unknown backend: megatron` (run 3236353). This is a known
+# TE issue (2.18 release notes: "known compatibility issue between FlashAttention v4, CuTeDSL and
+# CUDNN Frontend"). Pinning TE back to the base image's own 2.12.0 keeps its Python code matched to
+# the cutlass-dsl / cudnn-frontend / flash-attn the 26.02 container already ships.
+# --no-deps + all three packages named explicitly: nothing else moves (cutlass-dsl etc. stay as
+# the base image has them); only transformer_engine_torch (sdist) rebuilds against the final torch,
+# and transformer_engine_cu13 (prebuilt wheel) is re-laid at the same 2.12.0.
+# `cu13` matches this image's CUDA 13 stack and megatron-core 0.19's own `te` extra spec.
+RUN pip install -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall --no-deps \
+        "transformer-engine==2.12.0" "transformer_engine_cu13==2.12.0" "transformer_engine_torch==2.12.0"
 # Build-time gate: import torch (build-safe) and assert the TE core package and its torch-bindings
 # package are installed at the SAME version (the thing --force-reinstall can get wrong). We do NOT
 # `import transformer_engine` / `megatron.core` here -- those dlopen libcuda.so.1 (the CUDA driver,
 # host-provided at runtime, absent during build). The real runtime import is checked by
-# train-gsm8k-glm5.1-*.sh's own diagnostic block on the GPU nodes (which caught run 3235127).
+# train-gsm8k-glm5.1-*.sh's own diagnostic block on the GPU nodes (which caught runs 3235127/3236353).
 RUN python -c "\
 import importlib.metadata as m, torch;\
 te=m.version('transformer-engine'); tt=m.version('transformer-engine-torch'); mc=m.version('megatron-core');\
-assert te==tt, f'transformer-engine {te} != transformer-engine-torch {tt}';\
+assert te==tt=='2.12.0', f'transformer-engine {te} / transformer-engine-torch {tt} not both 2.12.0';\
 print(f'OK torch {torch.__version__} | transformer-engine {te} == transformer-engine-torch {tt} | megatron-core {mc}')"
 
 # Tests shipped with the image
