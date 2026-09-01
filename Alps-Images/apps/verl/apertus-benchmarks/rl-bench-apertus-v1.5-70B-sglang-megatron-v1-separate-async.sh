@@ -6,13 +6,64 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=4:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-0f334b540ccc7034" #alps7-dev-0f334b540ccc7034 image with megatron
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy of rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh migrated to the
+# same image and verl trainer as
+# example/train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh:
+#
+#   * image   : the verl-cuda image with baked-in verl v0.9.0 + updated deps
+#               (TransferQueue 0.1.7, megatron-core 0.19.0, megatron-bridge 0.6.1,
+#               flashinfer 0.6.14) -- no runtime verl checkout needed.
+#   * trainer : verl.experimental.fully_async_policy.fully_async_main
+#               -> verl.trainer.main_ppo, V1 trainer in separate-async mode
+#               (trainer.use_v1=True, trainer.v1.trainer_mode=separate_async).
+#
+# Config changes carried over from the GLM v1-separate migration:
+#   * async_training: block  -> trainer.v1.separate_async.* / trainer.v1.sampler.*
+#   * top-level rollout: block gone; the standalone rollout pool is declared in
+#     actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}
+#   * data.train_batch_size: 0 -> parameter_sync_step * ppo_mini_batch_size
+#   * TransferQueue: forced on by main_ppo; set explicitly + size storage units
+#   * old_log_probs: rollout.calculate_log_probs + algorithm.rollout_correction
+#     (actor.use_rollout_log_probs is unused by V1)
+#   * lr schedule: V1 sets actor.optim.total_training_steps before the workers
+#     are created, so the fully-async lr_decay_steps workaround is dropped
+#   * example/patches/v1-separate-async-fixes.patch + upstream PR #7421/#7422/#7423
+#     are applied (needed by the V1 separate-async standalone-rollout path)
+#
+# The fully-async recipe's reset to theely/verl Fix-fsdp-model-loading-on-async is
+# dropped: it is a single-file FSDP2-only change (unused by the Megatron trainer)
+# and a hard reset would clobber the baked v0.9.0 verl tree.
+#
+# CAVEAT -- the V1 separate-async trainer is not a pure disaggregated setup:
+# PPOTrainer._setup() always builds hybrid rollout replicas on top of the training
+# worker group (trainer world / rollout world = 48/16 = 3 replicas here) *in
+# addition to* the standalone rollout. actor_rollout_ref.hybrid_engine is not
+# consulted in the V1 path; v1-separate-async-fixes.patch no-ops those replicas
+# (they would otherwise squat gpu_memory_utilization=0.75 on every training GPU
+# at init and OOM the trainer's weight-sync staging).
+#
+# Apertus-1.5 support (Group 1 + Group 2): UNCHANGED from the fully-async recipe
+# -- swiss-ai transformers wheel, SGLang PR #32979 + local fixes, and the
+# wqwqazwsxedc Megatron-LM / Megatron-Bridge apertus fork wheels (installed over
+# the image's stock megatron-core/bridge) + the vendored Apertus1p5Bridge + xielu.
+#
+# NOTE: a first pass tried to keep the image's stock megatron-core 0.19.0 /
+# megatron-bridge 0.6.1 and add only the apertus delta as line-patches + vendored
+# bridge modules. It ran end-to-end but trained degenerately (runs 3240861 /
+# 3243271 / 3243467: fluent generations, zero format compliance, no GRPO signal)
+# -- a forward-pass discrepancy in the 0.18->0.19 / 0.5->0.6.1 jump that the
+# fork's apertus code silently depends on, not visible in weight stats. Reverted
+# to the fork wheels; only the image and the trainer are migrated.
+# ─────────────────────────────────────────────────────────────────────────────
+
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-621fa40275c4f036" #verl-cuda image: baked verl v0.9.0 + updated deps (matches train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh)
 
 export MODEL_NAME="Apertus-v1.5-70B"
 export MODEL_REPO="swiss-ai"
 
 export PROJECT_NAME="apertus-benchmarks"
-export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-megatron-async-${SLURM_JOB_NUM_NODES}n"
+export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
@@ -26,6 +77,19 @@ cd $TRAINING_HOME
 
 export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
+
+# V1 separate-async batching contract:
+#   data.train_batch_size == trainer.v1.separate_async.parameter_sync_step * actor.ppo_mini_batch_size
+# parameter_sync_step is the number of actor updates between two weight syncs to
+# the standalone rollout (the fully-async recipe called this trigger_parameter_sync_step).
+# train_batch_size and ppo_mini_batch_size are PROMPT counts; ppo_mini_batch_size is
+# multiplied by rollout.n internally for the DP-parallel actor mini-batch, and that
+# product must be >= 2x dp_size. Here dp_size = DP x EP = 6 x 1 = 6 (12 training
+# nodes x 4 GPUs / TP=8 = 6 DP replicas; dense model so EP=1). 6 * 16 = 96 >> 12.
+export ROLLOUT_N=16                  # responses per prompt (unchanged from the fully-async recipe)
+export PPO_MINI_BATCH_SIZE=6         # prompts; x ROLLOUT_N = 96 rows
+export PARAMETER_SYNC_STEP=2
+export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -48,44 +112,23 @@ defaults:
   - override data@data: legacy_data
   - _self_
 
-# ── Required by fully_async_main ──────────────────────────────────────────────
-async_training:
-
-  # On Policy Settings
-  # staleness_threshold: 0
-  # trigger_parameter_sync_step: 1
-
-  # Stream Pipeline Settings
-  staleness_threshold: 0.1
-  trigger_parameter_sync_step: 2
-
-  require_batches: 1
-  partial_rollout: False
-  use_trainer_do_validate: False
-
-# Top-level rollout block — fully_async_main copies .nnodes/.n_gpus_per_node
-# into actor_rollout_ref.rollout, so keep these in sync with the rollout block below.
-rollout:
-  nnodes: ${ROLLOUT_NNODES}
-  n_gpus_per_node: 4
-  # total_train_steps = total_rollout_steps / (ppo_mini_batch_size * require_batches *
-  # trigger_parameter_sync_step) = total_rollout_steps / (48*1*2) -- see
-  # fully_async_rollouter.py:set_max_required_samples. 4416/96 = 46 training steps,
-  # a short run meant to verify the loss/reward trend actually moves, not a full train.
-  total_rollout_steps: 4416
-  test_freq: 10
-# ──────────────────────────────────────────────────────────────────────────────
+# ── TransferQueue: mandatory experience store for the V1 trainer ──────────────
+transfer_queue:
+  enable: True
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      # verl recommends >= 2 x number of nodes for load balancing
+      num_data_storage_units: $(( SLURM_JOB_NUM_NODES * 2 ))
 
 data:
   train_files: ${TRAINING_HOME}/data/gsm8k/train.parquet
   val_files:   ${TRAINING_HOME}/data/gsm8k/test.parquet
-  train_batch_size: 0    # must be 0 in fully-async mode
-  gen_batch_size: 1      # must be 1 in fully-async mode
+  train_batch_size: ${TRAIN_BATCH_SIZE}   # == parameter_sync_step * ppo_mini_batch_size
+  gen_batch_size: 1      # prompts are submitted to the rollout one at a time
   return_raw_chat: True
 
 actor_rollout_ref:
-  hybrid_engine: False
-
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
     use_remove_padding: True  # Megatron THD layout requires sequence packing
@@ -97,71 +140,40 @@ actor_rollout_ref:
     use_shm: false
 
   actor:
-    optim:
-      # must be positive at init; set_total_train_steps is called too late
-      # (fully_async_main.py calls trainer.init_workers() -- which builds the
-      # Megatron LR scheduler and asserts lr_decay_steps > 0 -- before it ever
-      # calls trainer.set_total_train_steps(), so that runtime path can never
-      # satisfy this assertion; confirmed run 3172177,
-      # AssertionError: assert self.lr_decay_steps > 0 in
-      # megatron/core/optimizer_param_scheduler.py). Same fix, same value, as
-      # the sibling train-gsm8k-qwen-3B-full-async-megatron.sh script this
-      # recipe's actor block otherwise mirrors -- matches rollout.total_rollout_steps
-      # above so the schedule spans the full run.
-      lr_decay_steps: 4416
-    ppo_mini_batch_size: 48 #must be divisible by (rollout.n_gpus_per_node * rollout.nnodes)
+    # V1 sets actor.optim.total_training_steps in _init_dataloader (before the
+    # workers are created), so the fully-async lr_decay_steps workaround is gone.
+    checkpoint:
+      # Apertus-v1.5 is multimodal; this recipe deliberately does not map the
+      # vision_tokenizer / audio_tokenizer towers (text-only GSM8K). The strict
+      # HF-checkpoint export then fails ("473 tensors ... not written", run
+      # 3240861). strict: False saves the LM-only partial checkpoint instead.
+      strict: False
+    ppo_mini_batch_size: ${PPO_MINI_BATCH_SIZE}
     ppo_micro_batch_size_per_gpu: 1
     ppo_max_token_len_per_gpu: 16384
-    use_rollout_log_probs: True   # required for fully-async log prob correctness
     use_dynamic_bsz: True
     # 12 training nodes x 4 GPUs = 48 GPUs; TP=8, PP=1, EP=1 -> 8 GPUs/replica,
-    # 6 DP replicas (48/6=8, still divides ppo_mini_batch_size cleanly).
-    # Apertus-v1.5-70B is dense (no MoE), so EP must be 1. TP raised from 4 to 8
-    # (run 3171564: CUDA OOM in Megatron's DistributedDataParallel grad-buffer
-    # allocation during actor_init_model() -- 66.43 GiB already resident with
-    # TP=4's ~17.5B-param-per-GPU shard, only 28.56 GiB free for a 32.88 GiB
-    # buffer). TP=8 roughly halves the per-GPU parameter/gradient shard.
-    # Deliberately did not also increase node count this run despite having
-    # room to: bumping SLURM_JOB_NUM_NODES changes ROLLOUT_NNODES/TRAINING_NNODES
-    # (see the 0.25 split above), and every node count that keeps 4*TRAINING_NNODES
-    # divisible by TP=8 without also breaking ppo_mini_batch_size's own
-    # divisibility needs re-deriving both constraints together (e.g. 24 nodes
-    # gives 9 DP replicas, and 48 is not divisible by 9) -- rather than guess at
-    # a new combination blind, keeping nodes at 16 (already verified: 48 GPUs /
-    # TP=8 = 6 DP, and 48 mini-batch / 6 = 8) isolates this run to testing only
-    # the OOM fix. Starting point otherwise mirrored from
-    # train-gsm8k-qwen-3B-full-async-megatron.sh (same offload strategy that
-    # fixed the FSDP2 OOM in the sibling script) — unverified for this
-    # model/node count, needs a run.
+    # 6 DP replicas. Apertus-v1.5-70B is dense (no MoE), so EP must be 1. TP=8
+    # (raised from 4 in the fully-async recipe -- run 3171564: CUDA OOM in
+    # Megatron's DDP grad-buffer allocation with TP=4's ~17.5B-param-per-GPU
+    # shard) roughly halves the per-GPU parameter/gradient shard.
     megatron:
       tensor_model_parallel_size: 8
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-      # sequence_parallel defaults True whenever TP>1 (verl's EngineConfig),
-      # sharding activations along the sequence dim and reduce-scattering them
-      # back -- which requires the packed (THD) micro-batch's token count to be
-      # a multiple of tensor_model_parallel_size. Run 3173479 (the first run to
-      # ever reach a real training step) crashed on the very first one:
-      # AssertionError: First dimension of the tensor should be divisible by
-      # tensor parallel size, in megatron/core/tensor_parallel/mappings.py
-      # _reduce_scatter_along_first_dim. verl does have a TP-aware padding
-      # helper for exactly this (verl/utils/megatron/sequence_parallel.py
-      # pad_to_sequence_parallel), but it is only ever called from the
-      # pipeline-parallel *shape-hint* computation (pipeline_parallel.py), not
-      # from the actual data path the experimental fully_async_policy trainer
-      # uses to build the real forward input tensor -- so the real packed
-      # tensor this recipe feeds the model is never actually padded to a
-      # TP=8 multiple, only assumed to be. Rather than patch that gap in verl's
-      # experimental code blind (untested, cluster-cost-expensive to iterate
-      # on), disabled sequence_parallel outright: its only benefit is reducing
+      # sequence_parallel defaults True whenever TP>1; it shards activations
+      # along the packed (THD) sequence dim and reduce-scatters them, requiring
+      # the packed micro-batch token count to be a multiple of TP -- which the
+      # experimental async trainers never actually pad for (run 3173479:
+      # AssertionError in megatron/core/tensor_parallel/mappings.py
+      # _reduce_scatter_along_first_dim). Disabled; the only benefit is reduced
       # activation memory, which override_transformer_config.recompute_granularity:
-      # full below already achieves by recomputing activations in backward
-      # instead of storing them -- so little/nothing is actually given up here.
+      # full below already delivers.
       sequence_parallel: False
       param_offload: True
       grad_offload: True
       optimizer_offload: True
-      vanilla_mbridge: False  # use the wqwqazwsxedc/Megatron-Bridge apertus fork (Group 2 below)
+      vanilla_mbridge: False  # route through megatron-bridge AutoBridge -> the vendored Apertus1p5Bridge (Group 2 below)
       override_transformer_config:
         recompute_granularity: full
         recompute_method: uniform
@@ -172,14 +184,21 @@ actor_rollout_ref:
     name: sglang
     mode: async
     load_format: dummy
+    # Standalone (disaggregated) rollout resources -- V1 separate-async reads the
+    # rollout pool size from here instead of a top-level rollout: block.
+    nnodes: ${ROLLOUT_NNODES}
     n_gpus_per_node: 4
     temperature: 1.0
-    n: 16 #num responses per prompt
+    n: ${ROLLOUT_N} # responses per prompt -- GRPO group size for the relative-advantage baseline
     tensor_model_parallel_size: 4
     gpu_memory_utilization: 0.75
+    calculate_log_probs: True   # required: bypass_mode reads rollout_log_probs as old_log_probs
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
-      backend: nccl # weight sync via NCCL broadcast
+      # dense 70B via NCCL broadcast -- the MoE-specific delta_sharded backend the
+      # GLM recipe switched to (for its ~6000-collective full-model gather hang)
+      # does not apply here.
+      backend: nccl
 
   ref:
     log_prob_use_dynamic_bsz: True
@@ -206,12 +225,30 @@ reward:
     name: compute_reward
 
 trainer:
+  use_v1: True
+  v1:
+    trainer_mode: separate_async
+    separate_async:
+      # batches pushed to the rollout before the training loop starts
+      num_warmup_batches: 1
+      # actor updates between two weight syncs to the standalone rollout
+      parameter_sync_step: ${PARAMETER_SYNC_STEP}
+    sampler:
+      # staleness bound, in model versions, for a trajectory to remain usable
+      max_off_policy_threshold: 8
+      max_off_policy_strategy: drop
   total_epochs: 3
+  # Fixed step cap (overrides the epoch-based count) -- short benchmark run to see
+  # whether the loss/reward trend moves, same intent as the fully-async recipe's
+  # total_rollout_steps: 4416 (~46 training steps).
+  total_training_steps: 46
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
-  save_freq: 50
+  save_freq: 100  # > total_training_steps: no mid-run checkpoint on the shakedown (faster, cleaner signal). Lower for a real run (actor.checkpoint.strict is False so the multimodal-tower export gap is non-fatal).
+  test_freq: -1   # disable validation
+  val_before_train: false
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
@@ -228,42 +265,94 @@ EOF
 
 cat > "${TRAINING_CONFIG}/gsm8k_reward.py" <<- EOF
 # gsm8k_reward.py
+#
+# Robust answer extraction. Run 3246622's [REWARD-DUMP] blocks showed
+# Apertus-v1.5-70B solves GSM8K fluently and correctly but NEVER emits the
+# <answer>...</answer> tags this recipe's original prompt asked for -- it ends
+# with "Final answer: N", "\boxed{N}", a bare trailing number, or "N" right
+# after the <|inner_suffix|> reasoning delimiter. The old reward only credited
+# <answer> tags, so every rollout scored 0 -> no GRPO signal. This version
+# parses all of those forms so outcome reward drives training. (The dataset /
+# system prompt are unchanged -- no regen needed; RL just rewards correctness.)
 import re
 import math
 from typing import Optional
 
+_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+_FINAL = re.compile(
+    r"(?:final answer|the answer is|answer is|answer:)\D{0,24}(-?\d[\d,]*(?:\.\d+)?)",
+    re.IGNORECASE,
+)
 
-def extract_model_answer(response: str) -> Optional[str]:
-    """
-    Pull the content of the last <answer>...</answer> block.
-    Returns None if the model did not produce the expected format.
-    """
-    matches = re.findall(r"<answer>(.*?)</answer>", response, re.DOTALL)
-    if not matches:
+
+def _norm(raw: str) -> Optional[str]:
+    raw = raw.strip().replace(chr(36), "").replace(",", "").rstrip(".").strip()
+    if not raw:
         return None
-    raw = matches[-1].strip().replace(",", "")
     try:
         val = float(raw)
-        return str(val) if not math.isfinite(val) else (str(int(val)) if val == int(val) else str(val))
     except ValueError:
         return raw
+    if not math.isfinite(val):
+        return str(val)
+    return str(int(val)) if val == int(val) else str(val)
+
+
+def _boxed(s: str) -> Optional[str]:
+    i = s.rfind("boxed")
+    if i < 0:
+        return None
+    j = s.find("{", i)
+    k = s.find("}", j) if j >= 0 else -1
+    return s[j + 1:k] if 0 <= j < k else None
+
+
+def extract_model_answer(response: str) -> Optional[str]:
+    # Apertus-v1.5 puts its final answer after the last <|inner_suffix|> delimiter.
+    marker = "<|inner_suffix|>"
+    tail = response.split(marker)[-1] if marker in response else response
+
+    for scope in (tail, response):
+        m = re.findall(r"<answer>(.*?)</answer>", scope, re.DOTALL)
+        if m:
+            return _norm(m[-1])
+    for scope in (tail, response):
+        b = _boxed(scope)
+        if b is not None:
+            return _norm(b)
+    for scope in (tail, response):
+        m = _FINAL.findall(scope)
+        if m:
+            return _norm(m[-1])
+    for scope in (tail, response):
+        nums = _NUM.findall(scope)
+        if nums:
+            return _norm(nums[-1])
+    return None
 
 
 def compute_reward(
     data_source, solution_str, ground_truth, extra_info=None, **kwargs
 ) -> float:
-    # Truncated response (thinking opened but never closed): return 0, not a large
+    # Reasoning opened but never closed (truncated) -> neutral 0.0, not a big
     # negative, to avoid extreme GRPO advantages that cause gradient spikes.
     if "<think>" in solution_str and "</think>" not in solution_str:
         return 0.0
 
     model_ans = extract_model_answer(solution_str)
-    has_answer = "<answer>" in solution_str and "</answer>" in solution_str
-    format_reward  = 0.1 if has_answer else 0.0
-    outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
+    gt = _norm(str(ground_truth))
+    outcome_reward = 1.0 if (model_ans is not None and gt is not None and model_ans == gt) else 0.0
 
-    # Smooth length penalty starting at 350 words (~455 tokens), max -0.2 at 700 words.
-    # Keeps thinking chains well below the 1024-token hard cap so truncation stays rare.
+    # Small shaping bonus for a clearly-delimited final answer (any of the forms
+    # the model actually uses).
+    has_delim = (
+        "boxed{" in solution_str
+        or ("<answer>" in solution_str and "</answer>" in solution_str)
+        or bool(_FINAL.search(solution_str))
+    )
+    format_reward = 0.1 if has_delim else 0.0
+
+    # Smooth length penalty starting at 350 words, max -0.2 at 700 words.
     words = len(solution_str.split())
     length_penalty = -0.2 * min(1.0, max(0.0, (words - 350) / 350))
 
@@ -331,6 +420,164 @@ EOF
 
 sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
+
+# Content of example/patches/v1-separate-async-fixes.patch, embedded here
+# rather than read via a script-relative path: under sbatch, BASH_SOURCE[0]
+# resolves to the spool-staged copy of this script, not its checkout location,
+# so a script-relative read silently fails on every node (this is the exact
+# failure mode that lost the old sitecustomize.py-based fallback patch in run
+# 3129805 -- see Known hazards in CLAUDE.md). Applied via git apply on the baked
+# v0.9.0 verl tree below, alongside the upstream PR patches -- three real, stable
+# fixes for the V1 separate-async trainer (hybrid-rollout OOM, stale hybrid
+# weight-sync call, a shape-equality bug in TensorDict construction).
+cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
+# Local fixes for verl v0.9.0's V1 separate-async trainer, discovered debugging
+# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh (see Known hazards and the
+# Run log in CLAUDE.md for the full incident history). Re-diff against a newer verl
+# ref if this stops applying.
+#
+# 1. LLMServerManager._initialize_llm_servers (verl/workers/rollout/llm_server.py):
+#    PPOTrainer._setup() always builds hybrid rollout replicas on top of the
+#    training worker group (trainer_world_size / rollout_world_size replicas) *in
+#    addition to* the standalone rollout -- actor_rollout_ref.hybrid_engine is not
+#    consulted anywhere in the V1 path, so this could not be disabled from config.
+#    Those replicas are instantiated at gpu_memory_utilization=0.75 on the training
+#    GPUs during trainer.init(), before the first on_sample_end() ever runs, and
+#    free_cache_engine=false (required for TP=32 SGLang stability) makes their
+#    sleep() a no-op -- so they held ~71 GiB per training GPU for the life of the
+#    run. trainer.init() then needs ~15 GiB back on those same GPUs to stage
+#    Megatron params for the NCCL export to the standalone rollout, and OOMed
+#    (runs 3121001, 3125195, 3129805). separate-async never actually needs the
+#    hybrid engine: get_llm_client() is overridden in PPOTrainerSeparateAsync to
+#    always route through the standalone rollout, so the hybrid replicas existed
+#    only to be immediately put to sleep. Fixed by no-oping hybrid-mode calls
+#    (worker_group is not None); standalone-mode calls (worker_group is None) are
+#    unaffected. Confirmed fixed in run 3134772 (no OOM, training reached step 0).
+#
+# 2. PPOTrainerSeparateAsync.on_init_end (verl/trainer/ppo/v1/trainer_separate_async.py):
+#    drops the self.checkpoint_manager.update_weights(...) call. That manager's
+#    backend is forced to "naive" (trainer_base.py), which pushes weights into
+#    each worker's colocated hybrid engine directly rather than going through a
+#    replica list -- with hybrid replicas disabled by fix 1 above, that colocated
+#    engine is never created, so the call would push into nothing.
+#    self.standalone_checkpoint_manager.update_weights(...), the actual sync to
+#    the standalone rollout, is left untouched. Paired with fix 1; same runs.
+#
+# 3. list_of_dict_to_tensordict (verl/utils/tensordict_utils.py): decided
+#    nested-vs-stacked per field by checking `all(item.shape == val_list[0].shape
+#    for item in val_list)` -- trivially true for a length-1 list (this function
+#    is called once per rollout output, so len(list_of_dicts) is often 1) and also
+#    true whenever several ragged items (e.g. GRPO rollout-group responses)
+#    coincidentally share a length, most commonly by all saturating
+#    max_response_length. Silently produced a dense Tensor for fields callers
+#    assume are nested (input_ids, prompts, responses, position_ids), and any
+#    downstream .offsets() call then raised
+#    AttributeError: 'Tensor' object has no attribute 'offsets' (runs 3134772,
+#    3136766, 3137775). Fixed by delegating non-scalar tensor fields
+#    unconditionally to this same file's own nested_tensor_from_tensor_list (used
+#    elsewhere in the file for chunking/dispatch, and already correct there) --
+#    no more shape-equality guessing. This was a real, independent bug, but ended
+#    up never being the sole cause of the offsets crashes in this chain: see
+#    CLAUDE.md's run 3144665/3149736 entries for the actual root cause, a
+#    same-shaped bug in the separately pip-installed TransferQueue==0.1.6 (fixed
+#    upstream in 0.1.7; the training script upgrades the wheel at runtime rather
+#    than patching it here, since it isn't part of this checkout). Confirmed fixed
+#    end-to-end for the whole recipe in run 3149736 (14/231 training steps
+#    completed, sane metrics, zero offsets crashes).
+#
+# Originally shipped as sitecustomize.py runtime monkeypatches (fast to iterate on
+# mid-debugging -- no hand-crafted diff needed while the exact fix was still
+# changing), converted to this source patch once run 3149736 confirmed all three
+# were correct and stable: same reasoning as the Apertus benchmark's equivalent
+# conversion (apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch) --
+# a runtime monkeypatch is great for fast iteration but not the form a stable fix
+# should end up in. A plain source patch is one less moving part (no
+# sys.meta_path machinery, no PYTHONPATH staging, no import-timing dependency)
+# and the actual behavior is just readable in the file.
+diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
+index 18a06ee2..4c1815a5 100644
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -133,7 +133,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+     def on_init_end(self):
+         # update weights after loading checkpoint
+         self.standalone_checkpoint_manager.update_weights(self.global_steps)
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        # self.checkpoint_manager (the hybrid-replica sync path) is skipped: its
++        # backend is forced to "naive", which pushes weights into each worker's
++        # colocated hybrid engine directly rather than through a replica list --
++        # with LLMServerManager._initialize_llm_servers disabling hybrid replicas
++        # (see llm_server.py), that colocated engine is never created, so this call
++        # would push into nothing. self.standalone_checkpoint_manager.update_weights
++        # above, the actual sync to the standalone rollout, is unaffected.
+
+     def on_train_begin(self):
+         if self.config.skip.rollout_tq.enable:
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+index 91d82b15..810ccbee 100644
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -930,20 +930,21 @@ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDic
+     dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
+     batch_size = len(list_of_dicts)
+
+-    final_data = {
+-        key: (
+-            torch.stack(val_list)
+-            if val_list
+-            and all(isinstance(item, torch.Tensor) for item in val_list)
+-            and all(item.shape == val_list[0].shape for item in val_list)
+-            else (
+-                torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
+-                if val_list and all(isinstance(item, torch.Tensor) for item in val_list)
+-                else NonTensorStack(*val_list)
+-            )
+-        )
+-        for key, val_list in dict_of_lists.items()
+-    }
++    def _pack(val_list):
++        if not val_list or not all(isinstance(item, torch.Tensor) for item in val_list):
++            return NonTensorStack(*val_list)
++        # Scalar tensors have no dimension to make ragged along.
++        if all(item.dim() == 0 for item in val_list):
++            return torch.stack(val_list)
++        # Always nested -- never guess dense-vs-ragged from shape equality: that
++        # heuristic is trivially wrong for a length-1 list (every item "matches"
++        # its own shape) and misfires whenever several ragged items coincidentally
++        # share a length (e.g. multiple GRPO rollout responses that all saturate
++        # max_response_length), silently producing a dense Tensor for fields
++        # callers assume are nested and crashing their .offsets() calls downstream.
++        return nested_tensor_from_tensor_list(val_list)
++
++    final_data = {key: _pack(val_list) for key, val_list in dict_of_lists.items()}
+
+     td = TensorDict(final_data, batch_size=[batch_size])
+
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index d9beede7..4e2d767e 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -523,6 +523,18 @@ class LLMServerManager:
+                 so standalone replicas can avoid Ray named-actor collisions with hybrid
+                 replicas (which start at 0) when both coexist (e.g. separate async).
+         """
++        # separate-async's standalone rollout makes the hybrid replicas this method
++        # would otherwise build on top of the training worker group pure overhead:
++        # get_llm_client() is overridden elsewhere to always route through the
++        # standalone rollout, so hybrid replicas exist only to be put to sleep. Building
++        # them anyway costs ~gpu_memory_utilization worth of every training GPU during
++        # init, which the trainer's own weight-sync needs back (OOM without this).
++        if self.worker_group is not None:
++            self.rollout_replicas = []
++            self.server_handles = []
++            self.server_addresses = []
++            print("LLMServerManager: hybrid replicas disabled (worker_group is set) — skipping init_hybrid()")
++            return
+         if start_rank is None:
+             start_rank = self.start_rank
+         rollout_world_size = (
+EOF
+sbcast -f ${TRAINING_CONFIG}/v1-separate-async-fixes.patch ${TRAINING_CONFIG}/v1-separate-async-fixes.patch
 
 # ══════════════════════════════════════════════════════════════════════════
 # Add Apertus 1.5 support.
@@ -844,6 +1091,13 @@ class Apertus1p5Bridge(MegatronModelBridge):
             f"{L}.self_attention.k_layernorm.weight": f"{H}.self_attn.k_norm.weight",
             f"{L}.mlp.linear_fc2.weight": f"{H}.mlp.down_proj.weight",
         }
+        # Pre-attn / pre-MLP RMSNorm weights + the learnable xIELU scalars, mapped
+        # replicated (not TP-sharded). This recipe's use_transformer_engine spec
+        # produces the fused `linear_qkv.layer_norm_weight` / `linear_fc1.layer_norm_weight`
+        # names, so those direct mappings are what load. Validated end-to-end in run
+        # 3247540 (46 steps, healthy GRPO curve) -- and confirmed against fork
+        # megatron-core 0.18 / megatron-bridge 0.5.0; switching these to AutoMapping
+        # on stock megatron-bridge 0.6.1 loaded them as ~0 instead (run 3243271).
         repl = {
             f"{L}.self_attention.linear_qkv.layer_norm_weight": f"{H}.attention_layernorm.weight",
             f"{L}.mlp.linear_fc1.layer_norm_weight": f"{H}.feedforward_layernorm.weight",
@@ -897,7 +1151,7 @@ echo "Added Apertus1p5Bridge (new bridge for Apertus1p5ForConditionalGeneration)
 # before that source change existed -- bump this string whenever the
 # packaged source changes in a way that needs a fresh wheel.
 export MEGATRON_WHEEL_DIR=${TRAINING_HOME}/wheels
-export MEGATRON_WHEEL_BUILD_VERSION="v3-apertus1p5-bridge-pruned-vocab"
+export MEGATRON_WHEEL_BUILD_VERSION="v5-apertus1p5-bridge-v1sep"
 mkdir -p ${MEGATRON_WHEEL_DIR}
 if ! ls ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl >/dev/null 2>&1 \
     || ! ls ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl >/dev/null 2>&1 \
@@ -927,20 +1181,13 @@ else
     echo "megatron-core/megatron-bridge wheels already present and up to date (${MEGATRON_WHEEL_BUILD_VERSION}), skipping build."
 fi
 
-# Megatron-Bridge's apertus/apertus_bridge.py (reused as-is by the new
-# Apertus1p5Bridge, see apertus1p5_bridge.py above) wraps its xielu activation
-# in MCoreXIELU, which unconditionally requires the optional CUDA xielu
-# extension (github.com/rubber-duck-debug/xielu) and raises
-# "RuntimeError: CUDA xIELU is required. Install rubber-duck-debug/xielu."
-# at TransformerLayer construction time if it is not importable -- confirmed
-# in run 3171309, the first time actor_init_model() got far enough to reach
-# this line at all (both prior bugs, qwen3_asr and the pruned LM head, are
-# upstream of this point). Not vendored in the image -- built the same
-# "build once, install everywhere" way as the other CUDA-extension wheels
-# above, gated by its own commit-SHA marker (independent of
-# MEGATRON_WHEEL_BUILD_VERSION -- keeping unrelated cache keys separate is
-# the direct lesson from run 3171218, where reusing one shared marker for an
-# unrelated change caused a stale-wheel repeat).
+# apertus_bridge.py's MCoreXIELU (reused as-is by Apertus1p5Bridge) wraps xielu
+# and unconditionally requires the optional CUDA xielu extension
+# (github.com/rubber-duck-debug/xielu), raising
+# "RuntimeError: CUDA xIELU is required. Install rubber-duck-debug/xielu." at
+# TransformerLayer construction time if it is not importable (run 3171309). Not
+# in any megatron package or the image -- built once here and installed on every
+# node, gated by its own commit-SHA marker.
 export XIELU_SHA=2a55f6b9efa64954bf173e63297a2b2f99741b69
 export XIELU_WHEEL_DIR=${TRAINING_HOME}/wheels
 mkdir -p ${XIELU_WHEEL_DIR}
@@ -1008,6 +1255,23 @@ export WANDB_SILENT=true # Suppress WandB logs
 
 export RAY_memory_usage_threshold=0.99
 
+# Fetch the upstream PR patches once here and sbcast them to every node, instead
+# of curl-ing them from inside the srun (run 3124273: per-node fetches gave a
+# mixed cluster where only ~45/80 nodes carried a patch). -f makes an HTTP error
+# page a hard failure instead of a no-op "patch".
+#   PR #7421: DSA / mcore >= 0.16.2 compat (harmless here -- apertus1p5 is not DSA).
+#   PR #7422: preserve load_format=dummy in the disaggregated SGLang rollout --
+#             load-bearing for separate-async (v0.9.0 async_sglang_server.py flips
+#             dummy -> auto for every non-hybrid replica, i.e. the standalone rollout).
+#   PR #7423: fix the NCCL deadlock in async disaggregated weight sync.
+for pr in 7421 7422 7423; do
+    curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
+        || { echo "FATAL: could not download PR #${pr}"; exit 1; }
+    [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
+        || { echo "FATAL: PR #${pr} patch is empty"; exit 1; }
+    sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
+done
+
 
 
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
@@ -1015,17 +1279,41 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --container-writable bash -c '
 
 
-# Upgrade Verl to v0.9.0.
-export VERL_REF=v0.9.0
-git -C /workspace/verl fetch --depth 1 origin +refs/tags/${VERL_REF}:refs/tags/${VERL_REF} \
-    && git -C /workspace/verl checkout -f ${VERL_REF} \
-    || { echo "FATAL: could not check out verl ${VERL_REF}"; exit 1; }
-git -C /workspace/verl --no-pager log --oneline -1
+# verl is baked into the image at v0.9.0 (Containerfile VERL_REF=v0.9.0),
+# editable-installed from /workspace/verl -- no runtime checkout. The fully-async
+# recipe reset to theely/verl Fix-fsdp-model-loading-on-async is dropped: that
+# fork branch is a single-file FSDP2-only change (unused by the Megatron trainer)
+# and a hard reset would clobber the baked v0.9.0 tree.
+git -C /workspace/verl --no-pager log --oneline -1 || true
 
-# Apply Verl fixes
-git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Fix-fsdp-model-loading-on-async
-git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+# Image-version smoke test (diagnostic only, non-fatal -- a wrong image tag shows
+# here in the first ~30 s instead of via a downstream crash). NOTE: the megatron
+# versions printed here are the image stock ones; Group 2 below installs the
+# apertus forks over them.
+python3 -c "
+import importlib.metadata as _m
+for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", \"sglang\", \"transformers\", \"flashinfer-python\"):
+    try:
+        print(f\"  {_p}: {_m.version(_p)}\")
+    except Exception as _e:
+        print(f\"  {_p}: <not installed> ({_e})\")
+"
+
+# Apply the upstream PR patches + the V1 separate-async local fixes on the baked
+# v0.9.0 tree (sbcast to ${TRAINING_CONFIG} before the srun). None are in v0.9.0;
+# all apply cleanly to the tag. A patch that neither applies nor is already
+# present is fatal -- a cluster where only some ranks carry a patch is worse than
+# one that carries none (run 3124273).
+for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch"; do
+    if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
+        git -C /workspace/verl apply "$p" && echo "Applied $(basename "$p") on $(hostname)"
+    elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
+        echo "$(basename "$p") already present on $(hostname), skipping"
+    else
+        echo "FATAL: $(basename "$p") neither applies nor is already present on $(hostname)"
+        exit 1
+    fi
+done
 
 # Fix: Apertus1p5 text-only forward corruption (root cause of the
 # split_with_sizes crash chased through runs 3174079/3183472; see CLAUDE.md).
@@ -1056,11 +1344,10 @@ git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
 # vision_model=False is correct for this recipe specifically (a real image
 # input would need the opposite fix: keeping packed_seq_params in sync with
 # whatever build_vlm_attn_mask_thd produces -- out of scope here). Two call
-# sites confirmed identical text in both the verl-project v0.9.0 tag and the
-# theely/verl Fix-fsdp-model-loading-on-async branch this script resets onto
-# above -- patched after that reset so it survives. Located via
-# importlib.util.find_spec rather than a hardcoded path, same convention as
-# the megatron-bridge filelock patch below.
+# sites confirmed identical text in the verl-project v0.9.0 tag (baked into this
+# image) -- applied after the git-apply patch loop above so it stacks on top.
+# Located via importlib.util.find_spec rather than a hardcoded path, same
+# convention as the megatron-bridge filelock patch below.
 python3 -c "
 import importlib.util
 spec = importlib.util.find_spec(\"verl.workers.engine.megatron.transformer_impl\")
@@ -1205,6 +1492,16 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
+# Required for Megatron communication/computation overlapping.
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+# NCCL flight recorder -- so a weight-sync collective timeout (the V1
+# separate-async trainer->rollout sync is the prime hang suspect) dumps a
+# per-rank trace instead of a black box. One file per rank under /tmp.
+export TORCH_NCCL_TRACE_BUFFER_SIZE=20000
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/tmp/nccl_flightrecorder_${SLURM_JOB_ID}_rank
+
 
 if [ $SLURM_PROCID -eq 0 ]; then
     # Start Ray head on rank 0
@@ -1227,7 +1524,7 @@ if [ $SLURM_PROCID -eq 0 ]; then
             sleep 5
     done
 
-    HYDRA_FULL_ERROR=1 python -m verl.experimental.fully_async_policy.fully_async_main \
+    HYDRA_FULL_ERROR=1 python -m verl.trainer.main_ppo \
         --config-path ${TRAINING_CONFIG} \
         --config-name grpo_gsm8k \
         --config-dir /workspace/verl/verl/trainer/config
