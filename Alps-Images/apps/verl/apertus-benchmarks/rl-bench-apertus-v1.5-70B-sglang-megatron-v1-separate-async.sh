@@ -43,18 +43,24 @@
 # (they would otherwise squat gpu_memory_utilization=0.75 on every training GPU
 # at init and OOM the trainer's weight-sync staging).
 #
-# Apertus-1.5 support (Group 1 + Group 2): UNCHANGED from the fully-async recipe
-# -- swiss-ai transformers wheel, SGLang PR #32979 + local fixes, and the
-# wqwqazwsxedc Megatron-LM / Megatron-Bridge apertus fork wheels (installed over
-# the image's stock megatron-core/bridge) + the vendored Apertus1p5Bridge + xielu.
-#
-# NOTE: a first pass tried to keep the image's stock megatron-core 0.19.0 /
-# megatron-bridge 0.6.1 and add only the apertus delta as line-patches + vendored
-# bridge modules. It ran end-to-end but trained degenerately (runs 3240861 /
-# 3243271 / 3243467: fluent generations, zero format compliance, no GRPO signal)
-# -- a forward-pass discrepancy in the 0.18->0.19 / 0.5->0.6.1 jump that the
-# fork's apertus code silently depends on, not visible in weight stats. Reverted
-# to the fork wheels; only the image and the trainer are migrated.
+# Apertus-1.5 support:
+#   Group 1 (swiss-ai transformers wheel, SGLang PR #32979 + local fixes,
+#   vision_model=False patch) -- unchanged from the fully-async recipe.
+#   Group 2 (Megatron) -- applied at runtime as two GitHub `compare` diffs
+#   (upstream release tag ... theely fork branch) onto the STOCK image
+#   megatron-core 0.19.0 / megatron-bridge 0.6.1 (NO fork wheels, NO runtime
+#   clone, NO wheel build):
+#     theely/Megatron-LM     : mlp.py module activation_func + finalize_model_grads
+#                              xIELU TP grad-sum (2 hunks off NVIDIA:core_v0.19.0)
+#     theely/Megatron-Bridge : models/apertus{,1p5}/ (Apertus1p5Bridge) +
+#                              registration + safe_config_loader flock fix
+#                              (off NVIDIA-NeMo:v0.6.0)
+#   Regenerate the fork branches with patches/build-apertus1p5-megatron-forks.sh;
+#   pin MEGATRON_{LM,BRIDGE}_FORK_REF in Group 2 below. The apertus code is
+#   byte-identical to what runs 3240861/3243271/3243467 already built and ran
+#   against stock 0.19.0/0.6.1 -- they trained degenerately only because the
+#   reward function demanded <answer> tags the model never emits (CLAUDE.md
+#   "The zero-reward chain"), since fixed and validated (run 3251587, fork wheels).
 # ─────────────────────────────────────────────────────────────────────────────
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-621fa40275c4f036" #verl-cuda image: baked verl v0.9.0 + updated deps (matches train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh)
@@ -742,485 +748,45 @@ EOF
 sbcast -f ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff
 
 # ══════════════════════════════════════════════════════════════════════════
-# Group 2: Megatron support. Apertus 1.5 needs forked Megatron-LM/
-# Megatron-Bridge (wqwqazwsxedc, apertus branch) — the image's stock
-# megatron-bridge>=0.5.1/megatron-core>=0.17.0 (see Containerfile) have no
-# apertus1p5 support, same story as transformers/SGLang above. Clone +
-# checkout once on a single node into Lustre (never per-node inside the main
-# srun — see "Never fetch per-node from the internet inside the srun" in
-# CLAUDE.md).
-export MEGATRON_LM_DIR=${TRAINING_HOME}/Megatron-LM
-export MEGATRON_BRIDGE_DIR=${MEGATRON_LM_DIR}/Megatron-Bridge
-if [ ! -d "${MEGATRON_LM_DIR}/.git" ]; then
-    echo "Cloning wqwqazwsxedc/Megatron-LM + Megatron-Bridge (apertus branches)..."
-    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_CONFIG}/env.toml" \
-        --container-writable bash -c '
-        set -e
-        rm -rf ${MEGATRON_LM_DIR}
-        git clone https://github.com/wqwqazwsxedc/Megatron-LM.git ${MEGATRON_LM_DIR}
-        git -C ${MEGATRON_LM_DIR} checkout apertus
-        git clone https://github.com/wqwqazwsxedc/Megatron-Bridge.git ${MEGATRON_BRIDGE_DIR}
-        git -C ${MEGATRON_BRIDGE_DIR} checkout apertus
-    '
-    [ -d "${MEGATRON_LM_DIR}/.git" ] && [ -d "${MEGATRON_BRIDGE_DIR}/.git" ] \
-        || { echo "FATAL: Megatron-LM/Megatron-Bridge clone failed"; exit 1; }
-else
-    # Reuse the Lustre checkout, but reset TRACKED files to pristine first. It
-    # persists across submissions and the qwen3_asr sed, the models/__init__.py
-    # register line, and (historically) a [DIAG-ROPE] recompute.py diagnostic
-    # accumulate as tracked-file edits -- run 3250502 packaged a stale [DIAG-ROPE]
-    # patch left by an old sibling run, spamming ~hundreds of thousands of log
-    # lines. `checkout -f apertus` + `reset --hard` reverts them so every wheel
-    # build is deterministic; the qwen3_asr / apertus1p5_bridge steps below
-    # re-apply unconditionally / idempotently. No `git clean` -- MEGATRON_BRIDGE_DIR
-    # is a nested untracked dir inside MEGATRON_LM_DIR and the diagnostics only
-    # ever touch tracked files.
-    echo "Megatron-LM/Megatron-Bridge already cloned — resetting tracked files to pristine apertus branch."
-    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_CONFIG}/env.toml" \
-        --container-writable bash -c '
-        set -e
-        for d in ${MEGATRON_LM_DIR} ${MEGATRON_BRIDGE_DIR}; do
-            git -C $d checkout -f apertus
-            git -C $d reset --hard
-        done
-    '
-fi
-
-# Megatron-Bridge's own vendored qwen3_asr HF code (a local copy it keeps to
-# avoid a transformers/torch version conflict with the official qwen3-asr
-# package) unconditionally does AutoConfig.register/AutoModel.register/
-# AutoProcessor.register for "qwen3_asr" with the default exist_ok=False. The
-# swiss-ai transformers fork installed above already registers "qwen3_asr"
-# itself (AutoModel/AutoProcessor's own _LazyAutoMapping.register matches by
-# config class __name__, not object identity, so a same-named-but-distinct
-# Qwen3ASRConfig class still collides) -- every Megatron worker rank raises
-# ValueError: 'qwen3_asr'/'<Qwen3ASRConfig>' is already used by a Transformers
-# config/model at actor_init_model(). Run 3141796 hit the AutoConfig.register
-# collision; fixing only that one still left AutoModel.register colliding
-# next (run 3144663) -- all three calls needed the fix, not just the first.
-# This is a different vendored copy from the one SGLang PR #32979 already
-# fixes for the rollout side (see CLAUDE.md) -- that fix does not cover this
-# one. Patched once on the batch host since this is a single Lustre checkout
-# shared by every node via `pip install -e`, not a per-node dist-packages
-# copy; grep-guarded so reruns against an already-cloned checkout don't need
-# to re-patch.
-QWEN3_ASR_INIT="${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/qwen3_asr/hf_qwen3_asr/__init__.py"
-[ -f "${QWEN3_ASR_INIT}" ] \
-    || { echo "FATAL: expected qwen3_asr __init__.py not found at ${QWEN3_ASR_INIT}"; exit 1; }
-# Run the sed unconditionally instead of skipping on a single-line "already
-# patched" check (run 3149242: a stale Lustre checkout left over from an
-# earlier run had only the AutoConfig.register line patched -- from the
-# 3141796 fix, before the 3144663 fix extended it to all three calls -- so the
-# old guard's single grep matched, the block was skipped entirely, and the
-# still-unpatched AutoModel.register call crashed actor_init_model() on every
-# rank again). Each sed pattern only matches its call's un-patched
-# (exist_ok=True-less) form, so this is idempotent whether zero, one, two, or
-# all three calls were already patched.
-sed -i \
-    -e 's/AutoConfig\.register("qwen3_asr", Qwen3ASRConfig)$/AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)/' \
-    -e 's/AutoModel\.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration)$/AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration, exist_ok=True)/' \
-    -e 's/AutoProcessor\.register(Qwen3ASRConfig, Qwen3ASRProcessor)$/AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor, exist_ok=True)/' \
-    "${QWEN3_ASR_INIT}"
-grep -q 'AutoConfig.register("qwen3_asr", Qwen3ASRConfig, exist_ok=True)' "${QWEN3_ASR_INIT}" \
-    && grep -q 'AutoModel.register(Qwen3ASRConfig, Qwen3ASRForConditionalGeneration, exist_ok=True)' "${QWEN3_ASR_INIT}" \
-    && grep -q 'AutoProcessor.register(Qwen3ASRConfig, Qwen3ASRProcessor, exist_ok=True)' "${QWEN3_ASR_INIT}" \
-    || { echo "FATAL: one or more qwen3_asr Auto*.register patches failed to apply"; exit 1; }
-echo "Patched (or confirmed already-patched) qwen3_asr AutoConfig/AutoModel/AutoProcessor.register exist_ok=True in Megatron-Bridge checkout."
-
-# ══════════════════════════════════════════════════════════════════════════
-# Add Apertus 1.5 support to Megatron-Bridge itself. wqwqazwsxedc/Megatron-Bridge
-# (apertus branch) never implemented a bridge for
-# Apertus1p5ForConditionalGeneration -- confirmed against its git history: the
-# whole branch is stock NVIDIA r0.5.0 plus exactly one commit ("add apertus")
-# that only adds a bridge for the older, text-only ApertusForCausalLM.
-# AutoBridge.from_hf_pretrained() raises "Model architecture
-# 'Apertus1p5ForConditionalGeneration' is not yet supported" (run 3149776)
-# without this. New bridge module, adapted from apertus/apertus_bridge.py --
-# see the file's own docstring below for the full architectural comparison and
-# the vision/audio-weights and pruned-LM-head caveats. Checked-in copy:
-# apertus-benchmarks/patches/apertus1p5_bridge.py -- the two must be kept in
-# sync by hand (same convention as sitecustomize-verl-v0.9.0.py in the GLM
-# script; diff them before trusting either). Written once on the batch host,
-# before the wheel-build step, so the new file is what gets packaged.
-mkdir -p "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus1p5"
-touch "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus1p5/__init__.py"
-cat > "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus1p5/apertus1p5_bridge.py" <<- 'APERTUS1P5_BRIDGE_EOF'
-# Megatron-Bridge bridge for Apertus 1.5 (`Apertus1p5ForConditionalGeneration`).
+# Group 2: Megatron support for Apertus 1.5, applied at runtime as two GitHub
+# `compare` diffs (upstream release tag ... theely fork branch) against the STOCK
+# image megatron-core 0.19.0 / megatron-bridge 0.6.1 -- no fork wheels, no
+# runtime clone, no wheel build. The apertus code is identical to what runs
+# 3240861/3243271/3243467 already built and ran against stock 0.19.0/0.6.1 (they
+# trained degenerately only because of the reward function, since fixed -- see
+# CLAUDE.md "The zero-reward chain").
 #
-# wqwqazwsxedc/Megatron-Bridge (apertus branch) only ever added a bridge for the
-# older, text-only `ApertusForCausalLM` (see apertus/apertus_bridge.py) -- there is
-# no apertus1p5 bridge anywhere in that fork (confirmed against its git history:
-# the entire branch is stock NVIDIA r0.5.0 plus one commit, "add apertus", which
-# touches only apertus/{__init__.py,apertus_bridge.py} and a functional test).
-# AutoBridge.from_hf_pretrained() therefore raises "Model architecture
-# 'Apertus1p5ForConditionalGeneration' is not yet supported" (run 3149776) -- this
-# is a real, total gap, not a registration bug fixable with a one-line patch.
+# `<tag>...<branch>.diff` is GitHub's compare endpoint: `...` gives the diff from
+# the merge-base, i.e. exactly the fork branch's delta over the release tag. The
+# fork branch is a single commit off the tag; no PR / PR-number / base branch is
+# needed. Regenerate it with patches/build-apertus1p5-megatron-forks.sh (which
+# also prints the head SHAs -- pin those instead of the branch name for
+# reproducibility if the branch is ever force-pushed).
 #
-# Feasibility: swiss-ai/transformers' Apertus1p5TextModel (the actual language
-# backbone) is architecturally identical to plain Apertus -- same xielu MLP
-# (up_proj/down_proj only, no gate), same q_norm/k_norm RMSNorm on attention,
-# same attention_bias=False, same llama3-style rope_parameters dict shape
-# (rope_type/rope_theta/factor/original_max_position_embeddings/low_freq_factor/
-# high_freq_factor) -- confirmed by reading modeling_apertus1p5.py at the exact
-# commit this script pins (SWISS_AI_TRANSFORMERS_SHA). It only differs in two
-# structural ways:
-#   1. Hyperparameters live under `config.text_config` (an Apertus1p5TextConfig),
-#      not the top-level Apertus1p5Config -- the top level also carries
-#      vision_config/audio_config for the multimodal tokenizers this benchmark
-#      never uses.
-#   2. The decoder stack sits one level deeper in the HF module tree:
-#      Apertus1p5ForConditionalGeneration.model.language_model.{embed_tokens,
-#      layers,norm} instead of plain Apertus's Apertus...ForCausalLM.model.*.
-#      `lm_head` itself stays at the top level, tied to
-#      model.language_model.embed_tokens.weight (per _tied_weights_keys) --
-#      exactly analogous to plain Apertus's own lm_head/output_layer tie.
-#
-# This bridge is therefore adapted directly from apertus/apertus_bridge.py: same
-# MCoreXIELU activation and get_apertus_decoder_block_spec (imported, not
-# duplicated, so behavior stays identical to the one upstream commit that
-# actually exists), same rope/attention_bias/hidden_act validation, only the HF
-# config source (text_config instead of the top-level config) and the HF-side
-# weight key prefix (model.language_model.* instead of model.*) change.
-#
-# Deliberately NOT mapped: vision_tower/audio_tower/vision_tokenizer/
-# audio_tokenizer weights. Megatron's target here is plain GPTModel (text-only --
-# see "want to take advantage of Megatron parallelism" in the dispatching
-# conversation, not multimodal fidelity), which has no parameter slots for them
-# anyway, and this benchmark (text-only GSM8K GRPO) never calls
-# get_image_feature/get_audio_feature -- same reasoning already established for
-# the SGLang side of this script (see apertus-benchmarks/patches/
-# sglang-apertus1p5-local-fixes.patch point 6 in CLAUDE.md: those weights never
-# need to be numerically correct for this benchmark, only absent-is-fine). No
-# strict/leftover-key check was found anywhere in model_bridge.py's weight-load
-# path, so simply omitting these mappings is sufficient -- there is nothing to
-# suppress.
-#
-# Pruned LM head: confirmed (run 3171151) that swiss-ai/Apertus-v1.5-70B does
-# use a pruned head -- output_vocab_size=131072 vs the extended
-# vocab_size=266752 that also covers the visual/audio token ranges. An
-# earlier version of this bridge raised rather than risk mismapping shapes;
-# now handled properly since this benchmark (text-only GSM8K GRPO) never
-# produces or consumes a token id outside [0, output_vocab_size) anyway --
-# `output_vocab_size`'s own docstring in configuration_apertus1p5.py confirms
-# ids `0..output_vocab_size - 1` are exactly the retained/generatable
-# (non-multimodal) ones. Megatron-core's GPTModelProvider only has one
-# `vocab_size` sizing both tables, so provider_bridge sets it to
-# `output_vocab_size` (not the full extended vocab_size) whenever the two
-# differ, and mapping_registry truncates the *input* embedding table
-# (`model.language_model.embed_tokens.weight`, shape (266752, hidden) in the
-# checkpoint) down to its first `output_vocab_size` rows to match -- the
-# checkpoint's `lm_head.weight` is already exactly (131072, hidden) since it
-# really is a physically pruned Linear layer (see
-# Apertus1p5ForConditionalGeneration.__init__), so the output-side mapping
-# needs no such transform. `_TruncatedVocabEmbeddingMapping` below also
-# best-effort zero-pads back out to the full vocab_size on the reverse
-# (megatron_to_hf) direction, for whatever HF-format-export path might call
-# it -- those padded rows carry no real multimodal embedding, same caveat as
-# megatron_to_hf_config below.
-#
-# megatron_to_hf_config below (used for full HF-format checkpoint export, not
-# for the live NCCL weight sync this benchmark actually exercises during
-# training) is a best-effort adaptation nesting the generic flat CONFIG_MAPPING
-# output under "text_config" to match Apertus1p5Config's real shape -- lower
-# confidence than the forward (provider_bridge/mapping_registry) path, since it
-# is not needed to get past this benchmark's first training step and so was not
-# a priority to verify.
-
-from __future__ import annotations
-
-import torch
-from megatron.bridge.models.apertus.apertus_bridge import MCoreXIELU, get_apertus_decoder_block_spec
-from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.conversion.param_mapping import (
-    AutoMapping,
-    ColumnParallelMapping,
-    QKVMapping,
-    ReplicatedMapping,
-)
-from megatron.bridge.models.conversion.utils import unwrap_model
-from megatron.core.models.gpt.gpt_model import GPTModel
-from transformers import Apertus1p5ForConditionalGeneration
-
-
-class _TruncatedVocabEmbeddingMapping(AutoMapping):
-    """AutoMapping variant for a pruned-LM-head checkpoint's input embedding table.
-
-    HF's `embed_tokens.weight` covers the full extended vocab_size (text plus
-    multimodal token ids); Megatron-core's single `vocab_size` here is set to
-    the narrower `output_vocab_size` (see provider_bridge and the module
-    docstring's "Pruned LM head" section) so it matches the checkpoint's
-    already-pruned `lm_head.weight`. hf_to_megatron truncates the source
-    tensor to the first output_vocab_size rows before handing off to the
-    normal VocabParallelEmbedding sharding logic; megatron_to_hf best-effort
-    zero-pads back out to the full width (those rows carry no real multimodal
-    embedding -- acceptable since this bridge's HF-export path is already
-    lower-priority, see megatron_to_hf_config below).
-    """
-
-    def __init__(self, megatron_param, hf_param, output_vocab_size, full_vocab_size, permute_dims=None):
-        super().__init__(megatron_param, hf_param, permute_dims)
-        self._output_vocab_size = output_vocab_size
-        self._full_vocab_size = full_vocab_size
-
-    def hf_to_megatron(self, hf_weights, megatron_module):
-        if hf_weights.shape[0] > self._output_vocab_size:
-            hf_weights = hf_weights[: self._output_vocab_size].contiguous()
-        return super().hf_to_megatron(hf_weights, megatron_module)
-
-    def megatron_to_hf(self, megatron_weights, megatron_module):
-        result = super().megatron_to_hf(megatron_weights, megatron_module)
-        if not result:
-            return result
-        key = next(iter(result))
-        value = result[key]
-        if value.shape[0] < self._full_vocab_size:
-            pad = value.new_zeros((self._full_vocab_size - value.shape[0], *value.shape[1:]))
-            value = torch.cat([value, pad], dim=0)
-        return {key: value}
-
-    def resolve(self, captures):
-        resolved_megatron_param, resolved_hf_param = self._resolve_names(captures)
-        return type(self)(
-            resolved_megatron_param,
-            resolved_hf_param,
-            self._output_vocab_size,
-            self._full_vocab_size,
-            self.permute_dims,
-        )
-
-_ROPE_DEFAULTS = {
-    "rope_type": "llama3",
-    "original_max_position_embeddings": 8192,
-    "low_freq_factor": 1.0,
-    "high_freq_factor": 4.0,
-}
-
-
-class _TextConfigOnlyShim:
-    """Minimal stand-in for an hf_pretrained wrapper, exposing only `.config`.
-
-    MegatronModelBridge.provider_bridge() (the base implementation we delegate
-    to below) only ever reads `hf_pretrained.config` -- this lets us hand it
-    `Apertus1p5Config.text_config` directly instead of the top-level config
-    that also carries the unrelated vision_config/audio_config blocks.
-    """
-
-    def __init__(self, config):
-        self.config = config
-
-
-@MegatronModelBridge.register_bridge(source=Apertus1p5ForConditionalGeneration, target=GPTModel, model_type="apertus1p5")
-class Apertus1p5Bridge(MegatronModelBridge):
-    @classmethod
-    def hf_to_megatron_activation(cls, hidden_act: str):
-        if hidden_act != "xielu":
-            return super().hf_to_megatron_activation(hidden_act)
-        return lambda _: (_ for _ in ()).throw(RuntimeError("expected MCoreXIELU"))
-
-    def provider_bridge(self, hf_pretrained):
-        text_config = hf_pretrained.config.text_config
-        provider = super().provider_bridge(_TextConfigOnlyShim(text_config))
-
-        output_vocab_size = getattr(text_config, "output_vocab_size", None)
-        if output_vocab_size is not None and output_vocab_size != text_config.vocab_size:
-            # Pruned LM head: size Megatron's single vocab_size to the narrower,
-            # physically-real output_vocab_size (matching the checkpoint's actual
-            # lm_head.weight shape) rather than the full extended vocab_size --
-            # see the module docstring's "Pruned LM head" section. mapping_registry
-            # truncates the embedding table to match.
-            provider.vocab_size = output_vocab_size
-            provider.make_vocab_size_divisible_by = self.make_vocab_size_divisible_by(output_vocab_size)
-
-        rope = {
-            **(getattr(text_config, "rope_scaling", None) or {}),
-            **(getattr(text_config, "rope_parameters", None) or {}),
-        }
-        rope_type = rope.get("rope_type", rope.get("type", "llama3"))
-        factor = float(rope.get("factor", 1.0))
-        theta = float(rope.get("rope_theta", getattr(text_config, "rope_theta", 10000.0)))
-        if text_config.hidden_act != "xielu":
-            raise ValueError(f"Expected hidden_act='xielu', got {text_config.hidden_act!r}")
-        if text_config.attention_bias:
-            raise ValueError("Apertus1p5 attention_bias=True is unsupported")
-        if rope_type != "llama3":
-            raise ValueError(f"Unsupported Apertus1p5 RoPE type: {rope_type!r}")
-
-        provider.apertus_rope_scaling = {
-            "rope_type": rope_type,
-            "type": rope_type,
-            "factor": factor,
-            "original_max_position_embeddings": int(rope.get("original_max_position_embeddings", 8192)),
-            "low_freq_factor": float(rope.get("low_freq_factor", 1.0)),
-            "high_freq_factor": float(rope.get("high_freq_factor", 4.0)),
-        }
-        provider.normalization = "RMSNorm"
-        provider.qk_layernorm = True
-        provider.gated_linear_unit = False
-        provider.use_te_activation_func = False
-        provider.bias_activation_fusion = False
-        provider.add_bias_linear = False
-        provider.add_qkv_bias = False
-        provider.hidden_dropout = 0.0
-        provider.rotary_interleaved = False
-        provider.position_embedding_type = "rope"
-        provider.rotary_base = theta
-        provider.rope_scaling = True
-        provider.rope_scaling_factor = factor
-        provider.transformer_layer_spec = get_apertus_decoder_block_spec
-        return provider
-
-    def load_weights_hf_to_megatron(self, hf_pretrained, megatron_model, allowed_mismatched_params=None):
-        models = super().load_weights_hf_to_megatron(
-            hf_pretrained, megatron_model, allowed_mismatched_params=allowed_mismatched_params
-        )
-        [
-            m._sync_runtime_scalars()
-            for model in unwrap_model(models)
-            for m in model.modules()
-            if isinstance(m, MCoreXIELU)
-        ]
-        return models
-
-    @classmethod
-    def megatron_to_hf_config(cls, provider) -> dict:
-        text_config = super().megatron_to_hf_config(provider)
-        theta = float(provider.rotary_base)
-        rope = {
-            **(getattr(provider, "apertus_rope_scaling", None) or _ROPE_DEFAULTS),
-            "factor": float(provider.rope_scaling_factor),
-        }
-        rope["rope_type"] = rope["type"] = rope.get("rope_type", rope.get("type", "llama3"))
-        text_config.update(
-            hidden_act="xielu",
-            attention_bias=False,
-            rope_theta=theta,
-            rope_scaling=rope,
-            rope_parameters={**rope, "rope_theta": theta},
-        )
-        return {
-            "model_type": "apertus1p5",
-            "architectures": ["Apertus1p5ForConditionalGeneration"],
-            "text_config": text_config,
-        }
-
-    def mapping_registry(self) -> MegatronMappingRegistry:
-        text_config = self.hf_config.text_config
-        output_vocab_size = getattr(text_config, "output_vocab_size", None)
-        full_vocab_size = text_config.vocab_size
-
-        L, H = "decoder.layers.*", "model.language_model.layers.*"
-        if output_vocab_size is not None and output_vocab_size != full_vocab_size:
-            embedding_mapping = _TruncatedVocabEmbeddingMapping(
-                "embedding.word_embeddings.weight",
-                "model.language_model.embed_tokens.weight",
-                output_vocab_size,
-                full_vocab_size,
-            )
-        else:
-            embedding_mapping = AutoMapping(
-                "embedding.word_embeddings.weight", "model.language_model.embed_tokens.weight"
-            )
-
-        auto = {
-            "output_layer.weight": "lm_head.weight",
-            "decoder.final_layernorm.weight": "model.language_model.norm.weight",
-            f"{L}.self_attention.linear_proj.weight": f"{H}.self_attn.o_proj.weight",
-            f"{L}.self_attention.q_layernorm.weight": f"{H}.self_attn.q_norm.weight",
-            f"{L}.self_attention.k_layernorm.weight": f"{H}.self_attn.k_norm.weight",
-            f"{L}.mlp.linear_fc2.weight": f"{H}.mlp.down_proj.weight",
-        }
-        # Pre-attn / pre-MLP RMSNorm weights + the learnable xIELU scalars, mapped
-        # replicated (not TP-sharded). This recipe's use_transformer_engine spec
-        # produces the fused `linear_qkv.layer_norm_weight` / `linear_fc1.layer_norm_weight`
-        # names, so those direct mappings are what load. Validated end-to-end in run
-        # 3247540 (46 steps, healthy GRPO curve) -- and confirmed against fork
-        # megatron-core 0.18 / megatron-bridge 0.5.0; switching these to AutoMapping
-        # on stock megatron-bridge 0.6.1 loaded them as ~0 instead (run 3243271).
-        repl = {
-            f"{L}.self_attention.linear_qkv.layer_norm_weight": f"{H}.attention_layernorm.weight",
-            f"{L}.mlp.linear_fc1.layer_norm_weight": f"{H}.feedforward_layernorm.weight",
-            **{f"{L}.mlp.activation_func.{n}": f"{H}.mlp.act_fn.{n}" for n in ("alpha_p", "alpha_n", "beta", "eps")},
-        }
-        qkv = QKVMapping(
-            f"{L}.self_attention.linear_qkv.weight",
-            q=f"{H}.self_attn.q_proj.weight",
-            k=f"{H}.self_attn.k_proj.weight",
-            v=f"{H}.self_attn.v_proj.weight",
-        )
-        qkv._tp_mapping = ColumnParallelMapping(qkv.megatron_param, qkv.megatron_param)
-        return MegatronMappingRegistry(
-            embedding_mapping,
-            *(AutoMapping(m, h) for m, h in auto.items()),
-            *(ReplicatedMapping(m, h) for m, h in repl.items()),
-            qkv,
-            ColumnParallelMapping(f"{L}.mlp.linear_fc1.weight", f"{H}.mlp.up_proj.weight"),
-        )
-APERTUS1P5_BRIDGE_EOF
-MEGATRON_BRIDGE_MODELS_INIT="${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/__init__.py"
-[ -f "${MEGATRON_BRIDGE_MODELS_INIT}" ] \
-    || { echo "FATAL: expected Megatron-Bridge models/__init__.py not found at ${MEGATRON_BRIDGE_MODELS_INIT}"; exit 1; }
-grep -q "from megatron.bridge.models.apertus1p5.apertus1p5_bridge import Apertus1p5Bridge" "${MEGATRON_BRIDGE_MODELS_INIT}" \
-    || echo "from megatron.bridge.models.apertus1p5.apertus1p5_bridge import Apertus1p5Bridge" >> "${MEGATRON_BRIDGE_MODELS_INIT}"
-grep -q "from megatron.bridge.models.apertus1p5.apertus1p5_bridge import Apertus1p5Bridge" "${MEGATRON_BRIDGE_MODELS_INIT}" \
-    || { echo "FATAL: failed to register Apertus1p5Bridge import in Megatron-Bridge models/__init__.py"; exit 1; }
-echo "Added Apertus1p5Bridge (new bridge for Apertus1p5ForConditionalGeneration) to Megatron-Bridge checkout."
-
-# Build megatron-core + megatron-bridge into wheels once, on a single node,
-# rather than having each of the 16 main-srun nodes run `pip install -e`
-# directly against the same shared Lustre checkout. megatron-core's setup.py
-# compiles a C++ extension (the `datasets` helpers) in place inside the
-# source tree; 16 nodes doing that concurrently against one shared directory
-# raced on the build/copy step (run 3149726: "error: [Errno 2] No such file
-# or directory" copying helpers_cpp.*.so -- one node's build stepping on
-# another's temp/output files -- which failed the install on at least one
-# node and took the other 15 down with it). All 16 nodes are identical GH200
-# hardware, so one compile is enough for all of them -- same "build once,
-# install everywhere" treatment as the swiss-ai transformers wheel above.
-# Built after the qwen3_asr source patch above so the patched source is what
-# gets packaged. Package names confirmed from each fork's pyproject.toml:
-# "megatron-core" (Megatron-LM) and "megatron-bridge" (Megatron-Bridge).
-#
-# MEGATRON_WHEEL_BUILD_VERSION + marker file: TRAINING_HOME/wheels persists
-# across submissions on Lustre, and a plain "does the wheel file already
-# exist" check has already bitten this exact script once (run 3149242: a
-# stale, only-partially-patched checkout was skipped instead of re-patched).
-# Without a version gate here, adding the Apertus1p5Bridge module above to the
-# source tree would silently do nothing on a rerun that reuses wheels built
-# before that source change existed -- bump this string whenever the
-# packaged source changes in a way that needs a fresh wheel.
-export MEGATRON_WHEEL_DIR=${TRAINING_HOME}/wheels
-export MEGATRON_WHEEL_BUILD_VERSION="v6-apertus1p5-bridge-pristine"
-mkdir -p ${MEGATRON_WHEEL_DIR}
-if ! ls ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl >/dev/null 2>&1 \
-    || ! ls ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl >/dev/null 2>&1 \
-    || [ "$(cat ${MEGATRON_WHEEL_DIR}/build.version 2>/dev/null)" != "${MEGATRON_WHEEL_BUILD_VERSION}" ]; then
-    echo "Building megatron-core + megatron-bridge wheels (apertus forks, build version ${MEGATRON_WHEEL_BUILD_VERSION})..."
-    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
-        --environment="${TRAINING_CONFIG}/env.toml" \
-        --container-writable bash -c '
-        set -e
-        export PIP_CACHE_DIR=/tmp/pip-cache-wheelbuild-${SLURM_JOB_ID}
-        export TMPDIR=/tmp/pip-tmp-wheelbuild-${SLURM_JOB_ID}
-        mkdir -p $PIP_CACHE_DIR $TMPDIR /tmp/megatron-wheel
-        rm -f ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl
-        pip wheel --no-build-isolation --no-deps -w /tmp/megatron-wheel ${MEGATRON_LM_DIR}
-        # megatron-bridge is built against an importable megatron-core, in case
-        # its build backend introspects it -- install the just-built wheel
-        # locally on this same node before building the second wheel.
-        pip install --no-deps /tmp/megatron-wheel/megatron_core-*.whl
-        pip wheel --no-build-isolation --no-deps -w /tmp/megatron-wheel ${MEGATRON_BRIDGE_DIR}
-        cp /tmp/megatron-wheel/megatron_core-*.whl /tmp/megatron-wheel/megatron_bridge-*.whl ${MEGATRON_WHEEL_DIR}/
-    '
-    ls ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl >/dev/null 2>&1 \
-        && ls ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl >/dev/null 2>&1 \
-        || { echo "FATAL: megatron-core/megatron-bridge wheel build failed"; exit 1; }
-    echo "${MEGATRON_WHEEL_BUILD_VERSION}" > ${MEGATRON_WHEEL_DIR}/build.version
-else
-    echo "megatron-core/megatron-bridge wheels already present and up to date (${MEGATRON_WHEEL_BUILD_VERSION}), skipping build."
-fi
+#   Megatron-LM  (NVIDIA:core_v0.19.0 5be9626709af): 2 hunks -- transformer/mlp.py
+#     module activation_func, distributed/finalize_model_grads.py xIELU TP grad-sum
+#   Megatron-Bridge (NVIDIA-NeMo:v0.6.0 51885cf132b2 -- no v0.6.1 tag exists,
+#     0.6.0->0.6.1 is a patch release with no models/ API change): add
+#     models/apertus/ + models/apertus1p5/ (Apertus1p5Bridge) + models/__init__.py
+#     registration + safe_config_loader.py flock -> contextlib.nullcontext
+export MEGATRON_LM_FORK_REF="9898eb2be164641600f197368f765a904ad73812"      # theely/Megatron-LM apertus1p5-support head
+export MEGATRON_BRIDGE_FORK_REF="53bea08c8417627d5e83af6c9c16163a47e3a8b1"  # theely/Megatron-Bridge apertus1p5-support head
+# Fetch both diffs once on the batch host (never per-node -- "Never fetch
+# per-node from the internet inside the srun", CLAUDE.md); -f so an HTTP error
+# page is a failure not a no-op patch; assert non-empty; sbcast to every node.
+curl -sfL "https://github.com/theely/Megatron-LM/compare/NVIDIA:core_v0.19.0...theely:${MEGATRON_LM_FORK_REF}.diff" \
+    -o ${TRAINING_CONFIG}/megatron-lm-apertus1p5.diff \
+    || { echo "FATAL: could not download theely/Megatron-LM ${MEGATRON_LM_FORK_REF} compare diff"; exit 1; }
+[ -s ${TRAINING_CONFIG}/megatron-lm-apertus1p5.diff ] \
+    || { echo "FATAL: theely/Megatron-LM compare diff is empty"; exit 1; }
+curl -sfL "https://github.com/theely/Megatron-Bridge/compare/NVIDIA-NeMo:v0.6.0...theely:${MEGATRON_BRIDGE_FORK_REF}.diff" \
+    -o ${TRAINING_CONFIG}/megatron-bridge-apertus1p5.diff \
+    || { echo "FATAL: could not download theely/Megatron-Bridge ${MEGATRON_BRIDGE_FORK_REF} compare diff"; exit 1; }
+[ -s ${TRAINING_CONFIG}/megatron-bridge-apertus1p5.diff ] \
+    || { echo "FATAL: theely/Megatron-Bridge compare diff is empty"; exit 1; }
+sbcast -f ${TRAINING_CONFIG}/megatron-lm-apertus1p5.diff     ${TRAINING_CONFIG}/megatron-lm-apertus1p5.diff
+sbcast -f ${TRAINING_CONFIG}/megatron-bridge-apertus1p5.diff ${TRAINING_CONFIG}/megatron-bridge-apertus1p5.diff
+echo "Fetched theely/Megatron-{LM,Bridge} apertus1p5 compare diffs (${MEGATRON_LM_FORK_REF} / ${MEGATRON_BRIDGE_FORK_REF})."
 
 # apertus_bridge.py's MCoreXIELU (reused as-is by Apertus1p5Bridge) wraps xielu
 # and unconditionally requires the optional CUDA xielu extension
@@ -1329,8 +895,8 @@ git -C /workspace/verl --no-pager log --oneline -1 || true
 
 # Image-version smoke test (diagnostic only, non-fatal -- a wrong image tag shows
 # here in the first ~30 s instead of via a downstream crash). NOTE: the megatron
-# versions printed here are the image stock ones; Group 2 below installs the
-# apertus forks over them.
+# versions printed here are the stock image ones (0.19.0 / 0.6.1); Group 2 below
+# patches Apertus1p5Bridge into them via the two PR diffs, not a version change.
 python3 -c "
 import importlib.metadata as _m
 for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", \"sglang\", \"transformers\", \"flashinfer-python\"):
@@ -1434,76 +1000,26 @@ pip install --no-deps ${XIELU_WHEEL_DIR}/xielu-*.whl \
     || { echo "FATAL: rubber-duck-debug/xielu wheel install failed"; exit 1; }
 python3 -c "import xielu.ops; print(\"xielu:\", xielu.__file__)"
 
-# Install the apertus forks of Megatron-LM and Megatron-Bridge from the
-# wheels built once above, over the images stock megatron-bridge/megatron-core.
-# Same "Megatron-LM pulls its own deps, Megatron-Bridge deliberately does not"
-# split the fork itself documents (--no-deps on Megatron-Bridge only — its
-# deps are already satisfied by Megatron-LM + the image).
-#
-# A prebuilt wheel install is metadata-copy-only, no compilation -- this is
-# deliberately NOT `pip install -e <shared-Lustre-dir>` on every node: run
-# 3149726 had 16 nodes editable-installing (and therefore each recompiling
-# the megatron-core C++ extension) against the same shared checkout
-# concurrently, and the build step raced across nodes ("No such file or
-# directory" copying the compiled .so, taking the whole job down). See the
-# wheel-build step above.
-#
-# A node-local PIP_CACHE_DIR/TMPDIR: even a wheel install still needs pip
-# dependency resolution (for Megatron-LM own deps) off Lustre -- the default
-# cache under $HOME hit the same ENOLCK/ESTALE file-locking hazard as
-# AutoConfig.from_pretrained elsewhere in this repo when 16 nodes shared it
-# concurrently.
-export PIP_CACHE_DIR=/tmp/pip-cache-${SLURM_JOB_ID}
-export TMPDIR=/tmp/pip-tmp-${SLURM_JOB_ID}
-mkdir -p $PIP_CACHE_DIR $TMPDIR
-pip install ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl \
-    || { echo "FATAL: Megatron-LM (megatron-core) wheel install failed"; exit 1; }
-pip install --no-deps ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl \
-    || { echo "FATAL: Megatron-Bridge wheel install failed"; exit 1; }
-python3 -c "import megatron.core; print(\"megatron.core:\", megatron.core.__file__)"
-
-# Patch megatron-bridge safe_config_loader to skip filelock -- same hazard,
-# same fix, as the GLM scripts Known hazards entry (see CLAUDE.md): /dev/shm
-# and /tmp on CSCS Alps do not support fcntl.flock in the container
-# (ENOLCK/ESTALE on every attempt). Confirmed hit here too (run 3171930):
-# AutoBridge.from_hf_pretrained -> safe_config_loader raised
-# ValueError: Failed to load configuration ... Stale file handle, chained from
-# filelock/_unix.py -- a different call site than any already-patched one in
-# this script (the qwen3_asr/pruned-vocab/xielu fixes are all upstream of
-# this), but the exact same module the GLM script already has a working patch
-# for. The lock is unnecessary because the config files are written by
-# localid=0 before any reader starts (purely read-only after that). Matches
-# every unrelated function/class in the target file -- kept as a
-# line-by-line "with filelock." match rather than a regex that tries to
-# parse the argument, since FileLock() arguments often contain nested parens.
-python3 -c "
-import importlib.util
-spec = importlib.util.find_spec(\"megatron.bridge.models.hf_pretrained.safe_config_loader\")
-if not spec:
-    print(\"safe_config_loader not found — skipping patch\")
-else:
-    p = spec.origin
-    with open(p) as f:
-        lines = f.readlines()
-    if not any(\"import contextlib\" in l for l in lines):
-        lines.insert(0, \"import contextlib\n\")
-    new_lines = []
-    n_patched = 0
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(\"with filelock.\") and stripped.endswith(\":\"):
-            indent = len(line) - len(line.lstrip())
-            new_lines.append(\" \" * indent + \"with contextlib.nullcontext():\n\")
-            n_patched += 1
-        else:
-            new_lines.append(line)
-    if n_patched:
-        with open(p, \"w\") as f:
-            f.writelines(new_lines)
-        print(f\"Patched {n_patched} filelock site(s) in {p}\")
-    else:
-        print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
-"
+# Apply the two Apertus-1.5 Megatron support compare diffs onto the STOCK image
+# megatron-core (0.19.0) and megatron-bridge (0.6.1), in site-packages. Every
+# main-srun node gets a fresh container from the image (pyxis --container-writable
+# edits are per-job, discarded on exit), so this always patches pristine
+# site-packages -- no shared-checkout race (the run-3149726 hazard the fork-wheel
+# build existed to avoid), same "fresh + apply-or-FATAL" as the sglang patches.
+#   Megatron-LM diff      -> megatron/core/*      (repo path == installed path, -p1)
+#   Megatron-Bridge diff  -> src/megatron/bridge/* (installed drops src/, -p2)
+# --fuzz=3 on the bridge diff absorbs the harmless v0.6.0 (compare base) -> 0.6.1
+# (installed) context drift; the new-file hunks (models/apertus*, ...) are
+# version-independent.
+# (megatron is a namespace package with no __file__; derive site-packages from
+# the real megatron.core __init__.py instead.)
+SITE_PKG=$(python3 -c "import os, megatron.core as m; print(os.path.dirname(os.path.dirname(os.path.dirname(m.__file__))))")
+patch -p1 -d "${SITE_PKG}" < ${TRAINING_CONFIG}/megatron-lm-apertus1p5.diff \
+    || { echo "FATAL: theely/Megatron-LM apertus1p5 compare diff failed to apply"; exit 1; }
+patch -p2 -d "${SITE_PKG}" --fuzz=3 < ${TRAINING_CONFIG}/megatron-bridge-apertus1p5.diff \
+    || { echo "FATAL: theely/Megatron-Bridge apertus1p5 compare diff failed to apply"; exit 1; }
+python3 -c "import megatron.core, megatron.bridge; from megatron.bridge.models import Apertus1p5Bridge; print(\"megatron.core:\", megatron.core.__file__, \"| Apertus1p5Bridge OK\")" \
+    || { echo "FATAL: Apertus1p5Bridge not importable after applying the Megatron compare diffs"; exit 1; }
 
 # Apply SGLang partch for apertus1p5 model.
 patch -p2 -d /usr/local/lib/python3.12/dist-packages < ${TRAINING_CONFIG}/sglang-apertus1p5.diff \

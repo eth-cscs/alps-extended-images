@@ -2,6 +2,21 @@
 
 # Cross-cutting gotchas (apply to every verl recipe in this repo)
 
+- **megatron-core 0.19.0 is ~40–50% slower than 0.18.0 for large dense TP≥8 fwd/bwd.** Direct
+  A/B on the Apertus-v1.5-70B recipe, same image / verl / config, only the megatron version
+  differing: run `3251587` (`megatron-core 0.18.0+60b5c9588`, from the wqwqazwsxedc apertus fork
+  wheels) did `update_actor` in ~38–41 s/step → `perf/throughput` 158–184 tok/s; run `3253736`
+  (stock image `megatron-core 0.19.0`) did the *same* `update_actor` in ~58 s/step →
+  `perf/throughput` ~119–135 tok/s. **`update_weights` (megatron-bridge Megatron→HF streaming)
+  was identical (~9.6 s) in both**, so this is megatron-core's own forward/backward/optimizer
+  path, not the bridge, and not the `mlp.py` module-activation patch (byte-identical between the
+  two runs). The image bakes `megatron-core==0.19.0` (Containerfile, needed by megatron-bridge
+  0.6.1 / the GLM-5.1 recipe), so every stock-image Megatron recipe here pays this cost. Not
+  root-caused (no upstream perf note found; would need a 0.18↔0.19 kernel-level A/B). A recipe
+  that wants 0.18.0 speed must install the older wheel at runtime (`--no-deps --force-reinstall`,
+  as several recipes already do for other pins) and accept losing whatever 0.19.0-only
+  megatron-bridge features it needs.
+
 - **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is INCOMPATIBLE with SGLang.** SGLang's
   `torch_memory_saver` (invoked unconditionally by `load_model_with_memory_saver` during model
   load, *even when* `free_cache_engine: false`) runs a sanity check that hard-raises
@@ -3650,21 +3665,84 @@ migrated on two axes at the user's request (2026-08-31): the **image** and the *
 - **`checkpoint.strict: False`** + **`save_freq: 100`** (see hazards below).
 - **Reward function rewritten** (see the "The zero-reward chain" section below).
 
-## Group 1 / Group 2 (Apertus support) — UNCHANGED mechanism, kept from the sibling
+## Group 1 (Apertus support, SGLang side) — UNCHANGED mechanism, kept from the sibling
 
-Group 1 (swiss-ai transformers wheel, SGLang PR #32979 + local fixes) and Group 2 (wqwqazwsxedc
-Megatron-LM / Megatron-Bridge **apertus fork wheels** built at runtime and installed over the
-image's stock megatron-core/bridge + the vendored `Apertus1p5Bridge` +
-`patches/apertus1p5_bridge.py` + the xielu CUDA wheel + the `safe_config_loader` filelock patch)
-are all identical to the sibling. **A first pass tried to keep the image's stock megatron-core
-0.19.0 / megatron-bridge 0.6.1 and add only the apertus delta as targeted line-patches
-(`mlp.py` module-activation gate, `finalize_model_grads.py` TP grad-sum) + vendored bridge
-modules — this was abandoned.** It built and ran end-to-end (runs `3240861`/`3243271`/`3243467`)
-but trained degenerately for a reason later shown to be unrelated (the reward function — see
-below), *and* the fork wheels on the new image trained identically (run `3244676`), so the
-line-patch complexity bought nothing. The fork wheels (`megatron-core 0.18.0+60b5c9588`,
-`megatron-bridge 0.5.0+032c0740`) install cleanly over the new image's torch 2.11 / TE and were
-validated end-to-end in run `3247540`.
+Group 1 (swiss-ai transformers wheel, SGLang PR #32979 + local fixes, `vision_model=False`
+patch) is identical to the sibling.
+
+## Group 2 (Megatron side) — PR-diff refactor, 2026-09-01
+
+**History**: the migration was first validated (run `3251587`, 46/46 steps) with **wqwqazwsxedc
+Megatron-LM / Megatron-Bridge apertus fork wheels** (`megatron-core 0.18.0+60b5c9588` /
+`megatron-bridge 0.5.0+032c0740`) built at runtime and installed over the stock image. A prior
+"line-patch on stock 0.19.0/0.6.1 + vendored bridge" pass (runs `3240861`/`3243271`/`3243467`)
+also **built and ran end-to-end** on stock — it only trained degenerately because of the reward
+function (since fixed — see "The zero-reward chain"), and `[a1p5-diag]` proved the weights load
+byte-identically on stock-0.19/0.6.1 and fork-0.18/0.5, and the RoPE code is identical across
+0.18/0.19. So stock megatron + the apertus code is a **proven-working** combination.
+
+**2026-09-01 (user directive)**: replace the fork wheels with the STOCK image megatron-core
+0.19.0 / megatron-bridge 0.6.1 + Apertus 1.5 support applied at runtime as two GitHub
+**`compare` diffs** (`<upstream-release-tag>...<theely-fork-branch>.diff`). No fork wheels, no
+runtime clone, no wheel build, **no PR number / `gh` dependency**. Net: the recipe lost the
+~120-line clone+wheel-build+install block (batch host) and the wheel-install block (main srun),
+gaining a ~12-line `curl compare/…​.diff` + `patch -pN` block.
+
+- **Why `compare` not `pull/N.diff`**: GitHub's `compare` endpoint accepts a *tag* as the base
+  (a PR cannot — PRs target branches, which would force a throwaway `apertus1p5-base` branch and
+  a PR number to pin). `A...B.diff` uses merge-base semantics, so with `B` a single commit off
+  the release tag `A`, the diff is exactly the delta. Confirmed the cross-fork form works
+  (`theely/verl/compare/verl-project:v0.9.0...theely:<branch>.diff` returns a clean git diff),
+  and `theely/Megatron-{LM,Bridge}` already exist as forks of the right parents.
+- **`patches/build-apertus1p5-megatron-forks.sh`** (reworked, user runs it): pushes one branch
+  per fork — `apertus1p5-support` = release tag + one delta commit — to `theely/*`, and (if `gh`
+  is present) also opens a review PR against each upstream `main`. Prints the head SHAs and the
+  two compare `.diff` URLs. Bases:
+  - `theely/Megatron-LM` ← `NVIDIA/Megatron-LM` tag `core_v0.19.0` (`5be9626709af`). Delta:
+    `patches/mcore-apertus1p5.patch` — 2 hunks: `transformer/mlp.py` (instantiate + call a
+    module `activation_func` even when `use_te_activation_func` is False) and
+    `distributed/finalize_model_grads.py` (`or getattr(param, "sum_gradients_across_tp_domain",
+    False)` — sum the replicated xIELU `alpha_p`/`alpha_n` grads across TP). Both verified to
+    apply cleanly to `core_v0.19.0`.
+  - `theely/Megatron-Bridge` ← `NVIDIA-NeMo/Megatron-Bridge` tag `v0.6.0` (`51885cf132b2`).
+    **There is no `v0.6.1` git tag** — 0.6.1 on PyPI was cut from an unreleased patch commit off
+    a release branch; 0.6.0→0.6.1 is a patch release with no `models/` API churn, so `v0.6.0` is
+    the PR base and the recipe applies the diff with `patch --fuzz=3` to absorb the drift. Delta:
+    add `models/apertus/{__init__,apertus_bridge}.py` (plain `ApertusBridge` + `MCoreXIELU` +
+    `get_apertus_decoder_block_spec` — **upstream 0.6.x ships zero Apertus support**, checked at
+    `v0.6.0` and `main`), add `models/apertus1p5/{__init__,apertus1p5_bridge}.py`
+    (`Apertus1p5Bridge`, from `patches/apertus1p5_bridge.py`), register both in
+    `models/__init__.py` (import + `__all__` — the `@register_bridge` decorator only fires on
+    import), and `models/hf_pretrained/safe_config_loader.py` `filelock.FileLock(...)` →
+    `contextlib.nullcontext()` (fcntl.flock unsupported in-container on CSCS Lustre). **No
+    qwen3_asr fix** — v0.6.0 already guards it (`if Qwen3ASRConfig.model_type in CONFIG_MAPPING:
+    return`). Verified: the fork `apertus_bridge.py`'s imports (`AutoMapping`/`ColumnParallelMapping`/
+    `QKVMapping`/`ReplicatedMapping`, `conversion.utils.unwrap_model`, `register_bridge(source=,
+    target=, model_type=)`, `get_gpt_decoder_block_spec(..., normalization=, vp_stage=, pp_rank=)`,
+    `spec_utils.get_submodules`, `is_torch_min_version`) all exist unchanged at `v0.6.0` /
+    `core_v0.19.0` — the 0.5.0→0.6.0 API is stable on every surface this code touches.
+- **Checked-in sources**: `patches/apertus_bridge.py` (re-vendored from the fork — deleted at run
+  `3247540` cleanup, back now as the PR source), `patches/apertus1p5_bridge.py` (unchanged),
+  `patches/mcore-apertus1p5.patch`.
+- **Recipe** (`rl-bench-...-v1-separate-async.sh`): batch host `curl -sfL
+  https://github.com/theely/Megatron-LM/compare/NVIDIA:core_v0.19.0...theely:${MEGATRON_LM_FORK_REF}.diff`
+  (and the bridge equivalent, base `NVIDIA-NeMo:v0.6.0`), assert non-empty, `sbcast`. Main srun:
+  `patch -p1 -d $SITE_PKG < megatron-lm-apertus1p5.diff` (repo path == installed path) and
+  `patch -p2 -d $SITE_PKG --fuzz=3 < megatron-bridge-apertus1p5.diff` (installed drops `src/`),
+  each apply-or-FATAL — same "fresh container every job, apply-or-fail" discipline as the sglang
+  `patch -p2` calls; then a fatal `from megatron.bridge.models import Apertus1p5Bridge` smoke
+  test. `MEGATRON_{LM,BRIDGE}_FORK_REF` default to the branch name `apertus1p5-support` (pin to
+  the head SHA the bootstrap prints for reproducibility). xielu wheel build+install unchanged.
+- **Verified locally**: both PR diffs built via a real local git repo from the upstream base
+  files and `patch -pN`'d onto a fresh site-packages-layout tree — bridge (`-p2 --fuzz=3`) and
+  mcore (`-p1`) both apply clean, new files created, all `py_compile` OK; `models/__init__.py` +
+  `safe_config_loader.py` anchor edits confirmed against the real `v0.6.0` files; `bash -n` +
+  stray-`'` scan (caught one — `image's` inside the srun `bash -c '...'` body, fixed) clean.
+- **UNVERIFIED end-to-end on cluster** — needs one validation run. The only genuine risk left is
+  behavioral drift in the megatron-bridge base classes (`super().provider_bridge()` /
+  `super().load_weights_hf_to_megatron()` / base `mapping_registry`) between 0.5.0 (what the
+  apertus code was written against) and 0.6.1 (installed) — but the identical apertus code
+  already ran on stock 0.19.0/**0.6.1** in runs 3240861–3243467, so this is low risk.
 
 ## Known hazards (this recipe specifically)
 
@@ -3694,9 +3772,22 @@ validated end-to-end in run `3247540`.
   to reward 0.99). Not fixed here — the reward function parses around it (the final answer is the
   region after the last `<|inner_suffix|>`). A proper fix (verl tokenizer / sglang apertus_mm
   chat-template wiring) is an open follow-up if `<answer>`-format behavior is wanted.
-- Everything in the sibling's hazards list (qwen3_asr triple-`exist_ok`, SGLang PR #32979 file-set
-  drift → allowlist, pruned LM head, missing xielu, filelock, `sequence_parallel: False`,
-  `vision_model=False`, sbcast bus-error on large wheels) applies verbatim — same Group 1/2 code.
+- **The `theely/*:apertus1p5-support` branches must exist** before the recipe will run. Run
+  `patches/build-apertus1p5-megatron-forks.sh` once (needs push access to the forks). Until then
+  the batch-host `curl` of the compare `.diff` 404s → FATAL (loud, not silent).
+  `MEGATRON_{LM,BRIDGE}_FORK_REF` default to the branch name; set them to the head SHAs the
+  bootstrap prints if you want the diff frozen against a force-push.
+- **The megatron-bridge diff applies with `patch --fuzz=3`** because the compare base is `v0.6.0`
+  but the installed package is `0.6.1` (no `v0.6.1` tag exists). If a future megatron-bridge bump
+  moves `models/__init__.py` or `safe_config_loader.py` context past what fuzz-3 absorbs, the
+  `patch -p2` step FATALs — re-cut the fork branch off the new tag (bootstrap script) rather than
+  widening fuzz.
+- Everything in the sibling's hazards list (pruned LM head, missing xielu, `sequence_parallel:
+  False`, `vision_model=False`, sbcast bus-error on large wheels, SGLang PR #32979 file-set drift
+  → allowlist) applies verbatim — same Group 1 code. The sibling's qwen3_asr-`exist_ok` and
+  megatron-bridge `safe_config_loader` filelock hazards are now carried in the
+  `theely/Megatron-Bridge` PR (safe_config_loader) or moot (v0.6.0 guards qwen3_asr), not runtime
+  patches here.
 
 ## The zero-reward chain (runs 3240861 → 3247540) and its resolution
 
@@ -3859,6 +3950,62 @@ recipe-config issue, not a model-config one.
 - **The migration + tuning is done.** Recipe is stable at 16 nodes / mb=48 / 46 steps. Remaining
   open items are the two non-blocking follow-ups noted under `3247540` (chat-template
   `<|inner_suffix|>` leak; GSM8K near-saturation).
+- **Commit**: not committed.
+
+### 2026-09-01 — Group 2 fork-wheels → two-PR-diff refactor (implemented, unverified)
+
+Per user directive, Group 2 was reworked from "wqwqazwsxedc apertus fork wheels built at
+runtime" to "STOCK image megatron-core 0.19.0 / megatron-bridge 0.6.1 + Apertus 1.5 support
+applied at runtime as the diffs of two PRs on the `theely/*` forks." Full detail in the "Group 2
+(Megatron side) — PR-diff refactor" section above. Deliverables:
+
+- `patches/build-apertus1p5-megatron-forks.sh` — reworked bootstrap (user runs it): pushes one
+  `apertus1p5-support` branch (release tag + one delta commit) to each `theely/*` fork, opens a
+  review PR against each upstream `main` if `gh` is present, prints head SHAs + the two compare
+  `.diff` URLs.
+- `patches/mcore-apertus1p5.patch`, `patches/apertus_bridge.py` (re-vendored) — new checked-in
+  branch sources; `patches/apertus1p5_bridge.py` unchanged.
+- Recipe Group 2: `curl compare/<tag>...<branch>.diff` + `sbcast` (batch host) + `patch -p1` /
+  `patch -p2 --fuzz=3` onto site-packages + `from megatron.bridge.models import Apertus1p5Bridge`
+  smoke test (main srun). `MEGATRON_{LM,BRIDGE}_FORK_REF` default to `apertus1p5-support`. Net
+  −~200 lines (clone + wheel-build + wheel-install blocks gone).
+
+All diffs verified locally (`patch` dry-runs onto fresh upstream checkouts, `py_compile`,
+`bash -n`, stray-`'` scan). Then the user pushed the two `theely/*:apertus1p5-support` branches;
+both compare `.diff` URLs re-verified to fetch (HTTP 200) and `patch` cleanly onto the **real
+installed 0.6.1** wheel (no fuzz needed — 0.6.0/0.6.1 context identical in the touched files).
+`MEGATRON_{LM,BRIDGE}_FORK_REF` pinned to the branch-head SHAs
+(`9898eb2be164641600f197368f765a904ad73812` / `53bea08c8417627d5e83af6c9c16163a47e3a8b1`).
+
+### Run `3253736` — 2026-09-01 — VALIDATED: 46/46 steps on stock 0.19.0/0.6.1 + the two compare diffs; ~30% slower than the fork wheels
+
+- **Log**: `~/Downloads/slurm-3253736.out` (1.28 MB). 16 nodes, `clariden`, image
+  `verl-cuda:alps7-dev-621fa40275c4f036`. ~5 min queued, ran ~122 min, **COMPLETED (exit 0)**.
+- **Every failure window passed**: both compare diffs fetched + `sbcast` + `patch`ed cleanly on
+  all nodes; `megatron.core … | Apertus1p5Bridge OK` cluster-wide; **model construction cleared**
+  (`DistributedDataParallel contains 8.83B parameters`, no 0.5.0→0.6.1 base-class drift) — the
+  documented-benign `Unrecognized mapping type for …linear_qkv.layer_norm_weight` warnings
+  appeared and are harmless (the healthy curve proves weights loaded); no `split_with_sizes`, no
+  OOM, no `_balance_batch` KeyError.
+- **Training healthy, 46/46 steps**: `critic/score/max` 1.10 every step from step 1;
+  `critic/score/mean` 0.85 → ~0.96–1.04; `actor/grad_norm` 0.17–0.27 (finite, nonzero);
+  `ppo_kl` ~0.001; `pg_loss` 0.008–0.023; no NaN. `response_length/mean` 307 → 231 (same GRPO
+  compression as `3251587`'s 306 → 225). Peak mem ~72.6/95 GB. Checkpoint saved at
+  `global_step_46` (HF bridge export OK).
+- **Perf regression — `perf/throughput` ~119–135 tok/s (avg ~126)** vs run `3251587`'s (fork
+  wheels, same image/config) **158–184**. `timing_s/step` ~68–72 s vs ~48–56 s. **`update_weights`
+  is unchanged (~9.6–9.7 s both runs)** — the delta is entirely in `update_actor`
+  (`timing_per_token_ms/update_actor` ~0.105 → ~58 s/step here vs ~38–41 s in `3251587`), i.e.
+  the Megatron fwd/bwd/optimizer. The fork wheels ran `megatron-core 0.18.0+60b5c9588`; stock is
+  `0.19.0`. The `mlp.py` module-activation patch is byte-identical to the fork's, so it is not
+  the cause — **megatron-core 0.18.0 → 0.19.0 is ~40–50% slower for this dense-70B TP=8 fwd/bwd**
+  (bridge 0.5.0 → 0.6.1 is exonerated by the flat weight-sync time). Not a correctness issue; the
+  0.19.0 slowdown is a property of the image's baked megatron, which the fork wheels were
+  effectively *reverting*. **Open decision for the user**: accept the cleaner recipe (−~200
+  lines, upstreamable PRs, no fork-wheel build) at ~30% throughput, or keep fork wheels for
+  speed. Not root-caused — would need a megatron-core 0.18↔0.19 A/B or an upstream perf note.
+- **Verdict**: the two-PR-diff refactor is **functionally validated end-to-end**. Recipe left as
+  the stock+diffs version pending the perf decision.
 - **Commit**: not committed.
 
 # Megatron vs FSDP2
