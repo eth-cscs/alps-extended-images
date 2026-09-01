@@ -228,94 +228,42 @@ EOF
 
 cat > "${TRAINING_CONFIG}/gsm8k_reward.py" <<- EOF
 # gsm8k_reward.py
-#
-# Robust answer extraction. Run 3246622's [REWARD-DUMP] blocks showed
-# Apertus-v1.5-70B solves GSM8K fluently and correctly but NEVER emits the
-# <answer>...</answer> tags this recipe's original prompt asked for -- it ends
-# with "Final answer: N", "\boxed{N}", a bare trailing number, or "N" right
-# after the <|inner_suffix|> reasoning delimiter. The old reward only credited
-# <answer> tags, so every rollout scored 0 -> no GRPO signal. This version
-# parses all of those forms so outcome reward drives training. (The dataset /
-# system prompt are unchanged -- no regen needed; RL just rewards correctness.)
 import re
 import math
 from typing import Optional
 
-_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
-_FINAL = re.compile(
-    r"(?:final answer|the answer is|answer is|answer:)\D{0,24}(-?\d[\d,]*(?:\.\d+)?)",
-    re.IGNORECASE,
-)
-
-
-def _norm(raw: str) -> Optional[str]:
-    raw = raw.strip().replace(chr(36), "").replace(",", "").rstrip(".").strip()
-    if not raw:
-        return None
-    try:
-        val = float(raw)
-    except ValueError:
-        return raw
-    if not math.isfinite(val):
-        return str(val)
-    return str(int(val)) if val == int(val) else str(val)
-
-
-def _boxed(s: str) -> Optional[str]:
-    i = s.rfind("boxed")
-    if i < 0:
-        return None
-    j = s.find("{", i)
-    k = s.find("}", j) if j >= 0 else -1
-    return s[j + 1:k] if 0 <= j < k else None
-
 
 def extract_model_answer(response: str) -> Optional[str]:
-    # Apertus-v1.5 puts its final answer after the last <|inner_suffix|> delimiter.
-    marker = "<|inner_suffix|>"
-    tail = response.split(marker)[-1] if marker in response else response
-
-    for scope in (tail, response):
-        m = re.findall(r"<answer>(.*?)</answer>", scope, re.DOTALL)
-        if m:
-            return _norm(m[-1])
-    for scope in (tail, response):
-        b = _boxed(scope)
-        if b is not None:
-            return _norm(b)
-    for scope in (tail, response):
-        m = _FINAL.findall(scope)
-        if m:
-            return _norm(m[-1])
-    for scope in (tail, response):
-        nums = _NUM.findall(scope)
-        if nums:
-            return _norm(nums[-1])
-    return None
+    """
+    Pull the content of the last <answer>...</answer> block.
+    Returns None if the model did not produce the expected format.
+    """
+    matches = re.findall(r"<answer>(.*?)</answer>", response, re.DOTALL)
+    if not matches:
+        return None
+    raw = matches[-1].strip().replace(",", "")
+    try:
+        val = float(raw)
+        return str(val) if not math.isfinite(val) else (str(int(val)) if val == int(val) else str(val))
+    except ValueError:
+        return raw
 
 
 def compute_reward(
     data_source, solution_str, ground_truth, extra_info=None, **kwargs
 ) -> float:
-    # Reasoning opened but never closed (truncated) -> neutral 0.0, not a big
+    # Truncated response (thinking opened but never closed): return 0, not a large
     # negative, to avoid extreme GRPO advantages that cause gradient spikes.
     if "<think>" in solution_str and "</think>" not in solution_str:
         return 0.0
 
     model_ans = extract_model_answer(solution_str)
-    gt = _norm(str(ground_truth))
-    outcome_reward = 1.0 if (model_ans is not None and gt is not None and model_ans == gt) else 0.0
+    has_answer = "<answer>" in solution_str and "</answer>" in solution_str
+    format_reward  = 0.1 if has_answer else 0.0
+    outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Small shaping bonus for a clearly-delimited final answer (any of the forms
-    # the model actually uses).
-    has_delim = (
-        "boxed{" in solution_str
-        or ("<answer>" in solution_str and "</answer>" in solution_str)
-        or bool(_FINAL.search(solution_str))
-    )
-    format_reward = 0.1 if has_delim else 0.0
-
-    # Smooth length penalty starting at 350 words, max -0.2 at 700 words.
+    # Smooth length penalty starting at 350 words (~455 tokens), max -0.2 at 700 words.
+    # Keeps thinking chains well below the 1024-token hard cap so truncation stays rare.
     words = len(solution_str.split())
     length_penalty = -0.2 * min(1.0, max(0.0, (words - 350) / 350))
 
