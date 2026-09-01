@@ -1,8 +1,41 @@
 @../AGENTS.md
 
+# Cross-cutting gotchas (apply to every verl recipe in this repo)
+
+- **`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is INCOMPATIBLE with SGLang.** SGLang's
+  `torch_memory_saver` (invoked unconditionally by `load_model_with_memory_saver` during model
+  load, *even when* `free_cache_engine: false`) runs a sanity check that hard-raises
+  `RuntimeError: TorchMemorySaver is disabled for the current process because expandable_segments
+  is not supported yet` — the two allocator mechanisms are mutually exclusive. Every rollout TP
+  rank dies before the first training step (seen in run `3219305`). **Never set this as a global
+  env var in a script whose srun body is shared by the SGLang rollout processes** (i.e. every
+  recipe here — they all colocate or share the srun). There is no clean per-worker-type env
+  scoping in verl, so if a Megatron trainer genuinely needs `expandable_segments` for an OOM, it
+  has to come from a different lever (smaller `ppo_max_token_len_per_gpu`, grad-buffer bucket
+  size, more offload) — not this env var.
+
+- **verl v0.9.0 hardcodes several SGLang import paths that MOVED in SGLang 0.5.16** (this image's
+  version). Each surfaces as `ImportError: cannot import name 'X' from '<old module>'` only when
+  the relevant feature runs. Known so far, each with a checked-in one-line try/except patch under
+  `Alps-Images/apps/verl/example/patches/`: `extract_routed_experts_from_meta_info`
+  (`layers.moe.routed_experts_capturer` → `state_capturer.routed_experts`; R3 rollout capture;
+  `r3-sglang-routed-experts-import-fix.patch`), `LocalSerializedTensor`
+  (`model_executor.model_runner` → `model_executor.model_runner_components.weight_updater`;
+  `delta_sharded` rollout weight apply; `delta-sharded-localserializedtensor-import-fix.patch`).
+  When enabling any new verl rollout-side feature against this image, expect one more of these —
+  cross-check every `from sglang.srt...import` in the new code path against SGLang v0.5.16's own
+  source (its `weight_sync/utils.py` and `state_capturer/` are good references for the current
+  paths).
+
 # Dependencies
 
 Verl: You can find a local version of the verl repo at ../verl
+
+- **flashinfer packaging**: `flashinfer-cubin` / `flashinfer-jit-cache` are NOT fully on PyPI —
+  their real index is `https://flashinfer.ai/whl` (serves GitHub release assets). flashinfer
+  `>= ~0.6.14` hard-raises at import unless the installed `flashinfer-cubin` is the exact same
+  version. See the "flashinfer packaging" section under the GLM script's Image bake-in for the
+  full details, sub-index layout, and the matched-pair install used by the image + GLM script.
 
 # Launching and testing on HPC Cluster
 
@@ -17,6 +50,110 @@ If the job fails or completes download the output and proccess it.
 You can find the Firecrest client and secret at:
 ~/F7T_Credentials
 NEVER EVER SHARE, PRINT, or OUTPUT the Firecrest secret.
+
+# Configuration correctness audits (architecture-vs-config)
+
+**Why this exists**: every "Known hazards"/"Run log" entry in this file was found by chasing a
+crash, OOM, or assertion — a job log told us something was wrong. That process is blind to
+config that is *silently wrong but still runs*: a knob that doesn't match the model's real
+architecture, so training completes without erroring but is weaker or less aligned than it should
+be. Case in point: `train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh` trains a MoE model
+(GLM-5.1) with `actor_rollout_ref.actor.router_replay.mode` left at verl's default (`disabled`).
+verl's own docs (`docs/ascend_tutorial/dev_guide/model_dev/transfer_to_npu_guide.md`) name R3
+("Rollout Router Replay") as the mechanism that aligns MoE expert routing between the SGLang
+rollout and the Megatron trainer, and explicitly list GLM-5 as one of the models that adopt it in
+practice — a real, still-open gap in this script, found only by asking "does this config match
+what this architecture needs," not by any run failing. No amount of crash-driven debugging would
+ever have surfaced it, because nothing about its absence errors.
+
+**The audit, for any script in this repo that trains a model**:
+
+1. **Identify the model's real architecture class** from its actual HF `config.json` /
+   `model_type` — not from its name or from what the script's author assumed. Distinguish at
+   least: dense vs. MoE (routing/expert-parallelism knobs apply), text-only vs. multimodal
+   (vision/audio-tower and token-pruning knobs apply — see the Apertus v1.5 sections' pruned-LM-head
+   and `vision_model` bugs, both real architecture-vs-config mismatches found by crashes that this
+   audit would ideally catch before a run), and any other structural trait (tied embeddings,
+   custom attention, non-standard rope) that has a corresponding verl config knob.
+2. **Cross-reference against verl's own docs and recipes**, not memory or assumption — `grep`
+   `../verl/docs/` and `../verl/recipe/` (and, for a specific model family, `../verl/docs/algo/`
+   and any Ascend/NPU tutorial docs, which tend to spell out per-architecture recommendations more
+   explicitly than the main README) for the architecture class and, if one exists, the specific
+   model family. List every algorithm-relevant flag those sources recommend or require, then diff
+   it against what the script actually sets. Flags checked so far as load-bearing per architecture:
+   `algorithm.rollout_correction.bypass_mode` (off-policy log-prob correction, all models),
+   `actor_rollout_ref.actor.router_replay.mode` (MoE expert-routing alignment — `disabled`/`R2`/`R3`,
+   see verl's `verl/workers/config/actor.py`), and the multimodal-specific gaps documented in the
+   Apertus v1.5 sections below (pruned LM head sizing, `vision_model` flag forcing BSHD padding on
+   a text-only batch). Extend this list as new architecture-specific knobs are found.
+3. **Record the result** as its own dated entry (same format as a Run log entry) under that
+   script's section: what was checked, what verl's docs actually recommend, whether the script
+   matches, and if not, whether it was fixed or left as a documented, deliberate gap (e.g. "R3
+   would need a `record_file` and hasn't been verified to work with the `separate_async`/
+   TransferQueue V1 path — flagged, not yet enabled").
+4. **When to run it**: at least once for every script in this repo that has reached a stable,
+   real-training-step state (the point where its own Run log would otherwise stop growing) — do
+   not let a script go undocumented on this axis just because it stopped crashing. Re-run it
+   whenever verl is upgraded to a new pinned version/commit, since these are upstream
+   recommendations that move with verl's own code, not something this repo controls.
+
+This is a correctness-and-quality audit, not a crash hunt — a script can pass every item here and
+still be worth a second look from a human who knows the intended training objective; it catches
+"doesn't match documented best practice for this architecture," not "is definitely optimal."
+
+**First full pass — 2026-08-26**, across every training script that has reached a stable,
+real-step state in this repo:
+
+- `train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh` (GLM-5.1, MoE): **gap found, tried
+  twice, reverted twice.** R3 router replay is appropriate but was unset; enabling it also
+  required THD (`use_remove_padding: True`), which this script had disabled for a
+  since-plausibly-fixed reason. Run `3199623` (2026-08-27): confirmed two missing prerequisites
+  (megatron-bridge 0.5.1, not the needed ≥0.6.0; SGLang missing the `routed_experts_capturer`
+  module at the path verl expects) plus an unexplained CUDA crash. Fixed both prerequisites (a
+  source patch for the sglang import path — genuinely correct, stayed in; a megatron-bridge
+  0.5.1→0.6.1 runtime upgrade — turned out wrong) and retried as run `3201189`: got much further
+  (real Megatron model construction, not just init), but the megatron-bridge upgrade itself
+  turned out to need megatron-core ~0.19.0, not this image's 0.18.2, breaking core Megatron model
+  init *unconditionally* — worse than not upgrading at all. Fully reverted, including the
+  megatron-bridge upgrade this time (not just the three R3/THD flags). User explicitly authorized
+  fixing megatron-core too (2026-08-28); validated the combined megatron-core 0.19.0 +
+  megatron-bridge 0.6.1 upgrade on a cheap 1-node probe first (job `3207095`, after one
+  probe-script bug caught and fixed in `3207054`) — every import smoke test passed, including the
+  exact chain that crashed `3201189`. Wired into the real script and all three R3/THD flags
+  re-enabled. Run `3207151` (2026-08-28) then cleared every prior blocker and hit one more, in
+  verl's rollout-side routed-experts capture (stale `.numpy()` assumption vs sglang 0.5.16's
+  base64 string); the expanded `r3-sglang-routed-experts-import-fix.patch` fixed it, and run
+  `3207923` (2026-08-28) **validated the R3+THD fix — 5 clean training steps, the first this
+  recipe has ever produced with R3 enabled, stable metrics** — before failing on a separate
+  megatron-bridge weight-sync NCCL race (unrelated to R3; same class as run `3141801`, retry
+  pending). Remaining: confirm that race is a one-off, and PR the verl fix upstream. Full
+  findings in that script's own "Configuration audit" entry and Run log, below.
+- `train-gsm8k-glm5.1-700B-full-async-megatron.sh` (GLM-5.1, MoE, the base this was derived
+  from): same gap — router_replay unset here too. Not otherwise separately audited (this repo
+  tracks it only as the V1 script's ancestor, with no dedicated section of its own); unlike the
+  V1 script, it uses the classic non-TQ `agent_loop.py` path, which has confirmed full
+  `routed_experts` plumbing — so R3 is plausibly *more* directly usable here than on the TQ path,
+  for whoever picks this up next.
+- `rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh` and
+  `rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh` (Apertus-v1.5-70B, dense multimodal):
+  router_replay/R3 doesn't apply (not MoE). Their real architecture-vs-config gaps (vision-tower
+  attention implementation, SGLang multimodal loading, pruned-LM-head sizing, forced
+  `vision_model` flag) were already found — by crashes, ahead of this process existing — and are
+  fixed; see each script's own "Configuration audit" entry for the retroactive mapping.
+- `train-gsm8k-apertus-8B.sh` / `train-gsm8k-apertus-8B-full-async.sh` /
+  `train-gsm8k-apertus-70B-full-async.sh` (Apertus-8B/70B, the older text-only, non-v1.5,
+  non-multimodal architecture): dense, no MoE, no vision/audio config surface — confirmed via
+  `model_type` and the absence of any `vision_config`/expert-parallel settings. No gap found;
+  `rollout_correction.bypass_mode` (the one algorithm-level flag that applies to every model in
+  this repo) is set correctly in all three.
+- `train-gsm8k-qwen-3B-v1-separate-async-megatron.sh` / `train-gsm8k-qwen-3B-full-async-megatron.sh`
+  (Qwen2.5-3B): dense — confirmed by the script's own comment
+  (`expert_model_parallel_size: 1  # Qwen2.5-3B is dense (no MoE); EP must be 1`). No gap found.
+- `train-gsm8k-qwen-3B.sh`, `train-gsm8k-apertus-8B.sh` (the un-suffixed base variants) and the
+  `*-working`/`*-unclean` snapshot scripts under `example/` and `apertus-benchmarks/`: not
+  audited this pass — treated as superseded/backup copies of the scripts above rather than
+  independently maintained recipes (none of them appear in this file's own tracked run logs).
+  Worth a real look before anyone trains from one of them directly.
 
 # Debugging `train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh`
 
@@ -56,32 +193,35 @@ entrypoint `python -m verl.trainer.main_ppo`.
   `actor_rollout_ref.hybrid_engine` is not read anywhere in the V1 path; there is no config to
   disable this. They sleep after the first `on_sample_end()` and only wake for validation
   (disabled here), so the exposure is the init window. Prime suspect for init OOM.
-  Fallback patch: `example/patches/sitecustomize-verl-v0.9.0.py` — (1) makes
+  Fix: `example/patches/v1-separate-async-fixes.patch` — (1) makes
   `LLMServerManager._initialize_llm_servers` return no replicas when `worker_group is not None`;
   (2) drops the `self.checkpoint_manager.update_weights(...)` call from
   `PPOTrainerSeparateAsync.on_init_end` — its backend is forced to `naive`, which bypasses the
-  replica list and pushes weights into a colocated engine that would no longer exist. Written
-  after run 3125195 confirmed the hazard was still live. Delivery: the script embeds this file's
-  content as a heredoc and `sbcast`s it to every node before the srun (same treatment as
-  `gsm8k_reward.py`), then stages it as each node's `sitecustomize.py` under a per-node `/tmp`
-  dir (Python only auto-loads a module literally named `sitecustomize`) — a plain
-  script-relative `cp` failed silently on all 80 nodes in run 3129805 because `sbatch` executes
-  from a spool-staged copy of the script, not its checkout path, so `${BASH_SOURCE[0]}`-derived
-  paths don't resolve inside the srun. **The checked-in file and the heredoc are two copies of
-  the same content and must be kept in sync by hand** — diff them before trusting either.
-  Deliberately a separate file from `example/patches/sitecustomize.py` — that one was written
-  against v0.8.0 and its module/class paths are unverified against v0.9.0, so it's left untouched
-  and unused by this script. Patches apply eagerly now (see the next bullet) — **still not yet
-  verified end-to-end by a run.**
+  replica list and pushes weights into a colocated engine that would no longer exist. Applied via
+  `git apply` against `/workspace/verl` after the v0.9.0 checkout, same discipline as the
+  upstream PR patches (fetched/embedded once, `sbcast` to every node, apply-or-fail).
+  **This started life as a `sitecustomize.py` runtime monkeypatch** (written after run 3125195
+  confirmed the hazard was still live; see the `find_spec` entry below for why that mechanism
+  exists and how it evolved) — fast to iterate on while still debugging, but converted to this
+  plain source patch once run 3149736 confirmed the whole recipe works end-to-end with it, same
+  reasoning as the Apertus benchmark's equivalent conversion
+  (`apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch`): a monkeypatch is one more
+  moving part (`sys.meta_path` machinery, `PYTHONPATH` staging, import-timing dependence) that a
+  stable fix doesn't need. `example/patches/sitecustomize-verl-v0.9.0.py` and the script's old
+  heredoc copy of it are both gone now; `example/patches/sitecustomize.py` (a different, older
+  file, written against v0.8.0 with module/class paths never verified against v0.9.0) was never
+  used by this script and is untouched.
 - **`sys.meta_path` hooks using `find_module`/`load_module` are dead on Python 3.11+.** That
   legacy finder/loader protocol (deprecated since 3.4) lost its importlib compatibility shim on
   the Python 3.11/3.12 shipped in this image — confirmed locally: a `find_module`-only meta_path
-  entry is never even called for an ordinary import. Both `sitecustomize-verl-v0.9.0.py` (above)
-  and the Apertus benchmark's `sitecustomize-autoconfig-register.py` (see
-  `apertus-benchmarks/rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`) originally used this hook style
-  and silently never patched anything in any run — including 3129805, where the file *did* reach
-  the node correctly and still never fired, and 3133412 (Apertus), where the confirmation print
-  never appeared in the log and the target bug reproduced unchanged.
+  entry is never even called for an ordinary import. Both this GLM script's `sitecustomize.py`
+  (now retired — see above, converted to `example/patches/v1-separate-async-fixes.patch`) and the
+  Apertus benchmark's `sitecustomize-autoconfig-register.py` (see
+  `apertus-benchmarks/rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`, similarly retired once its
+  own conversion landed) originally used this hook style and silently never patched anything in
+  any run — including 3129805, where the file *did* reach the node correctly and still never
+  fired, and 3133412 (Apertus), where the confirmation print never appeared in the log and the
+  target bug reproduced unchanged.
   **Do not fix this by importing the target module eagerly, right at sitecustomize time** — that
   was tried next and does make the patch fire, but it forces the target's whole import chain
   (transformers → torch, or verl's worker/rollout modules → torch/ray/sglang) into *every* Python
@@ -103,21 +243,63 @@ entrypoint `python -m verl.trainer.main_ppo`.
   real loader (so the target module's actual code still runs) and only then applies the patch —
   confirmed locally that `find_spec` (unlike `find_module`) is genuinely invoked by Python 3.11+,
   and confirmed the pattern patches correctly and lazily (only on-demand, once, no eager import,
-  no recursion) with a local multi-target repro. Both `sitecustomize-verl-v0.9.0.py` and
-  `sitecustomize-autoconfig-register.py` now use this pattern — a class implementing
-  `find_spec(fullname, path, target=None)` that: returns `None` immediately unless `fullname` is
-  a target and not yet patched; otherwise removes itself from `sys.meta_path`, calls
-  `importlib.util.find_spec(fullname)` to get the *real* spec, restores itself, then returns that
-  spec with `.loader` replaced by a wrapper whose `exec_module` calls the original loader's
-  `exec_module` first and patches the now-executed module second. **Any new sitecustomize-style
-  patch in this repo must use this `find_spec` pattern — not `find_module`/`load_module` (dead),
-  and not an eager top-level `import`.** Unverified end-to-end by a run using this exact version
-  yet — the eager-import version is what got tested (and found to stall) in 3133616/3134586.
+  no recursion) with a local multi-target repro. `sitecustomize-autoconfig-register.py` (still
+  actively used by the Apertus Megatron-trainer variant,
+  `rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh`, untested as of run 3141796) uses this
+  pattern — a class implementing `find_spec(fullname, path, target=None)` that: returns `None`
+  immediately unless `fullname` is a target and not yet patched; otherwise removes itself from
+  `sys.meta_path`, calls `importlib.util.find_spec(fullname)` to get the *real* spec, restores
+  itself, then returns that spec with `.loader` replaced by a wrapper whose `exec_module` calls
+  the original loader's `exec_module` first and patches the now-executed module second. **Any new
+  sitecustomize-style patch in this repo must use this `find_spec` pattern — not
+  `find_module`/`load_module` (dead), and not an eager top-level `import`.** Confirmed working
+  end-to-end for this exact pattern in this GLM script's own retired `sitecustomize.py` (all four
+  of its confirmation lines fired correctly across every run from 3134772 through 3149736) before
+  it was converted to a source patch — so the pattern itself is sound; convert to a stable source
+  patch once a fix is confirmed, the same way this script and the Apertus FSDP2 benchmark both
+  did, rather than leaving it as a permanent runtime monkeypatch.
 - **Lustre file locking.** `flock` fails (ENOLCK/ESTALE) in the container: hence the
   megatron-bridge filelock patch, the `/tmp` model-config mirror, and the Triton/FlashInfer
   cache redirects. New "stale file handle" errors usually mean a new cache path needs redirecting.
 - **TP=32 SGLang.** CUDA graphs disabled and `free_cache_engine: false` — engine rebuild across
   8 nodes deadlocked previously. Re-enabling either is a regression risk.
+  A second, distinct TP=32 hang showed up once in run 3152802: ~9 minutes into ordinary
+  steady-state rollout generation (well after weight sync had already completed cleanly), one
+  SGLang TP rank fired its own 300s scheduler watchdog timeout, blocked inside
+  `recv_requests → _broadcast_reqs_across_ranks → torch.distributed.broadcast` — a stuck
+  NCCL/collective broadcast across the 8-node TP=32 group. Took down the whole SGLang replica
+  (Ray `SYSTEM_ERROR`), and every subsequent rollout task then failed in an infinite
+  `ActorDiedError` retry loop for the rest of the run (no recovery, no restart) until Slurm
+  killed it at the `--time=2:00:00` limit. Retried unmodified as run 3171176: did not recur in
+  that run — but 3171176 only reached 3 steps before monitoring stopped, nowhere near the
+  step-13 mark below, so "one-off" was a weak verdict on a short run.
+  **RECURRED, run `3209484` (2026-08-28) — new call site, ~step 13 of steady-state generation.**
+  Same shape (standalone rollout replica, 300s scheduler watchdog fires, py-spy dump, replica
+  killed, Ray `SYSTEM_ERROR`, `ActorDiedError` cascade, job FAILED, no recovery), but the stuck
+  frame this time is inside the **flashinfer MLA/DSA decode-attention `plan()`**:
+  `event_loop_overlap` -> `_execute_decode` -> `flashinfer_mla_backend.py:381 init_forward_metadata`
+  -> `:749 call_begin_forward` -> `flashinfer/mla/_core.py:839 plan` (a tensor `.to()` copy that
+  never returned). flashinfer 0.6.12; DSA backends `prefill=flashmla_sparse, decode=fa3`. NOT the
+  `_broadcast_reqs_across_ranks` broadcast of 3152802 — a different collective in the DSA plan
+  path, same lethal pattern. **This is the 3rd TP=32 SGLang scheduler hang across this recipe
+  (3152802, 3209484), 2 distinct call sites — no longer dismissable as a single flake; it is a
+  real intermittent fragility in the TP=32 SGLang + flashinfer + Slingshot DSA-rollout stack.**
+  It is *not* caused by R3 or the megatron-core/bridge upgrade — this code path is unchanged from
+  the pre-R3 baseline. **ROOT CAUSE FOUND AND FIXED — a stale flashinfer pin.** The Containerfile
+  had `flashinfer_python==0.6.12` (+ `flashinfer_cubin==0.6.12`, added 2026-07-27) while sglang
+  0.5.16 (what `sglang[all]` resolves to since the 2026-08-12 bump) requires
+  `flashinfer_python[cu13]==0.6.14`; the hang was on exactly the flashinfer MLA `plan()` path.
+  Upgrading to the matched `flashinfer_{python,cubin}==0.6.14` pair (from `flashinfer.ai/whl` —
+  see the "flashinfer packaging" section) **eliminated the hang: run `3217439` (2026-08-29) ran
+  20 clean R3+THD training steps with zero hang signatures**, well past the step-13 mark where
+  `3209484` died. Both the script (runtime wheel install) and the Containerfile now carry the
+  0.6.14 pair. The earlier "intermittent flake, you can get lucky" framing was wrong — the
+  short clean runs (`3149736` 14 steps, `3171176` 3 steps) just hadn't run long enough to hit it
+  reliably.
+  If a TP=32 SGLang scheduler hang ever recurs *on flashinfer 0.6.14+*, it is a new bug — start
+  from the watchdog py-spy dump; earlier fallback ideas (raise `watchdog_timeout`, different DSA
+  decode backend, shrink the replica below TP=32, rollout-replica auto-restart) are on record but
+  were never needed.
 - **Upstream PRs** #7421 (DSA/mcore), #7422 (`load_format=dummy` in standalone rollout),
   #7423 (NCCL deadlock in async weight sync) are applied at runtime. None of the three are in
   **v0.9.0** (all still apply cleanly to the tag), and they must run *after* the
@@ -200,10 +382,323 @@ entrypoint `python -m verl.trainer.main_ppo`.
   this specific `all_gather_object` call while others waited — a rank-count/collective-order
   mismatch somewhere inside megatron-bridge's per-tensor streaming HF conversion
   (`gather_from_ep_ranks`/`gather_from_tp_ranks`/`broadcast_from_pp_rank` all appear in the
-  flight-recorder dump). Not yet root-caused or fixed — first occurrence, and it pre-empts the
+  flight-recorder dump). Not yet root-caused or fixed — and it pre-empts the
   `list_of_dict_to_tensordict`/`_pack_field_values` diagnostic chain below entirely (that code
   only runs once training experience actually flows, which requires getting past this hang
   first).
+  **Recurrence, run `3207923` (2026-08-28) — same family, different collective and phase.** This
+  time it hit the **7th** trainer→rollout weight sync (after 5 clean training steps, not at
+  init), and the stuck collective was an **NCCL `ALLGATHER`** on `EXPERT_MODEL_PARALLEL_GROUP` /
+  `TENSOR_MODEL_PARALLEL_GROUP` in `param_mapping.py:806 gather_from_ep_ranks` (not the gloo
+  `all_gather_object` on the PP group). `last completed work: 50565, last enqueued: 50634` — a
+  peer never posted its matching collective. After the 1800000ms NCCL timeout,
+  `torch.distributed.barrier()` (`engine_workers.py:782`) failed with gloo `Connection closed by
+  peer` and the job died. Two differences from `3141801` worth noting: this run was on
+  **megatron-bridge 0.6.1** (vs. 0.5.1 then), and the desync is on the **EP/TP** gather rather
+  than the PP broadcast — so an EP-gather rank-count/order bug that's load- or version-dependent
+  can't be ruled out. `3141801` did not reproduce on unmodified retry (`3144665`).
+  **3rd occurrence, run `3219811` (2026-08-29) — now a confirmed recurring bug, not a flake.**
+  Same signature exactly as `3207923`: NCCL `ALLGATHER` 30-min timeout in
+  `param_mapping.py:806 gather_from_ep_ranks` → `stream_weights_megatron_to_hf` →
+  `send_weights (nccl_checkpoint_engine.py:246)`, at weight-sync #5 (feeding `global_step` 10),
+  rank 59 never entered the gather. Tally: **hit in `3141801` / `3207923` / `3219811`, did NOT
+  hit in `3144665` / `3209484` (12+ syncs) / `3217439` (20 steps)** — ~1 in 2 runs, at a random
+  sync, spanning megatron-bridge 0.5.1 and 0.6.1, present before R3 was enabled. It is the
+  single biggest blocker to a full run.
+  **4th occurrence, run `3240762` (2026-08-31) — mechanism found, fix applied.** First time it
+  hit the **`delta_sharded` SEED sync** (`delta_checkpoint_engine.py:521 _send_full_seed` →
+  `stream_weights_megatron_to_hf` → `broadcast_obj_from_pp_rank`'s gloo `all_gather_object` on
+  the PP group; `gather_from_ep_ranks` ALLGATHER on others). Ranks 244/33 never entered;
+  `last enqueued 172, last completed 109` — 63-collective drift. Root cause: `_send_full_seed`
+  drives the full HF-export generator **asymmetrically** — rank 0 buckets + broadcasts each
+  flush to the rollout CE group between pulls, non-master ranks discard and immediately pull the
+  next — so non-master ranks race ahead in the per-tensor PP/EP/TP assembly-collective chain
+  until a cross-group collective deadlocks. This is very likely the same asymmetry behind the
+  earlier occurrences (the `nccl` backend's `_send_weights` has a similar rank-0-does-extra-work
+  shape). **Fix applied** (`example/patches/wsync-debug-progress-log.patch`, expanded): for the
+  `"seed/full"` export only, `torch.distributed.barrier()` on the trainer WORLD group every
+  `VERL_WSYNC_SEED_BARRIER_EVERY` (default 1) HF tensors, after the consumer processed each —
+  bounds the drift to zero. Safe (a barrier can't corrupt state); ~1–3 min added to the one-time
+  seed. Unverified on cluster as of this entry — see run `3240762`'s Run-log entry. If the hang
+  recurs *with the barrier applied* it's a deeper bug (a single collective inside one tensor's
+  assembly, not cross-tensor drift) — then look at a megatron-bridge `stream_weights_megatron_to_hf`
+  robustness knob or a verl sync-retry, per the earlier notes here.
+  Meanwhile, before the barrier is validated, every long run still has a coin-flip chance of
+  dying here.
+- **Backticks (and bare `$(`/`$VAR`) inside this script's unquoted heredocs are live shell,
+  not text.** `env.toml`, `grpo_gsm8k.yaml`, `gsm8k_reward.py`, and `prepare_gsm8k.py` are all
+  generated via `cat > file <<- EOF` with an **unquoted** delimiter (`EOF`, not `'EOF'`) — this
+  script relies on that for real, working `$((...))` arithmetic expansion inside
+  `grpo_gsm8k.yaml` (e.g. `num_data_storage_units: $(( SLURM_JOB_NUM_NODES * 2 ))`), so it can't
+  simply be quoted away. The cost: any backtick written into one of these heredocs — including in
+  what looks like an inert YAML/Python comment — triggers real command substitution. Run
+  `3201189` hit this twice in one session: a markdown-style `` `router_replay: {mode: R3}` ``
+  in a YAML comment made bash try to *execute* `router_replay: {mode: R3}` as a command
+  (`line 104: router_replay:: command not found`, the literal first line of that run's log), and
+  a second backtick-quoted error message introduced while fixing the first had the identical
+  effect. Confirmed reproducible in a local sandbox, not a cluster artifact (`bash -x` on the
+  script's own first ~285 lines pinpoints the exact backtick pair via the xtrace `++` prefix) — so
+  this is always worth checking locally before spending cluster time. **Any edit inside one of
+  these four heredocs must be scanned for backticks (and any accidental bare `$(`/`$VAR`) the same
+  routine way the single-quoted `srun bash -c '...'` body is already scanned for stray `'`** — see
+  run 3149339's entry above for that established discipline; this is its counterpart for the
+  unquoted heredocs.
+
+## Configuration audit (architecture-vs-config) — 2026-08-26
+
+Per the repo-wide "Configuration correctness audits" process above. GLM-5.1 is a MoE model
+(`model_type=glm_moe_dsa`) — checked whether R3 (Rollout Router Replay), verl's mechanism for
+aligning MoE expert routing between the SGLang rollout and the Megatron trainer, is (a)
+appropriate here and (b) actually enabled.
+
+- **(a) Appropriate**: yes. verl's own docs
+  (`docs/ascend_tutorial/dev_guide/model_dev/transfer_to_npu_guide.md`) name R3 as the
+  alignment mechanism for large MoE models and list GLM-5 by name as one of the models that
+  adopt it in practice, alongside DeepSeek-V3.2 and MiMo-V2.
+- **(b) Enabled**: no. Confirmed the script never sets `router_replay` anywhere, and verl's
+  default (`verl/trainer/config/actor/actor.yaml:279`, `mode: disabled`) is off. Neither
+  `router_replay.mode` nor `rollout.enable_rollout_routing_replay` (a separate, also-required
+  flag — see below) is set.
+- **The correct config path for this recipe is `actor_rollout_ref.actor.megatron.router_replay.mode`,
+  not the top-level `actor_rollout_ref.actor.router_replay.mode`** — traced both fields to their
+  actual consumers: `engine_workers.py:494` (`WorkerDict.__init__`, fetched from the real v0.9.0
+  tag, since local `../verl` is v0.8.0 and has no `trainer/ppo/v1/` directory at all) reads
+  `self.config.actor.megatron.router_replay.mode` to set `self.enable_routing_replay` — the
+  top-level field is a distinct, separately-defined dataclass field that the V1/Megatron worker
+  path never reads. verl's own Ascend tutorial doc is internally inconsistent about which of the
+  two it means (states `actor.megatron.router_replay.mode` in prose, then shows
+  `actor.router_replay.mode` in its CLI example) — trust the code, not the doc prose, on this
+  specific point.
+- **Second required flag, independent of `router_replay.mode`**: `rollout.enable_rollout_routing_replay`
+  (`verl/workers/config/rollout.py:265`, default `False`) — read by
+  `verl/workers/rollout/sglang_rollout/async_sglang_server.py` (the standalone-rollout server this
+  recipe uses) to set SGLang's `enable_return_routed_experts` server arg and request
+  `return_routed_experts` per generate call, and to populate `output.routed_experts` via
+  `sglang.srt.layers.moe.routed_experts_capturer`. R3 needs *both* flags set, not just
+  `router_replay.mode`; also needs the image's SGLang build to actually contain that
+  `routed_experts_capturer` module (not checked — would need a cluster-side `python -c` probe).
+- **Whether it would actually work with this recipe's `separate_async` + TransferQueue combo:
+  plausible but unverified, not confirmed broken.** Traced the real propagation path in the
+  fetched v0.9.0 source: `verl/trainer/ppo/v1/agent_loop_tq.py` (the file behind every
+  `agent_loop_tq.py:224`-style reference elsewhere in this log) has zero direct mentions of
+  `routed_experts`/`router_replay`, but its `_agent_loop_postprocess` calls the shared, inherited
+  `AgentLoopOutput.as_dict()` (from `verl/experimental/agent_loop/agent_loop.py`, which *does*
+  carry a `routed_experts` field end-to-end when the classic non-TQ agent loop is used) and stores
+  whatever fields that produces into TransferQueue generically — so the mechanism for getting
+  `routed_experts` into TransferQueue at all appears to exist without TQ-specific code, contingent
+  on the inherited `_run_agent_loop` actually populating that field. What's genuinely untested:
+  `routed_experts` is a `[length, layer_num, topk_num]` tensor, a shape/structure this whole
+  recipe's TransferQueue debugging chain (runs 3134772–3149776, see above) never exercised — every
+  fix in that chain (TransferQueue 0.1.6→0.1.7, `list_of_dict_to_tensordict`) was validated only
+  for `input_ids`/`responses`/`attention_mask`-shaped fields, not this one.
+- **Blocker found before enabling anything**: `align_r3_router_replay_data`
+  (`verl/utils/megatron/router_replay_utils.py:341`) hard-requires nested/jagged `input_ids` —
+  `if not layers_topk_idx.is_nested or not input_ids.is_nested: raise TypeError("R3 router replay
+  requires jagged route targets and input_ids")`. This script had
+  `actor_rollout_ref.model.use_remove_padding: False`, with an existing (unattributed, no run
+  citation) comment: `# DSA attention does not support THD packed-sequence format; use BSHD`. As
+  configured, turning on R3 would not have produced an untested-but-plausible feature — it would
+  have produced a guaranteed `TypeError` on the first replay pass, since THD is exactly what
+  `use_remove_padding=True` enables and R3 cannot run without it.
+- **Researched whether this was already solved upstream** (web search, since local `../verl`
+  cannot answer questions about upstream roadmap/fixes): yes, plausibly. verl's own
+  ["Adding DeepSeek V4 support"](https://verl.readthedocs.io/en/latest/advance/deepseek_v4_integration.html)
+  doc (updated 2026-07-12) documents R2/R3 working together with THD for a DSA-based MoE model in
+  its "Model and kernel compatibility" section: *"The fused DSA kernel requires each local THD
+  shard to contain at least one CSA window. Shorter local shards must be padded before the kernel
+  call and unpadded afterward"* — a shard-size handling requirement, not a blanket
+  THD-incompatibility. Separately, Megatron-Bridge's 0.6.0 release notes explicitly advertise
+  **"GLM-5.2 with cuDNN fused DSA for 128K THD-packed context-parallel training"** — GLM's own DSA,
+  by name. This script's `Containerfile` pins `megatron-bridge>=0.5.1` with no upper bound
+  (`pip_install python "megatron-bridge>=0.5.1" ...`), so whatever image actually gets built very
+  plausibly already resolves to ≥0.6.0. This reads as the blocking comment predating a since-landed
+  upstream fix, not as a permanent architectural limit — but this is inference from public
+  docs/release notes, not a run against this exact pinned build, so still genuinely unverified for
+  GLM-5.1 specifically (the DeepSeek V4 doc and the 0.6.0 note are both about sibling/adjacent
+  models, not this one).
+- **Verdict — enabled, 2026-08-26 (user-approved after being shown the blocker and the research
+  above)**: the script now sets, in order of dependency:
+  1. `actor_rollout_ref.model.use_remove_padding: True` (was `False`) — unlocks THD, the
+     prerequisite for both R3 and the fused DSA kernel per the research above.
+  2. `actor_rollout_ref.actor.megatron.router_replay.mode: R3` — the correct, verified config
+     path (not the top-level legacy field).
+  3. `actor_rollout_ref.rollout.enable_rollout_routing_replay: True` — the SGLang-side companion
+     flag, required independently of `router_replay.mode`.
+  Also added two non-fatal diagnostic prints to the srun setup, right after the TransferQueue
+  version check: the resolved `megatron-bridge` version (warns if `<0.6.0`) and whether
+  `sglang.srt.layers.moe.routed_experts_capturer` actually imports (warns if not) — both of the
+  open assumptions above, made visible in the very next run's log instead of discovered only via
+  a downstream crash. Not fatal, since either failing will already produce a clear, specific
+  exception later (a router-replay forward error or an `AttributeError` at first
+  routed-experts-capturing generate call) rather than a silent wrong result — no need to guess
+  which assumption was wrong from a generic early abort.
+  **This is a bigger, coupled change than R3 alone** — it also flips the model's packed-sequence
+  format, an axis with its own failure history elsewhere in verl (a known, separate
+  `use_remove_padding=True` + context-parallelism grad_norm-explosion bug, irrelevant here since
+  this recipe sets no context parallelism, but real evidence this axis isn't risk-free in
+  general). The `routed_experts` TransferQueue round-trip risk from the previous version of this
+  entry — a `[length, layer_num, topk_num]` tensor shape this recipe's TQ debugging chain never
+  exercised — is also still completely untested. **Entirely unverified end-to-end — needs a
+  dedicated cluster run before any of this is trusted**, and given how much moved at once
+  (THD + R3 + two new diagnostics), a failure on the next run should not be assumed to be any one
+  of these specifically until the log says which.
+
+**Outcome, 2026-08-27 (run `3199623`, see Run log below for full detail)**: reverted. Both
+open assumptions above turned out to be real, confirmed-missing prerequisites, not just
+theoretical risk — the run's own new diagnostic prints showed `megatron-bridge version: 0.5.1`
+(not the ≥0.6.0 the THD-DSA research pointed to) and `sglang routed_experts_capturer not
+importable` (the module doesn't exist in this image's SGLang at all). The run also crashed with
+an unexplained single-rank CUDA "unspecified launch failure" in Megatron's DDP grad-buffer
+construction, immediately downstream of DSA-attention + router-replay-patch init — not
+conclusively pinned on either new flag vs. a one-off flake. All three of `use_remove_padding`,
+`router_replay.mode`, and `enable_rollout_routing_replay` are back to their pre-2026-08-26 values;
+the two diagnostic prints stay in the script (harmless, non-fatal) so a future re-attempt gets
+this signal for free. **Before trying this again**: megatron-bridge needs an actual runtime
+upgrade to ≥0.6.0 (same wheel-install-at-runtime pattern already used for TransferQueue
+0.1.6→0.1.7 in this same script — confirmed 0.6.0/0.6.1 are published on PyPI), and the SGLang
+side needs real investigation this pass didn't do: the deployed image's actual SGLang version was
+never probed (a gap in the diagnostics — should be added alongside the megatron-bridge check next
+time), and `routed_experts_capturer`'s presence looked inconsistent across the SGLang release tags
+spot-checked afterward (present in some, absent in others, plus evidence of the file having been
+relocated within the SGLang tree at some point) — this needs a clean answer, not another guess,
+before spending another allocation on it.
+
+**Outcome, 2026-08-28 (runs `3201189` then `3207151`)**: prerequisites now all met (megatron-core
+0.19.0 + megatron-bridge 0.6.1 runtime upgrade, validated on probe `3207095`; sglang
+routed-experts capture confirmed at `sglang.srt.state_capturer.routed_experts` and patched in) —
+and R3 **still fails**, now at the first-step rollout call: verl's `async_sglang_server.py`
+`skip_tokenizer_init: True` branch does `captured.numpy()` on what sglang 0.5.16 returns as a
+base64 **string**, not a tensor (`AttributeError: 'str' object has no attribute 'numpy'`,
+cluster-wide). verl's routed-experts capture is stale against this sglang across the board
+(v0.9.0 and `main` identical). This disproves this entry's earlier "plausible but unverified"
+read that R3 would work with `separate_async`+TransferQueue once prerequisites were met — the
+TransferQueue round-trip was never even reached. **Fix implemented + validated 2026-08-28**: the
+`skip_tokenizer_init` branch of verl's routed-experts capture is dead code against any current
+sglang — `r3-sglang-routed-experts-import-fix.patch` now rewrites the whole block to always
+base64-decode + reshape (shape/layout confirmed from sglang 0.5.16's own capturer source).
+**Run `3207923` cleared the whole pipeline and completed 5 clean training steps — the first this
+recipe has ever produced with R3 enabled** (loss 0.013–0.054, grad_norm 0.32–0.61, stable,
+memory in budget), plus 7 successful weight syncs. It then FAILED at ~1h40min on the 7th weight
+sync — an NCCL `ALLGATHER` desync inside megatron-bridge's Megatron→HF weight streaming
+(`gather_from_ep_ranks`), **not in R3 code** — same non-deterministic-race class as run `3141801`
+(which didn't reproduce on retry). So: the R3+THD fix itself is validated; the recipe now has a
+separate, likely-pre-existing megatron-bridge weight-sync stability question to settle (retry
+pending). See run `3207151` (diagnosis) and `3207923` (validation + the new failure) Run log
+entries.
+
+**Outcome, 2026-08-29 (run `3217439`)**: R3+THD on GLM-5.1 is validated end-to-end — **20 clean
+training steps with real GSM8K learning** (`critic/score/mean` 0.05 → ~0.15). The `3207923`
+weight-sync hang was confirmed a one-off (`3209484` cleared 12+ syncs); the `3209484` TP=32
+SGLang MLA hang was root-caused to the stale flashinfer 0.6.12 pin and **fixed** by the matched
+`flashinfer_{python,cubin}==0.6.14` pair. `3217439` then hit a *new*, marginal (24 MiB) CUDA OOM
+in the Megatron distributed optimizer at step 21 — non-PyTorch memory (NCCL / checkpoint-engine
+buffers) on the coordinator rank, torch's own peak dead-flat across all 20 steps. Proposed fix:
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` + lower `ppo_max_token_len_per_gpu`.
+Remaining open items: (a) land the step-21 OOM fix and get a longer run; (b) PR the
+`async_sglang_server.py` R3 fix upstream to verl; (c) validate the CI-built image (all the
+runtime upgrades are baked into the Containerfile now).
+
+## Image bake-in — 2026-08-28
+
+Once R3+THD was validated (run `3207923`), the runtime pip upgrades this script had been doing on
+every run were moved into `Alps-Images/apps/verl/Containerfile` so the image ships them directly,
+plus one stale-pin fix found while investigating run `3209484`:
+
+- `flashinfer_cubin==0.6.12` / `flashinfer_python[cu13]==0.6.12` → matched
+  `flashinfer_cubin==0.6.14` / `flashinfer_python[cu13]==0.6.14` from
+  `--extra-index-url https://flashinfer.ai/whl` (committed `8e6aae1`; PyPI's cubin lags at 0.6.13
+  so the matched pair must come from the flashinfer index). The 0.6.12 pin (2026-07-27) predates
+  the `sglang[all]`→0.5.16 bump and sglang 0.5.16 requires `flashinfer_python==0.6.14`; the skew
+  was the cause of run `3209484`'s TP=32 MLA `plan()` hang (fixed, validated run `3217439`).
+- `TransferQueue==0.1.6` → `==0.1.7` (line ~90).
+- `megatron-bridge>=0.5.1` (→0.5.1) / `megatron-core>=0.17.0` (→0.18.2) → pinned
+  `megatron-bridge==0.6.1` / `megatron-core==0.19.0` (line ~110), in the same single
+  `pip install -c /tmp/torch_constraints.txt ...` as before (the post-steps that restore
+  `transformers==5.8.1` / `timm==1.0.16` and bump `opentelemetry-sdk` still run after it).
+- **`sglang[all]` → `sglang[all]==0.5.16`** (2026-08-30, line ~37). Was unpinned, so a rebuild
+  resolved whatever was latest (0.5.17 / 0.5.18 by late Aug). 0.5.16 is the only recent sglang
+  whose own flashinfer requirement (`flashinfer_python[cu13]==0.6.14`) matches the Containerfile's
+  flashinfer pin — 0.5.17 wants `0.6.15.post1`, 0.5.18 wants `0.6.17`, so an unpinned sglang
+  silently reintroduces the flashinfer skew that caused run `3209484`'s MLA `plan()` hang. It is
+  also the layout the two verl-vs-sglang import-drift source patches target. sglang + flashinfer
+  must be bumped together, deliberately. (Note: sglang 0.5.16 declares `transformers==5.12.1` but
+  the Containerfile forces `transformers==5.8.1` a few lines down — a pre-existing skew that has
+  nonetheless worked for this recipe through many runs; left as-is, not part of this pin.)
+  **The `transformers==5.8.1` pin's origin** (traced 2026-08-30, commit `c8fca4a`, the commit that
+  first added megatron-bridge): `megatron-bridge` + `nvidia-modelopt[hf]` pull in a newer
+  transformers as a transitive dep, and unconstrained that resolution *also* drags
+  torch/torchvision to a different version than sglang compiled its extensions against → ABI break
+  (same family as run `3235127`'s transformer-engine break). The explicit `transformers==` /
+  `timm==` re-pin (now also `-c torch_constraints.txt`, added in `802a996`) restores what sglang
+  wants without letting torch move. The *value* `5.8.1` is just what unpinned `sglang[all]`
+  resolved to in July 2026 — now lagging sglang 0.5.16's declared `5.12.1`, hence pip's
+  non-fatal incompatibility warning at build. **Follow-up (user decision, 2026-08-30): test
+  `transformers==5.12.1` to match sglang 0.5.16, but only AFTER the current `delta_sharded`
+  validation run completes — not folded into it, since it's a deliberate re-validation of its
+  own.**
+- `ARG VERL_REF` `"v0.8.0"` → `"v0.9.0"` (line ~25). Every actively-run verl script already does
+  a runtime `git checkout -f v0.9.0` of `/workspace/verl` (both GLM v1-separate scripts, the
+  qwen-3B v1-separate script, both Apertus v1.5 benchmarks), so this makes the image match what
+  they already run and turns those runtime checkouts into no-ops. The V1 trainer
+  (`verl/trainer/ppo/v1/`) only exists in v0.9.0. Scripts that rely on the stock image verl
+  *without* a runtime checkout — `train-gsm8k-apertus-8B*.sh`, `train-gsm8k-qwen-3B.sh`,
+  `train-gsm8k-glm5.1-700B-full-async-megatron.sh` — move v0.8.0→v0.9.0 with this bump, untested
+  for those specific recipes. The CI image test (`tests/rl-async-benchmark.sh`) itself does a
+  runtime `git reset --hard` to the theely fork, so it does not exercise the stock ref either
+  way.
+
+**Status (2026-08-30)**: image **built and tagged** — `jfrog.svc.cscs.ch/.../verl:alps7-dev-a9f9e56471c0574e`
+("image with update dependencies"), from the current Containerfile. The user updated the
+`VERL_IMAGE` tag in `train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh` and asked to strip
+the now-redundant runtime upgrades. **Done** (2026-08-30): removed from that script — the
+TransferQueue / megatron-core / megatron-bridge / flashinfer wheel fetch+sbcast blocks (batch
+host) *and* the `pip install --no-deps --force-reinstall` blocks (srun), *and* the runtime
+`git fetch/checkout v0.9.0` (image is v0.9.0). Replaced the scattered version-print / R3-prereq
+diagnostics with one consolidated **non-fatal** image-version + import smoke test (`verl`,
+`TransferQueue`, `megatron-core/bridge`, `flashinfer-python/cubin`, `sglang`, `transformers`
+versions + the `megatron.training.models.gpt` / `sglang.srt.state_capturer.routed_experts` /
+`sglang...model_runner_components.weight_updater:LocalSerializedTensor` import chains) so a wrong
+image tag is obvious in ~30 s instead of via a downstream crash. Net −170 lines. **Still applied
+at runtime** (NOT in the image): the verl *source* patches — PR #7421/#7422/#7423,
+`v1-separate-async-fixes.patch`, `r3-sglang-routed-experts-import-fix.patch`,
+`wsync-debug-progress-log.patch` (diagnostic), `delta-sharded-localserializedtensor-import-fix.patch`
+— plus the megatron-bridge `safe_config_loader` filelock patch and the Lustre cache redirects.
+**Open risk**: the Containerfile does not pin `sglang` (`sglang[all]`), so this rebuild could
+have resolved a version other than 0.5.16 — which would break the two sglang-import source
+patches. The new consolidated diagnostic block checks exactly this (WARNs if either patched
+import path is absent). The other verl scripts (Apertus benchmarks, older GLM/qwen) still carry
+their own runtime upgrades and are unaffected by this cleanup — it was done only for the GLM
+v1-separate script the user pointed at the new tag.
+
+### flashinfer packaging — KEY: `flashinfer-cubin` / `flashinfer-jit-cache` are NOT (fully) on PyPI
+
+**Their real distribution channel is `https://flashinfer.ai/whl`** (a plain HTML index that serves
+the GitHub release assets, `github.com/flashinfer-ai/flashinfer/releases/download/vX.Y.Z/...`).
+flashinfer's own [install docs](https://docs.flashinfer.ai/installation.html) say to install them
+with `pip install flashinfer-cubin --index-url https://flashinfer.ai/whl` (and
+`flashinfer-jit-cache --index-url https://flashinfer.ai/whl/cu130` for a CUDA-specific JIT cache).
+
+- **PyPI `flashinfer-python`**: complete, up to date.
+- **PyPI `flashinfer-cubin`**: **incomplete / lagging** — as of 2026-08-29 it stops at `0.6.13`,
+  while `flashinfer.ai/whl` has `0.6.14` … `0.6.18`. ([GitHub issue #2133](https://github.com/flashinfer-ai/flashinfer/issues/2133)
+  is someone hitting the same PyPI gap at `0.5.3`.)
+- **PyPI `flashinfer-jit-cache`**: does not exist on PyPI at all.
+- **`flashinfer-python` >= ~0.6.14 hard-raises at import** if an installed `flashinfer-cubin` is
+  not the *exact* same version (`RuntimeError: flashinfer-cubin version (X) does not match
+  flashinfer version (Y)`). `FLASHINFER_DISABLE_VERSION_CHECK=1` bypasses it (per-kernel content-hash
+  AOT lookup + JIT fallback still work), but the clean fix is a matched pair — which requires
+  pulling the cubin from `flashinfer.ai/whl`, not PyPI.
+- **Sub-index layout**: `flashinfer.ai/whl/flashinfer-cubin/` and `.../flashinfer-python/` (arch-
+  independent `py3-none-any` wheels); `flashinfer.ai/whl/cu130/flashinfer-jit-cache/` etc. for the
+  CUDA-tagged jit-cache (`0.6.14+cu130-cp39-abi3-manylinux_2_28_aarch64.whl`). Nightlies at
+  `flashinfer.ai/whl/nightly/`.
+
+Found while debugging run `3214410` (the GLM script bumped `flashinfer-python` to 0.6.14 — sglang
+0.5.16's pin — and every worker then died on the cubin-mismatch `RuntimeError` because I had only
+checked PyPI, concluded no 0.6.14 cubin existed, and reached for the bypass). The GLM script and
+the Containerfile now install the matched `flashinfer_{python,cubin}==0.6.14` pair from
+`flashinfer.ai/whl` (the script via `${TRAINING_HOME}/wheels/` Lustre staging because the 458 MB
+cubin bus-errors on `sbcast`; the Containerfile via `--extra-index-url https://flashinfer.ai/whl`).
 
 ## Run log
 
@@ -680,10 +1175,1418 @@ had its (mis-targeted, dead) fifth patch target removed accordingly; the fourth
   projected total); this was a shakedown run, not intended to complete. **Next step for a real
   training run: bump `--time` substantially (or reduce total steps) — no further fix needed for
   the offsets/OOM/quoting issues this chain was chasing.**
-- **Cleanup still open**: the diagnostic `no_padding_2_padding` sitecustomize wrapper
-  (`example/patches/sitecustomize-verl-v0.9.0.py`, `_patch_padding_diagnostics`) is now confirmed
-  no longer needed and safe to remove on the next edit to this recipe — it was kept through this
-  run purely as confirmation.
+- **Commit**: not committed.
+
+**Follow-up cleanup (same day, no cluster cost)**: with the three real fixes (hybrid-rollout
+disable, stale weight-sync skip, `list_of_dict_to_tensordict`) confirmed stable end-to-end,
+converted them from the `sitecustomize.py` runtime monkeypatch to a plain source patch,
+`example/patches/v1-separate-async-fixes.patch`, applied via `git apply` against
+`/workspace/verl` alongside the upstream PR patches — same conversion, same reasoning, as the
+Apertus FSDP2 benchmark's equivalent (`sglang-apertus1p5-local-fixes.patch`): a monkeypatch is
+fine for fast iteration but not the form a stable fix should end up in. Verified locally before
+committing: generated the diff from a real edited `git worktree` at the v0.9.0 tag (not
+hand-written), confirmed it applies cleanly with `git apply --check` against a fresh v0.9.0
+checkout, confirmed `git apply --reverse --check` correctly detects "already applied" (the same
+idempotency check the PR-patch loop relies on), and confirmed all three edited files still
+compile. The now-diagnostic-only `no_padding_2_padding` wrapper and the whole
+`sitecustomize-verl-v0.9.0.py` mechanism (heredoc, `sbcast`, `PYTHONPATH`/`SITECUSTOMIZE_LOCAL`
+staging) are removed from both the script and the repo — this script no longer runs any
+`sitecustomize.py` at all. `example/patches/sitecustomize.py` (older, written against v0.8.0,
+never used by this script) is untouched.
+
+### Run `3152802` — 2026-08-22 — cleanup verified clean; new TP=32 SGLang broadcast hang during generation
+
+- **Log**: `~/Downloads/slurm-3152802.out`. 80 nodes, verl v0.9.0, system `clariden`. Ran the
+  full `--time=2:00:00` to `TIMEOUT` (exitCode 0) — not a fast crash, a slow one: dead in an
+  infinite retry loop for the last ~70 minutes of the run.
+- **Purpose**: verify the sitecustomize→source-patch cleanup (previous entry) introduced no
+  regression versus the confirmed-good run 3149736.
+- **Result — cleanup confirmed clean**: weight sync from trainer to standalone rollout
+  completed successfully (346.80s, ~3.97 GB/s per rank, all 32 ranks). All three converted
+  fixes verifiably took effect (no hybrid-rollout OOM, `v1-separate-async-fixes.patch` applied
+  on 80/80 nodes, no stale-weight-sync error). `TransferQueue version: 0.1.7` confirmed on all
+  80 nodes. Zero occurrences of the offsets `AttributeError` this whole chain was chasing.
+- **New, unrelated symptom**: ~9 minutes into ordinary rollout generation (well after the
+  successful weight sync), one SGLang TP rank (TP=32 across the 8-node standalone rollout)
+  fired its own 300s scheduler watchdog timeout, its py-spy dump showing it blocked inside
+  `recv_requests → _broadcast_reqs_across_ranks → torch.distributed.broadcast` — a stuck
+  NCCL/collective broadcast. Took down the whole SGLang replica (Ray `SYSTEM_ERROR`), after
+  which every `AgentLoopWorkerTQ` rollout task failed in an infinite `ActorDiedError` retry loop
+  against the now-dead actor for the rest of the run — no recovery, no restart, no further
+  training steps, just burning wall-clock until Slurm's `--time` limit killed it.
+- **Root cause**: not investigated further pending a second data point (see run 3171176) — see
+  the updated "TP=32 SGLang" entry in Known hazards above for the full mechanism and comparison
+  against the already-documented engine-rebuild deadlock hazard (this one is distinct: happened
+  during steady-state generation, not weight-sync/engine-rebuild timing).
+- **Fix**: none — resubmitted unmodified as run 3171176 to determine one-off vs. repeatable.
+- **Commit**: not committed.
+
+### Run `3171176` — 2026-08-22 — retry confirms the SGLang hang was a one-off; recipe considered solid
+
+- **Log**: `~/Downloads/slurm-3171176.out` (partial — monitoring stopped once the verification
+  purpose was met, job left running). 80 nodes, verl v0.9.0, system `clariden`. Unmodified
+  resubmission of the exact script from 3152802 — no code changes. Notably fast queue turnaround
+  this time (~99s to RUNNING, vs. minutes-to-~1h40m in prior runs).
+- **Result**: the SGLang TP=32 broadcast hang from 3152802 **did not recur**. Standalone rollout
+  came up cleanly; training reached 3 consecutive completed steps (loss -0.06 → -0.12 → -0.09,
+  grad_norm 0.17 → 0.24 → 0.18, both finite and stable; critic/reward mean 0.08 → 0.15 → 0.12,
+  noisy-but-expected for early GRPO) spanning ~15–29 minutes after rollout startup — comfortably
+  past the ~9-minute mark where 3152802 died. Zero occurrences anywhere in the log of the
+  watchdog-timeout/`SYSTEM_ERROR`/`ActorDiedError`/stuck-broadcast signature. `TransferQueue
+  version: 0.1.7` and all four patches (PR #7421/#7422/#7423 + `v1-separate-async-fixes.patch`)
+  confirmed applied cleanly on 80/80 nodes again. Only noise: the already-documented benign
+  Triton-autotune-cache `Stale file handle` atexit errors.
+- **Conclusion**: 3152802's hang is a one-off infra flake (most likely Slingshot/NCCL over the
+  8-node TP=32 group), not a repeatable bug — no code differs between the two runs, and the
+  second run cleared the exact window where the first one died. **The recipe end-to-end
+  (hybrid-rollout OOM fix, `list_of_dict_to_tensordict` fix, TransferQueue 0.1.7 upgrade, and
+  the sitecustomize→source-patch cleanup) is now considered solid.** If the TP=32
+  watchdog/broadcast signature recurs in any future run, treat it as a real, repeatable hazard
+  worth investigating from the py-spy dump — but on the evidence so far it isn't one.
+- **Commit**: not committed.
+
+### Run `3199623` — 2026-08-27 — R3 + THD test: both new prerequisites confirmed missing, new unexplained CUDA crash, reverted
+
+- **Log**: `~/Downloads/slurm-3199623.out` (416,701 bytes / 5,198 lines). 80 nodes, verl v0.9.0,
+  system `clariden`. FAILED after ~275s (~4.6 min) — exitCode 15, never reached weight loading or
+  SGLang rollout startup.
+- **Purpose**: first real test of the 2026-08-26 Configuration audit change — R3 router replay
+  plus the `use_remove_padding: True` it depends on, both entirely new to this recipe.
+- **The two new diagnostic prints (the run's other purpose) both surfaced real, confirmed
+  gaps**: `megatron-bridge version: 0.5.1` (not the ≥0.6.0 the THD-DSA research pointed to —
+  its accompanying `WARNING` fired on all 80 nodes) and `WARNING: sglang routed_experts_capturer
+  not importable (No module named 'sglang.srt.layers.moe.routed_experts_capturer')` (also all 80
+  nodes) — this image's `sglang[all]` build has no such module at all, so R3's rollout-side
+  capture cannot function regardless of anything on the Megatron side.
+- **Symptom**: never reached SGLang or weight loading (zero SGLang log lines, no `Loading
+  weights`). All 287/288 trainer ranks got as far as: `enable_routing_replay in MegatronEngine:
+  True` → `Applying Router Replay Patch...` → (non-fatal) `Only support config type of [...], but
+  got glm_moe_dsa. MFU will always be zero` (R3's model-type allowlist doesn't include
+  `glm_moe_dsa` — cosmetic) → (non-fatal, already-known DSA hazard) `fast_hadamard_transform is
+  unavailable; falling back to a pure-torch Walsh-Hadamard transform` → per-rank parameter counts.
+  Then one single worker (`pid=252380, ip=172.28.44.120`) crashed:
+  ```
+  File ".../megatron/core/distributed/param_and_grad_buffer.py", line 1216, in __init__
+      param.data.detach().copy_(old_param_data)
+  torch.AcceleratorError: CUDA error: unspecified launch failure
+  ```
+  Only one occurrence of any CUDA/NCCL error in the whole log; every other rank was killed
+  afterward via Ray, not independently faulting.
+- **Root cause — not conclusively found.** "unspecified launch failure" is CUDA's generic
+  async-reported symptom of an earlier bad kernel launch (the traceback itself warns the reported
+  stack may be misleading). It hit in Megatron's DDP grad-buffer construction, immediately
+  downstream of DSA-attention + router-replay-patch init — the two code paths this run newly
+  exercises. Best-supported explanation: a bad/unsupported CUDA kernel invocation somewhere in
+  DSA's THD-jagged handling or the router-replay patch on this specific (too-old, per the
+  diagnostic) megatron-bridge version, corrupting the CUDA context, surfacing on an unrelated
+  buffer copy a few calls later. Does not match the signature or phase of any previously
+  documented hazard for this script (OOM, Gloo hang, sequence_parallel assertion, lr_decay_steps,
+  filelock, xielu, TP=32 hang) — genuinely new. Caveat: only 1 of 288 ranks hit it, so a one-off
+  hardware/driver flake on that single GPU can't be fully ruled out either; unlike the TP=32 hang
+  precedent (3152802/3171176), this was never retried unmodified to check.
+- **Note on job lifecycle**: a cancellation was attempted mid-investigation (before the failure
+  was confirmed) — `DELETE`/`scancel` returned HTTP 500 / `Invalid job id specified`, because the
+  job had already gone terminal in Slurm before the cancel reached it. No effect either way; the
+  job's actual failure is what's documented here, not a cancellation.
+- **Fix**: reverted. `actor_rollout_ref.model.use_remove_padding` back to `False`,
+  `actor_rollout_ref.actor.megatron.router_replay` removed (back to disabled),
+  `actor_rollout_ref.rollout.enable_rollout_routing_replay` removed (back to unset/`False`) — see
+  this script's Configuration audit entry above for the full reasoning and what a real re-attempt
+  needs (megatron-bridge upgraded to ≥0.6.0 at runtime, and a real, unguessed answer on the
+  deployed image's actual SGLang version and where `routed_experts_capturer` actually lives in
+  it). The two diagnostic prints themselves stay in the script — harmless, non-fatal, and useful
+  signal for whenever this is retried.
+- **Commit**: not committed.
+
+### Probe job `3199799` — 2026-08-27 — cheap 1-node check answers both open questions from 3199623
+
+- **Log**: `~/Downloads/slurm-3199799.out`. 1 node, `clariden`, ran 61s, COMPLETED. Not a training
+  run — a minimal probe (no verl checkout, no config) that starts the same image and just prints
+  installed package versions and searches the installed `sglang` tree for the router-replay
+  capture feature. Submitted specifically to avoid spending another 80-node allocation on
+  diagnostics alone.
+- **Installed versions**: `sglang: 0.5.16`, `megatron-bridge: 0.5.1`, `megatron-core: 0.18.2`,
+  `transformers: 5.8.1`, `torch: 2.11.0`, `TransferQueue: 0.1.6`. Confirms 3199623's
+  `megatron-bridge` finding exactly; `TransferQueue: 0.1.6` matches the Containerfile's hard pin
+  (expected — this script's own runtime upgrade to 0.1.7 only takes effect inside the real GLM
+  script's srun, not this bare probe).
+  `sglang[all]` has no version pin anywhere in `Alps-Images/apps/verl/Containerfile` (confirmed
+  by reading it directly) — 0.5.16 is simply whatever PyPI resolved to at image-build time, and
+  this probe is now the only record of what that actually is.
+- **`routed_experts_capturer` — found, not missing, just relocated.** Not importable at
+  `sglang.srt.layers.moe.routed_experts_capturer` (the path verl v0.9.0's
+  `async_sglang_server.py` imports from) — but a full filename+content search of the installed
+  `sglang` tree found it at `sglang/srt/state_capturer/routed_experts.py` (module renamed too,
+  `routed_experts_capturer.py` → `routed_experts.py`), with `enable_return_routed_experts`
+  present in both `srt/server_args.py` and that same new file. **This is verl v0.9.0 shipping a
+  stale import path against sglang 0.5.16's current layout, not a genuinely missing feature** —
+  changes the fix from "wait for an upstream feature" to "patch one import path," much smaller in
+  scope than previously assumed.
+- **Two independent, now precisely-scoped fixes needed before retrying R3 + THD**:
+  1. Patch verl's `async_sglang_server.py` to import from `sglang.srt.state_capturer.routed_experts`
+     instead of `sglang.srt.layers.moe.routed_experts_capturer` — small, source-level, same
+     `find_spec`/source-patch discipline already used elsewhere in this script.
+  2. Upgrade `megatron-bridge` from 0.5.1 to ≥0.6.0 at runtime — same wheel-fetch/sbcast/install
+     pattern already proven for `TransferQueue` 0.1.6→0.1.7 in this exact script.
+  Neither has been implemented yet as of this entry.
+- **Commit**: not committed.
+
+**Implementation, 2026-08-27 (same day)**: both fixes above are now in the script, neither yet
+tested on a cluster.
+
+1. **SGLang import-path fix** — new checked-in patch,
+   `example/patches/r3-sglang-routed-experts-import-fix.patch`, a one-line change to
+   `verl/workers/rollout/sglang_rollout/async_sglang_server.py` re-pointing the lazy import from
+   `sglang.srt.layers.moe.routed_experts_capturer` to `sglang.srt.state_capturer.routed_experts`.
+   Verified before wiring in, same discipline as every other patch in this file: generated from a
+   real edited `git worktree` at the v0.9.0 tag (not hand-written), confirmed `extract_routed_
+   experts_from_meta_info` exists with the same name/signature at the new path by fetching the
+   real `sglang` `v0.5.16` tag source directly, confirmed the patch applies cleanly
+   (`git apply --check`) and the patched file compiles (`python3 -m py_compile`) against a fresh
+   v0.9.0 checkout, and confirmed `git apply --reverse --check` correctly detects "already
+   applied." Embedded into the script as a heredoc (same `BASH_SOURCE[0]`-under-`sbatch` reasoning
+   as `v1-separate-async-fixes.patch`), `sbcast`, and applied via the same
+   apply-or-already-present-or-fatal `git apply` loop as the other verl-source patches, right
+   after `v1-separate-async-fixes.patch`. Caught and fixed one real bug while wiring this in: the
+   round-trip risk this repo has hit before (Write/Edit silently trimming a trailing
+   whitespace-only line, per the Apertus FSDP2 broadcast-diagnostic incident) was avoided by
+   building the checked-in patch file from a real `git diff` output via direct file
+   concatenation rather than retyping it, and verified byte-identical between the checked-in file
+   and what actually landed in the script's heredoc by extracting it back out and diffing.
+2. **megatron-bridge upgrade** — 0.5.1 → 0.6.1 (the latest published release; 0.6.0 also exists
+   but 0.6.1 is newer by version number despite an earlier PyPI upload timestamp, an oddity not
+   investigated further). Both were published to PyPI on 2026-08-19/20 — about a week before this
+   image's probe found it resolved to 0.5.1, consistent with the earlier theory that the image
+   simply predates 0.6.0's release rather than something pinning it down. Fetched the real wheel
+   (`megatron_bridge-0.6.1-py3-none-any.whl`), verified its sha256 locally before embedding the
+   hash in the script, and wired it in with the same fetch-once/sbcast/`pip install --no-deps
+   --force-reinstall`/verify-version-by-printing-it pattern already proven for TransferQueue
+   0.1.6→0.1.7 in this exact script. Placed the install **before** the existing
+   `safe_config_loader` filelock patch (which targets a file inside the `megatron-bridge`
+   package) — ordering matters, since `--force-reinstall` rewrites every file in the package and
+   would silently undo a patch applied to it beforehand. One genuinely unverified residual risk,
+   stated plainly in the script's own comment: `megatron-bridge` 0.6.1's PyPI metadata declares an
+   unversioned `megatron-core[dev,mlm]` dependency (no explicit floor), so leaving the image's
+   `megatron-core` at 0.18.2 via `--no-deps` is plausible but not confirmed compatible with
+   0.6.1's actual code — first real signal on this is whether the next run gets past model
+   construction, not something checkable without a run.
+
+Also updated the existing `routed_experts_capturer` diagnostic print to check the new, confirmed
+path instead of the old one (and to separately flag if the *old* path unexpectedly starts working
+too, which would mean the deployed sglang changed again and the patch itself needs
+re-pointing) — otherwise the diagnostic would keep reporting the exact problem the new patch just
+fixed. **While editing that diagnostic's comment text, introduced and then caught (via the
+established stray-single-quote scan of the whole `srun bash -c '...'` body, not by a failed run)
+two literal apostrophes — "the image's sglang" and "that isn't guaranteed" — inside the outer
+single-quoted wrapper: the exact run-3149339 quoting hazard.** Both rephrased to avoid
+apostrophes entirely and the full body re-scanned clean before considering this done. Every
+change in this implementation pass is entirely unverified end-to-end by an actual cluster run.
+
+### Run `3201189` — 2026-08-27 — third R3+THD attempt: a new quoting bug, then the real megatron-core blocker
+
+- **Log**: `~/Downloads/slurm-3201189.out` (also fetched directly to
+  `scratchpad/slurm-3201189-check.out` while diagnosing). 80 nodes, verl v0.9.0, system
+  `clariden`. FAILED, exitCode 15, elapsed 4142s (~69 min) — the longest of the three R3 attempts
+  by far, and the first to actually reach real model construction.
+- **Submission itself hit two layers of friction, both resolved, neither a real infra problem**:
+  (1) background `train-launcher` dispatches were blocked twice by the Claude Code auto-mode
+  permission classifier before ever reaching FirecREST — resolved by submitting directly from the
+  foreground coordinator session instead, where a live human could approve; (2) that direct
+  submission then hit two separate brief CSCS-wide `clariden` outages (scheduler/SSH/filesystems
+  unhealthy, confirmed via `/status/systems`) — one during submission (HTTP 503, cleared in
+  ~1 minute) and one mid-run (~21 minutes, cleared on its own). Both self-resolved; neither related
+  to this recipe.
+- **Bug 1 (self-inflicted, found and fixed same day): a backtick inside an unquoted heredoc.**
+  The very first line of the log was `slurm_script: line 104: router_replay:: command not found` —
+  bash trying to *execute* `router_replay: {mode: R3}` as a command. Root cause: the
+  `grpo_gsm8k.yaml` heredoc uses an **unquoted** delimiter (`<<- EOF`, not `<<- 'EOF'`), so
+  backticks inside it trigger real command substitution — and the 2026-08-26 audit-entry comment
+  had written `` `router_replay: {mode: R3}` `` in backticks (markdown-style code formatting) as
+  plain English prose, not realizing this heredoc evaluates its content as shell. Confirmed by
+  reproducing locally (`bash -x` on the script's own first ~285 lines reproduced the identical
+  error and pinpointed the exact backtick pair via the `++` xtrace prefix) — **not a cluster
+  artifact, deterministic in a local sandbox too.** Verified the actual functional YAML was
+  unaffected (the real `router_replay:`/`mode: R3` keys are on separate lines a few rows down,
+  untouched — only the one comment line's text was garbled, replaced with the backtick command's
+  empty stdout), so R3's config was not the reason this run ultimately failed. Fixed by removing
+  the backticks; **found and fixed a second, self-introduced instance of the identical bug while
+  editing this same comment block during the subsequent revert** (a
+  `` `ModuleNotFoundError: ... 'megatron.training.models.gpt'` `` backtick-quoted error message,
+  same heredoc) — this class of hazard needs checking on every edit to these heredocs, the same
+  way the single-quote scan is already routine for the `srun bash -c '...'` body. **New standing
+  rule, added to Known hazards below: any edit inside an unquoted heredoc (`env.toml`,
+  `grpo_gsm8k.yaml`, `gsm8k_reward.py`, `prepare_gsm8k.py`) must be scanned for backticks and bare
+  `$(`/`$VAR`, the same discipline already applied to the single-quoted `srun` body for stray `'`.**
+- **Bug 2 (the real blocker): megatron-bridge 0.6.1 requires megatron-core ~0.19.0, not this
+  image's 0.18.2.** After the backtick fix, the run got further than either prior R3 attempt —
+  past setup, patch application (`r3-sglang-routed-experts-import-fix.patch` and all others
+  applied cleanly on all reporting nodes), and into real `actor_rollout_init_model()` — but every
+  worker hit `ModuleNotFoundError: No module named 'megatron.training.models.gpt'`, traced through
+  `megatron/bridge/training/config.py` → `megatron/bridge/models/gpt/gpt_builder.py` →
+  `from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, mtp_block_spec`, from
+  inside `create_ddp_config` — called unconditionally during Megatron model setup, **not gated on
+  R3 or THD at all**. Root-caused (no cluster cost — pure research after the log came back):
+  megatron-bridge's PyPI metadata declares an unversioned `megatron-core[dev,mlm]` dependency (no
+  floor), but its actual GitHub repo pins an exact `3rdparty/Megatron-LM` git submodule commit —
+  fetched that commit's `megatron/core/package_info.py` directly from GitHub for the `v0.6.0` tag
+  and confirmed it declares `MAJOR = 0, MINOR = 19, PATCH = 0` — i.e. megatron-bridge 0.6.x is
+  built and tested against Megatron-Core **0.19.0**, a real, non-adjacent jump from this image's
+  0.18.2. A benign side-effect confirming the mismatch further: ~40+ repeated (one per worker)
+  `UserWarning: Failed to import modelopt megatron.bridge plugin due to: ImportError("cannot
+  import name 'MegatronMappingRegistry' from partially initialized module ...")` earlier in the
+  same log — non-fatal on its own, but the same underlying version skew.
+- **Fix**: reverted, more thoroughly than the 3199623 revert. All three R3/THD flags back to
+  disabled (same as before), **and the megatron-bridge 0.6.1 upgrade itself fully removed** (wheel
+  fetch/sbcast on the batch host, and the `pip install --no-deps --force-reinstall` in the srun) —
+  this one doesn't just gate an unused feature when reverted, it was actively breaking core
+  Megatron model construction for *any* config, so leaving it in place at all was strictly worse
+  than the pre-this-session baseline. The `r3-sglang-routed-experts-import-fix.patch` stays
+  applied (harmless, independently correct, just unexercised while R3 is off). The two diagnostic
+  prints (megatron-bridge version, sglang routed-experts-capture path) stay too — the
+  megatron-bridge one will now correctly report `0.5.1` with its `<0.6.0` warning again, which is
+  accurate. Verified locally before considering this done: reproduced the script's first 282 lines
+  in a local sandbox after all fixes and got a clean run with no unexpected errors; `bash -n` and
+  full backtick/stray-quote sweeps (both the single-quoted `srun` body and all four unquoted
+  heredocs) pass clean.
+- **What a real next attempt needs**: this is now confirmed to require upgrading megatron-core
+  alongside megatron-bridge, not megatron-bridge alone — and unlike megatron-bridge (a pure-Python
+  wheel), megatron-core has real CUDA/compiled-extension dependencies (see the Containerfile's own
+  `fast-hadamard-transform` stub workaround for `megatron-core[dev,mlm]`), so a naive
+  `--no-deps` version bump carries meaningfully more risk of a *new*, different breakage (ABI/CUDA
+  mismatch) than anything fixed so far in this chain. Given this is now the second consecutive
+  real 80-node failure for this feature (3199623, 3201189), a third attempt should not be another
+  blind version-bump guess — it needs either (a) real investigation into whether megatron-core
+  0.19.x installs cleanly and stays ABI-compatible with this image's torch/CUDA stack before ever
+  touching the training recipe again, or (b) treating this as an image-level fix (bumping both
+  pins together in the Containerfile, rebuilt and tested through the normal CI pipeline) rather
+  than a runtime patch. Not attempted in this session — flagged for explicit user decision before
+  any further cluster spend on this feature.
+- **Commit**: not committed.
+
+**Follow-up, 2026-08-28 (user explicitly authorized): investigated and fixed the megatron-core
+gap properly, validated cheaply, then wired into the real script for a third attempt.**
+
+Research (no cluster cost): megatron-core 0.19.0 publishes a real `bdist_wheel` for this exact
+platform — `cp312` (matches the image's Python 3.12), `manylinux_2_24_aarch64.manylinux_2_28_aarch64`
+(matches GH200/aarch64) — confirmed by inspecting the wheel directly: only **one** compiled
+extension inside (`megatron/core/datasets/helpers_cpp...so`, a CPU-only dataset-helper, no
+CUDA/torch-ABI-sensitive code), and it does contain the previously-missing
+`megatron/training/models/gpt.py`. Much lower risk than a generic "compiled package" swap would
+suggest — most of Megatron-Core's actual CUDA-heavy code lives in separate packages
+(`transformer-engine`, `apex`, `flash-attn`) that this wheel imports at runtime but doesn't bundle.
+
+### Probe job `3207054` — 2026-08-28 — first validation attempt: a probe-script bug, not a real problem
+
+- **Log**: `~/Downloads/slurm-3207054.out`. 1 node, `clariden`. FAILED in 34s.
+- **Symptom**: `ERROR: Invalid wheel filename (wrong number of parts):
+  'megatron_core-0.19.0-cp312-aarch64'` — the probe script's own `curl -o` saved the downloaded
+  wheel under a shortened local filename that dropped required parts of the real 5-hyphen-part
+  wheel filename (`megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl`).
+  pip parses metadata from a local wheel's filename directly and rejects anything that doesn't
+  match the exact format, so the install (and every import smoke test after it) never ran.
+- **Confirmed unaffected**: both wheels (megatron-bridge 0.6.1, megatron-core 0.19.0) downloaded
+  and sha256-verified cleanly; baseline versions matched the existing write-up exactly
+  (`megatron-bridge: 0.5.1`, `megatron-core: 0.18.2`).
+- **Fix**: corrected the probe script to preserve the real full wheel filename throughout
+  (download target, sha256 check, and the `pip install` call) — a scratch-script bug, not
+  something that touched the real training script. Resubmitted immediately as `3207095`.
+
+### Probe job `3207095` — 2026-08-28 — megatron-bridge 0.6.1 + megatron-core 0.19.0 confirmed compatible
+
+- **Log**: `~/Downloads/slurm-3207095.out`. 1 node, `clariden`. **COMPLETED** in ~150s.
+- **Result**: both wheels installed cleanly (`pip install --no-deps --force-reinstall`, megatron-core
+  first then megatron-bridge, matching how the real script now orders them). Post-upgrade versions
+  confirmed via `importlib.metadata`: `megatron-bridge: 0.6.1`, `megatron-core: 0.19.0`.
+- **Every smoke test passed**: the exact import chain that crashed real run `3201189`
+  (`megatron.bridge.training.config.DistributedDataParallelConfig`) — OK. The specific
+  previously-missing module (`megatron.training.models.gpt` — `GPTModelBuilder`, `GPTModelConfig`,
+  `mtp_block_spec`) — OK. A broader sweep of 9 other `megatron.core`/`megatron.bridge` import
+  paths verl itself uses — 9/9 OK. The GLM-5.1-specific bridge module
+  (`megatron.bridge.models.glm_moe_dsa`) — OK. The previously-observed benign `modelopt`
+  circular-import `UserWarning` still fires (explicitly marked ignorable by modelopt itself,
+  unchanged from before the upgrade) — no new warnings or errors introduced.
+- **Caveat, stated plainly**: this validates that both packages *import* cleanly together and that
+  the specific broken chain now resolves. It does not validate actual model construction, forward/
+  backward passes, or anything GPU-execution-level — a 1-node probe with no real model/weights
+  can't test that. The real signal on those still requires the 80-node recipe itself.
+- **Fix wired into the real script** (`train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh`),
+  same day: replaced the removed megatron-bridge-only upgrade with a combined
+  megatron-core-then-megatron-bridge upgrade (same fetch-once/sbcast/`--no-deps
+  --force-reinstall` pattern as TransferQueue and the original megatron-bridge attempt), added a
+  megatron-core version + `megatron.training.models.gpt` import check to the existing diagnostic
+  block, and re-enabled all three R3/THD flags (`use_remove_padding`, `router_replay.mode: R3`,
+  `enable_rollout_routing_replay`) for a third real attempt. Verified locally before considering
+  this done: `bash -n`, the full stray-single-quote scan of the `srun bash -c '...'` body, and the
+  full backtick scan of all four unquoted heredocs (per the new standing rule from run `3201189`'s
+  entry above) all pass clean; reproduced the script's own YAML-generation portion in a local
+  sandbox with no unexpected output; confirmed the megatron-core wheel filename is byte-identical
+  across all 5 places it appears in the script (learned from probe `3207054`'s bug). **Entirely
+  unverified end-to-end on the real 80-node recipe — this is the third real attempt, needs a run.**
+
+### Run `3207151` — 2026-08-28 — fourth R3+THD attempt: both prior blockers cleared, first-ever R3 rollout, new failure in verl's routed-experts capture (stale vs sglang 0.5.16)
+
+- **Log**: `~/Downloads/slurm-3207151.out` (9660 lines / 953 KB, intact; backup at
+  `scratchpad/goodlog.out`). 80 nodes, verl v0.9.0, system `clariden`. Submitted PENDING, ran
+  ~39 min, then **user-authorized `scancel`** (FirecREST `DELETE /compute/clariden/jobs/3207151`
+  → HTTP 204, state `CANCELLED`) once the failure was confirmed unrecoverable — it was in a
+  cluster-wide infinite rollout-retry loop that would otherwise have burned the full 5h wall
+  limit (the driver never incremented its own `failure` counter — `running: 24, finished: 0,
+  failure: 0` held for ~7 min — because `AgentLoopWorkerTQ` retries internally forever).
+- **Purpose**: first real test of the combined megatron-core 0.19.0 + megatron-bridge 0.6.1
+  runtime upgrade (validated on probe `3207095`) with all three R3/THD flags re-enabled.
+- **Furthest any R3+THD attempt has ever reached — both historical blockers are genuinely
+  fixed**, confirmed by this run's own diagnostic prints and progress:
+  - `megatron-core version: 0.19.0`, `megatron-bridge version: 0.6.1`,
+    `megatron.training.models.gpt: OK` (the exact `ModuleNotFoundError` that killed `3201189`),
+    `sglang routed_experts capture: OK at sglang.srt.state_capturer.routed_experts`,
+    `TransferQueue version: 0.1.7` — every check green.
+  - Passed `DistributedDataParallel contains 9.24B parameters` cleanly — the exact
+    `_ParamAndGradBuffer.__init__` line where `3199623` died with a CUDA "unspecified launch
+    failure". No CUDA error this run.
+  - GLM5Bridge HF→Megatron weight conversion completed (`Loading from /tmp/glm_model_3207151 ...
+    100% (6201/6201)`).
+  - First trainer→rollout NCCL weight sync completed (`Rank 0 send weights done, 307.09s` /
+    `Rank 25 receive weights done, total_params: 59079, 309.02s, 4.48 GB/s`, world_size 33).
+  - SGLang standalone rollout serving (8-node replica, `HTTP server started`, DSA backends
+    `flashmla_sparse`/`fa3`).
+  - R3 router-replay patch initialized on all 288 trainer ranks
+    (`enable_routing_replay in MegatronEngine: True`, `Applying Router Replay Patch...`,
+    `routing replay layers: 23`/`26` per PP rank).
+  - `Training Progress: 0/40` — training loop entered; TransferQueue live (first
+    PUT_DATA/KV_RETRIEVE ops). Then failed at **first-step rollout generation** — no step
+    metrics line ever produced.
+- **Symptom**: every rollout call crashed, cluster-wide, first occurrence ~logline 6968:
+  ```
+  File ".../verl/workers/rollout/sglang_rollout/async_sglang_server.py", line 660, in generate
+      routed_experts = captured.numpy() if captured is not None else None
+  AttributeError: 'str' object has no attribute 'numpy'
+  ```
+  Path: `single_turn_agent_loop.run` → `server_manager.generate` → `llm_server.py:274`
+  `server.generate.remote` → `SGLangHttpServer.generate`. Surfaced to `AgentLoopWorkerTQ` as
+  `RayTaskError(AttributeError)`. Only one root cause in the entire log.
+- **Root cause — verl's routed-experts capture is stale against sglang 0.5.16, one layer below
+  the import-path patch.** `async_sglang_server.py`'s `enable_rollout_routing_replay` block has
+  two branches (verl v0.9.0 *and* current `main`, identical):
+  - `skip_tokenizer_init: True` (**this recipe** — confirmed `'skip_tokenizer_init': True` in the
+    log's rollout config dump): `captured = output["meta_info"].get("routed_experts");
+    routed_experts = captured.numpy() if captured is not None else None` — assumes `captured` is
+    a torch tensor (an **old** sglang behavior).
+  - `skip_tokenizer_init: False`: `from sglang.srt.layers.moe.routed_experts_capturer import
+    extract_routed_experts_from_meta_info` then
+    `extract_routed_experts_from_meta_info(output).reshape(-1, num_hidden_layers,
+    num_experts_per_tok)`.
+  `example/patches/r3-sglang-routed-experts-import-fix.patch` re-pointed the import **in the
+  `else` branch only** — but this recipe's TP=32 standalone rollout takes the **first** branch,
+  which never uses that import. In sglang 0.5.16, `output["meta_info"]["routed_experts"]` is a
+  **base64-encoded string** (confirmed by reading `sglang/srt/state_capturer/routed_experts.py`
+  at the `v0.5.16` tag: `extract_routed_experts_from_meta_info` does
+  `np.frombuffer(pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32)` and
+  returns a **flat** `np.int32` array). So `.numpy()` on a `str` → `AttributeError`. The
+  `else`-branch path — decode the base64, then `.reshape(-1, num_hidden_layers,
+  num_experts_per_tok)` — is the one that actually matches sglang 0.5.16; the `skip_tokenizer_init`
+  shortcut is simply obsolete.
+- **Fix — implemented 2026-08-28, unverified on cluster.** Expanded
+  `example/patches/r3-sglang-routed-experts-import-fix.patch` (checked-in file + the script's
+  heredoc copy, verified byte-identical) from the earlier import-path-only one-liner to a
+  full rewrite of the `enable_rollout_routing_replay` block in `async_sglang_server.py`: it
+  **drops the dead `skip_tokenizer_init` tensor branch entirely** and always goes through
+  `extract_routed_experts_from_meta_info(output).reshape(-1, num_hidden_layers,
+  num_experts_per_tok)` (imported from `sglang.srt.state_capturer.routed_experts`, with an
+  `ImportError` fallback to the old `sglang.srt.layers.moe.routed_experts_capturer` path so it's
+  also valid against older sglang / as an upstream PR). Keeps the `captured is not None` guard
+  and the `hf_config` `hasattr` check.
+  - **The layer-count-reshape worry from the earlier draft of this entry is resolved** — read
+    sglang 0.5.16's `state_capturer/routed_experts.py` directly: `RoutedExpertsCapturer`
+    allocates its buffer `num_layers = hf_text_config.num_hidden_layers` wide (dense-layer slots
+    stay zero), so reshaping by `num_hidden_layers` is exactly right. The trainer's MoE-only
+    recording (`routing replay layers: 23`/`26`) is an *internal* detail with its own
+    `index_by_layer` handling in `router_replay_utils.py:453` — it does not have to match the
+    rollout-captured tensor's layer dimension.
+  - `glm_moe_dsa` exposing `num_hidden_layers`/`num_experts_per_tok` as flat top-level config
+    fields is confirmed indirectly: sglang's own capturer reads the same two fields off
+    `hf_text_config` and constructed successfully this run (the rollout served and produced the
+    base64 output). transformers' `glm4_moe` config has both as flat fields; `glm_moe_dsa` is a
+    flat extension of it. If a future checkpoint nests them, the `hasattr` guard raises a clear
+    error rather than mis-shaping.
+  - **Verified locally before wiring in**: patch generated from a real edited `git worktree` at
+    the v0.9.0 tag (not hand-written), applies cleanly (`git apply --check`) + compiles
+    (`py_compile`) + `git apply --reverse --check` detects already-applied against a fresh
+    checkout; heredoc byte-identical to the checked-in file (spliced in programmatically, not
+    retyped, to avoid the trailing-whitespace-trim hazard); `bash -n` + the quoted-heredoc tab
+    check pass; and a standalone Python simulation of the full decode path (base64 int32 buffer →
+    `np.frombuffer` → `.reshape` → the `agent_loop.py:800-804` read-only-array unpack) round-trips
+    correctly and produces `(num_tokens, num_hidden_layers, num_experts_per_tok)`. Not testable
+    locally: actual `hf_config` field presence on the deployed checkpoint, and the trainer-side R3
+    alignment end-to-end with this tensor.
+- **Plan (user decision, 2026-08-28): (1) validate this fix on a cluster run, then (2) PR it
+  upstream** — verl's `skip_tokenizer_init` routed-experts branch is dead code against any
+  current sglang (v0.9.0 *and* `main` are identical), so this is a genuine upstream bug worth
+  fixing there. This is the fourth consecutive R3+THD failure (3199623, 3201189, 3207151, plus
+  the 2026-08-26 config-audit revert), each one layer deeper — but unlike the prior three, this
+  fix is against a fully-understood mechanism with the shape/layout confirmed from sglang's own
+  source, not a version-bump guess. Still needs a real 80-node run before it's trusted (per
+  memory `hpc_job_fix_then_ask`, ask before resubmitting).
+- **Outcome: validated — run `3207923` (2026-08-28) completed the first training steps this
+  recipe has ever produced with R3 enabled.** See that run's entry below. Step (2) — the upstream
+  verl PR — is the remaining open item.
+- **Config-audit note**: this run *disproves* the 2026-08-26 audit entry's tentative "plausible
+  but unverified" read that R3 would work with `separate_async` + TransferQueue given the
+  prerequisites — the prerequisites are all now met and it still fails, at the sglang-capture API
+  boundary rather than anywhere in the TQ round-trip. The TQ path was never reached.
+- **Infra note**: one ~6-min clariden SSH-service outage mid-run (CSCS-side, `/status/systems`
+  confirmed, self-recovered) plus a few transient FirecREST job-status timeouts — none affected
+  the job. A monitor-script bug briefly overwrote the local log with a 119-byte error stub during
+  one timeout; restored from backup, final log verified intact.
+- **Fix**: expanded `r3-sglang-routed-experts-import-fix.patch` to rewrite the whole
+  `enable_rollout_routing_replay` block (drop the dead `skip_tokenizer_init` `.numpy()` branch;
+  always base64-decode + reshape). All three R3/THD flags and the megatron-core 0.19.0 +
+  megatron-bridge 0.6.1 upgrade stay enabled. See the "Fix — implemented 2026-08-28" bullet
+  above for the full detail and local verification. Validated on run `3207923` (next entry).
+- **Commit**: not committed.
+
+### Run `3207923` — 2026-08-28 — R3+THD fix VALIDATED (5 clean steps, first ever with R3); later FAILED on a megatron-bridge weight-sync NCCL desync unrelated to R3
+
+- **Log**: `~/Downloads/slurm-3207923.out`. 80 nodes, verl v0.9.0, system `clariden`. ~43 min
+  queued (FirecREST/Slurm-controller was intermittently timing out cluster-wide during the wait —
+  scheduler overload, same transient pattern as run 3201189; job submission itself also hit one
+  transient HTTP 500 "Channel not open" and succeeded on retry, verified no duplicate job).
+  Started 11:27:38, RUNNING.
+- **Purpose**: validate the expanded `r3-sglang-routed-experts-import-fix.patch` (the
+  base64-decode fix from run `3207151`'s entry) end-to-end.
+- **Result — the `'str' object has no attribute 'numpy'` bug is fixed.** Zero occurrences of that
+  `AttributeError` / any `routed_experts` / `RayTaskError` / `ActorDiedError` / retry-loop
+  signature anywhere in the log. Full pipeline cleared for the first time with R3 on:
+  - All 5 diagnostic version prints green (`megatron-core 0.19.0`, `megatron-bridge 0.6.1`,
+    `megatron.training.models.gpt: OK`, `sglang routed_experts capture: OK at
+    sglang.srt.state_capturer.routed_experts`, `TransferQueue 0.1.7`).
+  - All patches applied cluster-wide (PR #7421/#7422/#7423, `v1-separate-async-fixes.patch`, the
+    expanded `r3-sglang-routed-experts-import-fix.patch`, megatron-bridge filelock patch).
+  - DDP grad-buffer construction (`DistributedDataParallel contains 9.24B parameters` — past the
+    3199623 crash point), GLM5Bridge weight conversion (6201/6201), first trainer→rollout weight
+    sync, SGLang rollout serving (HTTP up 11:37:36), rollout generation, R3 router replay active
+    (`routing replay layers: 26`).
+- **Training steps (the success bar — never reached before with R3)**:
+  - Step 1: `actor/loss` 0.0269, `actor/grad_norm` 0.420, `ppo_kl` 0.421, `critic/score` mean
+    0.092 (max 1.1), peak mem 77.9 GB, step time 518s (gen 120s / update_actor 86s /
+    update_weights 309s).
+  - Step 2: `actor/loss` 0.0128, `actor/grad_norm` 0.318, `ppo_kl` 0.350, `critic/score` mean
+    0.023, step time 344s, `trajectory_staleness` 1 (expected for separate-async).
+  - Steps 3–4: `actor/loss` 0.032 / 0.054, `actor/grad_norm` 0.422 / 0.605. Close watch stopped
+    at step 4/40, elapsed ~67 min — well past the failure window that killed every prior R3
+    attempt; a low-noise watch stays on for the terminal state only.
+  - Health: losses/grad-norms finite and stable across all 4 steps, no NaN/inf, no grad-norm
+    blow-up, peak GPU mem 77.9/95 GB, step time ~350–520s (`update_weights` ~310s dominates),
+    reward signal computing (near-zero, normal for early GRPO). `ppo_kl` ~0.35–0.42 is on the
+    high side but not unstable this early — worth watching over a longer run.
+- **Terminal state: FAILED (exit 15), elapsed ~1h40min, on the 7th trainer→rollout weight
+  sync — NOT in R3 code.** 5 clean training steps + 7 weight syncs (~309s each, ~4.47 GB/s)
+  completed first. A subset of trainer ranks hung in an NCCL `ALLGATHER` inside megatron-bridge's
+  Megatron→HF weight streaming:
+  ```
+  WorkNCCL(SeqNum=50566, OpType=ALLGATHER) ran for 1800006 ms  [EXPERT_MODEL_PARALLEL_GROUP / TENSOR_MODEL_PARALLEL_GROUP]
+    gather_from_ep_ranks    megatron/bridge/models/conversion/param_mapping.py:806
+    megatron_to_hf          param_mapping.py:2722
+    stream_weights_megatron_to_hf   model_bridge.py:1353
+    send_weights            verl/checkpoint_engine/nccl_checkpoint_engine.py:246
+  ```
+  `last completed work: 50565, last enqueued: 50634` — a peer never posted its matching
+  collective (rank-count/order mismatch in the EP/TP gather). After the 30-min NCCL timeout,
+  `torch.distributed.barrier()` (`engine_workers.py:782`) failed with gloo `Connection closed by
+  peer` and the job cascaded to death.
+  - **Same class as run `3141801`** (30-min megatron-bridge weight-sync collective hang,
+    `gather_from_ep_ranks`/`gather_from_tp_ranks` in the flight recorder) — which this repo saw
+    once and could **not** reproduce on unmodified retry (`3144665`), i.e. a non-deterministic
+    race in shared weight-streaming code that runs on every sync regardless of R3. 7 syncs
+    succeeded here before the 8th... actually the 7th hung. Caveat: this is megatron-bridge
+    **0.6.1** (new this attempt vs. 0.5.1 when `3141801` happened), and an EP-gather desync could
+    be load- or version-dependent, so R3-independence is likely but not certain.
+- **Not a full training run anyway**: 40 steps × ~350–520s ≈ 4–6h against a 5h `--time`, so even
+  without this failure it would have TIMEOUT'd around step ~35. A real training run needs more
+  `--time` / fewer steps.
+- **Fix**: none applied. The fix under test — `r3-sglang-routed-experts-import-fix.patch`
+  (expanded form) — **passed**: 5 clean R3 training steps, 0 `numpy`-bug occurrences, weight
+  syncs working. The failure is a separate, pre-existing-class megatron-bridge weight-streaming
+  race. Next move (user decision, per `hpc_job_fix_then_ask`): most likely an unmodified retry
+  to check one-off vs. repeatable (matching the `3141801`→`3144665` precedent), with an eye on
+  whether megatron-bridge 0.6.1 makes this EP-gather hang more systematic than 0.5.1 did.
+- **Remaining open item**: step (2) of the plan — PR the `async_sglang_server.py` fix upstream to
+  verl. The `skip_tokenizer_init` routed-experts branch is dead code against any current sglang
+  (v0.9.0 and `main` identical), so this is a genuine upstream bug. The patch already carries the
+  `ImportError` fallback to the old `sglang.srt.layers.moe.routed_experts_capturer` path, so it's
+  in PR-ready shape (works against both old and new sglang layouts).
+- **Commit**: not committed.
+
+### Run `3209484` — 2026-08-28 — unmodified retry: 3207923's weight-sync hang was a one-off (12+ clean syncs); ~step 13, a DIFFERENT hang — SGLang rollout scheduler stuck in flashinfer MLA plan (the TP=32 SGLang hazard, new call site)
+
+- **Log**: `~/Downloads/slurm-3209484.out` (1.8 MB). 80 nodes, `clariden`. Unmodified resubmit of
+  `3207923` (same script, R3+THD + megatron-core 0.19.0 / megatron-bridge 0.6.1). ~48 min queued
+  (FirecREST/Slurm-controller intermittently timing out during the wait again). Ran ~2h40min,
+  then FAILED (exit 15).
+- **Purpose**: determine whether `3207923`'s megatron-bridge `gather_from_ep_ranks` NCCL ALLGATHER
+  hang (7th weight sync) was a one-off race or repeatable.
+- **Answer: one-off.** All **12+** trainer→rollout weight syncs completed cleanly (~308–311s
+  each, ~4.47 GB/s), well past the 7th where `3207923` hung. No `gather_from_ep_ranks` / NCCL
+  ALLGATHER timeout / gloo "Connection closed by peer" anywhere. `3207923`'s hang stays a
+  non-deterministic race (matching the `3141801`→`3144665` precedent).
+- **R3+THD fix: validated again, harder.** ~13 clean training steps (up from `3207923`'s 5),
+  loss 0.011–0.088, grad_norm 0.29–0.63, `critic/score/mean` climbing 0.05→0.24 (policy
+  learning), memory steady 77.9/95 GB. **Zero** `'str' object has no attribute 'numpy'` /
+  `routed_experts` / rollout `RayTaskError`. R3 active throughout (`routing replay layers`).
+  `r3-sglang-routed-experts-import-fix.patch` (expanded) is solid.
+- **New failure — the "TP=32 SGLang" Known-hazard, at a new call site.** At ~step 13 (~16:19),
+  the standalone SGLang rollout replica's scheduler process (`sglang_server_0_0`, pid 162557)
+  hung. py-spy dump (triggered by SGLang's own 300s `watchdog_timeout`, which this script sets
+  explicitly) shows the scheduler stuck in:
+  ```
+  plan (flashinfer/mla/_core.py:839)               # a tensor .to() copy
+  call_begin_forward (flashinfer_mla_backend.py:749)
+  init_forward_metadata (flashinfer_mla_backend.py:381)
+  _execute_decode (runner/eager_runner.py:234)
+  run_batch (scheduler.py:3351) → event_loop_overlap (scheduler.py:1601)
+  ```
+  i.e. hung inside the flashinfer **MLA/DSA decode-attention `plan()`** step during ordinary
+  generation (DSA backends: `prefill=flashmla_sparse, decode=fa3`; flashinfer 0.6.12). Watchdog
+  killed the replica → Ray `SYSTEM_ERROR` ("connection error code 2") → every `AgentLoopWorkerTQ`
+  rollout task → `ActorDiedError` → `TaskRunnerV1` died → job FAILED. No recovery path for a
+  dead standalone replica.
+- **This is the third TP=32 SGLang scheduler hang in this recipe's history, second distinct call
+  site**: `3152802` (`_broadcast_reqs_across_ranks → torch.distributed.broadcast`), now `3209484`
+  (`flashinfer MLA plan`). `3152802`'s retry `3171176` "cleared" it — but `3171176` only ran 3
+  steps before monitoring stopped, nowhere near the step-13 mark, so that "one-off" verdict was
+  on a short run. The pre-R3 baseline `3149736` did 14 clean steps (to TIMEOUT) with no hang — so
+  the fragility is real but intermittent, and R3 is not obviously the cause (this hang is in the
+  base DSA rollout path, unchanged by R3's capture or the megatron upgrade). See the updated
+  "TP=32 SGLang" Known-hazards entry.
+- **Fix**: none applied. The R3 fix passed; the failure is the pre-existing TP=32 SGLang
+  collective fragility.
+- **Investigation, 2026-08-28 (no cluster cost) — root-cause candidate found: a stale flashinfer
+  version pin.** The stuck py-spy frames: one TP rank (TP2) ACTIVE in
+  `run_batch → _execute_decode → flashinfer_mla_backend.py:381 init_forward_metadata → :749
+  call_begin_forward → flashinfer/mla/_core.py:839 plan` (a `.to()` → `cuMemcpyDtoHAsync_v2` that
+  never returned — flashinfer's dense-MLA `plan()`; the batch's ~350-token seqs are below the
+  `index_topk=2048` DSA dense/sparse threshold, so it took the flashinfer dense-MLA path), while
+  another rank (TP3) is idle in `_broadcast_reqs_across_ranks` waiting for the *next* batch — a
+  single-rank stall → whole-TP-group deadlock → 300s watchdog kill. **`Alps-Images/apps/verl/Containerfile`
+  pins `flashinfer_python[cu13]==0.6.12` + `flashinfer_cubin==0.6.12` (added 2026-07-27, commit
+  `2d514a64`), but sglang 0.5.16's own `pyproject.toml` requires `flashinfer_python[cu13]==0.6.14`
+  ("keep it aligned with jit-cache version in Dockerfile").** The `sglang[all]` line was changed
+  2026-08-12 (commit `8bf10427`) and now resolves to 0.5.16, but the flashinfer pin was never
+  updated to match — so the image runs sglang 0.5.16's MLA-backend code (written/tested against
+  flashinfer 0.6.14's `wrapper.plan()`) against a downgraded 0.6.12. flashinfer has a documented
+  history of MLA/FMHA `plan`-path hangs and IMAs fixed version-to-version (flashinfer issue #2236
+  "BatchMLAPagedAttentionWrapper IMA", the 0.6.8 "revert Blackwell-ultra opt that caused FMHA
+  deadlocks"). Not proven to be *the* cause (would need a run on the fixed image), but it is a
+  concrete version-skew bug on exactly the code path that hung.
+- **Fix — Containerfile**: `flashinfer_python[cu13]` `0.6.12` → `0.6.14` (matching sglang 0.5.16's
+  pin), `flashinfer_cubin` `0.6.12` → `0.6.13` (flashinfer-cubin has no 0.6.14 published; the
+  1-patch python/cubin gap just JIT-compiles a few kernels). Part of the same image rebuild as
+  `VERL_REF` / megatron / TransferQueue.
+- **Fix — runtime (this script)**: **flashinfer_python 0.6.14 ONLY**, via the same
+  fetch-once/sbcast/`--no-deps --force-reinstall` pattern as the TransferQueue/megatron wheels
+  (`flashinfer_python-0.6.14-py3-none-any.whl`, 14.6 MB, sha256 `d124369...`). The cubin is
+  **deliberately not bumped at runtime**: run `3211735` (2026-08-28) tried to `sbcast` the
+  ~458 MB `flashinfer_cubin-0.6.13` wheel and hit `Bus error (core dumped)` on both flashinfer
+  wheels — the documented "sbcast bus-errors on large files" hazard (Apertus section, from the
+  transformers-fork tarball). The failed broadcast (identical src/dst path) also truncated the
+  staged wheel, so `pip install` then rejected it as invalid and the fatal guard killed all
+  80 nodes at 43s. The hang is in `flashinfer/mla/_core.py plan()` — **flashinfer_python code** —
+  so bumping just the small pure-Python wheel is the targeted fix; flashinfer_python 0.6.14
+  JIT-compiles any kernels it can't load from the image's older 0.6.12 cubin (JIT cache already
+  redirected off Lustre, plus a pre-warm step). A resubmit followed.
+- **Still on the table if the flashinfer bump doesn't fix it**: (a) raise `watchdog_timeout`
+  300→~1200; (b) different DSA decode backend; (c) shrink the rollout replica below TP=32;
+  (d) rollout-replica auto-restart. Independent of all of this, the R3 code fix is ready to
+  bake/upstream.
+- **Commit**: not committed.
+
+### Run `3211735` — 2026-08-28 — flashinfer fix attempt died in setup: sbcast bus-error on the 458 MB flashinfer_cubin wheel
+
+- **Log**: `~/Downloads/slurm-3211735.out` (147 KB). 80 nodes, `clariden`. FAILED (exit 15) at
+  **43s** — per-node setup, never reached Ray/training.
+- **Symptom**: `line 723: ... Bus error (core dumped) sbcast -f .../flashinfer_python-0.6.14...`
+  and `line 730: ... Bus error (core dumped) sbcast -f .../flashinfer_cubin-0.6.13...`. The
+  cubin sbcast left a truncated wheel on the nodes →
+  `ERROR: Wheel 'flashinfer-cubin' located at /tmp/... is invalid` →
+  `FATAL: could not install flashinfer_cubin 0.6.13 wheel` → fatal guard exit 1 on tasks
+  16/23/27/65/… → srun killed all 80.
+- **Root cause**: the first flashinfer-fix attempt added an sbcast of the ~458 MB
+  `flashinfer_cubin` wheel. `sbcast` bus-errors on wheels/tarballs that large — already
+  documented in the Apertus FSDP2 section ("`sbcast` hit Bus error (core dumped) on the large
+  tarball, corrupting it on several nodes"). The 4 small wheels (TransferQueue, megatron-core,
+  megatron-bridge, and now flashinfer_python at 14.6 MB) sbcast fine; the cubin does not. Should
+  have been caught before submitting — the hazard is in this same file's own notes.
+- **Diagnostics reached first**: `TransferQueue version: 0.1.7`, `megatron-core version: 0.19.0`,
+  `megatron-bridge version: 0.6.1` all correct. Nothing downstream.
+- **Fix (attempt 1)**: dropped the cubin from the runtime script — flashinfer_python 0.6.14 alone
+  (14.6 MB), still via sbcast. **Did not work** — see run `3213313`.
+- **Commit**: not committed.
+
+### Run `3213313` — 2026-08-28 — flashinfer_python-only sbcast ALSO bus-errored: the flashinfer `sbcast` call itself is the problem, not wheel size
+
+- **Log**: `~/Downloads/slurm-3213313.out` (142 KB). 80 nodes, `clariden`. FAILED (exit 15) at
+  **40s** — setup only.
+- **Symptom**: `slurm_script: line 725: 196596 Bus error (core dumped) sbcast -f
+  ".../flashinfer_python-0.6.14-py3-none-any.whl" ...` — on the **14.6 MB** python wheel this
+  time, whose `sha256sum -c` printed `OK` on the line immediately above (`/tmp/flashinfer_python-0.6.14-py3-none-any.whl: OK`).
+  The 3 preceding wheel sbcasts (`transferqueue`, `megatron_core`, `megatron_bridge`) all
+  succeeded and their `pip install`s ran fine later in the log. Corrupt wheel on the nodes →
+  `ERROR: Wheel 'flashinfer-python' ... is invalid` → `FATAL` → all 80 killed.
+- **Root cause — narrowed**: it is **not** a wheel-size issue (14.6 MB failed; 458 MB failed in
+  `3211735`). The flashinfer `sbcast` call specifically fails while the earlier 3 wheel sbcasts
+  in the same block succeed — so it is either an Nth-consecutive-`sbcast` limit or batch-host
+  `/tmp` pressure by the time the ~8th–10th `sbcast` of the run (PR patches + source patches +
+  3 wheels + flashinfer) is reached. Not root-caused precisely; a `Bus error` in the `sbcast`
+  process on the submit host points at an mmap fault on the source file (batch-host `/tmp`),
+  despite the full-content sha256 passing.
+- **Fix (attempt 2)**: **stage the flashinfer wheel on shared Lustre (`${TRAINING_HOME}/wheels/`),
+  no `sbcast` at all.** Every node `pip install`s it directly from that path — a plain static-file
+  read, which has none of the flock/write hazards that make Lustre unsafe for locks/caches. Same
+  pattern the Apertus Megatron script uses for its own wheels. `${TRAINING_HOME}` (`/capstor/...`)
+  is mounted in the container per `env.toml`. **Worked — run `3214410` cleared setup.**
+- **Commit**: not committed.
+
+### Run `3214410` — 2026-08-29 — setup finally cleared (Lustre wheel), but flashinfer 0.6.14 hard-raises on the cubin version mismatch at import
+
+- **Log**: `~/Downloads/slurm-3214410.out` (15,660 lines). 80 nodes, `clariden`. Ran overnight,
+  FAILED (`srun: Force Terminated`) — got much further than `3211735`/`3213313` but still never
+  reached a training step.
+- **Setup cleared**: the Lustre-staged flashinfer wheel installed with no `Bus error` — `sbcast`
+  fix confirmed. `flashinfer-python version: 0.6.14` printed on all ranks.
+- **Symptom**: on every worker, at flashinfer import time:
+  `RuntimeError: flashinfer-cubin version (0.6.12) does not match flashinfer version (0.6.14).
+  Please install the same version of both packages. Set FLASHINFER_DISABLE_VERSION_CHECK=1 to
+  bypass this check.` Traced through `TaskRunnerV1.run()` → `run_ppo` → (flashinfer import). All
+  80 nodes died on it; job force-terminated.
+- **Root cause**: flashinfer 0.6.14 added a **hard** python-vs-cubin version gate at import — it
+  does NOT silently JIT-fallback on a mismatched cubin package (my earlier assumption was wrong).
+  The image has `flashinfer_cubin 0.6.12` (from the old Containerfile pin); bumping only
+  `flashinfer_python` to 0.6.14 trips the gate.
+- **Fix (attempt 3, wrong) — then corrected**: first reached for
+  `export FLASHINFER_DISABLE_VERSION_CHECK=1` (job `3217384`, cancelled before it ran) because I
+  concluded no `flashinfer_cubin 0.6.14` existed — **only true on PyPI**. `flashinfer-cubin` is
+  distributed via `https://flashinfer.ai/whl` (GitHub release assets), where `0.6.14` and up all
+  exist; see the new **"flashinfer packaging"** section above (the KEY takeaway from this whole
+  sub-chain). **Corrected fix (attempt 4)**: install the matched `flashinfer_{python,cubin}==0.6.14`
+  pair — script fetches both wheels (python 14.6 MB sha256 `d124369…`, cubin 458 MB sha256
+  `7bbed9f3…`) from the GitHub `v0.6.14` release into `${TRAINING_HOME}/wheels/` (Lustre, not
+  `sbcast`) and `pip install`s them from there; Containerfile uses
+  `pip install --extra-index-url https://flashinfer.ai/whl "flashinfer_cubin==0.6.14"
+  "flashinfer_python[cu13]==0.6.14"`. `FLASHINFER_DISABLE_VERSION_CHECK` removed from both — the
+  matched pair passes the check naturally, clean AOT, no JIT-contention risk.
+- **Commit**: not committed.
+
+### Job `3217384` — 2026-08-29 — cancelled while PENDING (superseded by the matched-pair fix)
+
+- Submitted with the `FLASHINFER_DISABLE_VERSION_CHECK=1` bypass approach; user opted for the
+  cleaner matched-0.6.14-pair fix (after the `flashinfer.ai/whl` discovery) before it allocated.
+  `DELETE /compute/clariden/jobs/3217384` → HTTP 204, `CANCELLED`, never ran, no allocation
+  consumed, no log. Resubmitted as the next job with the corrected script.
+
+### Run `3217439` — 2026-08-29 — flashinfer 0.6.14 FIXES the TP=32 MLA hang: 20 clean R3+THD steps, healthy learning; new failure is a marginal CUDA OOM in the Megatron optimizer at step 21
+
+- **Log**: `~/Downloads/slurm-3217439.out` (938 KB). 80 nodes, `clariden`. Queued ~44 min, ran
+  **~2h43m** (elapsed 9787s), FAILED (exit 15) at step 21.
+- **THE KEY RESULT — the whole R3+THD chain is now working end-to-end through 20 training steps.**
+  - **Setup fully clean**: matched `flashinfer-python 0.6.14` **+ `flashinfer-cubin 0.6.14`**
+    (Lustre-staged from `flashinfer.ai/whl`, no `sbcast`), no version-check `RuntimeError`,
+    `megatron-core 0.19.0` / `megatron-bridge 0.6.1` / `megatron.training.models.gpt: OK` /
+    `routed_experts capture: OK` / `TransferQueue 0.1.7`. No `Bus error` / sbcast / wheel / FATAL.
+  - **The TP=32 SGLang MLA/DSA `plan()` hang did NOT recur.** Cleared step 13–15 (where `3209484`
+    hung) and ran to step 20 with zero hang signatures anywhere — no SGLang scheduler watchdog,
+    no py-spy dump, no `flashinfer/mla/_core.py`, no `_broadcast_reqs_across_ranks`, no
+    `SYSTEM_ERROR`, no `ActorDiedError`. **Confirms the stale flashinfer 0.6.12 pin was the
+    cause.** (This resolves the "TP=32 SGLang" Known-hazards entry for this recipe — see it.)
+  - **R3+THD training is healthy**: 20 completed steps, `actor/loss` ~0.02–0.06, `actor/grad_norm`
+    0.27–0.56 (all finite, stable), `critic/score/mean` rising 0.048 → ~0.15 by step 12–14 (real
+    GSM8K learning), response length drifting down 255 → 244. Weight syncs completed cleanly
+    throughout (last: 316s, 4.38 GB/s).
+- **New failure — CUDA OOM in the Megatron distributed optimizer, step 21, single rank
+  (`pid 294017`, GPU 0 — the GLM5Bridge / checkpoint-engine coordinator rank).** Traceback:
+  `actor_rollout_update_actor → train_mini_batch → distrib_optimizer.py:2789
+  _copy_model_grads_to_main_grads → shard_main_param.grad = shard_model_grad.float()`.
+  `torch.OutOfMemoryError: Tried to allocate 24.00 MiB. GPU 0 ... 21.38 MiB free ... this
+  process has 85.29 GiB in use (68.29 GiB allocated by PyTorch, 131.81 MiB reserved-but-unallocated).`
+  - **Analysis**: per-step `max_memory_allocated_gb` was **dead flat at 77.92 GiB across all 20
+    steps** — torch's own high-water mark is completely stable, no leak on the PyTorch side. At
+    OOM only 68.29 GiB was torch-allocated and just 132 MiB was reserved-but-unallocated (so
+    *not* primarily fragmentation, despite the error's generic `expandable_segments` hint). The
+    tip-over is the **~17 GiB of non-PyTorch memory** on GPU 0 (NCCL comm buffers + checkpoint-engine
+    weight-sync buffers + CUDA context) — plausibly creeping up over the ~10 weight syncs, on the
+    coordinator rank specifically, until a routine 24 MiB optimizer allocation had nowhere to go.
+    Razor-thin (24 MiB short at step 21 of 40).
+  - **Distinct from every prior failure in this chain** (hang, sbcast, version check,
+    megatron-bridge `gather_from_ep_ranks`, offsets, Gloo). First OOM this recipe has hit at a
+    real training step (the earlier OOMs were all at init / hybrid-rollout).
+- **Fix (attempt 1 — one half failed)**: (a) `export
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` in the srun env block — **reverted, does not
+  work here** (run `3219305`, next entry): the srun body is shared by the SGLang standalone-rollout
+  processes, and SGLang's `torch_memory_saver` (called unconditionally by
+  `load_model_with_memory_saver`, even with `free_cache_engine: false`) hard-raises
+  `TorchMemorySaver is disabled ... expandable_segments is not supported yet` on every rollout TP
+  rank. Removed; a `# do NOT set this` note left in its place. (b) `actor.ppo_max_token_len_per_gpu`
+  16384 → 12288 in `grpo_gsm8k.yaml` — **kept**, this is the real lever (cuts the actor fwd/bwd
+  activation peak; the model already has full param/grad/optimizer offload + full recompute).
+- **Commit**: not committed.
+
+### Run `3219305` — 2026-08-29 — OOM-mitigation attempt 1: `expandable_segments` global export is incompatible with SGLang, dies in rollout bring-up
+
+- **Log**: `~/Downloads/slurm-3219305.out` (638 KB). 80 nodes, `clariden`. Queued ~58 min, ran
+  ~24 min, FAILED (exit 15) — **before the first training step**.
+- **Trainer side got further than ever**: GLM5Bridge conversion 100% (6201/6201),
+  `DistributedDataParallel contains 9.24B parameters`, **no OOM at the DDP grad-buffer**. Setup
+  fully clean (flashinfer 0.6.14 py+cubin, megatron 0.19.0/0.6.1, gpt module OK, routed_experts
+  OK, TransferQueue 0.1.7) — no regression on any previously-fixed issue.
+- **Symptom**: all 32 SGLang standalone-rollout TP ranks, in `Scheduler.__init__ →
+  init_tp_model_worker → ModelRunner.load_model → load_model_with_memory_saver`:
+  `RuntimeError: TorchMemorySaver is disabled for the current process because expandable_segments
+  is not supported yet` (`torch_memory_saver/entrypoint.py:140 _sanity_checks`). Every rank →
+  replica down → `ActorDiedError` → Ray `SYSTEM_ERROR` → all 80 tasks killed.
+- **Root cause**: `export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (OOM mitigation #1)
+  was a global env var in the shared srun body, so it also applied to the SGLang rollout
+  processes. `torch_memory_saver` and `expandable_segments` are mutually exclusive allocator
+  mechanisms; SGLang invokes the former unconditionally.
+- **Fix**: dropped mitigation #1 entirely (no clean way to scope an allocator env var to only the
+  Megatron trainer workers without fragile per-worker-env plumbing). Mitigation #2
+  (`ppo_max_token_len_per_gpu` 12288) stays and is now the sole step-21 OOM mitigation — untested,
+  since `3219305` never reached a training step. Resubmit needed.
+- **Commit**: not committed.
+
+### Run `3219811` — 2026-08-29 — 9 clean steps (best learning signal yet), then the megatron-bridge weight-sync hang AGAIN (3rd occurrence) — did not reach the step-21 OOM test
+
+- **Log**: `~/Downloads/slurm-3219811.out` (9529 lines). 80 nodes, `clariden`. Queued ~42 min,
+  ran ~2h, FAILED (exit 15) at weight-sync #5 (feeding `global_step` 10).
+- **Everything through step 9 worked**: setup all green (flashinfer 0.6.14 py+cubin, megatron
+  0.19.0/0.6.1, gpt module OK, routed_experts OK, TransferQueue 0.1.7 — `PYTORCH_CUDA_ALLOC_CONF`
+  removed, no `TorchMemorySaver` error this time), first weight sync + SGLang rollout serving + 4
+  more clean weight syncs (~328s each). **9 completed training steps, and the model is clearly
+  learning**: `critic/score/mean` 0.10 → 0.24 (step 6) → **0.32 (step 8)** → 0.19 (step 9) — the
+  strongest GSM8K learning signal across all runs. loss 0.009–0.089, grad_norm 0.27–0.59, all
+  finite. **No OOM anywhere.**
+- **Symptom**: `Watchdog caught collective operation timeout: WorkNCCL(... OpType=ALLGATHER ...)
+  ran for 1800099 ms` in
+  `send_weights (nccl_checkpoint_engine.py:246) → stream_weights_megatron_to_hf
+  (model_bridge.py:1353) → megatron_to_hf → gather_from_ep_ranks (param_mapping.py:806)`. Rank 59
+  never entered the EP/TP/PP gather; peers waited the full 30-min NCCL timeout; Slurm killed all
+  80.
+- **This is the 3rd occurrence of the megatron-bridge weight-sync collective hang** — after
+  `3141801` (at the very first sync, megatron-bridge 0.5.1, pre-R3) and `3207923` (7th sync,
+  0.6.1). It did NOT recur in `3144665`, `3209484` (12+ syncs) or `3217439` (~10 syncs, 20 steps).
+  So it is a **real, recurring, non-deterministic bug in this recipe's weight-streaming path** —
+  roughly 1 in 2 runs, at a random sync — spanning megatron-bridge 0.5.1 and 0.6.1, present
+  before R3 was enabled. **Not** caused by the `ppo_max_token_len_per_gpu` cut (that only touches
+  actor activation memory, not weight-sync collectives). It is now the single biggest blocker to
+  a full run — bigger than the step-21 OOM (which has only ever been reached once).
+- **The step-21 OOM question is still unanswered** (never reached it). `max_memory_allocated_gb`
+  stayed pinned at 77.92 GiB steps 1–9, identical to `3217439` — the token-budget cut is
+  confirmed not to move that metric.
+- **Investigation, 2026-08-29 (no cluster cost)** — what the `3219811` log + upstream source
+  show about the weight-sync hang:
+  - **Timeline**: ~11 weight syncs completed cleanly (~325s each, one roughly every step —
+    `parameter_sync_step: 2` but syncs land ~every step in the log; each streams the FULL 700B
+    model, `total_params: 59079` tensors, `Converting to HuggingFace 6201/6201`, ~1.4 TB at
+    ~4.25 GB/s). The 12th hung: a rank in EP-group GUID 1404 (one of 288/8 = 36 expert-parallel
+    groups) never posted allgather `SeqNum=79314` in `param_mapping.py:806 gather_from_ep_ranks`.
+    `last enqueued 79382, last completed 79313` — that rank had raced *ahead* enqueuing 69 more
+    async collectives, then one earlier one never matched. Every EP/TP/PP group that rank touches
+    then cascaded (`gather_from_ep_ranks` ALLGATHER, `gather_from_tp_ranks` ALLGATHER,
+    `broadcast_from_pp_rank` BROADCAST all time out). **Rank 0 (the CE sender) completed its own
+    view of that sync at 18:04** while other ranks were already stuck since ~17:59 — because rank
+    0 is in a *different* EP group; the stuck group's 8 members are all CE non-senders running a
+    tight `for name,weight in weights: pass` over the same bridge generator.
+  - **No preceding exception on any rank.** NCCL's own diagnostic: "wrong sizes / order not same
+    / the scheduled collective didn't run ... GIL deadlock ... network errors ... bugs in NCCL".
+    The bridge task list is built lockstep (`sorted_global_param_names_all_pp_ranks`, all-gathered,
+    `None`-padded for non-owning PP ranks), so a *structural* divergence is unlikely — this reads
+    as a **transient**: one rank momentarily stalled (GIL / a slow CPU copy / tqdm render / verl's
+    async loop) or a Slingshot/NCCL message glitch during the ~5-min, ~6000-back-to-back-collective
+    streaming window, and verl has **no retry** on a failed weight sync — a stuck collective =
+    full 30-min NCCL timeout = job death.
+  - **Not a version regression** (megatron-bridge 0.5.1 *and* 0.6.1), **not R3/THD-specific**
+    (shared code, on every sync, `3141801` predates R3). Upstream: verl issue #6691 confirms the
+    Megatron→HF→SGLang MoE weight-sync path is problematic and under active work; issue #3704
+    recommends `NCCL_TIMEOUT` for *slightly-exceeded* timeouts — doesn't apply here (ours runs the
+    full 30 min = true deadlock).
+  - **No clean config-only fix found.** A real fix = patch verl's `send_weights`/`update_weights`
+    to catch a sync-PG timeout and retry the sync (needs a short dedicated timeout on the sync PG
+    + re-init) — real work, not attempted.
+- **Deeper investigation, 2026-08-29 (user asked for online search + a verl retry/debug fix):**
+  - **Online: this is a known, unresolved upstream class of bug.** verl #2197 (NCCL timeout,
+    Megatron TP>1) — closed by an inactivity bot, never fixed, multiple "same problem" replies.
+    verl #2325 (Megatron+SGLang NCCL timeout, "some process getting stuck") — open, 15 comments,
+    no fix. verl #3704 (Megatron NCCL broadcast timeout) — open; maintainer asks for exactly the
+    per-PG debug info we lack. verl #6691 (MoE megatron-bridge weight-sync OOM) — open, active
+    work on the MoE sync path. **No upstream fix for "one rank silently stops posting a collective
+    during weight sync."**
+  - **An in-process retry of THIS hang is not really feasible.** It is stuck in *Megatron's own*
+    EP/TP/PP process groups (not verl's 33-rank checkpoint-engine group), and torch has no
+    "retry this collective" primitive — recovering a hung NCCL collective there needs a full
+    `destroy_process_group` + `parallel_state.initialize_model_parallel(...)` re-init, i.e. ≈ a
+    job restart. The realistic "retry" is job-level (monitor detects the hang → requeue).
+  - **The actual fix verl provides: `checkpoint_engine.backend: delta_sharded`
+    (`DeltaShardedCheckpointEngine`).** verl's newer disaggregated-async weight-sync engine,
+    built specifically to avoid this fragility. Read of its source (`delta_checkpoint_engine.py`,
+    `workers/engine/megatron/transformer_impl.py:1015-1110`): steady-state syncs export **each
+    rank's LOCAL mcore shard** (`get_per_tensor_param_shard` — `yield rec.megatron_name,
+    local.reshape(-1), rec.spec`, **no cross-rank gather in the export**; params owned by another
+    PP stage yield "zero-count lockstep rows"), run the bridge param-mapping logic **comm-stubbed**
+    (`_hf_delta_entry`: "real group sizes, gathers synthesized locally"), and ship only the
+    **changed `(position, value)` pairs** via `_GatherQueue` with **count-only flush triggers**
+    (their own comment: "a per-rank byte trigger desyncs the gathers" — so they made it count-based
+    on purpose). This replaces the ~6000-back-to-back-`gather_from_ep_ranks`-collectives storm
+    with a small, count-lockstepped sparse gather. Only the **one-time seed sync (#1)** still uses
+    the old full `get_per_tensor_param()` streaming path — our hangs were always at sync 5/7/12,
+    never #1, so if the seed passes every later sync is on the robust path. **Bonus: much faster**
+    (ships deltas, not the full ~1.4 TB every 2 steps).
+    - **Config cost is likely one line**: `checkpoint_engine.backend: nccl → delta_sharded`. verl
+      auto-appends the SGLang `delta_loader` when the backend is `delta_sharded`
+      (`async_sglang_server.py:263-269` — no SGLang fork/patch), and `engine_workers.py:751`
+      routes the delta engine's own seed/steady state machine + snapshot priming.
+    - **Requirements we already meet**: `vanilla_mbridge: False` (asserted), no LoRA (asserted).
+    - **Risks**: not in verl's README "Supported Backends" table (newer / less battle-tested) —
+      could carry its own bugs; the seed sync still exercises the fragile path once.
+- **Implemented, 2026-08-29 (user-approved), unverified on cluster:**
+  1. **`checkpoint_engine.backend: nccl → delta_sharded`** (`grpo_gsm8k.yaml`;
+     `engine_kwargs.nccl → engine_kwargs.delta_sharded`). `bucket_size` comes from
+     `update_weights_bucket_megabytes` not `engine_kwargs`, so no other config needed; verl
+     auto-wires the SGLang `delta_loader`.
+  2. **`example/patches/wsync-debug-progress-log.patch`** (new checked-in patch + script heredoc,
+     verified byte-identical + applies clean + compiles against fresh v0.9.0) — wraps both weight-
+     export generators in `MegatronEngine` (`get_per_tensor_param` = seed; `get_per_tensor_param_delta_shard`
+     = steady) with a pass-through that prints `[WSYNC-DBG] rank=N <tag> tensor#K name=… t+Ns`
+     every 1000 tensors and on generator exit. Applied via the same `git apply` apply-or-fail
+     loop as the other verl-source patches.
+  3. **NCCL flight-recorder env** in the srun block: `TORCH_NCCL_TRACE_BUFFER_SIZE=20000`
+     (the missing piece — run `3219811`'s dump showed `last enqueued NCCL work: -1`, i.e. the
+     ring buffer was OFF), `TORCH_NCCL_DUMP_ON_TIMEOUT=1`,
+     `TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/tmp/nccl_flightrecorder_<jobid>_rank`.
+  4. **Node count / mini-batch: left at 80 / `PPO_MINI_BATCH_SIZE=6`**, NOT bumped to 104 / 8 as
+     the pre-approved plan said — because `delta_sharded` removes the full-model HF-export buffers
+     that rank 0 staged every sync on the `nccl` backend (`prepare()` even skips the parent's
+     `2 × bucket_size` fixed buffers), which is very plausibly the bulk of the ~17 GiB non-torch
+     memory that caused `3217439`'s step-21 OOM. Testing `delta_sharded` at 80 nodes first tells
+     us whether the OOM is also gone; 104 nodes + `PPO_MINI_BATCH_SIZE=8` (DP 3→4) is the
+     immediate fallback if the step-21 OOM recurs. `PARAMETER_SYNC_STEP 2→4` is a further fallback.
+  `ppo_max_token_len_per_gpu` stays at 12288 (harmless).
+- **Commit**: not committed.
+
+### Run `3223205` — 2026-08-29/30 — `delta_sharded` FIXES the weight-sync hang (trainer side: zero `gather_from_ep_ranks`, seed export in ~3s), then one more verl-vs-sglang import drift on the rollout side
+
+- **Log**: `~/Downloads/slurm-3223205.out` (8694 lines). 80 nodes, `clariden`. ~15h queued, ran
+  ~24 min, FAILED (exit 15) — **during the first (seed) weight sync**, before any training step.
+- **The `delta_sharded` trainer side works — and it kills the hang.** The `[WSYNC-DBG]` patch fired
+  on all 383 workers: `seed/full tensor#2001 ... t+3s` — the full-model HF export that took ~326s
+  and hung ~1 run in 2 on the `nccl` backend completed in **~3 seconds** with **zero
+  `gather_from_ep_ranks`, zero NCCL ALLGATHER, zero watchdog, zero SYSTEM_ERROR**. Setup all green
+  (`Applied wsync-debug-progress-log.patch` 80/80, flashinfer 0.6.14 py+cubin, megatron
+  0.19.0/0.6.1, gpt OK, routed_experts OK, TransferQueue 0.1.7), DDP grad-buffer no OOM, SGLang
+  rollout HTTP server up.
+- **Symptom** — the seed sync's *rollout-side* delta ingestion:
+  ```
+  verl/workers/rollout/sglang_rollout/sglang_rollout.py:404  _update_weights_delta_flush
+    from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+  ImportError: cannot import name 'LocalSerializedTensor' from 'sglang.srt.model_executor.model_runner'
+  ```
+  (`on_init_end` → `standalone_checkpoint_manager.update_weights` → `checkpoint_engine/base.py:337`
+  → `sglang_rollout.py:317 update_weights` → `_update_weights_delta` → `_update_weights_delta_flush`.)
+- **Root cause**: exactly the same class as `r3-sglang-routed-experts-import-fix.patch` — verl
+  v0.9.0's `delta_sharded` rollout path hardcodes `from sglang.srt.model_executor.model_runner
+  import LocalSerializedTensor`, but sglang 0.5.16 moved that class to
+  `sglang.srt.model_executor.model_runner_components.weight_updater` (confirmed: sglang v0.5.16's
+  own `weight_sync/utils.py:10-12` imports it from the new path, class def at
+  `model_runner_components/weight_updater.py:370`). The `nccl` backend (runs `3217439` etc.)
+  never hit this because its rollout-side apply goes through sglang's *own*
+  `weight_sync.utils.update_weights`, which has the correct import; verl's `delta` path inlines a
+  stale copy. The other 3 sglang imports in that verl function were checked and are still valid.
+- **Fix**: new checked-in patch `example/patches/delta-sharded-localserializedtensor-import-fix.patch`
+  (+ script heredoc/sbcast/apply, verified byte-identical, applies clean + compiles + reverse-checks
+  against fresh v0.9.0) — one-line: try the new path, `except ImportError` fall back to the old.
+  Wired into the same apply-or-fail loop as the other verl-source patches, right after
+  `wsync-debug-progress-log.patch`.
+- **Still unanswered** (never reached): the step-21 OOM (no `OutOfMemoryError` anywhere in this
+  log), the delta *steady* path, and whether steps are faster.
+- **Commit**: not committed.
+
+### Runs `3234169` / `3235127` — 2026-08-30 — the CI-built image is broken (transformer-engine ↔ torch 2.11 ABI); the new consolidated diagnostic caught it in 60 s
+
+- **Context**: user built the image from the current Containerfile (VERL_REF v0.9.0 + TransferQueue
+  0.1.7 + megatron 0.19.0/0.6.1 + flashinfer 0.6.14) and pointed the GLM script at it, and asked
+  to strip the now-redundant runtime pip upgrades (done — see the Image bake-in section).
+- **`3234169`** — FAILED at 43 s: pyxis 404, wrong image path. Corrected to
+  `.../alps-images/verl-cuda:alps7-dev-a9f9e56471c0574e` (CI appends the `-cuda` variant suffix).
+- **`3235127`** — FAILED at ~4.6 min, phase 1 partial. Container pulled fine.
+  - **The new consolidated image-diagnostic block worked exactly as designed** — printed
+    `verl 0.9.0 · TransferQueue 0.1.7 · megatron-core 0.19.0 · megatron-bridge 0.6.1 ·
+    flashinfer-python 0.6.14 · flashinfer-cubin 0.6.14 · sglang 0.5.18 · transformers 5.8.1` and
+    ran the 3 import smoke tests, in the first ~60 s. **sglang resolved to 0.5.18, not 0.5.16**
+    (unpinned build — the Containerfile `sglang[all]==0.5.16` pin was uncommitted at build time).
+    Both sglang-import source patches still import OK on 0.5.18 (`state_capturer.routed_experts`
+    and `model_runner_components.weight_updater:LocalSerializedTensor` both present) — so the
+    sglang drift was NOT the failure.
+  - **Root cause**: `transformer_engine_torch.cpython-312-aarch64-linux-gnu.so: undefined symbol:
+    _ZN3c104impl3cow23materialize_cow_storageERNS_11StorageImplE` (`c10::impl::cow::materialize_cow_storage`).
+    The NGC base image (`pytorch-cuda:26.02-py3`) ships transformer-engine built against its own
+    torch; `sglang[all]` then upgrades torch to its pinned **2.11.0** (PyPI wheel), and nothing
+    rebuilds TE against it. `import megatron.core` fails on all 80 nodes → verl's `EngineRegistry`
+    has no `megatron` backend → fatal `AssertionError: Unknown backend: megatron` at
+    `engine_workers.py:137`. torchao `_C*.so` also fails to load (same ABI break; secondary).
+    This never bit the runs on the *old* image because the removed runtime upgrades used
+    `pip install --no-deps --force-reinstall` — `--no-deps` never disturbed the base image's
+    (then-matched) TE.
+  - All 5 source patches applied cleanly 80/80. `delta_sharded` still untested.
+- **Fix (Containerfile, 2026-08-30, needs rebuild)**: two changes.
+  1. **`sglang[all]` → `sglang[all]==0.5.16`** (line ~37) — the only recent sglang whose own
+     flashinfer pin (`0.6.14`) matches the Containerfile's; see the Image bake-in bullet.
+  2. **A final `transformer-engine[core-cu13,pytorch]` `--force-reinstall --no-build-isolation`
+     step** placed *after every torch-moving install* (after flashinfer), so TE's torch bindings
+     (`transformer-engine-torch`, sdist-only → source build, ~20-40 min) are compiled against the
+     final torch 2.11.0. Committed `72f6472`.
+- **Build attempt 1 (commit `72f6472`) FAILED at the verification step**: the TE source rebuild
+  itself succeeded (STEP 36), but the build-gate `RUN python -c "import ... transformer_engine.pytorch,
+  megatron.core"` died with `OSError: libcuda.so.1: cannot open shared object file` — `import
+  transformer_engine` dlopens the CUDA *driver*, which is host-provided at container *runtime* and
+  absent during `docker build`. My gate was too strict.
+- **Fix (commit `8dc2a9b`)**: build-safe gate — `import torch` (fine at build) + assert
+  `transformer-engine` and `transformer-engine-torch` are installed at the **same** version (what
+  `--force-reinstall` can get wrong); NO `import transformer_engine` / `megatron.core` at build.
+  The real runtime import is already checked by the GLM script's own diagnostic block on the GPU
+  nodes (which is exactly what caught `3235127`).
+  - **Residual risk (REALIZED in run `3236353`, now fixed)**: `transformer-engine[core-cu13,pytorch]`
+     was unpinned → resolved to 2.18.0, whose cutlass flash-attn backend imports `block_copy` from
+     a newer `nvidia-cutlass-dsl` than the NGC base ships. See run `3236353` below.
+- **Commit**: Containerfile committed (`72f6472`, `8dc2a9b`); script + patches not committed.
+
+### Run `3236353` — 2026-08-30 — first run on the CI image: TE unpinned → 2.18.0 → cutlass `block_copy` ImportError → `Unknown backend: megatron` (same shape as 3235127); TE pinned to 2.12.0
+
+- **Log**: `~/Downloads/slurm-3236353.out` (16,584 lines). 80 nodes, `clariden`,
+  image `verl-cuda:alps7-dev-b9c322b732cca289` (built from Containerfile `8dc2a9b`). ~34 min
+  queued, ran ~3m52s, FAILED (exit 15) at the **start of phase 3** — `actor_rollout_init_model()`,
+  before DDP grad-buffer construction. 0 training steps.
+- **What checked out**: all baked-in versions correct (verl 0.9.0, TransferQueue 0.1.7,
+  megatron-core 0.19.0, megatron-bridge 0.6.1, flashinfer-python/cubin 0.6.14, sglang 0.5.16,
+  transformers 5.8.1). **Both sglang import-drift patches validated by the diagnostic smoke tests**
+  — `sglang routed_experts capture: OK` and `sglang LocalSerializedTensor: OK at
+  model_runner_components.weight_updater` (the latter is run `3223205`'s blocker — smoke test
+  passes, though the actual delta weight-sync path was never reached). All 6 source patches
+  applied cleanly on 80/80.
+- **Symptom**: the consolidated diagnostic block's third check printed, on all 80 nodes:
+  `WARNING megatron.training.models.gpt NOT importable` — traceback:
+  ```
+  transformer_engine/pytorch/attention/dot_product_attention/backends.py:169
+      from cutlass.utils import LayoutEnum, block_copy
+  ImportError: cannot import name 'block_copy' from 'cutlass.utils'
+      (.../nvidia_cutlass_dsl/python_packages/cutlass/utils/__init__.py)
+  ```
+  Then the fatal crash: `import megatron.core` fails through
+  `megatron.core.extensions.transformer_engine` → verl never registers the `megatron` backend →
+  `AssertionError: Unknown backend: megatron` (`verl/workers/engine/base.py:399`, via
+  `engine_workers.py:137`). Identical *shape* to run `3235127`.
+- **Root cause**: the `8dc2a9b` Containerfile change added a `--force-reinstall` of
+  `transformer-engine[core-cu13,pytorch]` **unpinned** — it resolved to **2.18.0**. The NGC base
+  `pytorch-cuda:26.02-py3` bundles **TE 2.12.0** matched to its own `nvidia-cutlass-dsl` /
+  `nvidia-cudnn-frontend` / flash-attn. TE 2.18.0's cutlass flash-attn backend does
+  `from cutlass.utils import block_copy` — a symbol the base image's older cutlass-dsl lacks. This
+  is a **known, documented TE issue** (TE 2.18 release notes: *"known compatibility issue between
+  the FlashAttention v4, CuTeDSL and CUDNN Frontend pip packages, which could produce ...
+  `ImportError: cannot import name 'block_copy' from 'cutlass.utils'`"*; the documented stable
+  combo is `flash-attn-4==4.0.0b11` + `nvidia-cutlass-dsl[cu13]==4.4.2` + `nvidia-cudnn-frontend==1.26.0`).
+  The `8dc2a9b` gate only asserted `transformer-engine == transformer-engine-torch` version — it
+  did not pin the version or check cutlass-dsl.
+- **Fix (Containerfile, needs rebuild)**: pin TE to **2.12.0** (the NGC 26.02 base's own version)
+  and name all three packages explicitly with `--no-deps` so nothing else moves:
+  ```
+  RUN pip install -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall --no-deps \
+          "transformer-engine==2.12.0" "transformer_engine_cu13==2.12.0" "transformer_engine_torch==2.12.0"
+  ```
+  Only `transformer_engine_torch` (sdist) rebuilds against the final stable torch 2.11.0 —
+  `transformer_engine_cu13` (prebuilt wheel) is re-laid at 2.12.0, and `nvidia-cutlass-dsl` /
+  `nvidia-cudnn-frontend` / flash-attn stay exactly as the base image ships them (matched to TE
+  2.12.0). TE 2.12.0's Python code does NOT import `block_copy`. Build gate updated to assert
+  `te == tt == '2.12.0'`. Also added `transformer-engine`, `transformer-engine-torch`,
+  `nvidia-cutlass-dsl` to the GLM script's runtime diagnostic package list, and expanded the
+  `megatron.training.models.gpt` WARNING text to name this failure mode.
+- **What this run was meant to test — all still untested**: `delta_sharded` steady-state syncs
+  (fast? no `gather_from_ep_ranks` hang?), the `LocalSerializedTensor` runtime path (smoke test
+  only), the step-21 OOM, the TP=32 SGLang MLA hang. None reached.
+- **Commit**: Containerfile fix committed (`e3f4d98`); script diagnostic tweaks not committed.
+
+### Run `3240384` — 2026-08-31 — TE 2.12.0 pin WORKS (image fixed); furthest run yet; died mid-seed-sync on a hardware node failure — infra, not code
+
+- **Log**: `~/Downloads/slurm-3240384.out`. 80 nodes, `clariden`,
+  image `verl-cuda:alps7-dev-621fa40275c4f036` (Containerfile `e3f4d98`, TE pinned to 2.12.0).
+  ~18 min queued, ran ~41 min, FAILED — **a dead compute node, not a code/config bug**.
+- **Cause**: compute node `172.28.27.124` stopped responding mid-run — Ray raylet
+  `"marked dead because the detector has missed too many heartbeats"`; GCS then went
+  cluster-wide-unavailable and Ray tore down. Driver surfaced it as
+  `trainer_separate_async.py:135 on_init_end → standalone_checkpoint_manager.update_weights →
+  checkpoint_engine/base.py:515 → ray.get(...) → ActorDiedError` (that node's WorkerDict died
+  with the node). Nothing in the script or config is implicated.
+- **The TE 2.12.0 pin (`e3f4d98`) is validated — the CI image works.** Diagnostic block, all 80
+  nodes: `transformer-engine: 2.12.0` / `transformer-engine-torch: 2.12.0` /
+  `nvidia-cutlass-dsl: 4.5.0` (TE 2.12's code doesn't reference `block_copy`, so the newer
+  cutlass-dsl is fine), and all 3 import smoke tests green — `megatron.training.models.gpt: OK`
+  (the exact import that killed `3235127` and `3236353`), `sglang routed_experts capture: OK`,
+  `sglang LocalSerializedTensor: OK`. 6 source patches applied 80/80, no FATAL.
+- **Furthest any run on a CI-built image has reached** — cleared every historical crash point
+  before the node died:
+  - Phase 2: `DistributedDataParallel contains 9.24B parameters` (past `3199623`'s CUDA crash).
+  - Phase 3: GLM5Bridge HF→Megatron conversion `100% (6201/6201)`.
+  - Phase 4: SGLang TP=32 standalone rollout `HTTP server started`.
+  - **Seed weight sync (`delta_sharded`), trainer-side export: ran clean** — `[WSYNC-DBG]
+    seed/full generator exited after 59079 tensors, 78–80s` on the ranks that finished (others
+    were still streaming ~tensor #38001 at t+91s when the node dropped). **Zero
+    `gather_from_ep_ranks`, zero NCCL ALLGATHER** — the trainer side of the weight-sync-hang
+    concern looks good, but this was the one-time seed path, not a steady-state delta sync.
+- **Still not validated end-to-end** (job died before reaching them): `delta_sharded` rollout-side
+  ingestion / `_update_weights_delta_flush` / the `LocalSerializedTensor` runtime call, the
+  steady-state delta sync (speed + no hang), the step-21 OOM, the TP=32 SGLang MLA hang, any
+  training step.
+- **Fix**: none — hardware node failure. Clean case for an unmodified resubmit (same as this
+  repo's infra-flake precedent, `3152802`→`3171176` / `3207923`→`3209484`). Per memory
+  `hpc_job_fix_then_ask`, asked the user before resubmitting.
+- **Commit**: not committed.
+
+### Run `3240762` — 2026-08-31 — unmodified retry of 3240384: cleared the node-failure, then hit the megatron-bridge weight-sync desync (4th occurrence) — this time on the `delta_sharded` SEED sync. Seed-sync lockstep-barrier fix added.
+
+- **Log**: `~/Downloads/slurm-3240762.out` (460 KB, complete). 80 nodes, `clariden`, image
+  `verl-cuda:alps7-dev-621fa40275c4f036`. ~5 min queued, ran ~50 min, FAILED (exit 15) — **the
+  megatron-bridge weight-sync collective desync, NOT a node failure** (no NODE_FAIL, no raylet
+  death, no OOM).
+- **Everything green up to the seed sync** — same as `3240384`: diagnostic block (TE 2.12.0 /
+  TE-torch 2.12.0, all 3 smoke tests OK), 6 patches 80/80, DDP grad-buffer
+  (`9.24B parameters`), GLM5Bridge conversion (6201/6201), SGLang TP=32 rollout HTTP up (no
+  flashinfer MLA hang — that fix holds), `checkpoint_engine.backend: delta_sharded` active.
+- **Symptom**: the seed weight sync hung. ~96 trainer ranks finished the seed export cleanly
+  in 77–132s (`[WSYNC-DBG] seed/full generator exited after 59079 tensors`); the rest stalled
+  after **545 / ~1116 tensors** and ran the full 1800000ms (30-min) NCCL/gloo timeout.
+  ```
+  delta_checkpoint_engine.py:521  _send_full_seed  →  for name, tensor in weights
+  model_bridge.py:1353            stream_weights_megatron_to_hf
+  param_mapping.py:1581           megatron_to_hf
+  param_mapping.py:465            broadcast_obj_from_pp_rank
+                                 torch.distributed.all_gather_object(..., group=self.pp_group)
+  RuntimeError: gloo ... Timed out waiting 1800000ms for recv operation
+  ```
+  Plus `gather_from_ep_ranks` (`param_mapping.py:806`) NCCL ALLGATHER timeouts on other ranks.
+  `last enqueued work: 172, last completed work: 109` (PP group) — a rank raced ~63 collectives
+  ahead, one never matched. Ranks 244 and 33 flagged as the peers that never entered.
+- **Root cause — 4th occurrence** (`3141801` / `3207923` / `3219811` / `3240762`) of the
+  megatron-bridge weight-streaming collective desync, and the **first on the `delta_sharded`
+  seed sync**. `delta_sharded` fixed the STEADY-STATE syncs (validated: `3223205` trainer-side
+  seed export was clean, no `gather_from_ep_ranks`) — but its one-time seed sync
+  (`_send_full_seed`) still streams the full `get_per_tensor_param()` HF export, which runs a
+  chain of PP/EP/TP assembly collectives per HF tensor. `_send_full_seed` drives that generator
+  **asymmetrically**: rank 0 buckets and broadcasts each flush to the rollout CE group between
+  pulls, while every non-master rank just discards its tensor and immediately pulls the next —
+  so non-master ranks race ahead in the per-tensor collective chain (the observed 63-tensor
+  drift) until a later cross-group collective deadlocks. This is the mechanism the earlier
+  "one rank momentarily stalled" investigation (run `3219811` entry) suspected but couldn't
+  pin — the `delta_sharded` seed path makes the asymmetry explicit and reproducible.
+- **Fix — seed-sync lockstep barrier** (`example/patches/wsync-debug-progress-log.patch`,
+  expanded from the diagnostic-only version; checked-in file + script heredoc verified
+  byte-identical; `git apply --check` / `py_compile` / `--reverse --check` all clean against a
+  fresh v0.9.0 worktree). `_wsync_progress_log` now, for the `"seed/full"` export only, calls
+  `torch.distributed.barrier()` on the trainer WORLD group every
+  `VERL_WSYNC_SEED_BARRIER_EVERY` (default **1**) HF tensors, **after** the consumer processed
+  each — no rank can start tensor K+1's assembly collectives until every rank finished K, so the
+  drift is bounded to `VERL_WSYNC_SEED_BARRIER_EVERY`. One-time cost on the seed only
+  (~1–3 ms/barrier × ~59079 items ≈ 1–3 min added to the ~80–130s seed; the env var lets us
+  raise it to 8/16 without a rebuild if that's too slow). The `delta-steady` path is already
+  count-lockstepped by design and is **not** barriered. Not a monkeypatch of megatron-bridge —
+  it's a WORLD barrier in verl's own generator wrapper, which is strictly safe (a barrier
+  cannot corrupt state; worst case it doesn't prevent this specific race and costs a few
+  minutes).
+- **Still not validated end-to-end** (job died in the seed sync): `delta_sharded` rollout-side
+  ingestion / `_update_weights_delta_flush` / `LocalSerializedTensor` runtime call, steady-state
+  delta sync speed, step-21 OOM, any training step.
+- **Fix**: `wsync-debug-progress-log.patch` seed-barrier (above), unverified on cluster. Per
+  `hpc_job_fix_then_ask`, asking the user before resubmitting.
+- **Commit**: not committed.
+
+### Run `3241496` — 2026-08-31 — seed-sync barrier fix WORKS (288/288 ranks, no hang) + `LocalSerializedTensor` runtime path WORKS; new blocker: fused_adam optimizer-state OOM at STEP 1 on local-GPU-0. 104-node / DP=4 fix.
+
+- **Log**: `~/Downloads/slurm-3241496.out` (728 KB, complete). 80 nodes, `clariden`, image
+  `verl-cuda:alps7-dev-621fa40275c4f036`, **seed-sync barrier applied** (`wsync-debug-progress-log.patch`
+  expanded). ~47 min queued, ran ~27.7 min, FAILED (exit 15) — 24× CUDA OOM over ~3.5 min in the
+  first optimizer step, then Slurm force-terminated. Phase 7 (training loop) entered, **0 steps**.
+- **THE SEED-SYNC BARRIER FIX WORKS** — the 4-occurrence megatron-bridge desync is resolved:
+  - `[WSYNC-DBG] rank=N seed/full generator exited after 59079 tensors, 139s` on **all 288
+    trainer ranks** (`[repeated 287x across cluster]`). **Zero** `gather_from_ep_ranks` /
+    `all_gather_object` / `OpType=ALLGATHER` / `1800000ms` anywhere in the log.
+  - `delta-sharded FULL-SEED v=0 done in 139.6s (flushes=687 wire=1385.6GB)`, then
+    `cupy staging pool after seed send: held 3.54GB; device free 57.10->60.65GB on release` —
+    staging cleanly returned, **60.65 GB free on GPU 0 right after the seed**.
+  - Seed took ~140s vs ~80–130s unbarriered — the predicted modest slowdown, no hang.
+- **`LocalSerializedTensor` runtime path WORKS** (run `3223205`'s blocker): rollout-side seed
+  ingestion `delta apply v=0 flushes=687 (in-place via sglang loader)` on all 32 CE workers, no
+  `ImportError`. `delta-sharded-localserializedtensor-import-fix.patch` validated end-to-end.
+- **Also confirmed**: TE 2.12.0 pin holds, DDP grad-buffer (`9.24B parameters`), GLM5Bridge
+  6201/6201, SGLang TP=32 rollout up (no flashinfer MLA hang).
+- **New blocker — CUDA OOM in `fused_adam._initialize_state`** (lazy `exp_avg`/`exp_avg_sq`
+  alloc on the first `optimizer.step()`), traceback
+  `engine_workers.py:710 update_actor → transformer_impl.py:736 optimizer_step →
+  megatron/core/optimizer/distrib_optimizer.py:3163 → transformer_engine/pytorch/optimizers/fused_adam.py:381
+  torch.empty_like`. Hit **local-GPU-0 on ~9+ distinct trainer nodes** (every OOM says "GPU 0";
+  the failing actor ip/pid varies across 9 IPs). Tried 12–24 MiB, `8.75 MiB free`. Numbers
+  thrash across the 24 retries (PyTorch-allocated 58–78 GiB, process total 71–91 GiB) but the
+  non-PyTorch slice is a **consistent ~12.3 GiB** (NCCL comm buffers + CUDA context on each
+  node's device 0), and **"reserved but unallocated" is only 35–95 MiB — NOT fragmentation**, so
+  `expandable_segments` would not help (and breaks SGLang, run `3219305`).
+- **Same OOM class as run `3217439`** (nccl backend, step 21, `fused_adam` / GPU 0 / ~24 MiB
+  short / ~17 GiB non-torch). `delta_sharded` moved it **earlier** (step 21 → step 1): its seed
+  sync runs at `on_init_end`, so the CE NCCL group + residual buffers are already resident when
+  step 1's optimizer runs, whereas the nccl backend's first sync is at step 2. Not a regression
+  from `delta_sharded` per se — the underlying "local-GPU-0 carries ~12 GiB extra, workload
+  sized to just fit a normal GPU" was always there.
+- **Fix — 104 nodes / DP 3→4 + token cut** (user-approved, 2026-08-31): `#SBATCH --nodes` 80→104
+  (`TRAINING_NNODES` 72→96 → 384 trainer GPUs → DP = 384/(TP4·PP3·EP8) = 4);
+  `PPO_MINI_BATCH_SIZE` 6→8 (× `ROLLOUT_N` 8 = 64 rows = 2× the new `dp_size` DP4·EP8 = 32 —
+  `TRAIN_BATCH_SIZE` auto-derives 12→16 prompts); `ppo_max_token_len_per_gpu` 12288→8192.
+  DP 3→4 shrinks the per-GPU grad-buffer / optimizer working set / activation footprint ~25%
+  (multi-GiB, vastly more than the 12 MiB shortfall); the token cut is paired insurance on the
+  activation peak. Rejected: `expandable_segments` (not fragmentation, breaks SGLang), NCCL-env
+  trims (gamble, touches the just-stabilized collective stack). Unverified on cluster.
+- **Still not validated**: `delta_sharded` steady-state delta sync speed (seed done, steady never
+  reached), any training step, step-21 OOM.
+- **Commit**: not committed (script: 104n/DP4/token; `wsync-debug-progress-log.patch` seed-barrier).
+
+### Run `3243323` — 2026-08-31 — 104 nodes / DP=4: seed-barrier + LocalSerializedTensor re-validated; step-1 `fused_adam` OOM RECURRED (DP=4 + token cut cut ~3–6 GiB, still 12–24 MiB short). Deep-dived the memory; ~17.7 GiB unattributed.
+
+- **Log**: `~/Downloads/slurm-3243323.out` (700 KB, complete). **104 nodes** (96 trainer → DP 3→4),
+  `PPO_MINI_BATCH_SIZE` 8, `ppo_max_token_len_per_gpu` 8192, `clariden`, image
+  `alps7-dev-621fa40275c4f036`. ~53 min queued, ran ~29 min, FAILED (exit 15) — 24× CUDA OOM in
+  step 1's optimizer, then Slurm force-terminated. 0 steps.
+- **Re-validated (3rd time now)**: seed-sync WORLD-barrier — `seed/full generator exited after
+  59079 tensors, ~140s` on all **384** ranks, zero `gather_from_ep_ranks` / hang. `LocalSerializedTensor`
+  runtime path — `delta apply v=0 flushes=687` on all 32 CE workers. TE 2.12.0, R3 active
+  (`routing replay layers: 23/26`), SGLang rollout up (no MLA hang).
+- **Symptom — same as `3241496`**: `fused_adam.py:381 _initialize_state` → `torch.empty_like` for
+  `exp_avg`/`exp_avg_sq` on the first `optimizer.step()`, OOM by 12–24 MiB on trainer-node
+  local-GPU-0 (nodes `172.28.51.179` pids 171645–648, `172.28.42.20`, and ~5 more). DP 3→4 +
+  token 12288→8192 cut PyTorch-allocated ~3–6 GiB (3241496 ~64–68 GiB → this run ~61–66 GiB) —
+  **not enough**.
+- **Memory forensics** (from the saved log, per OOM message):
+  `GPU 0: 95.00 total, ~7.5 MiB free, this process ~77.3 GiB (PyTorch ~65 GiB + non-PyTorch
+  ~12.3 GiB), "reserved but unallocated" 35–95 MiB` → **~17.7 GiB on GPU 0 unaccounted by
+  PyTorch's "this process"** (95 − 77.3 − 0.007). Could NOT definitively attribute it:
+  - **Not oversubscription** — each OOM node has exactly 4 `WorkerDict` pids (1/GPU).
+  - **Not a co-resident SGLang / CE worker** — the standalone rollout (8 nodes) and the 32 CE
+    workers are on disjoint IPs from every OOM node.
+  - **Not a ref model** — `need_reference_policy` = `use_kl_in_reward OR actor.use_kl_loss`, both
+    `False` here, so verl builds `Role.ActorRollout` (no ref); the `"actor and ref model engine
+    initialized"` log line is unconditional and does not imply a ref was created.
+  - **Not `critic`** (`enable: False`), not a `SimpleStorageUnit` requirement (node `.42.20`
+    OOM'd with no StorageUnit co-resident).
+  - **Leading candidates, unconfirmed**: (a) onloaded bf16 params (`9.24B × 2 ≈ 18.5 GiB`,
+    `param_offload: True` onloads them during `train_mode`) mis-attributed by PyTorch's accounting
+    when `load_megatron_model_to_gpu` bypasses the caching allocator; (b) C-extension memory
+    PyTorch under-counts — TE fused-adam workspace, megatron-core distrib-optimizer scratch, NCCL
+    NVLS/registered buffers, R3/cupy routed-experts buffers; (c) same-GPU orphan process from
+    node reuse (this repo's run `3185487` precedent) — but 5+ nodes is a lot for random orphans.
+  - **Same OOM class as `3217439`** (nccl, step 21). `delta_sharded` moved it to step 1 (seed
+    sync at `on_init_end` leaves buffers resident before step 1; nccl's first sync is step 2).
+- **Fix — NOT applied, needs user decision.** DP scaling gives only ~2–3 GiB per bump. Higher-
+  leverage, in order:
+  1. **`actor.optim.use_precision_aware_optimizer: True` + `exp_avg_dtype: bf16` +
+     `exp_avg_sq_dtype: bf16`** (`verl/workers/config/optimizer.py:201-204`; currently all
+     default fp32) — halves the two biggest optimizer tensors, ~7 GiB saved. Standard megatron-core
+     feature; slight numerical change (bf16 2nd moment); untested here with `optimizer_offload` +
+     TE fused-adam.
+  2. **`NCCL_NVLS_ENABLE=0`** in the srun env — frees NVLink-multicast buffers (part of the
+     ~12.3 GiB NCCL footprint); pure perf knob, low risk, ~2–4 GiB.
+  3. More trainer nodes → DP=5 (128 total) — guaranteed but +24 nodes on top of 104.
+  Recommendation: **1 + 2 together, keep 104 nodes** (or drop to 80 to test whether #1 alone
+  suffices).
+- **IMPORTANT framing correction (user, 2026-08-31)**: the "12–24 MiB short" throughout this
+  entry and `3241496`'s is **misleading** — it is only the size of the *single* `torch.empty_like`
+  that happened to fail, mid-way through `fused_adam._initialize_state` iterating over the whole
+  sharded param set. The optimizer-state init is a **multi-GiB cumulative allocation** (this
+  rank's DP-shard of fp32 master + `exp_avg` + `exp_avg_sq` ≈ ~28 GiB fp32 total at DP=4), and it
+  ran out partway. The true deficit is **unknown** and could be several GiB — the PyTorch-allocated
+  number bouncing 58→78 GiB across the 24 retries is consistent with a large, still-incomplete
+  allocation, not a hairline miss. So a fix must free GiB, not MiB.
+- **Fix applied (user-approved, 2026-08-31), unverified on cluster**: **1 + 2, kept 104 nodes.**
+  Added to the script: `actor_rollout_ref.actor.optim.{use_precision_aware_optimizer: True,
+  exp_avg_dtype: bf16, exp_avg_sq_dtype: bf16}` (new `optim:` block, sibling of `actor.megatron`;
+  `main_grads_dtype` left `fp32`) — halves `exp_avg`/`exp_avg_sq` (the exact tensors that fail),
+  ~28 GiB fp32 optimizer state → ~18.5 GiB, **~9 GiB saved**. Plus `export NCCL_NVLS_ENABLE=0` in
+  the srun env block (right after the `TORCH_NCCL_*` flight-recorder exports) — frees
+  NVLink-multicast buffers, part of the ~12.3 GiB non-PyTorch footprint, ~2–4 GiB. Caught + fixed
+  one stray apostrophe ("recipe's") in the new NVLS comment inside the single-quoted `srun bash
+  -c '...'` body before submitting (the run-3149339 hazard — `bash -n` flagged it). `bash -n` +
+  full stray-quote / backtick sweeps clean.
+  **This run will actually MEASURE the deficit** — the OOM message's this-process / PyTorch-allocated
+  numbers (and how far into the param loop it gets) will show whether ~11–13 GiB of new headroom
+  is enough or whether DP=5/6 / TP=8 / a smaller config is needed. bf16 2nd moments also carry a
+  slight numerical risk (watch grad_norm / NaN over the first steps).
+- **Commit**: not committed.
+
+### Run `3244653` — 2026-08-31 — precision-aware bf16 moments barely helped (~1.4 GiB, all from NVLS-off); step-1 OOM recurred. Memory math points at ~18.5 GiB of onloaded bf16 params PyTorch doesn't count.
+
+- **Log**: `~/Downloads/slurm-3244653.out` (584 KB). 104 nodes, `use_precision_aware_optimizer:
+  True` + `exp_avg{,_sq}_dtype: bf16`, `NCCL_NVLS_ENABLE=0`, `ppo_max_token_len_per_gpu` 8192.
+  ~29 min run, FAILED — step-1 `fused_adam` OOM again (only 3 OOMs this time, then `srun` task 0
+  exited → cascade).
+- **Re-validated (4th time)**: seed sync clean on all 384 ranks, 137s, zero hang (NVLS-off did
+  not slow it). LocalSerializedTensor, TE 2.12.0, R3, SGLang rollout — all fine.
+- **Symptom**: `fused_adam.py:568 step → :324 get_unscaled_state → unscaled =
+  state[state_name].float()` — TE fused-adam **upcasts each bf16 moment back to fp32 on GPU** at
+  step time. `Tried 24.00 MiB. GPU 0: 30.75 MiB free. this process 75.63 GiB (PyTorch 63.07 +
+  non-PyTorch 12.2), reserved-but-unallocated 405 MiB.`
+- **Delta vs `3243323`** (~65 GiB PyTorch / ~77 GiB process): PyTorch-allocated **65 → 63.07 GiB**
+  (−~2), process **77 → 75.63 GiB** (−~1.4). **Almost all the ~1.4 GiB gain is from
+  `NCCL_NVLS_ENABLE=0`.**
+- **Why precision-aware bf16 moments did ~nothing for GPU**: `optimizer_offload: True` already
+  keeps the fp32 master + moments on **CPU**, so bf16 saves *CPU* memory, not GPU. And TE
+  fused-adam's `get_unscaled_state` does an explicit `.float()` upcast of each moment **on GPU 0**
+  during the step — so bf16 actually *adds* a transient GPU alloc on the tight GPU. Net ≈ neutral
+  (slightly negative). **→ revert `use_precision_aware_optimizer`.**
+- **The ~19 GiB "another process" — best current theory**: `95.00 − 75.63 (this process) − 0.03
+  (free) = 19.3 GiB` used by *something else* on trainer GPU 0. Ruled out (runs `3243323`/`3244653`):
+  oversubscription (exactly 4 `WorkerDict` pids/node), co-resident SGLang/CE (disjoint IPs), ref
+  model (`need_reference_policy` False — no ref built), critic (disabled), `SimpleStorageUnit`
+  requirement (a node OOM'd with none co-resident). **Leading unconfirmed theory: it is the
+  actor's own onloaded bf16 params** — `9.24B × 2 bytes ≈ 18.5 GiB`, matches ~19 GiB — brought
+  on-GPU by verl's `param_offload` onload (`load_megatron_model_to_gpu`) via a path PyTorch's
+  caching allocator / process-footprint accounting doesn't track, so it shows as "another
+  process" rather than part of "this process 75.63 GiB". If true, the real per-GPU need is
+  ~75.6 + 18.5 ≈ 94 GiB, and the fp32 upcast (24 MiB) is the final straw. **Not confirmed — the
+  log has NO memory instrumentation; a diagnostic run (dump `torch.cuda.memory_summary()` +
+  `nvidia-smi --query-compute-apps` on the OOMing rank right before `optimizer.step()`) would
+  settle it.**
+- **Fix — NOT applied, needs user decision.** Levers, now better understood:
+  1. **Revert `use_precision_aware_optimizer`** (net-negative here) — do regardless.
+  2. **`ppo_max_token_len_per_gpu` 8192 → 4096** — real cut to the step-1 activation contribution
+     to the 63 GiB PyTorch number (~3–6 GiB).
+  3. **TP 4 → 8** (keep 96 trainer nodes, PP=3, EP=8, DP=2): halves the per-GPU param shard
+     (→ ~9.2 GiB) *and* optimizer state — directly halves the suspected ~18.5 GiB. Cost: TP=8
+     spans 2 GH200 nodes → half the per-layer TP collective goes over Slingshot, not NVLink — a
+     real per-step slowdown. `DP=2` was flagged insufficient at TP=4 but the arithmetic
+     (`3M + 11 GiB` at TP=8 vs `6M + 11` at TP=4) says it fits with room at TP=8.
+  4. **DP 4 → 5** (128 total nodes) — +24 nodes again; ~2–3 GiB/bump, may still not be enough
+     if the ~18.5 GiB param theory is right (DP doesn't shard params).
+  5. **Diagnostic run first** — instrument the OOMing rank, confirm the ~19 GiB, then fix
+     precisely. Costs one run.
+- **Decision (user, 2026-08-31): #5, diagnostic run.** Reverted `use_precision_aware_optimizer`
+  (removed the `optim:` block, left a NOTE explaining why); kept `NCCL_NVLS_ENABLE=0` (~1.4 GiB,
+  safe); kept 104 nodes and `ppo_max_token_len_per_gpu: 8192` unchanged so the memory picture is
+  directly comparable to `3244653`. Added **`example/patches/step1-oom-memdump.patch`** (new,
+  diagnostic-only): `_step1_oom_memdump()` fires once per rank right before the first
+  `optimizer.step()` — every rank prints its own torch CUDA accounting
+  (`free/total/gpu_used/torch_alloc/torch_reserved`), and local rank 0 (the GPU that OOMs) also
+  shells out to `nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory` +
+  `--query-gpu=...` + `torch.cuda.memory_summary()`. `[MEMDUMP]` lines land in the main slurm log
+  just before the crash → identifies the ~19 GiB by pid/process. **Must apply after
+  `wsync-debug-progress-log.patch`** (both touch `transformer_impl.py`; the memdump diff's context
+  assumes `_wsync_progress_log` is present) — wired into the apply loop last, after
+  `delta-sharded-localserializedtensor-import-fix.patch`. Verified: fresh v0.9.0 → wsync → memdump
+  applies clean + compiles + reverse-checks; heredoc byte-identical to the checked-in file;
+  `bash -n` + stray-quote/backtick sweeps clean.
+- **Commit**: not committed.
+
+### Run `3246683` — 2026-08-31 — step-1 OOM diagnostic: `[MEMDUMP]` fired, mystery SOLVED — there is NO phantom process; it is a genuine ~12–24 MiB hairline miss on the fused_adam optimizer-state transient on GPU 0.
+
+- **Log**: `~/Downloads/slurm-3246683.out` (6842 lines). 104 nodes, `NCCL_NVLS_ENABLE=0`,
+  `use_precision_aware_optimizer` reverted, `ppo_max_token_len_per_gpu: 8192`,
+  `step1-oom-memdump.patch` + `wsync-debug-progress-log.patch` applied. ~28 min, FAILED — step-1
+  `fused_adam` OOM as expected. All 8 patches applied 104/104, seed sync clean (131s, all 384
+  ranks, no hang), SGLang rollout up — everything through step 1 works.
+- **`[MEMDUMP]` fired on every rank right before the first `optimizer.step()`.** lrank=0 header
+  (the GPU that OOMs), representative: `free≈35.5G total=95.00G gpu_used≈59.4G torch_alloc≈45.7G
+  torch_reserved≈48.9G non_torch_this_proc≈10.6–12.1G`.
+  **`nvidia-smi --query-compute-apps` for the OOMing GPU — THE KEY DATA:**
+  ```
+  GPU-c51c…, 181272, ray::WorkerDict.actor_rollout_update_actor, 61384 MiB
+  GPU-ddcf…, 181273, ray::WorkerDict.actor_rollout_update_actor, 61512 MiB
+  GPU-209a…, 181274, ray::WorkerDict.actor_rollout_update_actor, 61512 MiB
+  GPU-1038…, 181275, ray::WorkerDict.actor_rollout_update_actor, 61512 MiB
+  ```
+  **Exactly ONE process per GPU — the trainer `WorkerDict` itself.** No SGLang, no
+  CheckpointEngineWorker, no ref/critic, no second CUDA context. `nvidia-smi --query-gpu` shows
+  GPU total **97871 MiB (≈95.6 GiB)**, not the 95.00 PyTorch reports.
+- **THE "~19 GiB another process" FROM RUNS 3241496/3243323/3244653 WAS A MISATTRIBUTION.** It
+  came from reading PyTorch's OOM message (`95.00 total − 75.6 this process = 19.4 "other"`)
+  literally — but "95.00" is PyTorch rounding down the real ~95.6 GiB, and its "this process has
+  X" figure is a partial estimate that misses some driver/context bytes, so the subtraction
+  manufactured a phantom. The `[MEMDUMP]` `nvidia-smi` proves there is no other process.
+- **Real mechanism**: right before the optimizer step GPU 0 has ~35 GiB free (torch reserved
+  ~48 GiB + non-PyTorch ~12.3 GiB). `fused_adam.initialize_state` then allocates the full
+  distributed-optimizer shard on GPU 0 — fp32 master-remainders + `exp_avg` + `exp_avg_sq`,
+  ~35 GiB for the DP=4 shard — and misses by **12–24 MiB**. `optimizer_offload: True` only helps
+  *between* steps; during the step the whole shard is resident on GPU. **Genuinely a hairline
+  miss** — deficit is MiB-to-maybe-a-few-hundred-MiB, not GiB (contra the earlier "could be much
+  more" worry; the `[MEMDUMP]` free-before / OOM-after bracket confirms it).
+- **This run's OOM numbers ≈ identical to `3244653`** (`63.08 GiB alloc / 75.31 GiB process`).
+  NVLS-off did not reduce the ~12.3 GiB non-PyTorch. DP 3→4, token 8192, precision-aware revert —
+  all moved the step-1 picture by ~0.
+- **Fix directions (not applied)** — now a confirmed hairline miss, so cheap/targeted first:
+  1. **`torch.cuda.empty_cache()` immediately before `optimizer.step()`** — `[MEMDUMP]` shows
+     torch_reserved (~48.9) > torch_alloc (~45.7): ~3 GiB of reserved-but-unallocated cache.
+     Returning it to the driver before the optimizer's large contiguous allocs could hand it the
+     few hundred MiB it needs. Tiny, safe. (`optimizer_step` already has a *conditional*
+     `empty_cache()` for the distillation-topk path — make it unconditional.)
+  2. **`ppo_max_token_len_per_gpu` 8192 → 4096** — lowers the fwd/bwd reserved high-water
+     (peak reserved ~59 GiB per `memory_summary`) carried into the optimizer step.
+  3. **DP 4 → 5** (128 nodes) — shrinks the optimizer shard ~35 → ~28 GiB. Guaranteed, +24 nodes.
+  4. **megatron-core CPU-streaming optimizer** (`use_layer_wise_distributed_optimizer`, currently
+     `False`; or `HybridDeviceOptimizer` / `optimizer_cpu_offload`) — streams optimizer state
+     per-bucket instead of whole-shard-on-GPU, structurally cutting the ~35 GiB. Needs research.
+  Recommendation: **1 + 2 together, keep 104 nodes**; DP=5 (#3) fallback; #4 the "proper" fix.
+- **Fix applied (user-approved, 2026-08-31), unverified**: **1 + 2.** `step1-oom-memdump.patch`
+  expanded (same filename, header updated to "FIX + diagnostic"): `optimizer_step()`'s
+  `get_torch_device().empty_cache()` made **unconditional** (was gated on the
+  `_distillation_use_topk_active` path, unused here) — returns the ~3 GiB of PyTorch
+  reserved-but-unallocated cache to the driver right before `self.optimizer.step()`, so
+  `fused_adam.initialize_state` gets a clean arena. `_step1_oom_memdump()` kept (confirms
+  whether the fix cleared it + by how much). And `ppo_max_token_len_per_gpu` **8192 → 4096**.
+  Kept: 104 nodes, `NCCL_NVLS_ENABLE=0`, `use_precision_aware_optimizer` reverted. Verified:
+  fresh v0.9.0 → wsync → step1 patch applies + compiles + reverse-checks; heredoc byte-identical;
+  `bash -n` + sweeps clean.
+- **Commit**: not committed.
+
+### Run `3247517` — 2026-08-31 — `empty_cache()` fix WORKED (reserved−alloc gap 3 GiB → 0.15 GiB) but step-1 OOM still recurred (5th). The optimizer-state init genuinely needs ~38 GiB and GPU 0 has ~38 GiB — zero margin. Needs DP scaling or CPU-streaming optimizer.
+
+- **Log**: `~/Downloads/slurm-3247517.out` (742 KB). 104 nodes, unconditional `empty_cache()`,
+  `ppo_max_token_len_per_gpu: 4096`, `NCCL_NVLS_ENABLE=0`. ~28 min, FAILED — step-1 `fused_adam`
+  OOM (5th consecutive). All 8 patches 104/104, seed sync clean (132s, all 384 ranks), SGLang
+  rollout up.
+- **The `empty_cache()` fix did exactly what it should**: `[MEMDUMP]` right before the optimizer
+  step shows `torch_reserved − torch_alloc = 0.15 GiB` (was ~3 GiB in `3246683`). Reserved-but-
+  unallocated at OOM: 16–52 MiB — nothing left to reclaim. The cache is not the problem.
+- **`ppo_max_token_len_per_gpu` 8192→4096 had zero visible effect** — expected: the OOM is in
+  **fixed-size optimizer-state init** (fp32 master-remainders + `exp_avg` + `exp_avg_sq` for the
+  DP=4 shard), not token-dependent activations.
+- **The real number**: `[MEMDUMP]` shows **~38 GiB free on GPU 0 right before `optimizer.step()`**
+  (`torch_alloc ≈44.3, torch_reserved ≈44.5, non_torch ≈12.1, gpu_used ≈56.6, free ≈38.4`).
+  `fused_adam.initialize_state` then allocates the full optimizer-state shard — which needs
+  **~38 GiB** — and misses by 12–24 MiB. **Genuine hairline miss, but the thing that has to fit
+  is ~38 GiB, so there is essentially zero margin and every run lands on OOM.** The user's
+  "could be much more" caution was right: the *deficit* is MiB, but the *allocation that must
+  fit* is ~38 GiB, so a fix must free multiple GiB.
+- **`use_precision_aware_optimizer` cannot help** (tried `3244653`): with `optimizer_offload:
+  True` the fp32 master+moments live on CPU between steps, and TE's `get_unscaled_state` upcasts
+  to fp32 on GPU anyway during the step.
+- **Fix — NOT applied. Needs user decision. Levers that actually free GiB:**
+  1. **DP 4 → 5** (128 nodes: 120 trainer, 480 GPUs / (TP4·PP3·EP8) = 5) — shrinks the optimizer
+     shard `~38 → ~30 GiB` (~7.6 GiB margin, overwhelming for a MiB miss). Config-only, no new
+     patches, no risk. `dp_size` = 5·8 = 40 → `PPO_MINI_BATCH_SIZE` 8 → 10 (10·8 = 80 = 2×),
+     `TRAIN_BATCH_SIZE` auto 16→20. +24 nodes (128 = 60% over the original 80).
+  2. **DP 4 → 6** (152 nodes) — `~38 → ~25 GiB`, ~12.7 GiB margin. `PPO_MINI_BATCH_SIZE` → 12.
+     +48 nodes (90% over 80).
+  3. **megatron-core CPU-streaming optimizer** — `use_layer_wise_distributed_optimizer` (config
+     field, currently `False`) or `HybridDeviceOptimizer` / per-bucket `optimizer_cpu_offload`:
+     stream the optimizer state from CPU per-bucket during the step instead of whole-shard-on-GPU.
+     Structurally removes the ~38 GiB (could even allow going back toward 80 nodes). Needs a
+     research pass — confirm it composes with verl's V1 Megatron path + TE fused-adam + the
+     `distrib_optimizer.py:3163` code that OOMs — and likely its own debugging.
+  Recommendation: **DP=5 (#1)** — cheapest guaranteed fix, we've validated everything else works,
+  the miss is tiny. #3 is the "stop adding nodes" play but carries its own risk after 5 clean
+  failures on the same line.
+- **Fix applied (user-approved, 2026-09-01), unverified**: **DP=5.** `#SBATCH --nodes` 104→128
+  (`TRAINING_NNODES` 96→120 → 480 trainer GPUs → DP = 480/(TP4·PP3·EP8) = 5); `PPO_MINI_BATCH_SIZE`
+  8→10 (× `ROLLOUT_N` 8 = 80 rows = 2× the new `dp_size` DP5·EP8 = 40; `TRAIN_BATCH_SIZE` auto
+  16→20). Kept: unconditional `empty_cache()`, `ppo_max_token_len_per_gpu: 4096`,
+  `NCCL_NVLS_ENABLE=0`, `step1-oom-memdump.patch` (so the `[MEMDUMP]` confirms the margin), same
+  image. Config-only, no new patches. `bash -n` + sweeps clean.
 - **Commit**: not committed.
 
 # Training Apertus v1.5 on verl (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`)
@@ -801,6 +2704,128 @@ on every node, the same "fetch once, distribute, apply-or-fail" discipline as th
 "Never fetch per-node from the internet inside the srun" above) — none of it lives only in this
 file.
 
+## Configuration audit (architecture-vs-config) — 2026-08-26
+
+Per the repo-wide "Configuration correctness audits" process above.
+
+- **Architecture**: Apertus-v1.5-70B is a **dense**, text+vision+audio multimodal model
+  (`model_type: apertus1p5`) — confirmed dense (71.94B parameters, no expert/EP config anywhere
+  in this script) in run `3189642`'s successful weight load. Not MoE, so `router_replay`/R3 (see
+  the GLM section's audit entry) does not apply here.
+- **Multimodal-specific config, already found and fixed — but found by crashes, not by this
+  audit process** (this recipe's whole "Known hazards" numbered list above *is* the
+  architecture-vs-config audit for this script, just discovered the hard way): the vision-tower
+  forced `eager` attention (point 2), the SGLang generic-multimodal-loader misload (point 3), and
+  `attn_implementation`/checkpoint-key mismatches (points 5–6) are all instances of "config didn't
+  match what this multimodal architecture actually needs." Flagging retroactively so future
+  scripts get this checked *before* a crash forces it, not instead of the existing fixes.
+- **FSDP2-specific check**: this script loads the model via stock HF
+  `Apertus1p5ForConditionalGeneration.from_pretrained` (no custom bridge, unlike the Megatron
+  variant) — confirmed by `grep`ping the script for any `output_vocab_size`/`lm_head`/pruned-vocab
+  handling: none exists, and none is needed here. HF's own modeling code already sizes `lm_head`
+  to the checkpoint's real (pruned, 131072-wide) weight; there is no separate `vocab_size` field a
+  bridge has to get right, unlike Megatron's single-`vocab_size` `GPTModelProvider` (see that
+  section's pruned-head fix, run `3171151`). No gap found on this axis for FSDP2.
+- **Not checked this pass**: whether `actor.fsdp_config.{param,optimizer,grad}_offload: True` and
+  `ppo_max_token_len_per_gpu: 4096` (point 7's OOM fix) are still the *right* values now that the
+  hybrid-rollout-adjacent OOM chain (run 3185487) and the FSDP2-vs-Megatron reward-collapse
+  investigation are both still open — revisit once those resolve, since a memory-budget fix and a
+  correctness fix can interact.
+
+## Run log
+
+### Run `3184895` — 2026-08-25 — SGLang PR #32979 drift breaks the patch step here too; the Megatron script's allowlist fix was never ported
+
+- **Log**: `~/Downloads/slurm-3184895.out` (226,053 bytes). 16 nodes, `clariden`. FAILED in ~35-43s
+  — died during per-node setup, well before Ray/training started.
+- **Symptom**: `patch -p2 -d /usr/local/lib/python3.12/dist-packages <
+  ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff` (the fatal, non-best-effort patch step) failed:
+  `patching file sglang/srt/managers/detokenizer_manager.py` / `Hunk #1 FAILED at 143` / `FATAL:
+  sglang PR #32979 patch failed to apply`. `srun` force-terminated all 16 nodes.
+- **Root cause**: identical class of bug already fixed once in the sibling Megatron script (see
+  its own Run log, `3152782`): `sgl-project/sglang#32979` is open/unmerged and this script
+  re-fetches its diff fresh every run with no commit pin, so its file set drifts. This script's
+  own patch-categorization was still a fatal-by-default blocklist (only `base_processor.py`
+  special-cased as best-effort) — the Megatron script's allowlist fix for this exact drift was
+  never ported here.
+- **Fix**: ported the Megatron script's allowlist verbatim — only the 4 files confirmed
+  load-bearing for apertus1p5 support (`qwen3_asr.py`, `apertus.py`, both `apertus_mm.py`) are
+  fatal-if-they-fail; everything else the PR touches (currently `base_processor.py` and
+  `detokenizer_manager.py`) is merged into one best-effort diff applied with a `WARNING` instead
+  of aborting. Verified the new comment text sits outside the single-quoted `srun bash -c '...'`
+  block (the run-3149339 quoting hazard) before submitting.
+- **Commit**: not committed.
+
+### Run `3185487` — 2026-08-25 — allowlist fix confirmed working; new, undocumented OOM: rank 0 alone materializes the full un-sharded model before FSDP shards it
+
+- **Log**: `~/Downloads/slurm-3185487.out` (417,000 bytes). 16 nodes, `clariden`. Ran 14m49s
+  (889s), FAILED (exit code 15) — furthest this exact patch-categorization test needed to go.
+- **Confirmed working**: the 3184895 allowlist fix worked — the 4 load-bearing files patched
+  cleanly on every node; the best-effort bundle hit the same context-sensitive
+  `detokenizer_manager.py`/`base_processor.py` hunk failures as before, but now only logged
+  `WARNING: one or more best-effort sglang PR #32979 hunks did not apply ... — continuing` instead
+  of aborting the job. The job proceeded through config load, Ray init, and into FSDP2 trainer
+  model loading — through **100% weight loading** (1224/1224 shards, ~9m44s) before crashing.
+  This confirms the patch-categorization fix (this run's actual purpose) is correct and complete.
+- **Symptom (new, unrelated to the patch fix)**: `torch.OutOfMemoryError: CUDA out of memory.
+  Tried to allocate 8.14 GiB. GPU 0 has a total capacity of 95.00 GiB of which 2.48 GiB is free.
+  Including non-PyTorch memory, this process has 524.00 MiB memory in use`, in
+  `WorkerDict.actor_init_model()`, on `pid=133569, ip=172.28.25.100` — the same rank that had just
+  printed `Loading weights: 100%|██████████| 1224/1224` moments earlier. Immediately preceded by
+  `Before FSDP, memory allocated (GB): 0.00, memory reserved (GB): 0.00, device memory used/total
+  (GB): 92.52/95.00` (verl's `log_gpu_memory_usage`, only ever printed by global rank 0). Full
+  traceback: `_build_fsdp_module` → `apply_fsdp2` → `torch.distributed._composable.fully_shard` →
+  `_get_modules_and_states` → `_move_states_to_device` → `tensor.to(device)`.
+- **Not caused by the patch-categorization fix**: confirmed by scope — this session's only
+  uncommitted change to this file before submitting was the two `awk` filter blocks and the apply
+  step (patch-drift fix above), none of which touch model loading, FSDP, or memory config. The
+  `actor.fsdp_config.{param,optimizer,grad}_offload` / `ppo_max_token_len_per_gpu: 4096` settings
+  from the run-3138546 OOM fix (see the numbered list above) are unchanged and intact.
+- **Root cause — not fully resolved, but narrowed with fetched fork source**: the running FSDP2
+  loading code comes from `theely/verl`'s `Fix-fsdp-model-loading-on-async` branch (`git reset
+  --hard` onto this after the `v0.9.0` checkout — see the srun body), fetched fresh from GitHub
+  and inspected directly (not the local `../verl`, which is `v0.8.0` and doesn't have this fork's
+  code at all). By design (`transformer_impl.py`, comment: "For fsdp2, only rank 0 loads weights
+  from disk; all others receive via broadcast_from_rank0"), **global rank 0 alone** calls
+  `auto_class.from_pretrained(...)` with real (non-meta) tensors — every other rank builds an
+  empty/meta-tensor model structure only. `log_gpu_memory_usage`'s `device memory used/total`
+  reads `torch.cuda.mem_get_info()` — physical-GPU-wide usage, not this process's own allocator
+  stats (which is why `memory allocated`/`memory reserved` read 0.00 while `device ... used` reads
+  92.52 — two different measurements). So rank 0's physical GPU already had ~92.52 GiB in use from
+  *something*, before rank 0's own FSDP-triggered `_move_states_to_device` call (its first GPU
+  write) even started, at a point where nothing in this trace has yet asked to place the model on
+  GPU. Checked whether the fork branch itself regressed since the last confirmed-working run
+  (3139370, 2026-08-21): via the GitHub API, the branch's most recent fsdp2-loading-relevant
+  commits are `9708019a` (2026-07-10) and `0acefce7` (2026-06-25) — both well before 3139370, so
+  the branch has not changed; this rules out a fork-branch regression as the explanation. Two
+  remaining, undistinguished hypotheses: (a) something else (most plausibly a standalone SGLang
+  rollout replica, given `gpu_memory_utilization: 0.75` × 95 GiB ≈ 71 GiB plus engine/cudagraph
+  overhead is in the right range) landed on the same physical node/GPU as trainer global-rank-0 —
+  an oversubscription/placement bug in this script's `fully_async` node split, analogous to the
+  GLM/Megatron "hybrid rollout squats on trainer GPUs" hazard but never previously documented for
+  this FSDP2 recipe; or (b) a leftover/orphaned process from an earlier job left GPU memory
+  unreleased on this specific (possibly reused) physical node — a cluster-side flake unrelated to
+  this script. Not distinguished from the log alone; no SGLang-server-startup log line appears
+  anywhere before the crash, which is some (not conclusive) evidence against (a), since it implies
+  the rollout replicas hadn't started serving yet — though placement/GPU reservation could still
+  precede the log lines that would show that.
+- **Why more nodes is not a safe blind next step**: `ppo_mini_batch_size: 48` is currently exactly
+  equal to `TRAINING_NNODES(12) * 4 = 48` training GPUs (1 sample/GPU, the documented minimum,
+  same shape as the Megatron/GLM chain's `ppo_mini_batch_size >= dp_size` invariant). Raising
+  total node count without recomputing this would make `ppo_mini_batch_size` smaller than the new
+  GPU count (e.g. 24 nodes → 18 training nodes → 72 GPUs > 48) and hit that assertion immediately
+  — trading this OOM for a new, avoidable failure. Also: a single-GPU pre-FSDP squat on rank 0
+  isn't obviously fixed by adding *more* GPUs elsewhere in the cluster either way, since the squat
+  (whatever it is) is local to rank 0's own physical GPU.
+- **Fix**: none yet — this needs one more data point before deciding on a fix. Next run:
+  resubmit this exact, unmodified 16-node config to determine whether the OOM recurs identically
+  (systematic — start pointing at the placement/oversubscription hypothesis in earnest, e.g. by
+  checking Ray's actual node/GPU assignment for the rollout replicas vs. rank 0) or does not
+  recur (one-off node/GPU squat, matching this repo's own precedent for exactly this kind of call
+  — see the Megatron/GLM section's `3152802`/`3171176` TP=32 SGLang hang, retried unmodified and
+  confirmed a one-off).
+- **Commit**: not committed.
+
 # Training Apertus v1.5 on verl, Megatron trainer (`rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh`)
 
 Apertus-v1.5-70B GRPO on GSM8K, CSCS Alps, 16 nodes × 4 GH200 (`clariden`). Script:
@@ -810,6 +2835,34 @@ verbatim (transformers wheel, SGLang PR #32979 + local fixes) — but swaps the 
 Megatron, which needs its own fork: `wqwqazwsxedc/Megatron-LM`/`Megatron-Bridge` (branch
 `apertus`), cloned once into Lustre and `pip install -e`'d on every node ("Group 2: Megatron
 support" in the script). Untested as of run `3141796`.
+
+## Configuration audit (architecture-vs-config) — 2026-08-26
+
+Per the repo-wide "Configuration correctness audits" process above. Same dense (not MoE)
+architecture as the FSDP2 sibling, so `router_replay`/R3 doesn't apply here either. Two
+architecture-vs-config gaps specific to routing this dense multimodal model through a Megatron
+`GPTModel` (rather than HF's own class, as the FSDP2 sibling does) were already found — both by
+crashes, both now fixed, both retroactively exactly what this audit category exists to catch
+earlier next time:
+
+- **Pruned LM head** (run `3171151`/`3171218`): `Apertus1p5TextConfig`'s `output_vocab_size`
+  (131072) is narrower than the embedding `vocab_size` (266752) — a real architectural trait of
+  this checkpoint — but Megatron-core's `GPTModelProvider` has only one `vocab_size` for both
+  input embedding and output head. `Apertus1p5Bridge.provider_bridge()` now sizes Megatron's
+  `vocab_size` to `output_vocab_size` and truncates the input embedding table to match
+  (`_TruncatedVocabEmbeddingMapping` in `apertus1p5_bridge.py`) — see that run's entry for the
+  full reasoning and the acknowledged remaining risk (raises rather than silently mismapping if a
+  future checkpoint isn't actually pruned the way this one is).
+- **`vision_model=True` forced on every forward regardless of batch content** (found and fixed
+  same day as run `3183472`): `verl/workers/engine/megatron/transformer_impl.py` derives
+  `vision_model` from `hasattr(hf_config, "vision_config")` — true for any vision-capable
+  architecture, not from whether the current batch has image content — which corrupted THD
+  packed-sequence tensors for this text-only GSM8K recipe. Patched to force `vision_model=False`
+  for this specifically-text-only workload; a genuinely multimodal use of this model would need
+  the opposite fix. See that run's entry for the full trace.
+
+Nothing new found this pass beyond what's already fixed above; both fixes remain unverified by an
+actual cluster run as of the last entry in this section's run log.
 
 ### Run `3141796` — 2026-08-21 — same qwen3_asr collision as the SGLang side, now on Megatron-Bridge
 
@@ -976,9 +3029,927 @@ support" in the script). Untested as of run `3141796`.
   implementation work (a full `MegatronModelBridge` subclass), not a one-line fix, and unlike the
   qwen3_asr/wheel fixes it cannot be smoke-tested locally (needs a real Megatron init to validate
   the mapping registry), so it was intentionally not attempted without checking in first.
-- **Fix**: none yet — awaiting direction on whether to attempt writing an `Apertus1p5Bridge` for
-  the `wqwqazwsxedc/Megatron-Bridge` fork (real implementation effort, cluster-validated only) or
-  to treat the Megatron trainer variant of this benchmark as blocked pending upstream support,
-  given the sibling FSDP2 script (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`) already
-  trains Apertus-v1.5-70B successfully without Megatron.
+- **Fix**: user asked to write the bridge (wants Megatron parallelism, not just the working FSDP2
+  fallback). New file `apertus-benchmarks/patches/apertus1p5_bridge.py` (checked-in copy) defines
+  `Apertus1p5Bridge`, adapted directly from `apertus_bridge.py`'s `ApertusBridge` — reuses its
+  `MCoreXIELU`/`get_apertus_decoder_block_spec` by import (not duplicated), same
+  rope/attention_bias/hidden_act validation, only two things change: `provider_bridge` reads
+  `hf_pretrained.config.text_config` (via a tiny local `_TextConfigOnlyShim` exposing just
+  `.config`, since `Apertus1p5Config` nests all LM hyperparameters one level down, alongside
+  unrelated `vision_config`/`audio_config`) instead of the top-level config, and every HF-side
+  weight key in `mapping_registry` is re-prefixed `model.language_model.*` instead of `model.*`
+  (confirmed against `modeling_apertus1p5.py`: `Apertus1p5ForConditionalGeneration.model` is an
+  `Apertus1p5Model` whose `.language_model` is the actual `Apertus1p5TextModel` holding
+  `embed_tokens`/`layers`/`norm`; `lm_head` itself stays unprefixed at the top level, tied to
+  `model.language_model.embed_tokens.weight` per `_tied_weights_keys`, mirroring plain Apertus's
+  own `output_layer.weight`/`lm_head.weight` tie). Vision/audio tower weights are deliberately
+  left unmapped — target is plain `GPTModel` (no parameter slots for them anyway), this benchmark
+  is text-only GSM8K and never needs them numerically correct (same reasoning as the FSDP2/SGLang
+  section's point 6), and no strict/leftover-key check exists anywhere in `model_bridge.py`'s
+  weight-load path to object. One real unresolved risk, documented in the file's own docstring
+  and guarded with an explicit `raise` rather than silently mismapping: `Apertus1p5TextConfig`
+  supports a *pruned* LM head (`output_vocab_size` narrower than the embedding `vocab_size`), which
+  Megatron-core's standard `GPTModelProvider` cannot represent (one `vocab_size` sizes both
+  tables) — not verified against the real checkpoint since `swiss-ai/Apertus-v1.5-70B`'s
+  `config.json` sits behind a gated HF repo unreachable from where this was authored; if the
+  checkpoint does turn out pruned, `provider_bridge` raises a clear error instead of training on
+  wrong shapes. Wired into the script right after the qwen3_asr source patch (same shared Lustre
+  checkout, single batch-host write, same two-copies-kept-in-sync-by-hand convention) and *before*
+  the wheel-build step so the new file gets packaged — also added a `MEGATRON_WHEEL_BUILD_VERSION`
+  marker gate to that step (`build.version` file next to the cached wheels) so this source change
+  actually forces a rebuild, rather than repeating the exact "stale cache masks a real source
+  change" mistake from run 3149242's qwen3_asr guard. Entirely unverified — no `provider_bridge`/
+  `mapping_registry` implementation in this bridge library can be meaningfully checked outside a
+  real Megatron init, so this needs a cluster run.
+- **Commit**: not committed.
+
+### Run `3152782` — 2026-08-22 — new regression, unrelated to the bridge: the open SGLang PR grew a context-sensitive hunk
+
+- **Log**: `~/Downloads/slurm-3152782.out` (1510 lines). 16 nodes, `clariden`. RUNNING → FAILED in
+  ~101s — died on all 16 nodes during the SGLang PR #32979 patch-apply step, before ever reaching
+  the new `Apertus1p5Bridge` (never got to test point 3, `AutoBridge.from_hf_pretrained`).
+- **Good news, unrelated to the failure**: both new setup steps for the bridge fix confirmed
+  working — "Added Apertus1p5Bridge ... to Megatron-Bridge checkout" printed, and the wheel-build
+  step logged "build version v2-apertus1p5-bridge" (a real rebuild, not a stale-cache skip) — the
+  `MEGATRON_WHEEL_BUILD_VERSION` marker gate from the 3149776 fix write-up worked as intended.
+- **Symptom**: `patch -p2 -d /usr/local/lib/python3.12/dist-packages < sglang-apertus1p5.diff`
+  failed identically on all 16 nodes:
+  ```
+  patching file sglang/srt/managers/detokenizer_manager.py
+  Hunk #1 FAILED at 143.
+  1 out of 2 hunks FAILED -- saving rejects to file sglang/srt/managers/detokenizer_manager.py.rej
+  ...
+  FATAL: sglang PR #32979 patch failed to apply
+  ```
+- **Root cause**: `sgl-project/sglang#32979` is an open, unmerged PR that is still being actively
+  pushed to upstream (confirmed via the GitHub API: `updated_at` for the PR was essentially
+  concurrent with this run), and the script always re-fetches its diff fresh on every submission
+  (`curl .../pull/32979.diff`, no commit pin, no caching) — deliberate, since pinning an unmerged
+  PR to a stale SHA would just trade this failure mode for silently missing upstream fixes, but it
+  does mean the file set is not stable between runs. Between the 3149776 submission and this one
+  the PR grew from 6 changed files to 10: two new test files, a `docs/docs/...` file (not
+  `docs_new/`, so unaffected by the existing docs exclusion), and — the actual break — a new hunk
+  in `python/sglang/srt/managers/detokenizer_manager.py` adding an `apertus2509` tool-call-parser
+  output trim. That hunk is context-sensitive against whatever SGLang version the image happens to
+  ship, exactly the same class of issue already known and already tolerated for
+  `base_processor.py` — but the script's filtering was a *blocklist* (`keep` everything under
+  `python/sglang/` except `base_processor.py`+`test/`+`docs_new/`), so this brand-new file landed
+  in the fatal-if-it-fails bucket by default and took the whole job down. Confirmed the new hunk
+  itself is inert for this benchmark regardless: it only fires when
+  `server_args.tool_call_parser == "apertus2509"`, which this GSM8K recipe never sets — same "safe
+  to skip" situation as `base_processor.py`'s audio-only hunk.
+- **Fix**: flipped the categorization from a blocklist to an allowlist. Only the files actually
+  confirmed load-bearing for the apertus1p5 fix (`qwen3_asr.py`, `apertus.py`, and both
+  `apertus_mm.py` files — point 3 above) are fatal-if-they-fail; every other file the PR touches
+  under `python/sglang/` (currently `base_processor.py` and `detokenizer_manager.py`) is
+  extracted into one combined best-effort diff and applied with a warning instead of aborting;
+  `test/` and `docs/` (both the old `docs_new/` guess and the actual `docs/docs/...` path this PR
+  uses) stay excluded entirely. This is meant to self-adapt to future drift in this still-evolving
+  PR — a new unrelated file added upstream now defaults to best-effort instead of fatal, so this
+  exact failure mode (one new file breaks the whole fatal bucket) should not recur even as the PR
+  keeps changing shape. Unverified — needs a run; the new `Apertus1p5Bridge` from the previous
+  entry is still completely untested since this failure pre-empted it.
+- **Commit**: not committed.
+
+### Run `3171151` — 2026-08-24 — SGLang allowlist fix confirmed working; new bridge registered correctly and hit exactly the anticipated pruned-head gap
+
+- **Log**: `~/Downloads/slurm-3171151.out` (514,854 bytes). 16 nodes, `clariden`. RUNNING → FAILED
+  after ~3.8 min.
+- **Test 1 passed**: the allowlist fix from 3152782 worked as designed. All four load-bearing
+  files (`qwen3_asr.py`, `apertus.py`, both `apertus_mm.py`) patched cleanly; the best-effort
+  bundle hit non-fatal warnings for `detokenizer_manager.py` and `base_processor.py` (both
+  context-sensitive against the image's SGLang version, both inert for this benchmark) without
+  aborting the job. Confirms this categorization is now resilient to the PR's continued drift.
+- **Test 2 — real signal, not a registration bug**: `AutoBridge.from_hf_pretrained` no longer
+  raised "not yet supported" — the new `Apertus1p5Bridge` registration and dispatch worked
+  correctly. It got as far as its own `provider_bridge()` and hit exactly the deliberate guard
+  written into that method:
+  ```
+  ValueError: Apertus1p5 checkpoint uses a pruned LM head (output_vocab_size=131072 != vocab_size=266752).
+  ```
+  This confirms empirically (for the first time — the real `config.json` was never reachable
+  during authoring, see the previous entry) that `swiss-ai/Apertus-v1.5-70B` really does use a
+  pruned head: 131072 real/generatable text ids out of a 266752-wide extended vocabulary that
+  also covers the visual/audio token ranges.
+- **Fix**: implemented proper pruned-head support instead of raising. Since this benchmark
+  (text-only GSM8K GRPO) never produces or consumes a token id outside `[0, output_vocab_size)`
+  — confirmed via `output_vocab_size`'s own docstring in `configuration_apertus1p5.py`, which
+  states the retained ids are exactly `0..output_vocab_size - 1` — it's safe to size Megatron's
+  single `vocab_size` to `output_vocab_size` (131072) rather than the full extended `vocab_size`.
+  `provider_bridge` now sets `provider.vocab_size = output_vocab_size` and recomputes
+  `provider.make_vocab_size_divisible_by` from that narrower value (this factor is itself derived
+  from the vocab size, per `MegatronModelBridge.make_vocab_size_divisible_by`'s docstring, so
+  reusing the value computed for the full vocab_size would have been wrong). The checkpoint's
+  `lm_head.weight` is already physically `(131072, hidden)` — a real pruned `nn.Linear`, not a
+  view — so `output_layer.weight` needs no transform. Only the *input* embedding table,
+  `model.language_model.embed_tokens.weight` (physically `(266752, hidden)`, since input ids can
+  span the full extended range even when output can't), needs to shrink to match; new
+  `_TruncatedVocabEmbeddingMapping(AutoMapping)` in `apertus1p5_bridge.py` truncates it to its
+  first `output_vocab_size` rows on `hf_to_megatron` before delegating to the normal
+  `VocabParallelEmbedding` sharding logic, and best-effort zero-pads back out on the reverse
+  direction (for whatever HF-export path might exercise it — those padded rows have no real
+  multimodal embedding, same acknowledged caveat as `megatron_to_hf_config`). Needed
+  `mapping_registry(self)` to read `self.hf_config.text_config` directly (it takes no
+  `hf_pretrained` argument, unlike `provider_bridge`) — confirmed from `auto_bridge.py` that
+  `bridge.hf_config` is always populated by the framework's own dispatch machinery
+  (`_get_model_bridge_impl`) before `mapping_registry()` can run, and that this is the ordinary,
+  only way any bridge's argument-less `mapping_registry()` can access config context, not a
+  private workaround. Checked-in patch file and the script's heredoc copy verified byte-identical.
+  Unverified — needs a run.
+- **Commit**: not committed.
+
+### Run `3171218` — 2026-08-24 — pruned-head fix never actually ran: forgot to bump the wheel cache version
+
+- **Log**: `~/Downloads/slurm-3171218.out` (551,369 bytes). 16 nodes, `clariden`. Reached phase 1
+  cleanly, then failed with the *exact same* `ValueError: Apertus1p5 checkpoint uses a pruned LM
+  head (output_vocab_size=131072 != vocab_size=266752)...` as 3171151 — i.e. the fix from that
+  entry appeared not to have any effect at all.
+- **Root cause**: self-inflicted repeat of the exact class of bug the `MEGATRON_WHEEL_BUILD_VERSION`
+  marker exists to prevent (see run 3149726/3149776's entries). The pruned-head fix was added to
+  `apertus1p5_bridge.py` without bumping `MEGATRON_WHEEL_BUILD_VERSION` (left at
+  `"v2-apertus1p5-bridge"`, unchanged from the *previous* fix). Lustre's `${TRAINING_HOME}/wheels`
+  still had a `build.version` file reading `v2-apertus1p5-bridge` from run 3171151's build — since
+  the marker matched, the wheel-build step's cache check saw "already present and up to date" and
+  skipped rebuilding, installing the stale pre-fix wheel again. The new embedding-truncation code
+  never actually executed on a cluster.
+- **Fix**: bumped `MEGATRON_WHEEL_BUILD_VERSION` to `"v3-apertus1p5-bridge-pruned-vocab"`. General
+  lesson (already stated once in this log and now demonstrated again by ignoring it): every source
+  change to anything packaged into these cached wheels must be paired with a version bump in the
+  same edit, not treated as a separate step to remember later.
+- **Commit**: not committed.
+
+### Run `3171309` — 2026-08-24 — pruned-head fix confirmed working; new failure, one layer deeper: missing CUDA xielu extension
+
+- **Log**: `~/Downloads/slurm-3171309.out` (550,073 bytes). 16 nodes, `clariden`. Failed after
+  ~4.5 min of actual execution — furthest point reached yet for this script.
+- **Confirmed working**: the wheel rebuild fired correctly this time ("build version
+  v3-apertus1p5-bridge-pruned-vocab", not a skip), and — the actual point of this run —
+  **no repeat of the pruned-LM-head `ValueError` or the "not yet supported" error.** The
+  `Apertus1p5Bridge.provider_bridge()` vocab-size fix from run 3171151 is confirmed correct.
+  `actor_init_model()` proceeded past `AutoBridge.from_hf_pretrained` entirely, into actual
+  Megatron `TransformerLayer` construction — new territory.
+- **Symptom**: `RuntimeError: CUDA xIELU is required. Install rubber-duck-debug/xielu.`, raised
+  from `megatron/bridge/models/apertus/apertus_bridge.py:33`, inside `MCoreXIELU.__init__`
+  (imported and reused as-is by the new `Apertus1p5Bridge` — see that file's own docstring),
+  while Megatron builds a `TransformerLayer`'s MLP.
+- **Root cause**: `MCoreXIELU` (Megatron-Bridge's own wrapper, distinct from
+  `transformers.activations.XIELUActivation`, which the FSDP2 script uses directly and which has
+  a pure-PyTorch fallback when no CUDA kernel is available) hard-requires the CUDA xielu op and
+  has no such fallback. The optional `xielu` PyPI/GitHub package
+  (`github.com/rubber-duck-debug/xielu`, a fast CUDA implementation of the activation from
+  arXiv:2411.13010) is not vendored in the image and nothing in this script installed it — every
+  earlier run died upstream of this line (qwen3_asr collisions, then the pruned-head check), so
+  this is the first run to ever reach the code path that needs it.
+- **Fix**: build-once-install-everywhere, same pattern as the other CUDA-extension wheels in this
+  script. Confirmed via the package's own `setup.py`/README: `pip install . --no-build-isolation
+  --no-deps` with `CUDA_HOME` set, using CMake (a real compiled build, not a pure wheel download)
+  producing an arch/os-tagged-but-python-version-independent wheel (`universal_wheel` override in
+  its `setup.py`). Built once on a single node (fetch commit `2a55f6b9`'s tarball, `pip wheel
+  --no-build-isolation --no-deps`), cached under the same `${TRAINING_HOME}/wheels`, installed on
+  all 16 nodes with a plain `pip install --no-deps`. Deliberately given its own commit-SHA cache
+  marker (`xielu.sha`), independent of `MEGATRON_WHEEL_BUILD_VERSION` — direct lesson from run
+  3171218: coupling unrelated changes to one shared cache-version string is exactly what caused
+  that repeat. Unverified — needs a run.
+- **Commit**: not committed.
+
+### Run `3171564` — 2026-08-24 — xielu fix confirmed working; furthest point yet; new failure: CUDA OOM in Megatron's DDP grad buffer
+
+- **Log**: `~/Downloads/slurm-3171564.out` (536 KB). 16 nodes, `clariden`. Failed after ~7.6 min —
+  furthest point this script has ever reached.
+- **Confirmed working**: the xielu wheel built and installed cleanly on all 16 nodes, and was
+  actually exercised — `[transformers] Using experimental xIELU CUDA. Enabled torch._dynamo for
+  xIELU CUDA.` fired with no `CUDA xIELU is required` error. `actor_init_model()` proceeded past
+  `AutoBridge`/bridge dispatch, past the pruned-head vocab handling, into real Megatron
+  `TransformerLayer` construction — every previously-diagnosed bug in this chain (qwen3_asr ×3,
+  wheel-build race, pruned LM head, missing xielu) is now closed.
+- **Symptom**:
+  ```
+  torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 32.88 GiB. GPU 0 has a total
+  capacity of 95.00 GiB of which 28.56 GiB is free. Including non-PyTorch memory, this process
+  has 66.43 GiB memory in use.
+  ```
+  on all 16 nodes, inside `megatron.core.distributed.distributed_data_parallel
+  .DistributedDataParallel.__init__` → `_ParamAndGradBuffer.__init__` → `self.grad_data =
+  torch.zeros(...)` (`param_and_grad_buffer.py:1122`), called from
+  `WorkerDict.actor_init_model()` → `engine_workers.py:590 init_model` →
+  `transformer_impl.py:399 initialize()` → `_build_megatron_module` →
+  `megatron.bridge.models.model_provider.provide_distributed_model` → `get_model` → `_ddp_wrap`.
+- **Root cause**: at `tensor_model_parallel_size: 4`, each GPU holds roughly a 70B/4 ≈
+  17.5B-parameter shard — already 66.43 GiB resident (model weights plus whatever `param_offload`/
+  `grad_offload`/`optimizer_offload` haven't moved to CPU yet at this point in init) before the
+  DDP grad buffer's own allocation is even attempted, leaving only 28.56 GiB free for a 32.88 GiB
+  buffer. Not related to xielu or any of the earlier bugs — this is the first run to ever reach
+  real Megatron model construction at all.
+- **Fix**: raised `tensor_model_parallel_size` from 4 to 8 in both `actor.megatron` and
+  `ref.megatron` (rollout's own `tensor_model_parallel_size: 4`, a separate SGLang-side setting,
+  left untouched) — roughly halves the per-GPU parameter/gradient shard. Deliberately did *not*
+  also increase node count this run despite being invited to: 12 training nodes × 4 GPUs = 48
+  GPUs, and 48/8 = 6 DP replicas divides `ppo_mini_batch_size: 48` cleanly (48/6=8) — verified
+  arithmetic. Increasing node count changes `ROLLOUT_NNODES`/`TRAINING_NNODES` via the script's
+  0.25 split and would need re-deriving this same divisibility from scratch (e.g. 24 nodes gives
+  18 training nodes → 72 GPUs → 9 DP replicas, and 48 is *not* divisible by 9 — would need
+  `ppo_mini_batch_size` changed too). Isolated this run to testing only the TP fix rather than
+  guessing at a new node-count/mini-batch combination blind; node count is an easy follow-up once
+  TP=8 is confirmed sufficient (or insufficient). Unverified — needs a run.
+- **Commit**: not committed.
+
+### Run `3171930` — 2026-08-24 — new failure upstream of the OOM fix: same Lustre filelock hazard as the GLM script, different call site
+
+- **Log**: `~/Downloads/slurm-3171930.out` (519,163 bytes). 16 nodes, `clariden`. Failed after
+  239s (~4 min) — during `actor_init_model()`, but *before* the point 3171564 reached, so the
+  TP=8 fix for that run's DDP grad-buffer OOM was never actually exercised here.
+- **Symptom**: `ValueError: Failed to load configuration from
+  .../models/Apertus-v1.5-70B after 4 attempts ... Last error: [Errno 116] Stale file handle`,
+  raised in `megatron/bridge/models/hf_pretrained/safe_config_loader.py:134`, chained from
+  `filelock/_unix.py:63` (`fcntl.flock(..., LOCK_NB)` → `OSError: [Errno 116]`). Call path:
+  `WorkerDict.actor_init_model()` → `engine.initialize()` → `_build_tf_config()` →
+  `AutoBridge.from_hf_pretrained()`.
+- **Root cause**: the exact same "Lustre does not support `flock` in-container" hazard already
+  documented and already fixed once in this repo — see the GLM script's Known hazards entry
+  ("Lustre file locking") — but at a *different* call site: megatron-bridge's own
+  `safe_config_loader`, not the `AutoConfig.from_pretrained`/filelock site the GLM script's
+  existing filelock patch targets (that patch was never ported to this Apertus/Megatron script at
+  all — this is the first run to reach a code path in `megatron.bridge` that hits it). Every bug
+  fixed so far in this script's chain (qwen3_asr ×3, wheel-build race, pruned LM head, missing
+  xielu) is upstream of this call site too, which is why it took 11 attempts to surface.
+- **Fix**: ported the GLM script's proven `safe_config_loader` filelock patch verbatim — a
+  `python3 -c` snippet that finds the module via `importlib.util.find_spec`, then replaces every
+  `with filelock....:` line with `with contextlib.nullcontext():` (line-by-line prefix match, not
+  a regex on the `FileLock(...)` argument, since those often contain nested parens). Safe because
+  the config files are written once by local rank 0 before any reader starts — purely read-only
+  after that, so the lock was never load-bearing here, only unsupported by the filesystem. Wired
+  in right after the megatron-bridge wheel install in the main srun, before the SGLang patches.
+  Unverified — needs a run; the TP=8 OOM fix from 3171564 also still needs its first real test.
+- **Commit**: not committed.
+
+### Run `3172177` — 2026-08-24 — filelock fix confirmed working, ran 33 min (vs. 4 min); new failure: LR scheduler needs total-steps set statically
+
+- **Log**: `~/Downloads/slurm-3172177.out` (743 KB). 16 nodes, `clariden`. Failed after ~1976s
+  (~33 min) — by far the longest this recipe has ever run before failing, though still inside
+  `actor_init_model()`, before any weight-loading log line. Inconclusive on the TP=8 OOM fix from
+  3171564: no OOM occurred, but the run never reached that far either.
+- **Confirmed working**: the filelock patch fired (`Patched 1 filelock site(s)`), no recurrence of
+  the "Stale file handle" config-load crash from 3171930.
+- **Symptom**: `AssertionError: assert self.lr_decay_steps > 0`, raised in
+  `megatron/core/optimizer_param_scheduler.py:159`, via `verl/utils/megatron/optimizer.py:131`
+  (`get_megatron_optimizer_param_scheduler`) → `verl/workers/engine/megatron/transformer_impl.py:428`
+  (`_build_lr_scheduler`) → `WorkerDict.actor_init_model()`, identically on all 18 worker ranks.
+  The printed config dump showed `lr_decay_steps: None`, `total_training_steps: -1`/`None`.
+- **Root cause**: an ordering bug in `verl`'s own `fully_async_main.py` (not specific to this
+  script or to Megatron) — `_initialize_components()` calls `self._create_trainer(config)`, which
+  calls `trainer.init_workers()` (building the Megatron LR scheduler, hence the assertion) several
+  steps *before* it ever calls `trainer.set_total_train_steps.remote(total_train_steps)` (only
+  reached later, after the rollouter is also created). So the runtime path that is supposed to
+  populate `actor.optim.total_training_steps`/`lr_decay_steps` structurally cannot run in time for
+  worker init in this entrypoint — `total_training_steps` must be set statically in the YAML
+  config instead. Confirmed this is a known, already-solved gap: the sibling
+  `train-gsm8k-qwen-3B-full-async-megatron.sh` script (which this recipe's `actor` block otherwise
+  mirrors) already carries the exact fix with a comment stating this exact mechanism almost
+  verbatim — this script just never copied that one line over.
+- **Fix**: added `actor_rollout_ref.actor.optim.lr_decay_steps: 22419`, matching
+  `rollout.total_rollout_steps: 22419` already set above it (so the LR schedule spans the full
+  intended run) — same value, same fix, as the qwen-3B sibling script. Unverified — needs a run;
+  this is the third run in a row where the TP=8 OOM fix from 3171564 still has not actually been
+  exercised (each prior attempt died earlier for an unrelated reason first).
+- **Commit**: not committed.
+
+### Run `3173479` — 2026-08-24 — furthest run ever: cleared every prior blocker, reached the first real training step, new failure in sequence-parallel packing
+
+- **Log**: `~/Downloads/slurm-3173479.out` (946,738 bytes). 16 nodes, `clariden`. Ran 2893s
+  (~48.2 min) — by far the longest and furthest this recipe has ever gotten. Included a ~25-minute
+  quiet stretch during DDP/optimizer construction (no crash, no log growth) that resolved on its
+  own — not a hang, just slow setup for a 71B-param model across 16 nodes; flagged as a stall
+  mid-run but turned out to be legitimate.
+- **Everything from 3171564 through 3172177 confirmed fixed, in one run**: no `lr_decay_steps`
+  assertion; **the TP=8 OOM fix from 3171564, untested for three straight runs, finally exercised
+  and passed** (`DistributedDataParallel contains 8.83B parameters`, no
+  `torch.OutOfMemoryError`); full `FullyAsyncTrainer` init; all 4 SGLang rollout replicas
+  completed weight loading, CUDA graph capture, and HTTP server startup (first time ever reached);
+  first NCCL trainer→rollout weight sync completed; initial GSM8K validation ran with real
+  (near-zero, expected pre-training) accuracy metrics.
+- **Symptom**: the first real training step (`update_actor`/`train_mini_batch`) crashed on all
+  trainer ranks:
+  ```
+  AssertionError: First dimension of the tensor should be divisible by tensor parallel size
+  ```
+  in `megatron/core/tensor_parallel/mappings.py:173` (`_reduce_scatter_along_first_dim`).
+- **Root cause**: `sequence_parallel` defaults to `True` in verl whenever `tensor_model_parallel_size
+  > 1` (`verl/workers/config/engine.py`), which shards activations along the packed-sequence
+  (THD) dimension and requires that dimension's length be a multiple of TP size. verl does have a
+  TP-aware padding helper for exactly this
+  (`verl/utils/megatron/sequence_parallel.py:pad_to_sequence_parallel`, computed dynamically from
+  `mpu.get_tensor_model_parallel_world_size()`, not hardcoded) — but tracing its only two call
+  sites showed it is invoked solely from the pipeline-parallel *shape-hint* computation
+  (`verl/utils/megatron/pipeline_parallel.py:compute_transformers_input_shapes`), not from
+  wherever the experimental `fully_async_policy` trainer actually builds the real packed input
+  tensor fed to the model. So the shape metadata assumes TP-aligned padding while the real data
+  tensor is never actually padded to match — a latent gap in `verl`'s experimental async-Megatron
+  combination that no prior run had ever reached (every earlier bug in this whole 13-attempt chain
+  was upstream of the first real training step).
+- **Fix**: disabled `sequence_parallel` outright (`actor.megatron.sequence_parallel: False`,
+  `ref.megatron.sequence_parallel: False`) rather than patching the padding gap in verl's
+  experimental code blind — that would need cluster-cost-expensive iteration to get right, and
+  this recipe's `override_transformer_config.recompute_granularity: full` (already set) already
+  captures sequence_parallel's main benefit here (reduced activation memory, via full activation
+  recomputation instead), so little is actually given up by turning it off. Unverified — needs a
+  run; this would be the first real training step ever completed for this whole recipe if it
+  clears.
+- **Commit**: not committed.
+
+### Run `3174079` — 2026-08-24 — sequence_parallel fix confirmed working; new failure one step deeper: cu_seqlens/tensor-size mismatch inside THD rotary embedding
+
+- **Log**: `~/Downloads/slurm-3174079.out` (1,125,817 bytes). 16 nodes, `clariden`. Ran
+  16:04:18–16:53:22 (~49 min) — essentially the same duration/shape as 3173479.
+- **Confirmed working**: the 3173479 `sequence_parallel: False` fix held — no recurrence of the
+  `_reduce_scatter_along_first_dim` divisibility assertion. Training again reached
+  `update_actor`/`train_mini_batch` on the first real step (`Training Progress: 0/233` printed,
+  matching this run's shorter `total_rollout_steps`/mini-batch-size-derived step count vs.
+  3173479's 231 — consistent, not a regression).
+- **Symptom**: all trainer ranks crashed inside the model forward, in Megatron-core's unfused THD
+  rotary-embedding path:
+  ```
+  RuntimeError: split_with_sizes expects split_sizes to sum exactly to 669 (input tensor's size
+  at dimension 0), but got split_sizes=[240, 256, 296, ... 280, 240]   # 32 entries, sum=14752
+  ```
+  at `megatron/core/models/common/embeddings/rope_utils.py:235` (`_apply_rotary_pos_emb_thd`,
+  called from `attention.py`'s `query = apply_rotary_pos_emb(query, ..., cu_seqlens=cu_seqlens_q,
+  ...)`), reached via `transformer_block.py`'s `checkpointed_forward` →
+  `tensor_parallel.checkpoint` → a `TransformerLayer.forward` call — i.e. inside the *original*
+  forward pass of one of the per-layer activation-recompute checkpoints (`recompute_granularity:
+  full`, `recompute_method: uniform`, `recompute_num_layers: 1`), not a backward-recompute replay.
+  Recurred identically (varying only which layer/step it hit) 7 times across the log before Slurm
+  killed the job; the target (tensor's real size) varied run-to-run (669, 659, 706) but the
+  32-entry `split_sizes` list always summed to ~14,744–14,768 — i.e. the full per-DP-rank
+  mini-batch (32 packed GRPO sequences, matching `ppo_mini_batch_size:48 / 6 DP replicas × n=4
+  responses/prompt`).
+- **Root cause — not yet found**: traced the whole pipeline that builds `packed_seq_params`
+  (`../verl`'s `preprocess_thd_engine`, `verl/models/mcore/util.py:317`) and the THD rope code in
+  the actual `wqwqazwsxedc/Megatron-LM` fork (fetched fresh from GitHub — `rope_utils.py`,
+  `attention.py`, `recompute.py`, `transformer_config.py` — since `../verl`'s vendored megatron
+  isn't this fork). Ruled out, with reasoning:
+  - **Not a config gap**: `context_parallel_size` (default 1, unset anywhere in this script or
+    the fork's `TransformerConfig`) and `distribute_saved_activations` (default `False`, unset)
+    both confirmed at their safe defaults — neither CP-chunking nor the TP-activation-compression
+    codepath in `tensor_parallel/random.py`'s `CheckpointFunction` should be active. Also, the
+    crash is in `CheckpointFunction.forward`'s *first* `run_function(*args)` call
+    (`random.py:581`), before any save/compress/gather logic runs — so `distribute_saved_activations`
+    couldn't be the cause even if enabled.
+  - **Not the known sequence_parallel padding gap** (3173479's fix) — that's already disabled and
+    confirmed not recurring (different assertion, different file).
+  - **Not `dynamic_context_parallel`** (verl's own hybrid-CP feature, `engine.py:191`, default
+    `False`, unset here) — would need an explicit config flag neither this script nor the bridge
+    sets.
+  - **`prepare_micro_batches`/`rearrange_micro_batches`** (`verl/workers/engine/utils.py:58`)
+    genuinely does token-budget-based dynamic batching (`ppo_max_token_len_per_gpu: 16384`, this
+    rank's full 32-sequence/~14.75k-token mini-batch fits in one microbatch under that budget) —
+    so `packed_seq_params` and the model's `input_ids_rmpad` should always be built from the same
+    32-sequence batch inside a single `forward_step` call; no evidence found of stale/cross-microbatch
+    reuse.
+  - **`Apertus1p5Bridge`/`get_apertus_decoder_block_spec`** (Megatron-Bridge's `apertus_bridge.py`,
+    reused by this script's bridge) uses the *standard* `get_gpt_decoder_block_spec(...,
+    use_transformer_engine=True)` layer spec — only `q_layernorm`/`k_layernorm`/`activation_func`
+    (xIELU) are swapped in; the self-attention module class itself is untouched, so this isn't an
+    Apertus-specific attention reshape bug on its face.
+  - The one concrete, unexplained fact: the crashing tensor's real size (669/659/706) sits close
+    to a *single* sequence's padded length in each batch (e.g. run 1's list has entries 656/672
+    near 669), while `cu_seqlens`/`split_sizes` always describes the *full* 32-sequence batch —
+    i.e. whatever tensor reaches this rope call has collapsed to roughly one sequence's worth of
+    tokens while the packed-sequence metadata paired with it still describes all 32. No contiguous
+    run of the 32 sequence-length list sums exactly to the observed target in any of the three
+    logged occurrences, so it isn't simply "wrong slice boundary" either. This is unresolved.
+- **Fix**: none yet. Added a diagnostic-only patch (user approved this path over the
+  config-bisection alternative): `${MEGATRON_LM_DIR}/megatron/core/recompute.py`'s `chunk_runner`
+  now prints, right before every per-layer activation-recompute chunk runs,
+  `hidden_states.shape` and `packed_seq_params.cu_seqlens_q_padded[-1]`/`num_seqs` (tagged
+  `[DIAG-ROPE]`) — applied via a plain Python line-insert on the batch host (not `sed -i .../a\`,
+  to sidestep the GNU/BSD portability gap that class of edit has; tested locally end-to-end
+  against the real fetched `recompute.py`, including idempotency on a rerun) right after the
+  `Apertus1p5Bridge` addition and before the megatron wheel build, with
+  `MEGATRON_WHEEL_BUILD_VERSION` bumped to `v4-diag-rope-recompute` so the instrumented source
+  actually gets packaged (the exact mistake from run 3171218, avoided this time). Since
+  `recompute_num_layers: 1` + `recompute_method: uniform`, this fires once per transformer layer
+  and should show either the tensor already wrong at layer 0 (verl-side preprocessing bug) or a
+  specific later layer where it first diverges (a bug in that layer's forward, most likely the
+  xIELU/q-k-RMSNorm/GQA-adjacent code the Apertus bridge swaps in). Remove once the mechanism is
+  found, same instrument-once-then-remove discipline as the GLM script's diagnostics. Unverified
+  end-to-end by a cluster run yet — needs one.
+- **Commit**: not committed.
+
+### Run `3183472` — 2026-08-25 — [DIAG-ROPE] data collected: corruption exists before layer 0 even runs
+
+- **Log**: `~/Downloads/slurm-3183472.out` (991,922 bytes). 16 nodes, `clariden`. Queued ~33 min,
+  ran ~19 min, then failed (exit code 15, elapsed 4565s incl. queue). Setup confirmed clean, no
+  regression: qwen3_asr patch, `Apertus1p5Bridge` dispatch, xIELU wheel, Megatron wheels rebuilt
+  at `v4-diag-rope-recompute` (real rebuild, not a stale-cache skip), Lustre filelock patch,
+  SGLang PR #32979 + local fixes all applied correctly. Zero OOM. Rollout came up fully (4 SGLang
+  replicas, weight loading, CUDA graph capture, HTTP servers) and training began
+  (`Training Progress: 0/233`) before crashing on the first `update_actor` step — identical crash
+  signature to 3174079 (`split_with_sizes` in `rope_utils.py:235`).
+- **The `[DIAG-ROPE]` data (the actual point of this run)**: only ever printed at `chunk=0-1` —
+  **the very first transformer layer** — on every rank that logged it; no later chunk index ever
+  appeared, meaning the crash happens inside/around layer 0 itself, before a second diagnostic
+  line could even fire. Two distinct lines survived Ray's log dedup:
+  - `hidden_states.shape=(623, 43, 8192) cu_seqlens_last=14976 num_seqs=43`
+  - `hidden_states.shape=(597, 43, 8192) cu_seqlens_last=15000 num_seqs=43` (repeated 47x —
+    essentially every other trainer rank matched this pattern)
+  Two of the run's six distinct `split_with_sizes ... sum exactly to <N>` crash values (**623**
+  and **597**) exactly match the two captured `hidden_states.shape[0]` values — direct proof the
+  undersized tensor exists **before layer 0's forward is even entered**, not something that
+  shrinks partway through the layer stack. (The other four crash variants — 706, 629, 572, 580,
+  presumably other DP replicas — never got a surviving `[DIAG-ROPE]` line in the log, lost to
+  buffering/dedup before the crash killed those ranks, but the mechanism is presumably identical.)
+- **New, much stronger root-cause theory** (not yet confirmed by a diagnostic in verl's own code,
+  only by matching shapes): `hidden_states.shape = (623, 43, 8192)` has middle dim **43 == num_seqs
+  exactly** and first dim 623 close to a plausible max-individual-sequence-length for a
+  43-sequence batch — i.e. this is the classic Megatron post-embedding **`[s, b, h]` layout with a
+  real batch dimension of 43**, not the packed THD `[total_tokens, 1, hidden]` layout
+  `preprocess_thd_engine` (`../verl`'s `verl/models/mcore/util.py:317`) is supposed to produce.
+  Standard Megatron embedding (`word_embeddings(input_ids)` on a `[b, s]` input, then
+  `.transpose(0, 1)`) turns a `[43, 623]`-shaped `input_ids` into exactly `[623, 43, hidden]` — so
+  the tensor actually reaching the model looks like a normal **padded, per-sequence-batched**
+  input (43 sequences × 623-token padding), not the packed rmpad buffer, while
+  `packed_seq_params` still carries `qkv_format='thd'` and THD-style `cu_seqlens` (confirmed,
+  since reaching `_apply_rotary_pos_emb_thd` at all requires `packed_seq_params.qkv_format ==
+  'thd'` to be true in `attention.py`) describing the true packed total (14976/15000 tokens).
+  Traced one plausible mechanism — `verl/workers/engine/megatron/transformer_impl.py:910`:
+  `data_format = "thd" if self.engine_config.use_remove_padding else "bshd"` — and found verl's
+  own code carries an acknowledged, unresolved gap here: `EngineConfig.use_remove_padding`
+  (`verl/workers/config/engine.py:112`, default `True`) is a **separate field** from
+  `ModelConfig.use_remove_padding` (`verl/workers/config/model.py:120`, also default `True`, and
+  what this script actually sets — `actor_rollout_ref.model.use_remove_padding: True`) — the
+  dataclass has its own literal `# TODO (this may conflict with the one in model config)` comment
+  on the engine-level field. `verl/workers/engine_workers.py` syncs engine↔model at several call
+  sites via `self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding",
+  False)` (note the **default of `False`** in that `.get()`, mismatched against the dataclass's
+  own default of `True`) — a real candidate for the sync silently not happening on this
+  experimental `fully_async_policy` Megatron path and `data_format` ending up `"bshd"`. **This
+  theory has a hole**: the `"bshd"` branch of `gptmodel_forward_model_engine`
+  (`verl/models/mcore/model_forward.py`) should not itself construct a `qkv_format='thd'`
+  `packed_seq_params` at all (that's built only in the `"thd"` branch, via
+  `preprocess_thd_engine`) — yet the crash unambiguously reached THD-format rope, which requires
+  exactly that. So either this `data_format` mechanism isn't the actual cause and the bug is a
+  distinct defect inside `preprocess_thd_engine` itself (its `shape = list(input_ids.shape[1:])`
+  computation, `util.py:378`, was the other candidate spot examined but not conclusively ruled in
+  or out), or there's a code path not yet found where both branches' effects combine. Not
+  resolved — needs one more targeted diagnostic, this time patching verl's own (git-checked-out
+  v0.9.0) `preprocess_thd_engine`/`gptmodel_forward_model_engine` to print `data_format`,
+  `input_ids.shape` (pre-preprocessing), and `input_ids_rmpad.shape` (post-preprocessing,
+  pre-model-call) directly, rather than inferring from megatron-core's post-embedding
+  `hidden_states` shape one level downstream.
+- **Fix**: none yet — still diagnostic. Awaiting a decision on the next diagnostic patch before
+  spending another cluster allocation.
+- **Commit**: not committed.
+
+**Follow-up (same day, no cluster cost): root cause found and fixed, no further diagnostic run
+needed.** Fetched the real `verl-project/verl` **v0.9.0 tag** source directly from GitHub for
+`verl/models/mcore/model_forward.py`, `verl/models/mcore/util.py`, and
+`verl/workers/engine/megatron/transformer_impl.py` — the local `../verl` checkout used for all
+prior analysis in this chain is actually **v0.8.0** (confirmed via `git describe`), and per this
+repo's own established lesson ("checked against v0.9.0 source... not the v0.8.0-4-g933979db
+checkout"), that gap mattered again here. Also fetched the same three files from
+`theely/verl`'s `Fix-fsdp-model-loading-on-async` branch, since this script's srun does
+`git checkout -f v0.9.0` **then** `git reset --hard pr_origin/Fix-fsdp-model-loading-on-async`
+— the second command replaces the whole tree, so the fork branch's content is what actually
+ships, not the bare v0.9.0 tag. Confirmed the relevant code is textually identical in both.
+
+Root cause: `verl/workers/engine/megatron/transformer_impl.py` calls
+`gptmodel_forward_model_engine(..., vision_model=hasattr(self.model_config.hf_config,
+"vision_config"), ...)` at two call sites. `Apertus1p5Config` always carries a `vision_config`
+attribute (it is a genuinely multimodal architecture, per its own class definition) — so this
+evaluates `True` on every forward call, regardless of whether the current batch has any image
+content. Inside `verl/models/mcore/model_forward.py`'s `gptmodel_forward_model_engine`, the
+`"thd"` branch calls `preprocess_thd_engine` and gets a correctly packed `input_ids_rmpad`
+(shape `[1, total_tokens]`) plus a matching THD `packed_seq_params` — but immediately after,
+unconditionally: `if vision_model: input_ids_rmpad, attention_mask =
+build_vlm_attn_mask_thd(input_ids, pad_token_id)`. Despite the `"_thd"` in its name,
+`build_vlm_attn_mask_thd` (`verl/models/mcore/util.py`) calls
+`input_ids.to_padded_tensor(pad_token_id)`, producing a **dense, per-sequence-padded** tensor of
+shape `[batch_size, max_seqlen]` — this **overwrites** the correctly packed `input_ids_rmpad`,
+while `packed_seq_params` (built moments earlier from the correctly packed data) is left
+completely unchanged and still describes the true packed-THD `cu_seqlens`/token totals. That
+mismatched pair — a BSHD-shaped tensor paired with THD-format `packed_seq_params` — survives
+through the embedding layer (`word_embeddings([batch, maxseq]).transpose(0,1)` producing exactly
+the `[maxseq, batch, hidden]` shape the `[DIAG-ROPE]` diagnostic captured,
+e.g. `(623, 43, 8192)` with `43` exactly matching `num_seqs`) all the way to the rotary-embedding
+call, where megatron-core tries to `torch.split()` the small BSHD-shaped tensor using
+`cu_seqlens` sized for the full packed batch — exactly the `split_with_sizes` crash chased
+through runs 3174079 and 3183472. Confirmed this is not a mistake specific to this script: it is
+a genuine, reachable bug in verl's own `gptmodel_forward_model_engine` for any Megatron
+`vision_model=True` + THD-packing combination — `vision_model` is derived purely from whether
+the **architecture** supports vision (`hasattr(..., "vision_config")`), never from whether the
+**current batch** actually has any image content, so a text-only workload on a vision-capable
+architecture always hits this.
+
+Fix: added a source patch (in the per-node main srun, right after the `git reset --hard
+pr_origin/...` step so it survives that reset, using `importlib.util.find_spec` to locate the
+file rather than a hardcoded path — same convention as the megatron-bridge filelock patch a few
+lines below it) that forces `vision_model=False` at both call sites. Correct specifically for
+this recipe: it is text-only GSM8K, `multi_modal_inputs` is always empty, so there is no real
+image content `build_vlm_attn_mask_thd` needs to handle — a genuine multimodal workload on this
+model would need the opposite fix (keeping `packed_seq_params` in sync with whatever
+`build_vlm_attn_mask_thd` produces), out of scope here. The patch is idempotent (checks for its
+own marker comment before re-patching, fatal if the expected un-patched text isn't found and no
+marker is present either) and was verified end-to-end locally against both the real v0.9.0 tag
+file and the theely-fork variant (patches correctly, produces valid Python, indentation
+preserved, idempotent re-run skips cleanly) before being wired into the script. The now-obsolete
+`[DIAG-ROPE]` instrumentation (previous entry) was removed and `MEGATRON_WHEEL_BUILD_VERSION`
+reverted to `v3-apertus1p5-bridge-pruned-vocab` accordingly. Also caught and fixed, before
+submitting: the new comment block's prose used two apostrophes (`3183472's`, `tensor's`) and the
+python patch's `target` string used literal single quotes around `'vision_config'` — all of
+which, unescaped, would have prematurely terminated the outer single-quoted `bash -c '...'`
+wrapper this whole srun body lives in (the exact class of bug documented in run 3149339's
+Known-hazards-worthy lesson). Caught by grepping the entire outer single-quoted body for any
+literal `'` before submitting, not by a failed run. Unverified by an actual cluster run yet —
+needs one.
+
+# Training Apertus v1.5 on verl, Megatron + V1 separate-async trainer (`rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh`)
+
+Apertus-v1.5-70B GRPO on GSM8K, CSCS Alps, 16 nodes × 4 GH200 (`clariden`). Script:
+`Alps-Images/apps/verl/apertus-benchmarks/rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh`.
+A copy of the fully-async Megatron sibling (`rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh`),
+migrated on two axes at the user's request (2026-08-31): the **image** and the **verl trainer**.
+
+## What changed vs the fully-async sibling
+
+- **Image**: `verl:alps7-dev-0f334b540ccc7034` → `verl-cuda:alps7-dev-621fa40275c4f036` (the tag
+  `train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh` uses — baked verl v0.9.0 + TransferQueue
+  0.1.7 / megatron-core 0.19.0 / megatron-bridge 0.6.1 / flashinfer 0.6.14 / sglang 0.5.16). No
+  runtime verl checkout. The fully-async recipe's `git reset --hard theely/verl
+  Fix-fsdp-model-loading-on-async` is dropped — single-file FSDP2-only change, unused by the
+  Megatron trainer, and a hard reset would clobber the baked v0.9.0 tree.
+- **Trainer**: `verl.experimental.fully_async_policy.fully_async_main` →
+  `verl.trainer.main_ppo`, V1 trainer in `separate_async` mode. Same transformation as the GLM
+  v1-separate migration: `async_training:` block → `trainer.v1.separate_async.*` /
+  `trainer.v1.sampler.*`; top-level `rollout:` block gone (standalone-rollout pool declared in
+  `actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}`); `data.train_batch_size: 0` →
+  `parameter_sync_step * ppo_mini_batch_size` (`ROLLOUT_N=16`, `PPO_MINI_BATCH_SIZE=6`,
+  `PARAMETER_SYNC_STEP=2`, `TRAIN_BATCH_SIZE=12`); `transfer_queue:` block added; `old_log_probs`
+  via `rollout.calculate_log_probs` + `algorithm.rollout_correction.bypass_mode` (the fully-async
+  `actor.use_rollout_log_probs` and `actor.optim.lr_decay_steps` workaround are both dropped —
+  V1 sets `total_training_steps` before workers are created).
+- **PR patches + `v1-separate-async-fixes.patch`**: fetched once on the batch host, `sbcast`, and
+  `git apply`'d on `/workspace/verl` — same as the GLM v1-separate script. #7422 (preserve
+  `load_format=dummy` in the disaggregated rollout) and the hybrid-replica no-op (fix 1 of
+  `v1-separate-async-fixes.patch`) are load-bearing for separate-async; without the latter the
+  V1 trainer builds hybrid rollout replicas (trainer-world/rollout-world = 48/16 = 3 here) at
+  `gpu_memory_utilization=0.75` on every training GPU and OOMs at init.
+- **`checkpoint.strict: False`** + **`save_freq: 100`** (see hazards below).
+- **Reward function rewritten** (see the "The zero-reward chain" section below).
+
+## Group 1 / Group 2 (Apertus support) — UNCHANGED mechanism, kept from the sibling
+
+Group 1 (swiss-ai transformers wheel, SGLang PR #32979 + local fixes) and Group 2 (wqwqazwsxedc
+Megatron-LM / Megatron-Bridge **apertus fork wheels** built at runtime and installed over the
+image's stock megatron-core/bridge + the vendored `Apertus1p5Bridge` +
+`patches/apertus1p5_bridge.py` + the xielu CUDA wheel + the `safe_config_loader` filelock patch)
+are all identical to the sibling. **A first pass tried to keep the image's stock megatron-core
+0.19.0 / megatron-bridge 0.6.1 and add only the apertus delta as targeted line-patches
+(`mlp.py` module-activation gate, `finalize_model_grads.py` TP grad-sum) + vendored bridge
+modules — this was abandoned.** It built and ran end-to-end (runs `3240861`/`3243271`/`3243467`)
+but trained degenerately for a reason later shown to be unrelated (the reward function — see
+below), *and* the fork wheels on the new image trained identically (run `3244676`), so the
+line-patch complexity bought nothing. The fork wheels (`megatron-core 0.18.0+60b5c9588`,
+`megatron-bridge 0.5.0+032c0740`) install cleanly over the new image's torch 2.11 / TE and were
+validated end-to-end in run `3247540`.
+
+## Known hazards (this recipe specifically)
+
+- **`checkpoint.strict: False` is required.** Apertus-v1.5 is multimodal; this recipe deliberately
+  does not map the `vision_tokenizer` / `audio_tokenizer` towers (text-only GSM8K). The strict
+  HF-checkpoint export then hard-fails at whatever `save_freq` triggers — `RuntimeError: 473
+  tensors from the original checkpoint were not written` (all `model.audio_tokenizer.*` /
+  `model.vision_tokenizer.*`), which killed run `3240861` at step 20. `strict: False` saves the
+  LM-only partial checkpoint; `save_freq: 100` (> `total_training_steps: 46`) also keeps the
+  shakedown from exercising checkpoint save at all.
+- **`[a1p5-diag]` weight dump** (in `patches/apertus1p5_bridge.py`'s `load_weights_hf_to_megatron`)
+  was a temporary diagnostic — removed after run `3247540` confirmed the conversion. It proved:
+  every weight group loads with sane stats on BOTH fork-0.18/0.5 and stock-0.19/0.6.1
+  (`attention_layernorm.weight` mean +0.0022 byte-identical to the HF checkpoint — Apertus's
+  layer-0 norm gammas genuinely are ~0, not zero-centered; standard `w·rmsnorm(x)` applies
+  correctly). If a future conversion regression is suspected, re-add it.
+- **Do NOT switch the `apertus1p5_bridge.py` RMSNorm mappings from `ReplicatedMapping` to
+  `AutoMapping`.** Tried on stock megatron-bridge 0.6.1 (run `3243271`) chasing an "Unrecognized
+  mapping type" warning from `_add_separate_layernorm_mappings` — it loaded
+  `attention_layernorm`/`feedforward_layernorm` as ~0 (wrong) and did not fix anything. The
+  warning only skips an unused `input_layernorm.weight` alias; the fused-TE
+  `linear_qkv.layer_norm_weight` direct mapping is what actually loads.
+- **`<|inner_prefix|>` / `<|inner_suffix|>` chat-template leak.** On the new image's sglang 0.5.16
+  + PR #32979, Apertus-v1.5's reasoning delimiters leak into the response text as literal tokens
+  (`...candy.<|inner_suffix|>76`). The fork's older image handled them (the model followed the
+  prompt's `<answer>` instruction there and RL reinforced it — that's how run `3184869` learned
+  to reward 0.99). Not fixed here — the reward function parses around it (the final answer is the
+  region after the last `<|inner_suffix|>`). A proper fix (verl tokenizer / sglang apertus_mm
+  chat-template wiring) is an open follow-up if `<answer>`-format behavior is wanted.
+- Everything in the sibling's hazards list (qwen3_asr triple-`exist_ok`, SGLang PR #32979 file-set
+  drift → allowlist, pruned LM head, missing xielu, filelock, `sequence_parallel: False`,
+  `vision_model=False`, sbcast bus-error on large wheels) applies verbatim — same Group 1/2 code.
+
+## The zero-reward chain (runs 3240861 → 3247540) and its resolution
+
+Five consecutive runs completed real training steps but with **`critic/score/max` flat at exactly
+0.0 every step** — zero GRPO advantage variance, `grad_norm` 0.0 on ~half the steps, no learning.
+Chased as a weight-conversion bug for four runs (stock line-patches vs fork wheels, `AutoMapping`
+vs `ReplicatedMapping`, zero-centered-gamma, RoPE) — all dead ends; `[a1p5-diag]` proved the
+weights load correctly and identically in every configuration, and the RoPE code is byte-identical
+across megatron-core 0.18/0.19.
+
+**Root cause (run `3246622`, found by adding a `[REWARD-DUMP]` print to the reward function):**
+Apertus-v1.5-70B **solves GSM8K fluently and correctly** but ends its answers with
+`Final answer: N` / `\boxed{N}` / a bare trailing number / `N` right after `<|inner_suffix|>` —
+**never** the `<answer>...</answer>` tags the recipe's original `gsm8k_reward.py` (copied from the
+GLM/qwen recipes) demanded. Every rollout scored 0 → no signal. Not a stack bug at all.
+
+**Fix**: `gsm8k_reward.py` rewritten to parse `<answer>` OR `\boxed{}` OR `final answer: N` OR the
+last number, each checked first in the post-`<|inner_suffix|>` region; outcome reward (correct = 1.0)
+now drives training; small shaping bonus for any clear delimiter; length penalty kept. **No
+dataset / system-prompt change** — GSM8K parquet is not regenerated. General lesson: when a
+migrated recipe shows zero reward with visibly-working generations, dump the actual rollout text
+(a `print` in the custom reward fn is the fastest way — verl does not log generations) BEFORE
+assuming a model/weight bug.
+
+## Configuration audit (architecture-vs-config) — 2026-08-31
+
+Per the repo-wide process. Apertus-v1.5-70B is **dense** (8.83B params/rank at TP=8; no
+expert/EP config), text+vision+audio multimodal, `model_type: apertus1p5`. `router_replay`/R3
+does not apply (not MoE). `algorithm.rollout_correction.bypass_mode: True` set (the one
+algorithm flag applying to every model in this repo). The multimodal-specific gaps (vision-tower
+`eager` attention, SGLang generic-loader misload, pruned LM head, `vision_model=False` forced,
+deliberately-unmapped vision/audio towers) are all inherited from the sibling's already-fixed
+list — see that section's audit entry. No new architecture-vs-config gap this pass. The one
+architecture-adjacent finding is the reward/prompt-format mismatch above, which is a
+recipe-config issue, not a model-config one.
+
+## Run log
+
+### Runs `3240861` / `3243271` / `3243467` — 2026-08-31 — stock-0.19/0.6.1 line-patch approach: builds + runs, trains degenerately (later shown = reward bug)
+
+- **Approach**: keep the image's stock megatron-core 0.19.0 / megatron-bridge 0.6.1; add apertus
+  support as `mlp.py` + `finalize_model_grads.py` line-edits (the apertus-relevant delta of the
+  fork's one megatron-core commit) + vendor `apertus_bridge.py` (fork verbatim) +
+  `apertus1p5_bridge.py` into the installed package.
+- **Result**: all setup clean (image smoke test green, both line-patches applied, bridges
+  vendored, `DistributedDataParallel contains 8.83B parameters`, no OOM). `3243271` also carried
+  an `AutoMapping` experiment for the two RMSNorm mappings (chasing an "Unrecognized mapping
+  type" warning) — loaded them as ~0, reverted. `3240861` FAILED at step 20 on the strict
+  HF-export `473 tensors not written` (→ `checkpoint.strict: False` added). All three trained
+  with `critic/score/max` flat 0.0.
+- **`[a1p5-diag]`** (added in `3243467`): every weight group loads sane; `config.rotary_base`
+  4000000, `rope_scaling_factor` 32.0 (real 70B checkpoint values, correctly read);
+  `layernorm_zero_centered_gamma=False`; HF `attention_layernorm` spot-check byte-identical to
+  loaded. Ruled out weights / norms / rope as the cause.
+- **Commit**: not committed.
+
+### Run `3244676` — 2026-08-31 — reverted to fork megatron wheels on the new image: builds cleanly, completes 46 steps, STILL degenerate → megatron version is definitively not the cause
+
+- Fork wheels (`megatron_core-0.18.0+60b5c9588`, `megatron_bridge-0.5.0+032c0740`) built from
+  source at runtime and `pip install`'d over the new image's stock — **no ABI error, `import
+  megatron.core` OK**, DDP grad-buffer fine. Completed all 46 steps.
+- `critic/score/max` = 0.0 on every one of the 46 steps; `[a1p5-diag]` byte-identical to the
+  stock-patch runs. **Conclusion: 0.18/0.5 vs 0.19/0.6.1 is not the variable.** Reverted the
+  script to the fork-wheel Group 2 (the line-patch approach bought nothing).
+- **Commit**: not committed.
+
+### Run `3246622` — 2026-08-31 — `[REWARD-DUMP]` diagnostic: ROOT CAUSE FOUND — the model works, the reward function was wrong
+
+- Added a rate-limited `print(solution_str)` to `compute_reward`. Generations are **fluent,
+  correct, step-by-step GSM8K solutions** ending in `Final answer: 10.00`, `Final Answer:
+  \boxed{20}`, bare `76`, `The final answer is $20,800.` — never `<answer>` tags. Also visible:
+  `<|inner_prefix|>`/`<|inner_suffix|>` leaking as literal text.
+- The reward only credited `<answer>...</answer>` → every rollout 0 → no GRPO variance. Completed
+  46 steps, degenerate, no crash (`checkpoint.strict: False` held — the `473` export error was
+  now non-fatal).
+- **Fix**: rewrote `gsm8k_reward.py` — robust answer extraction (`<answer>` | `\boxed{}` |
+  `final answer: N` | last number, post-`<|inner_suffix|>` first), outcome reward drives
+  training. Verified locally against the actual dumped generations.
+- **Commit**: not committed.
+
+### Run `3247540` — 2026-08-31 — VALIDATED: 46/46 steps, healthy GRPO curve — the migration is complete
+
+- Reward fix live. `[REWARD-DUMP]` `parsed=` field non-`None` on every surviving sample
+  (`gt='9240' parsed='9240'`, etc.). **`critic/score/max` = 1.1 from step 1** (1.0 outcome +
+  0.1 delimiter bonus). `critic/score/mean` ~0.94 → ~0.99 (modest — Apertus-v1.5-70B already
+  near-saturates GSM8K); GRPO learning shows most clearly in **response-length compression 306 →
+  225 tokens**. `grad_norm` nonzero every step (one benign zero-variance step 34); `ppo_kl`
+  ~0.001 stable; `actor/loss` small/finite, no NaN. `update_weights` ~8 s / ~15 GB/s throughout.
+  Slurm COMPLETED, exit 0, ~30 s/step, ~24 min of stepping. One non-fatal `473 tensors not
+  written` at final HF export (the known multimodal gap; `strict: False` makes it a warning).
+- **Diagnostics removed** (`[a1p5-diag]`, `[REWARD-DUMP]`); `MEGATRON_WHEEL_BUILD_VERSION` →
+  `v5-apertus1p5-bridge-v1sep`; checked-in `patches/apertus_bridge.py` deleted (the fork wheels
+  provide it). `patches/apertus1p5_bridge.py` kept (still vendored into the fork bridge
+  checkout), comments updated.
+- **Open follow-ups** (both non-blocking): the `<|inner_suffix|>` chat-template leak (a proper
+  fix would let the model follow `<answer>` again); and GSM8K being near-saturated for this base
+  model (a longer run / harder eval would show real learning headroom).
+- **Commit**: not committed.
+
+# Megatron vs FSDP2
+
+Direct comparison of the two Apertus-v1.5-70B GRPO/GSM8K trainer variants
+(`rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh` vs
+`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`) once both had, for the first time, actually
+reached sustained real training steps rather than crashing/OOMing during init (see each script's
+own run log above for how many attempts that took).
+
+## Job `3184869` (Megatron) vs job `3185943` (FSDP2) — 2026-08-25
+
+- **Logs**: `~/Downloads/slurm-3184869.out` (Megatron, 1,138,195 bytes) and
+  `~/Downloads/slurm-3185943.out` (FSDP2, 3,507,893 bytes). Both fetched fresh, both 16 nodes,
+  `clariden`.
+- **Final state**: both jobs hit **TIMEOUT** at the `--time=2:00:00` limit — neither finished the
+  configured 233-step run, and neither crashed (no OOM/traceback in either tail).
+- **Steps reached**: Megatron 38/233 (~16%), FSDP2 47/233 (~20%) — comparable, so the trend
+  comparison below isn't an artifact of one run being too short to judge.
+- **Reward/accuracy (`critic/score/mean`, the actual GSM8K learning signal — not the PPO-clip
+  actor loss, which stays near-zero for GRPO regardless of whether the policy is improving)**:
+  - **Megatron**: near-0 through step 10 (-0.0002 to +0.013 noise), then a clean breakout —
+    step 11: 0.036 → step 17: 0.12 → step 19: 0.66 → step 21: 0.99 → holds ~0.93-1.02 through
+    step 38. `grad_norm` stayed healthy (0.09-0.43) throughout; response length fell from ~330 to
+    ~200 tokens as accuracy rose — a textbook converging GRPO curve.
+  - **FSDP2**: flat at ~0 (-0.0003 to +0.00001) across all 47 steps. No breakout at any point.
+    **8 of 47 steps (17%) had `grad_norm` exactly 0.0** — every sample in that batch received an
+    identical GRPO-standardized advantage, i.e. zero training signal for the whole step. Megatron
+    had zero such steps in 38.
+- **Verdict**: not noise, not a "FSDP2 just learns slower" difference — FSDP2 shows no learning
+  signal whatsoever over a step count comparable to where Megatron had already reached ~95%+
+  accuracy. The recurring exact-zero-`grad_norm` steps point to a degenerate reward/advantage
+  collapse (every one of the `rollout.n: 16` samples for a prompt getting an identical reward)
+  specific to the FSDP2 run, not merely slower convergence.
+
+## Investigation: config diff ruled out, fork-based weight loading is the leading suspect
+
+- **Sampling config is identical between the two scripts** — checked directly, not assumed:
+  both set `actor_rollout_ref.rollout.{temperature: 1.0, n: 16}` and neither sets `top_p`/`top_k`
+  (both scripts source the same `rollout` config defaults). `async_training` block
+  (`staleness_threshold: 0.1`, `trigger_parameter_sync_step: 2`, `require_batches: 1`,
+  `partial_rollout: False`) is byte-identical too. So a rollout-sampling misconfiguration
+  (e.g. accidentally-greedy decoding collapsing all `n=16` samples to the same output/reward) is
+  ruled out as the cause — both scripts ask SGLang to sample the same way.
+- **The one significant source-level delta between the two scripts, beyond FSDP2-vs-Megatron
+  parallelism itself**: the FSDP2 script's srun does
+  `git remote add pr_origin https://github.com/theely/verl.git` →
+  `git fetch pr_origin Fix-fsdp-model-loading-on-async` →
+  `git reset --hard pr_origin/Fix-fsdp-model-loading-on-async` after the v0.9.0 checkout — i.e.
+  it runs a **forked, non-upstream verl tree** for its actor/FSDP2 weight-loading path. The
+  Megatron script has no equivalent fork swap; it runs the plain v0.9.0 checkout (plus the
+  documented PR/local patches). This fork's own design, per its code comment (see run
+  `3185487`'s entry in the FSDP2 script's own run log): **only global rank 0 loads real weights
+  from disk; every other rank builds an empty/meta-tensor model and receives its shard via a
+  broadcast from rank 0.**
+- **Hypothesis (not yet confirmed)**: if that rank-0-load-then-broadcast path is subtly broken —
+  wrong shard boundaries, a race with FSDP2's own sharding, or corruption in the broadcast itself
+  — some or all FSDP2 trainer ranks could end up with incorrect actor weights. Those weights are
+  then pushed to the standalone SGLang rollout replicas via the NCCL checkpoint engine
+  (`checkpoint_engine.backend: nccl`, same as Megatron's) every `trigger_parameter_sync_step: 2`
+  actor updates. A broken/degenerate policy on the rollout side would produce near-identical
+  (uniformly wrong, or uniformly the same low-entropy) responses for repeated samples of the same
+  prompt — which is exactly what a GRPO zero-variance reward group looks like, and would explain
+  both the flat reward curve and the recurring exact-zero `grad_norm` steps.
+- **Not yet verified.** This is a plausible mechanism from reading the fork's own documented
+  design and matching it against the observed symptom, not something confirmed by a targeted
+  diagnostic. Next step, if pursued: log rollout output diversity (e.g. distinct response text
+  count) per prompt group directly from the FSDP2 rollout replicas, and/or diff actor weight
+  checksums across FSDP2 trainer ranks right after `actor_init_model()` and again after the first
+  NCCL weight sync, to confirm or rule out corrupted/mismatched weights before assuming the fork
+  is at fault. No code changes made yet — this section is diagnosis, not a fix.
+- **Commit**: not committed.
+
+## Hygiene fix: forked-branch swap converted to a pinned static patch (not yet cluster-tested)
+
+Before pursuing the checksum diagnostic above, converted the FSDP2 script's dependency on
+`theely/verl@Fix-fsdp-model-loading-on-async` from a live `git reset --hard` branch swap to a
+static, checked-in patch — `apertus-benchmarks/patches/fsdp2-rank0-load-fix.patch`, applied via
+`git -C /workspace/verl apply` with the same apply-or-already-present-or-fatal idempotency check
+the GLM/Megatron scripts already use for their PR patches.
+
+- **Why**: the branch swap ran whatever commit the fork happened to be at when each job
+  submitted, with no pin — the exact "uncontrolled version drift" class of hazard already
+  documented for SGLang PR #32979's live re-fetch (runs `3184895`/`3152782`). Unlike every other
+  external fix in this script, it had never actually been diffed against the real v0.9.0 tag to
+  confirm it was scoped to just the one intended change.
+- **Verified before converting, not assumed**: fetched GitHub's compare between the real
+  `verl-project:v0.9.0` tag and the fork branch tip. Despite a messy/diverged commit graph
+  (`ahead_by: 4, behind_by: 159` — an artifact of history rewriting on one side or the other), the
+  file-level tree comparison shows **exactly one file differs**:
+  `verl/workers/engine/fsdp/transformer_impl.py`. No hidden drift from unrelated commits on the
+  fork branch — the branch swap and this patch are functionally identical.
+- **What the fix actually does** (for the record, since it was previously undocumented in this
+  repo): stock v0.9.0 has every FSDP2 rank independently call `auto_class.from_pretrained(...)`,
+  loading the full model into host RAM per rank — for this 70B model at 4 workers/node, ~4×140 GB
+  = 560 GB per node. The patch makes only global rank 0 load real weights from disk; every other
+  rank builds an empty/meta-tensor model via `accelerate.init_empty_weights()`, and
+  `fsdp2_load_full_state_dict(..., broadcast_from_rank0=True)` — a real, supported PyTorch/verl
+  FSDP2 API, not a custom mechanism — distributes the actual weights afterward. This recipe runs
+  `critic.enable: false`, so the patch's value-head/TRL branch is dead code here; only the plain
+  `language_model` branch and the final `full_state`/broadcast hunk are actually exercised.
+- **Verified locally before wiring in** (mirroring this repo's own established discipline —
+  see the GLM/Megatron sections' repeated "verify against the real v0.9.0 tag, not local `../verl`"
+  lesson; local `../verl` is confirmed still `v0.8.0`, so it was not used for this check): checked
+  out the actual `verl-project/verl` `v0.9.0` tag fresh from GitHub, confirmed the patch applies
+  cleanly (`git apply --check`), confirmed the patched file compiles
+  (`python3 -m py_compile`), and confirmed `git apply --reverse --check` correctly detects
+  "already applied" — the same idempotency check the apply-or-fail loop relies on. Checked-in
+  patch file and the script's heredoc copy verified byte-identical. `bash -n` and a grep of the
+  entire outer single-quoted `srun bash -c '...'` body for stray literal `'` characters both pass
+  (the run-3149339 quoting hazard).
+- **This is a reproducibility/hygiene fix, not a fix for the reward-collapse symptom itself** —
+  the resulting behavior should be identical to what runs 3184869/3185943 already ran, just now
+  pinned and auditable instead of live-fetched. Does not replace the checksum/rollout-diversity
+  diagnostic above, which still needs to run to actually confirm or rule out this code path as the
+  collapse's cause. Unverified end-to-end by a cluster run yet — needs one before drawing any
+  conclusion.
+- **Commit**: not committed.
+
+## Diagnostic added on top: weight-broadcast checksum (not yet cluster-tested)
+
+Implemented the checksum diagnostic proposed above, rather than a separate short test-only job —
+`apertus-benchmarks/patches/fsdp2-broadcast-diagnostic.patch`, applied via the same
+`git apply`/`--reverse --check` idempotency pattern, stacked directly on top of
+`fsdp2-rank0-load-fix.patch` (same file, `verl/workers/engine/fsdp/transformer_impl.py`).
+
+- **What it does**: picks a small parameter deterministically (`min` by `numel()` over
+  `module.named_parameters()`, so every rank picks the same one). On rank 0, right before FSDP2
+  sharding, hashes that parameter's *real* value (from the `state_dict()` just loaded from disk)
+  with SHA-256 and prints it. After `fsdp2_load_full_state_dict(...)` returns, every rank
+  re-gathers that same parameter's full value via `DTensor.full_tensor()` (a collective, called
+  unconditionally by all ranks) and prints its own SHA-256. If every rank's post-load hash matches
+  rank 0's pre-shard hash, the broadcast reproduced weights correctly and the hypothesis is
+  refuted; if any rank's hash differs, that's direct evidence the rank-0-load/broadcast path is
+  actually corrupting weights, redirecting the investigation there instead of the reward/sampling
+  pipeline.
+- **Verified locally before wiring in** (same discipline as the fix above, and as this repo's
+  established diagnostic-patch precedent — see the GLM section's runs 3137775–3144665): built the
+  isolated diagnostic-only diff by diffing a rank0-fix-only checkout against a rank0-fix+diagnostic
+  checkout (not by hand-editing a diff), confirmed it applies cleanly on top of
+  `fsdp2-rank0-load-fix.patch` against the real `v0.9.0` tag, confirmed the combined result
+  compiles, confirmed `--reverse --check` idempotency detection works, and confirmed the
+  checked-in patch file, its embedded heredoc copy in the script, and the intended source content
+  are all byte-identical (caught and fixed one real bug in this process: the first attempt to embed
+  the patch as a heredoc silently dropped a trailing context line that was only a single space
+  character — both `Write` and `Edit` trimmed it — which would have made `git apply` fail with
+  "corrupt patch" on the cluster; rebuilt via direct file concatenation instead, and re-verified
+  hunk line counts explicitly rather than trusting `git apply --check` alone the second time).
+  `bash -n` and the single-quoted `srun bash -c '...'` stray-quote scan both pass (the diagnostic's
+  Python uses double-quoted f-strings throughout, no literal `'` characters).
+- **Scope check**: since `git checkout -f v0.9.0` always resets the verl tree fresh at the start
+  of every run, both patches' forward-apply always runs against a pristine checkout in practice —
+  the `--reverse --check` "already present" fallback (present for the same idempotency-convention
+  reasons as every other patch in this repo) is not actually load-bearing here and was not tested
+  against a real already-both-applied state beyond confirming it fails safely (script would report
+  FATAL and stop rather than silently doing the wrong thing).
+- **Remove once the mechanism is confirmed one way or the other** — diagnostic only, same
+  instrument-once-then-remove discipline as every other diagnostic in this repo.
+- **Commit**: not committed.
+
+### Run `3189642` — 2026-08-25 — script bug: diagnostic patch was sbcast'd but never applied; new, unrelated OOM in the first backward pass
+
+- **Log**: `~/Downloads/slurm-3189642.out`. 16 nodes, `clariden`. Submission hit an unrelated,
+  system-wide CSCS scheduler/SSH/filesystem outage (`/status/systems` confirmed all unhealthy
+  except S3) that delayed status confirmation by ~25 min — not specific to this job. Once CSCS
+  recovered, ran ~26 min before **FAILED** (exit code 15).
+- **Symptom 1 (script bug, self-inflicted)**: `fsdp2-rank0-load-fix.patch` applied cleanly on
+  16/16 nodes, but grepping the full log for `DIAG-FSDP2-BROADCAST` or any related confirmation
+  text returns **zero matches** — the diagnostic instrumentation never ran.
+- **Root cause**: the "Apply Verl fixes" block in the srun body only ever had a `git apply` step
+  for `fsdp2-rank0-load-fix.patch`. `fsdp2-broadcast-diagnostic.patch` was correctly embedded as
+  a heredoc and `sbcast`'d to every node (confirmed present on disk), but no corresponding
+  `git apply` call was ever added for it — the patch sat on every node's `/tmp` unused. A pure
+  oversight when wiring the diagnostic in, not caught by any of the local verification done
+  beforehand (patch-apply/compile/idempotency checks all validated the *patch files themselves*,
+  not that the *script* actually invokes `git apply` on the second one).
+- **Fix**: added the missing apply block, mirroring the first one exactly (same
+  apply-or-already-present-or-fatal pattern), stacked immediately after
+  `fsdp2-rank0-load-fix.patch`'s. Verified this time by re-extracting both heredocs from the
+  actual current script content (not from scratch files) and simulating the full sequential
+  apply against the real `v0.9.0` tag: both apply cleanly in order, the combined result compiles,
+  and `grep -c DIAG-FSDP2-BROADCAST` on the patched file returns 3 (the tag appears 3 times in
+  the instrumentation, as expected). `bash -n` and the stray-single-quote scan both still pass.
+- **Symptom 2 (new, unrelated to the diagnostic)**: progress well past every prior init-time
+  blocker — 100% weight loading (1224/1224 shards, ~4m32s), `Apertus1p5ForConditionalGeneration
+  contains 71.94B parameters`, healthy post-FSDP memory (22.37/95.00 GB), SGLang rollout fully up
+  (CUDA graphs captured, HTTP servers started), reached `Training Progress: 0/233` — i.e. the
+  rank0-load-fix patch's actual job (preventing the FSDP2 init OOM) is confirmed working exactly
+  as intended. Crashed instead on the very first `update_actor` call:
+  `torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.89 GiB ... 92.98 GiB memory in
+  use` on a single rank (`WorkerDict pid=228086`, node `172.28.44.100`), which took down the
+  whole job via Ray. **Zero training-step metric lines exist in this log** — no `actor/loss`,
+  `grad_norm`, or `critic/score/mean` — so this run produced neither the weight-broadcast
+  diagnostic data nor any reward-trend data, and the original reward-collapse hypothesis remains
+  completely untested.
+- **Not yet investigated**: whether this backward-pass OOM is a new regression from converting
+  the fork branch swap to a static patch (functionally, the two should be identical — the earlier
+  diff/compare-API check found only the one file differs, and that file's content is unchanged by
+  the conversion), a resource-boundary flake specific to this node/allocation (92.98/95 GiB is
+  extremely tight — consistent with this repo's other one-off node-squat OOMs, e.g. run 3185487's
+  rank-0 pre-FSDP squat and run 3152802's TP=32 hang, both later confirmed non-repeating on
+  retry), or something else entirely (e.g. a larger-than-usual dynamic-bsz micro-batch on this
+  particular first mini-batch). Since run 3185943 — functionally the same rank0-load/broadcast
+  mechanism, via the live fork branch instead of this patch — ran 47 steps with no OOM at all,
+  a code-level regression from the patch conversion looks unlikely on its face, but hasn't been
+  ruled out with certainty.
+- **Fix**: none yet for the OOM. The diagnostic-apply bug fix above should be sufficient on its
+  own to collect the `[DIAG-FSDP2-BROADCAST]` hash data on a retry, since that instrumentation
+  runs during `actor_init_model()` — before this OOM's crash point in `update_actor` — so even an
+  identical OOM recurrence wouldn't prevent capturing it. Whether to also investigate/mitigate the
+  OOM before resubmitting, or resubmit unmodified first (same "retry once to check if it's a
+  one-off" approach already validated elsewhere in this repo) is an open decision, not yet made.
 - **Commit**: not committed.
