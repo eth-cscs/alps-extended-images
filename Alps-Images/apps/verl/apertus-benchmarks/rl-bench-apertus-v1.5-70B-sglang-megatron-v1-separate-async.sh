@@ -84,12 +84,24 @@ export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 # the standalone rollout (the fully-async recipe called this trigger_parameter_sync_step).
 # train_batch_size and ppo_mini_batch_size are PROMPT counts; ppo_mini_batch_size is
 # multiplied by rollout.n internally for the DP-parallel actor mini-batch, and that
-# product must be >= 2x dp_size. Here dp_size = DP x EP = 6 x 1 = 6 (12 training
-# nodes x 4 GPUs / TP=8 = 6 DP replicas; dense model so EP=1). 6 * 16 = 96 >> 12.
-export ROLLOUT_N=16                  # responses per prompt (unchanged from the fully-async recipe)
-export PPO_MINI_BATCH_SIZE=6         # prompts; x ROLLOUT_N = 96 rows
-export PARAMETER_SYNC_STEP=2
-export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))
+# product must be >= 2x dp_size (= DP x EP = 6 x 1 = 6: 12 training nodes x 4 GPUs
+# / TP=8 = 6 DP replicas, dense so EP=1) -- 48 * 16 = 768 >> 12.
+#
+# ppo_mini_batch_size=48 matches the fully-async recipe / the sibling
+# rl-bench-apertus-v1.5-70B-sglang-megatron-async.sh (job 3184869, which learned
+# to reward ~0.99). The V1-separate migration originally shrank it to 6 (copied
+# from the GLM-5.1 700B v1-separate recipe, where 6 is forced by that model being
+# memory-bound at PP=3) -- that cut perf/throughput ~3x (fixed per-step cost:
+# ~9.7s trainer->rollout weight sync + optimizer + TransferQueue round-trip,
+# amortized over 8x fewer tokens; run 3247540 = ~37 tok/s vs 3184869 = ~120).
+# Apertus-70B at TP=8 + full offload has ~34 GiB free (61/95 GiB peak at mb=6);
+# dynamic-bsz caps each MICRObatch at ppo_max_token_len_per_gpu=16384 so the
+# activation peak is per-microbatch, not per-mini-batch -- 8x more rows just
+# means more sequential microbatches, same peak.
+export ROLLOUT_N=16                  # responses per prompt (matches 3184869)
+export PPO_MINI_BATCH_SIZE=48        # prompts; x ROLLOUT_N = 768 rows (matches 3184869)
+export PARAMETER_SYNC_STEP=2         # matches 3184869's trigger_parameter_sync_step
+export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))  # 96
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -238,9 +250,19 @@ trainer:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
   total_epochs: 3
-  # Fixed step cap (overrides the epoch-based count) -- short benchmark run to see
-  # whether the loss/reward trend moves, same intent as the fully-async recipe's
-  # total_rollout_steps: 4416 (~46 training steps).
+  # _balance_batch (trainer_base.py:1467, on by default) reads tag["seq_len"] on
+  # every trajectory. When the separate-async sampler delivers fewer than
+  # required_multiple = ppo_mini_batch_size(48) * rollout.n(16) = 768 valid
+  # trajectories in a sync window, verl pads with synthetic samples that carry
+  # no seq_len tag -> KeyError (run 3250502 died here at step 36). Disabling
+  # DP-token-load balancing avoids that path entirely; use_dynamic_bsz already
+  # bounds per-microbatch tokens so the imbalance cost is small. (At the old
+  # ppo_mini_batch_size=6 the multiple was 96 and run 3247540 never came up
+  # short in 46 steps, so this was dormant.)
+  balance_batch: False
+  # Fixed step cap (overrides the epoch-based count). 46 steps x TRAIN_BATCH_SIZE
+  # (parameter_sync_step 2 x ppo_mini_batch_size 48 = 96 prompts) = 4416 prompts
+  # -- exactly the fully-async recipe's total_rollout_steps: 4416 (job 3184869).
   total_training_steps: 46
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
@@ -744,7 +766,26 @@ if [ ! -d "${MEGATRON_LM_DIR}/.git" ]; then
     [ -d "${MEGATRON_LM_DIR}/.git" ] && [ -d "${MEGATRON_BRIDGE_DIR}/.git" ] \
         || { echo "FATAL: Megatron-LM/Megatron-Bridge clone failed"; exit 1; }
 else
-    echo "Megatron-LM/Megatron-Bridge already cloned, skipping."
+    # Reuse the Lustre checkout, but reset TRACKED files to pristine first. It
+    # persists across submissions and the qwen3_asr sed, the models/__init__.py
+    # register line, and (historically) a [DIAG-ROPE] recompute.py diagnostic
+    # accumulate as tracked-file edits -- run 3250502 packaged a stale [DIAG-ROPE]
+    # patch left by an old sibling run, spamming ~hundreds of thousands of log
+    # lines. `checkout -f apertus` + `reset --hard` reverts them so every wheel
+    # build is deterministic; the qwen3_asr / apertus1p5_bridge steps below
+    # re-apply unconditionally / idempotently. No `git clean` -- MEGATRON_BRIDGE_DIR
+    # is a nested untracked dir inside MEGATRON_LM_DIR and the diagnostics only
+    # ever touch tracked files.
+    echo "Megatron-LM/Megatron-Bridge already cloned — resetting tracked files to pristine apertus branch."
+    srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
+        --environment="${TRAINING_CONFIG}/env.toml" \
+        --container-writable bash -c '
+        set -e
+        for d in ${MEGATRON_LM_DIR} ${MEGATRON_BRIDGE_DIR}; do
+            git -C $d checkout -f apertus
+            git -C $d reset --hard
+        done
+    '
 fi
 
 # Megatron-Bridge's own vendored qwen3_asr HF code (a local copy it keeps to
@@ -1151,7 +1192,7 @@ echo "Added Apertus1p5Bridge (new bridge for Apertus1p5ForConditionalGeneration)
 # before that source change existed -- bump this string whenever the
 # packaged source changes in a way that needs a fresh wheel.
 export MEGATRON_WHEEL_DIR=${TRAINING_HOME}/wheels
-export MEGATRON_WHEEL_BUILD_VERSION="v5-apertus1p5-bridge-v1sep"
+export MEGATRON_WHEEL_BUILD_VERSION="v6-apertus1p5-bridge-pristine"
 mkdir -p ${MEGATRON_WHEEL_DIR}
 if ! ls ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl >/dev/null 2>&1 \
     || ! ls ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl >/dev/null 2>&1 \

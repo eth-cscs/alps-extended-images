@@ -2581,12 +2581,66 @@ suggest — most of Megatron-Core's actual CUDA-heavy code lives in separate pac
   Recommendation: **DP=5 (#1)** — cheapest guaranteed fix, we've validated everything else works,
   the miss is tiny. #3 is the "stop adding nodes" play but carries its own risk after 5 clean
   failures on the same line.
-- **Fix applied (user-approved, 2026-09-01), unverified**: **DP=5.** `#SBATCH --nodes` 104→128
-  (`TRAINING_NNODES` 96→120 → 480 trainer GPUs → DP = 480/(TP4·PP3·EP8) = 5); `PPO_MINI_BATCH_SIZE`
-  8→10 (× `ROLLOUT_N` 8 = 80 rows = 2× the new `dp_size` DP5·EP8 = 40; `TRAIN_BATCH_SIZE` auto
-  16→20). Kept: unconditional `empty_cache()`, `ppo_max_token_len_per_gpu: 4096`,
-  `NCCL_NVLS_ENABLE=0`, `step1-oom-memdump.patch` (so the `[MEMDUMP]` confirms the margin), same
-  image. Config-only, no new patches. `bash -n` + sweeps clean.
+- **Fix applied (user-approved, 2026-09-01)**: **DP=5.** `#SBATCH --nodes` 104→128,
+  `PPO_MINI_BATCH_SIZE` 8→10.
+
+### Run `3250425` — 2026-09-01 — DP=5 / 128 nodes: step-1 OOM RECURRED (6th). DP scaling has hit diminishing returns — the optimizer.step() transient (~40 GiB) is dominated by the full-param all-gather buffer, which does NOT shrink with DP.
+
+- **Log**: `~/Downloads/slurm-3250425.out` (665 KB). 128 nodes (DP=5), unconditional
+  `empty_cache()`, `ppo_max_token_len_per_gpu: 4096`. ~32 min, FAILED — step-1 `fused_adam` OOM
+  (6th consecutive). All 8 patches 128/128, **seed sync clean (136s, all 480 ranks, zero
+  `gather_from_ep_ranks`)**, delta ingestion worked, SGLang rollout up.
+- **`[MEMDUMP]` free-before-step: 38.9 / 39.9 / 42.3 GiB** — vs `3247517`'s ~38 GiB. **DP 4→5
+  bought only ~2 GiB, not the projected ~8.** `torch_reserved − torch_alloc` = 0.15–0.22 GiB
+  (empty_cache working).
+- **OOM**: `fused_adam.py:381 _initialize_state → torch.empty_like` for `exp_avg_sq`.
+  `Tried 24 MiB · 4.81 MiB free · process 73.6 GiB · PyTorch-allocated 61.4 GiB ·
+  reserved-unalloc 45 MiB` (not fragmentation). **~19 MiB short — trajectory essentially
+  unchanged from `3247517`.**
+- **Why DP scaling stalled** (analysis): at MEMDUMP time GPU 0 holds ~40 GiB (bf16 params 18.5,
+  which DP does NOT shrink; grad buffer ~7–9; fp32 master ~7–9; ~12 non-PyTorch). DP 4→5 shrinks
+  only the grad-buffer + fp32-master shards (~3.6 GiB total). Then `optimizer.step()` allocates
+  its ~40 GiB transient: `exp_avg` + `exp_avg_sq` (`2 × 9.24B·4/DP` ≈ 14.8 GiB at DP=5, DOES
+  shrink) **plus the distributed-optimizer's full-param all-gather buffer (~18.5 GiB, full param
+  size, does NOT shrink with DP)** plus grad-norm + `.float()` upcast scratch. Against ~40 GiB
+  free, it misses by MiB every time. **DP=6/7 would keep giving ~2–4 GiB each — the all-gather
+  buffer and the bf16 params are the fixed floor.**
+- **Fix — NOT applied. The real lever is the optimizer's all-gather buffer / whole-step
+  transient, not DP.** Options:
+  1. **`use_layer_wise_distributed_optimizer: True`** (`verl/workers/config/optimizer.py`, seen
+     `False` in every config dump) — Megatron-core processes the optimizer update **layer-by-
+     layer**, keeping only one layer's optimizer state + all-gather buffer on GPU at a time.
+     Cuts the ~40 GiB transient to single-digit GiB. Could allow going back to 104 or even 80
+     nodes. **Best structural fix**; needs a research pass (does it compose with verl V1 Megatron
+     + TE fused-adam + `optimizer_offload` + the `distrib_optimizer.py:3163` path?) and probably
+     its own debugging — but every other lever is exhausted.
+  2. **`overlap_param_gather: False`** / a smaller `distributed_optimizer` all-gather bucket — do
+     the param all-gather in chunks instead of one ~18.5 GiB buffer. Smaller change than #1.
+  3. **DP=6 (152 nodes)** — ~2–4 GiB more. Brute force, diminishing, +48 nodes (90% over 80).
+  Recommendation: **#1 (layer-wise optimizer)** — DP scaling is out of runway.
+- **Fix applied (user-approved, 2026-09-01) — CPU-streaming (HybridDevice) optimizer.** Research
+  found the real answer: `use_layer_wise_distributed_optimizer` is **Muon-only** in verl v0.9.0
+  (`verl/utils/megatron/optimizer.py:33 is_muon_layer_wise_config`), doesn't apply to Adam. BUT
+  `actor.optim.override_optimizer_config` (a real `McoreOptimizerConfig` field,
+  `verl/workers/config/optimizer.py:113`) is forwarded **verbatim** to Megatron-core's
+  `OptimizerConfig(**optim_args)` (`optimizer.py:210`), and **verl's own canonical large-MoE
+  Megatron-async recipes use exactly this** — `verl/experimental/fully_async_policy/shell/
+  grpo_30b_a3b_base_math_megatron_96_32_mis.sh` (Qwen 30B-A3B MoE, 96+32 nodes) and every other
+  30B/35B MoE megatron-async example script set the same four keys:
+  ```yaml
+  actor.optim.override_optimizer_config:
+    optimizer_cpu_offload: True          # -> Megatron HybridDeviceOptimizer: optimizer state
+    optimizer_offload_fraction: 1.0      #    lives on CPU, streamed bucket-by-bucket during
+    overlap_cpu_optimizer_d2h_h2d: True  #    step(); GPU never holds the full moments
+    use_precision_aware_optimizer: True  #    (required by that path; moments stay fp32)
+  ```
+  `actor.megatron.{param,grad,optimizer}_offload: True` stays on alongside (verl's
+  `offload_megatron_optimizer` already handles a HybridDeviceOptimizer via
+  `_move_new_state_to_right_device`, and the example scripts keep `megatron.optimizer_offload`
+  on too). This directly removes the ~40 GiB GPU optimizer transient that DP scaling couldn't
+  touch. **Kept 128 nodes / DP=5 / `PPO_MINI_BATCH_SIZE=10` for this run to isolate the
+  optimizer change** — if it works, node count can come back down in a follow-up. Config-only,
+  no new patches, same image. `bash -n` + YAML-indent + backtick sweeps clean.
 - **Commit**: not committed.
 
 # Training Apertus v1.5 on verl (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`)
@@ -3737,9 +3791,74 @@ recipe-config issue, not a model-config one.
   `v5-apertus1p5-bridge-v1sep`; checked-in `patches/apertus_bridge.py` deleted (the fork wheels
   provide it). `patches/apertus1p5_bridge.py` kept (still vendored into the fork bridge
   checkout), comments updated.
+- **Post-run tuning (2026-08-31; validated in runs `3250502`/`3251587` below)**: `perf/throughput` was ~37 tok/s vs job
+  `3184869`'s ~120. Cause: the V1-separate migration had shrunk `ppo_mini_batch_size` 48 → 6
+  (copied from the GLM-5.1 700B v1-separate recipe, where 6 is forced by PP=3 memory pressure).
+  `perf/throughput = total_tokens_per_step / step_time`, and the ~9.7 s/step trainer→rollout
+  weight sync + optimizer + TransferQueue round-trip is a fixed per-step cost, so an 8× smaller
+  batch ≈ 1/3 the token rate (and ~3.5× worse wall-clock per prompt). MFU is 0 in both (verl
+  can't compute it for `apertus1p5`), so `perf/throughput` is the only number and it is
+  batch-size-sensitive. Restored `PPO_MINI_BATCH_SIZE=48` / `TRAIN_BATCH_SIZE=96` to match
+  `3184869` exactly (all other actor params — `ppo_max_token_len_per_gpu` 16384,
+  `ppo_micro_batch_size_per_gpu` 1, `use_dynamic_bsz`, TP=8/PP=1/EP=1, offloads, recompute —
+  already matched). Safe on memory: dynamic-bsz caps each *microbatch* at 16384 tokens, so the
+  activation peak (was 61/95 GiB at mb=6) is per-microbatch, unchanged by mb size. `46 steps ×
+  96 prompts = 4416` = the fully-async recipe's `total_rollout_steps` exactly, so
+  `total_training_steps: 46` is unchanged and processes the same total data.
 - **Open follow-ups** (both non-blocking): the `<|inner_suffix|>` chat-template leak (a proper
   fix would let the model follow `<answer>` again); and GSM8K being near-saturated for this base
   model (a longer run / harder eval would show real learning headroom).
+- **Commit**: not committed.
+
+### Run `3250502` — 2026-09-01 — `ppo_mini_batch_size` 6 → 48 (match job 3184869): perf/memory/quality all validated; new crash at step 36 in verl's `_balance_batch`
+
+- **Change**: `PPO_MINI_BATCH_SIZE` 6 → 48, `TRAIN_BATCH_SIZE` 12 → 96 — the only training param
+  that differed from the fully-async sibling. Motivation: `perf/throughput` = `total_tokens /
+  step_time`, and the ~9.7 s/step fixed weight-sync + optimizer + TQ cost was amortized over 8×
+  fewer tokens → ~37 tok/s vs job `3184869`'s ~120.
+- **Validated at mb=48**: peak `actor/perf/max_memory_allocated_gb` **72.6 GiB** / 95 (mb=6 was
+  61 — the per-microbatch dynamic-bsz cap held, ~+11 GiB only, ~10 GiB headroom); **throughput
+  ~160–180 tok/s** (beat the 100–130 estimate); `timing_s/step` ~49–53 s, `update_actor`
+  ~38–41 s; `critic/score` healthy, identical shape to `3247540`. **NOT an OOM.**
+- **Crash — step 36, verl bug, directly triggered by the batch change**:
+  ```
+  verl/trainer/ppo/v1/trainer_base.py:1467  _balance_batch
+    torch.tensor([tag["seq_len"] for tag in batch.tags], ...)   KeyError: 'seq_len'
+  ```
+  `required_multiple = ppo_mini_batch_size(48) * rollout.n(16) = 768`. When the separate-async
+  sampler delivers < 768 valid trajectories in a sync window, verl pads with synthetic samples
+  carrying no `seq_len` tag; `_balance_batch` (`trainer.balance_batch: True` by default) reads
+  `tag["seq_len"]` unconditionally → KeyError. Steps 34/35 logged `Upsampled batch from N to 768`
+  and survived (intermittent — depends whether padded samples reach the tag list); step 36 didn't.
+  At mb=6 the multiple was 96 and `3247540` never came up short in 46 steps → dormant.
+- Also surfaced: a **stale `[DIAG-ROPE]` diagnostic** patched into `recompute.py` in the shared
+  Lustre `Megatron-LM` checkout by an old sibling run (see that script's run `3174079` entry) —
+  the checkout persists across submissions and the reuse branch never reset it, so every wheel
+  build since packaged it. ~hundreds of thousands of log-spam lines.
+- **Fix** (both in the script): `trainer.balance_batch: False` (skips `_balance_batch` entirely —
+  `use_dynamic_bsz` already bounds per-microbatch tokens so the DP-imbalance cost is small); and
+  the Megatron clone reuse branch now `git checkout -f apertus && git reset --hard` on both
+  `${MEGATRON_LM_DIR}` and `${MEGATRON_BRIDGE_DIR}` (no `git clean` — Bridge is a nested untracked
+  dir and the diagnostics only touch tracked files). `MEGATRON_WHEEL_BUILD_VERSION` →
+  `v6-apertus1p5-bridge-pristine`.
+- **Commit**: not committed.
+
+### Run `3251587` — 2026-09-01 — FULLY VALIDATED: 46/46 steps at `ppo_mini_batch_size: 48`, healthy curve, throughput beats the original fully-async run
+
+- Both `3250502` fixes live. **`git reset --hard` ran, `[DIAG-ROPE]` = 0 occurrences** (was
+  hundreds of thousands). Wheels rebuilt at `v6`. **Zero `KeyError: 'seq_len'` / `_balance_batch`
+  / `Upsampled batch`** — ran clean through step 36 to 46 + a checkpoint save at `global_step_46`.
+- **Perf** (steady steps 2–45): `perf/throughput` **158–184 tok/s** (mb=6 was ~37; job `3184869`
+  fully-async was ~120 — this now beats it), `timing_s/step` ~48–56 s, peak
+  `max_memory_allocated_gb` **72.5 GiB** / 95, weight sync ~9.5–9.8 s.
+- **Score**: `critic/score/max` 1.10 every step; `critic/score/mean` ~0.84–1.05 (~0.98 avg,
+  trending up — near-saturated); `actor/grad_norm` 0.18–0.43, all nonzero, no NaN. Same shape as
+  `3247540` / `3250502`.
+- COMPLETED, exit 0, ~87 min wall. Only log "errors" are post-`Training Progress: 100%` teardown
+  noise (DataLoader worker `Killed`, wandb atexit, Ray GCS spam).
+- **The migration + tuning is done.** Recipe is stable at 16 nodes / mb=48 / 46 steps. Remaining
+  open items are the two non-blocking follow-ups noted under `3247540` (chat-template
+  `<|inner_suffix|>` leak; GSM8K near-saturation).
 - **Commit**: not committed.
 
 # Megatron vs FSDP2
