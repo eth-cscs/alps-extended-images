@@ -276,7 +276,7 @@ trainer:
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 100  # > total_training_steps: no mid-run checkpoint on the shakedown (faster, cleaner signal). Lower for a real run (actor.checkpoint.strict is False so the multimodal-tower export gap is non-fatal).
-  test_freq: -1   # = total_training_steps -> one validation pass, at the last step (greedy pass@1 on GSM8K test)
+  test_freq: 46
   val_before_train: true   # + a baseline validation before step 1
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
@@ -329,9 +329,10 @@ sbcast -f ${TRAINING_CONFIG}/dataset_prepare.py ${TRAINING_CONFIG}/dataset_prepa
 # the 3-hunk example/patches/ version -- keep the shared hunks 1+2 in sync.
 cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
 # Local fixes for verl v0.9.0's V1 separate-async trainer, discovered debugging
-# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh (see Known hazards and the
-# Run log in CLAUDE.md for the full incident history). Re-diff against a newer verl
-# ref if this stops applying.
+# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh and
+# rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh (see Known
+# hazards and the Run log in CLAUDE.md for the full incident history). Re-diff
+# against a newer verl ref if this stops applying.
 #
 # 1. LLMServerManager._initialize_llm_servers (verl/workers/rollout/llm_server.py):
 #    PPOTrainer._setup() always builds hybrid rollout replicas on top of the
@@ -351,32 +352,58 @@ cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
 #    (worker_group is not None); standalone-mode calls (worker_group is None) are
 #    unaffected. Confirmed fixed in run 3134772 (no OOM, training reached step 0).
 #
-# 2. PPOTrainerSeparateAsync.on_init_end (verl/trainer/ppo/v1/trainer_separate_async.py):
-#    drops the self.checkpoint_manager.update_weights(...) call. That manager's
-#    backend is forced to "naive" (trainer_base.py), which pushes weights into
-#    each worker's colocated hybrid engine directly rather than going through a
-#    replica list -- with hybrid replicas disabled by fix 1 above, that colocated
-#    engine is never created, so the call would push into nothing.
-#    self.standalone_checkpoint_manager.update_weights(...), the actual sync to
-#    the standalone rollout, is left untouched. Paired with fix 1; same runs.
+# 2 & 3. PPOTrainerSeparateAsync.on_init_end and .switch_to_rollout
+#    (verl/trainer/ppo/v1/trainer_separate_async.py): both drop their
+#    self.checkpoint_manager.update_weights(...) call. That manager's backend is
+#    forced to "naive" (trainer_base.py), whose update_weights() bypasses the
+#    (correctly empty, thanks to fix 1) hybrid replica list entirely and instead
+#    calls ray.get(actor_wg.update_weights(mode="naive")) on every actor rank --
+#    each of which unconditionally does `await self.rollout.resume(tags=["weights"])`
+#    when free_cache_engine is True (engine_workers.py). This recipe's real weight
+#    sync is self.standalone_checkpoint_manager (nccl backend, on_step_end) and
+#    never touches SGLang memory-occupation tags at all, so a resume of "weights"
+#    here has no matching prior release -- SGLang's resume_memory_occupation does
+#    a bare `offload_tags.remove("weights")`, and KeyError: 'weights' crashes every
+#    standalone rollout TP rank.
+#    - on_init_end: confirmed fixed in run 3134772 (no OOM, training reached step 0).
+#    - switch_to_rollout: this call site is NOT exercised by on_init_end's fix --
+#      current_mode starts at ROLLOUT (so on_validate_begin's `if current_mode ==
+#      TRAINER` guard skips switch_to_rollout for any validation before the first
+#      training sample), then flips to TRAINER after the first sample and NEVER
+#      flips back during training (should_switch_to_rollout() is a hardcoded
+#      `return False` stub in this verl version) -- so switch_to_rollout only ever
+#      runs the first time a validation happens *after* training has started, i.e.
+#      the first genuinely mid-run test_freq validation. Run 3261338 (2026-09-02):
+#      45/46 steps completed cleanly (val_before_train's baseline eval worked fine,
+#      since it never touches this code path), then crashed exactly here on the
+#      step-46 (test_freq=46) validation switch -- traced via the real v0.9.0
+#      source (base.py:CheckpointEngineManager.update_weights, engine_workers.py:
+#      WorkerDict.update_weights, sglang_rollout.py:ServerAdapter.resume,
+#      async_sglang_server.py's tags semantics) to confirm this exact mechanism,
+#      not guessed. self.checkpoint_manager.resume_generation_replicas() and
+#      add_replicas_to_balancer() right below are left untouched: both operate on
+#      the (correctly empty) replica list via asyncio.gather(*[... for r in []]),
+#      confirmed genuinely inert (unlike update_weights's naive-backend branch,
+#      which bypasses that list). switch_to_trainer() needs no equivalent fix --
+#      its two calls (abort_replicas/sleep_replicas) are replica-list-only, and it
+#      already ran once (after the first sample) with no crash across every run.
 #
-# (The third fix in this family -- list_of_dict_to_tensordict's shape-equality
-# heuristic in verl/utils/tensordict_utils.py, which silently stacked ragged
-# per-sample tensors into a dense Tensor and broke downstream .offsets() calls --
-# is now upstream verl PR #7661, fetched + git-apply'd by the PR-patch loop
-# below, so it is no longer carried here.)
+# (A fourth fix that used to live here -- list_of_dict_to_tensordict's
+# shape-equality heuristic in verl/utils/tensordict_utils.py, which silently
+# stacked ragged per-sample tensors into a dense Tensor and broke downstream
+# .offsets() calls -- is now upstream verl PR #7661, fetched + git-apply'd by the
+# PR-patch loop below, so it is no longer carried here.)
 #
 # Originally shipped as sitecustomize.py runtime monkeypatches (fast to iterate on
 # mid-debugging -- no hand-crafted diff needed while the exact fix was still
-# changing), converted to this source patch once run 3149736 confirmed both
-# were correct and stable: same reasoning as the Apertus benchmark's equivalent
-# conversion (apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch) --
-# a runtime monkeypatch is great for fast iteration but not the form a stable fix
-# should end up in. A plain source patch is one less moving part (no
+# changing), converted to this source patch once run 3149736 confirmed the first
+# two were correct and stable: same reasoning as the Apertus benchmark's
+# equivalent conversion (apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch)
+# -- a runtime monkeypatch is great for fast iteration but not the form a stable
+# fix should end up in. A plain source patch is one less moving part (no
 # sys.meta_path machinery, no PYTHONPATH staging, no import-timing dependency)
 # and the actual behavior is just readable in the file.
 diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
-index 18a06ee2..4c1815a5 100644
 --- a/verl/trainer/ppo/v1/trainer_separate_async.py
 +++ b/verl/trainer/ppo/v1/trainer_separate_async.py
 @@ -133,7 +133,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
@@ -394,6 +421,24 @@ index 18a06ee2..4c1815a5 100644
 
      def on_train_begin(self):
          if self.config.skip.rollout_tq.enable:
+@@ -179,7 +185,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+
+     def switch_to_rollout(self):
+         # TODO: disable auto offload in config and offload according to the switch strategy
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        # self.checkpoint_manager.update_weights(...) is skipped for the same reason
++        # as on_init_end above: backend="naive" bypasses the (empty) hybrid replica
++        # list and pushes mode="naive" onto every actor rank, which unconditionally
++        # calls rollout.resume(tags=["weights"]) -- resuming a tag never released,
++        # since this recipe's real weight sync (standalone_checkpoint_manager, nccl
++        # backend, on_step_end) never touches memory-occupation tags at all. Left
++        # unpatched, this crashes SGLang's resume_memory_occupation with
++        # KeyError: 'weights' the first time switch_to_rollout runs -- which, since
++        # should_switch_to_rollout() is a hardcoded False stub, is only ever at
++        # validation (run 3261338: 45/46 steps clean, crashed here at the final val).
+         self.checkpoint_manager.resume_generation_replicas()
+         self.add_replicas_to_balancer()
+         self.current_mode = HybridEngineMode.ROLLOUT
 diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
 index d9beede7..4e2d767e 100644
 --- a/verl/workers/rollout/llm_server.py

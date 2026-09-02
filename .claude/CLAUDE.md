@@ -2749,6 +2749,93 @@ suggest — most of Megatron-Core's actual CUDA-heavy code lives in separate pac
   `bash -n` + YAML-indent + sweeps clean, same image.
 - **Commit**: not committed.
 
+### Runs `3260912` (node-join stall, cancelled) / `3262227` — 2026-09-02 — **STEP 1 FULLY COMPLETES** (fwd+bwd+optimizer.step(), zero CUDA OOM) — but the two host-RAM tuning knobs bought ~0: identical 446/450 GB OOM in the post-step delta-steady sync.
+
+- `3260912`: Ray join stalled at 127/128 for 35 min (one node never got through container
+  setup, no Slurm-level fault) — cancelled per user approval, resubmitted unmodified as
+  `3262227` (fast turnaround, clean bootstrap this time).
+- **`3262227`**: `~/Downloads/slurm-3262227.out` (1.87 MB). 128 nodes,
+  `optimizer_offload_fraction: 0.7`, `update_weights_bucket_megabytes: 512`. ~65 min, FAILED.
+  Diagnostic block, 8 patches (0 FATAL), seed sync (173s, 480 ranks, no hang), rollout up — all
+  clean. **Step 1 fwd + bwd + `optimizer.step()` all completed** — `[MEMDUMP]` showed **`CUDA
+  OOMs: 0`**, 35–44 GB GPU free per rank. First time this recipe has ever gotten a Megatron
+  optimizer step to fully finish.
+- **The post-step `delta_sharded` steady weight sync died again on host RAM — numbers essentially
+  unchanged from `3257320`**: node `172.28.50.69` at **446.19 / 450.00 GB (99.15%)** vs
+  `3257320`'s 446.01/450.00. **`optimizer_offload_fraction` 1.0→0.7 and
+  `update_weights_bucket_megabytes` 2048→512 moved the host-RAM ceiling by ~0.** Sync never
+  progressed past `tensor#1` (`model.norm.weight`) before the Ray OOM killer fired. Zero per-step
+  metrics logged (dies before any are emitted).
+- **What this disproves**: `optimizer_offload_fraction` does NOT scale the CPU-resident footprint
+  of the HybridDeviceOptimizer proportionally — likely the full optimizer state stays pinned on
+  host regardless of fraction (the fraction only controls how much is *also* kept resident on
+  GPU, not how much leaves CPU). `update_weights_bucket_megabytes` likewise wasn't the dominant
+  term. **Both knobs were the wrong lever — the real host-RAM consumer is elsewhere**, most likely
+  verl's own `param_offload`/`grad_offload` (~37 GB, untouched by this round) and/or the delta
+  engine's pinned CPU snapshot (~18.5 GB) and/or `overlap_cpu_optimizer_d2h_h2d`'s double-buffer
+  (if it pins a second full-size copy for the overlap, that alone could be ~22 GB).
+- **Fix — NOT applied, needs user decision.** Given real, now-confirmed GPU headroom (35–44 GB
+  free at `[MEMDUMP]`, step 1 fully clean), the strongest lever is moving something OFF host
+  entirely rather than re-tuning fractions that didn't move the needle:
+  1. **`actor.megatron.param_offload: False`** — keep the ~18.5 GB bf16 params on GPU always
+     (GPU can afford it). Removes that chunk from host RAM entirely, not just tunes it.
+  2. **`actor.megatron.grad_offload: False`** — same for the ~18.5 GB (bf16, post `main_grads_dtype`)
+     grad buffer, if GPU room allows both.
+  3. **`overlap_cpu_optimizer_d2h_h2d: False`** — if the overlap double-buffers, this could free a
+     comparable chunk to the optimizer state itself, at the cost of step time (no overlap).
+  Recommendation: **#1 first** (single, well-scoped, big known chunk); add #2/#3 if the first
+  round doesn't clear the ~4–5 GB gap. Also worth instrumenting: a host-RSS memdump (analogous to
+  `[MEMDUMP]`) right before `on_step_end()`'s weight sync would settle this definitively instead
+  of guessing again — has not been added yet.
+- **Fix applied (user-approved, 2026-09-02)**: `actor.megatron.param_offload: True → False` —
+  the only change. Keeps 128 nodes / `grad_offload` / `optimizer_offload` /
+  `optimizer_offload_fraction: 0.7` / `update_weights_bucket_megabytes: 512` / everything else.
+  `bash -n` + sweeps clean, same image.
+- **Commit**: not committed.
+
+### Run `3263683` — 2026-09-02 — `param_offload: False` FIXED the host-RAM OOM (gone, no recurrence) — furthest run ever (seed sync, step 1 fwd+bwd+optimizer.step(), first-ever real exercise of the delta_sharded STEADY sync) — new failure: an NCCL ALLGATHER hang in the steady sync itself, same desync class as the (already-fixed) seed sync.
+
+- **Log**: `~/Downloads/slurm-3263683.out`. 128 nodes, `param_offload: False` (only change vs
+  `3262227`). Clean node join (no repeat of `3260912`'s stall). ~65 min elapsed before the
+  terminal NCCL timeout fired (30-min watchdog + propagation lag).
+- **The host-RAM OOM is GONE** — zero `OutOfMemoryError` / "node running low on memory" anywhere.
+  `param_offload: False` fixed exactly what it targeted.
+- **Furthest ever reached**: diagnostic block, 8 patches (128/128, 0 FATAL), DDP grad-buffer
+  (9.24B params, no OOM), seed sync clean (184.4s, 480 ranks, zero `gather_from_ep_ranks`),
+  rollout up, `[MEMDUMP]` before step 1 optimizer (**43–46 GB GPU free** — even better than
+  `3262227`'s numbers despite params now resident), **step 1's fwd + bwd + `optimizer.step()` all
+  completed**, and then — **for the first time ever** — the job reached the **post-step
+  `delta_sharded` STEADY weight sync** (the actual per-step sync path, never previously exercised
+  at real scale; every prior run died before or during it on host RAM).
+- **New failure — NCCL ALLGATHER collective timeout, in the steady sync's very first flush**:
+  ```
+  Watchdog caught collective operation timeout: WorkNCCL(SeqNum=4, OpType=ALLGATHER,
+    NumelIn=34, NumelOut=16320, Timeout(ms)=1800000) ran for 1800001 milliseconds
+  ```
+  Fired identically on ~478/480 ranks, right after every rank logged
+  `[WSYNC-DBG] delta-steady tensor#1 name=[('model.norm.weight', (6144,))] t+0s` and then went
+  silent — the steady sync's first cross-rank collective (small: `NumelIn=34` — a handful of
+  changed elements) never completed cluster-wide. Cascaded into `DistBackendError` +
+  `Fatal Python error: Aborted` on multiple ranks.
+- **Diagnosis — same desync class as the seed-sync bug, different (never-before-exercised) code
+  path.** The `_wsync_progress_log` WORLD-barrier fix (added after run `3240762`, validated
+  through 10+ syncs) only fires for the `"seed/full"` tag (`if _seed and ...`) — **the
+  `"delta-steady"` tag was deliberately left unbarriered**, because CLAUDE.md's own prior
+  investigation (run `3219811`) concluded the steady path's `_GatherQueue` is
+  "count-lockstepped by design" and doesn't need it. **That assumption is now disproven by direct
+  evidence**: this is the first run to ever reach a real per-step delta-steady sync at full scale
+  (every prior run died earlier), and its very first collective hung — the same
+  asymmetric-driver mechanism (rank 0 does extra bucket/flush work between generator pulls while
+  other ranks race ahead) that caused the seed-sync hangs plausibly applies here too; the
+  count-based flush trigger reduces but does not eliminate it, same as `PPO_MINI_BATCH_SIZE`
+  margin reduced-but-didn't-eliminate the old TransferQueue shape bug.
+- **Fix — NOT applied, needs user decision**: extend the same proven WORLD-barrier mechanism to
+  the `"delta-steady"` tag in `_wsync_progress_log` (drop the `_seed and` restriction, or add a
+  parallel `_steady`-gated barrier with its own `VERL_WSYNC_STEADY_BARRIER_EVERY` env, default 1).
+  Steady syncs are far smaller than the seed (only changed values), so per-item barriering there
+  is cheap. This is the same fix, extended to the one tag it was never applied to.
+- **Commit**: not committed.
+
 # Training Apertus v1.5 on verl (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`)
 
 Apertus-v1.5-70B GRPO on GSM8K, CSCS Alps, 16 nodes × 4 GH200 (`clariden`). Script:
@@ -3846,6 +3933,30 @@ gaining a ~12-line `curl compare/…​.diff` + `patch -pN` block.
 
 ## Known hazards (this recipe specifically)
 
+- **`switch_to_rollout()` crashes the standalone rollout the first time it ever runs mid-training
+  — i.e. the first `test_freq` validation after training has started.** Root-caused from real
+  v0.9.0 source (not guessed) after run `3261338` crashed here at 45/46 steps — see the Run log
+  entry and `patches/v1-separate-async-fixes.patch`'s own comment for the full trace. One-line
+  summary: `PPOTrainerSeparateAsync.switch_to_rollout()` (`trainer_separate_async.py`) calls
+  `self.checkpoint_manager.update_weights(...)` — the *hybrid* checkpoint manager, backend forced
+  to `"naive"` — whose `update_weights()` bypasses the (correctly empty, per fix 1) hybrid replica
+  list entirely and calls `actor_wg.update_weights(mode="naive")` on every actor rank, each of
+  which unconditionally does `rollout.resume(tags=["weights"])` when `free_cache_engine` is True.
+  This recipe's real sync (`standalone_checkpoint_manager`, `nccl` backend) never touches
+  SGLang memory-occupation tags at all, so the resume has no matching prior release → SGLang's
+  `resume_memory_occupation` does a bare `offload_tags.remove("weights")` → `KeyError: 'weights'`
+  on every standalone rollout TP rank, cascading to job death. Only reachable via `switch_to_rollout()`,
+  which is itself only reachable the first time a validation happens *after* the first training
+  sample (`should_switch_to_rollout()` is a hardcoded `False` stub, so it's never called mid-training
+  otherwise) — i.e. `val_before_train`'s baseline pass never touches it (current_mode is still its
+  initial `ROLLOUT` value), only a genuine `test_freq` mid/end-of-run validation does. **Fixed**:
+  `v1-separate-async-fixes.patch` gained a second hunk in `trainer_separate_async.py` dropping this
+  same `self.checkpoint_manager.update_weights(...)` call from `switch_to_rollout()`, mirroring the
+  already-existing `on_init_end()` fix (same root cause, second call site, never exercised before
+  `test_freq` was ever enabled). `resume_generation_replicas()`/`add_replicas_to_balancer()` right
+  below are untouched — confirmed genuinely inert (empty-replica-list `asyncio.gather`), unlike
+  `update_weights`'s naive-backend branch which bypasses that list. Unverified on cluster as of
+  this entry — needs a run with `test_freq` enabled.
 - **`checkpoint.strict: False` is required.** Apertus-v1.5 is multimodal; this recipe deliberately
   does not map the `vision_tokenizer` / `audio_tokenizer` towers (text-only GSM8K). The strict
   HF-checkpoint export then hard-fails at whatever `save_freq` triggers — `RuntimeError: 473
@@ -4138,6 +4249,96 @@ installed 0.6.1** wheel (no fuzz needed — 0.6.0/0.6.1 context identical in the
   speed. Not root-caused — would need a megatron-core 0.18↔0.19 A/B or an upstream perf note.
 - **Verdict**: the two-PR-diff refactor is **functionally validated end-to-end**. Recipe left as
   the stock+diffs version pending the perf decision.
+- **Commit**: not committed.
+
+### Run `3260837` — 2026-09-02 — CANCELLED: pyxis container-start flake on 1/16 nodes, not a code issue
+
+- **Log**: `~/Downloads/slurm-3260837.out`. 16 nodes, `clariden`. Queued ~13.5 min, ran ~26 min
+  before user-cancelled.
+- **Purpose**: first test of `reward.py`/`dataset_prepare.py` downloaded from the repo (instead of
+  embedded) + `val_before_train: true` + `test_freq: 46` (both re-enabled, see the two entries
+  above this one).
+- **Result**: every watched batch-host step passed (reward.py/dataset_prepare.py download + `grep`
+  guards, dataset-prep correctly skipped for the already-current `v2-triple-bracket` parquet,
+  transformers/xielu wheels, Megatron compare diffs + PR patches, `Apertus1p5Bridge OK` on
+  15/16 nodes) — then Ray wedged at **15/16 nodes for ~14 min**: one node's pyxis/enroot container
+  never started (`error: pyxis: container start error: Interrupted system call` /
+  `couldn't start container` / `spank_pyxis.so: task_init() failed with rc=-1` in the teardown
+  log), all 16 nids otherwise Slurm-healthy (not drained). No timeout on the head-node join loop,
+  so the job sat idle until cancelled. One-off infra flake, no code/config fault.
+- **Fix**: none — unmodified resubmit (`3261338`, next entry), which did not repeat the pyxis
+  stall (16/16 joined fast).
+- **Commit**: not committed.
+
+### Run `3261338` — 2026-09-02 — reward.py/dataset_prepare.py downloads validated, val_before_train works (baseline 0.46), 45/46 steps clean, then a NEW crash in the first-ever mid-run validation switch — root-caused and fixed
+
+- **Log**: `~/Downloads/slurm-3261338.out` (4236 lines, full). 16 nodes, `clariden`. Resubmit of
+  `3260837` (pyxis flake, no code change). Ran ~101 min, **FAILED** (not a timeout) at 45/46 steps
+  — one step short of completion.
+- **Everything new in this recipe iteration validated, in one run**:
+  - `reward.py` / `dataset_prepare.py` `curl`-downloaded from the repo raw URL, `grep`-guard
+    checks passed, no FATAL. Dataset-prep correctly skipped (parquet already `v2-triple-bracket`).
+  - **`val_before_train` (previously disabled in every prior run) ran clean**:
+    `val-core/gsm8k/acc/mean@1 = 0.4597` — the first-ever baseline GSM8K greedy-pass@1 number for
+    this recipe.
+  - 45 clean training steps: `critic/score/max = 1.10` on **every single step**, `score/mean`
+    climbed 0.514 → ~1.00 and held; `actor/grad_norm` finite (0.24–0.43); `perf/throughput`
+    115–136 tok/s (expected megatron-core 0.19 band); final checkpoint (`global_step_46/actor`)
+    saved successfully (the usual non-fatal `473 tensors not written` multimodal-tower warning).
+- **Symptom (new failure mode, first time seen for this recipe)**: right after the step-46
+  checkpoint save and weight sync, log line `"Switching hybrid engine to rollout mode for
+  validation"` (the `test_freq=46` end-of-run validation, also newly enabled this run), then every
+  standalone-rollout SGLang TP rank crashed simultaneously:
+  ```
+  sglang/srt/managers/scheduler_components/weight_updater.py:238, resume_memory_occupation
+    self.offload_tags.remove(tag)
+  KeyError: 'weights'
+  ```
+  → `RayTaskError` → job death. Step 46 itself and the final validation never completed; only the
+  baseline val (0.4597) exists from this run.
+- **Root cause — traced from the real v0.9.0 source, not guessed** (fetched
+  `trainer_separate_async.py`, `checkpoint_engine/base.py`, `workers/engine_workers.py`,
+  `workers/rollout/sglang_rollout/{sglang_rollout,async_sglang_server}.py` directly from GitHub):
+  `current_mode` starts at `ROLLOUT`, so `val_before_train`'s `on_validate_begin()` (`if
+  current_mode == TRAINER`) never calls `switch_to_rollout()` — that's why the baseline eval never
+  hit this. After the first training sample, `on_sample_end()` flips `current_mode → TRAINER` and
+  it **never flips back** during training (`should_switch_to_rollout()` is a hardcoded `return
+  False` stub in this verl version) — so `switch_to_rollout()` runs for the **first time ever**
+  at the step-46 validation. `switch_to_rollout()` calls
+  `self.checkpoint_manager.update_weights(self.global_steps)` — the exact same call already
+  removed from `on_init_end()` by this patch's existing fix, for the exact same reason, at a
+  *second* call site the original fix never touched (because it was never exercised before
+  `test_freq` was ever enabled). `self.checkpoint_manager` is the *hybrid* manager, backend forced
+  to `"naive"`; `CheckpointEngineManager.update_weights()`'s `backend == "naive"` branch
+  (`checkpoint_engine/base.py`) bypasses the correctly-empty hybrid replica list entirely and
+  calls `ray.get(actor_wg.update_weights(mode="naive"))` on **every actor rank** — each of which
+  (`engine_workers.py`'s `WorkerDict.update_weights`, `effective_mode == "naive"` branch)
+  unconditionally does `await self.rollout.resume(tags=["weights"])` when
+  `config.rollout.free_cache_engine` is True (confirmed `True` in this recipe's resolved config).
+  This recipe's *real* weight sync (`standalone_checkpoint_manager`, `nccl` backend, `on_step_end`)
+  never calls `release_memory_occupation`/`resume_memory_occupation` at all (confirmed by grepping
+  `checkpoint_engine/nccl_checkpoint_engine.py` — zero references), so `"weights"` is never in
+  `offload_tags` to begin with → the bare `offload_tags.remove("weights")` in SGLang's
+  `resume_memory_occupation` (sglang 0.5.16, `scheduler_components/weight_updater.py:238`) raises
+  `KeyError` on every rank.
+- **Fix — implemented, unverified on cluster.** `patches/v1-separate-async-fixes.patch` (+ the
+  recipe's byte-identical heredoc copy) gained a second hunk in `trainer_separate_async.py`:
+  drops the same `self.checkpoint_manager.update_weights(self.global_steps)` line from
+  `switch_to_rollout()`, with the mechanism documented inline (mirrors `on_init_end`'s existing
+  fix exactly). `resume_generation_replicas()` and `add_replicas_to_balancer()` (the next two
+  lines of `switch_to_rollout()`) are left untouched — confirmed genuinely inert
+  (`CheckpointEngineManager.resume_generation_replicas`/`abort_replicas`/`sleep_replicas` all
+  `asyncio.gather(*[... for r in self.replicas])` on the empty replica list; only `update_weights`
+  has the naive-backend branch that bypasses that list). `switch_to_trainer()` needs no fix — its
+  two calls are both replica-list-only and it already ran once (after the first sample) with no
+  crash, in every run so far. Verified locally before wiring in: fetched the real v0.9.0
+  `trainer_separate_async.py`, applied both hunks (`on_init_end` + `switch_to_rollout`),
+  `git apply --check` clean, file compiles, `git apply --reverse --check` confirms idempotency;
+  recipe heredoc re-verified byte-identical to the checked-in patch file; `bash -n` +
+  stray-quote/backtick sweeps clean.
+- **Not yet re-tested**: needs a full ~101-min run to reach step 46 again and confirm the fix
+  clears the crash and produces the final `val-core/gsm8k/acc/mean@1` to compare against the
+  0.4597 baseline.
 - **Commit**: not committed.
 
 # Megatron vs FSDP2
