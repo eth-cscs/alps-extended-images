@@ -28,7 +28,8 @@
 #     (actor.use_rollout_log_probs is unused by V1)
 #   * lr schedule: V1 sets actor.optim.total_training_steps before the workers
 #     are created, so the fully-async lr_decay_steps workaround is dropped
-#   * example/patches/v1-separate-async-fixes.patch + upstream PR #7421/#7422/#7423
+#   * apertus-benchmarks/patches/v1-separate-async-fixes.patch (2-hunk) + upstream
+#     PR #7421/#7422/#7423/#7661 (#7661 = the 3rd v1-separate-async fix, now upstream)
 #     are applied (needed by the V1 separate-async standalone-rollout path)
 #
 # The fully-async recipe's reset to theely/verl Fix-fsdp-model-loading-on-async is
@@ -239,7 +240,7 @@ algorithm:
 
 reward:
   custom_reward_function:
-    path: ${TRAINING_CONFIG}/gsm8k_reward.py
+    path: ${TRAINING_CONFIG}/reward.py
     name: compute_reward
 
 trainer:
@@ -275,8 +276,8 @@ trainer:
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 100  # > total_training_steps: no mid-run checkpoint on the shakedown (faster, cleaner signal). Lower for a real run (actor.checkpoint.strict is False so the multimodal-tower export gap is non-fatal).
-  test_freq: -1   # disable validation
-  val_before_train: false
+  test_freq: -1   # = total_training_steps -> one validation pass, at the last step (greedy pass@1 on GSM8K test)
+  val_before_train: true   # + a baseline validation before step 1
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
@@ -291,173 +292,41 @@ distillation:
   enabled: false
 EOF
 
-cat > "${TRAINING_CONFIG}/gsm8k_reward.py" <<- EOF
-# gsm8k_reward.py
-#
-# Robust answer extraction. Run 3246622's [REWARD-DUMP] blocks showed
-# Apertus-v1.5-70B solves GSM8K fluently and correctly but NEVER emits the
-# <answer>...</answer> tags this recipe's original prompt asked for -- it ends
-# with "Final answer: N", "\boxed{N}", a bare trailing number, or "N" right
-# after the <|inner_suffix|> reasoning delimiter. The old reward only credited
-# <answer> tags, so every rollout scored 0 -> no GRPO signal. This version
-# parses all of those forms so outcome reward drives training. (The dataset /
-# system prompt are unchanged -- no regen needed; RL just rewards correctness.)
-import re
-import math
-from typing import Optional
+# Reward function: downloaded from this repo (raw) rather than embedded, so it
+# can be iterated on without touching this launch script. Fetched once on the
+# batch host (never per-node -- CLAUDE.md "Never fetch per-node from the
+# internet inside the srun"), sanity-checked, sbcast below. It must define
+# compute_reward(data_source, solution_str, ground_truth, ...) -- see
+# actor_rollout_ref.reward_model / custom_reward_function in grpo_gsm8k.yaml.
+# NOTE: reward.py and dataset_prepare.py's SYSTEM_PROMPT are coupled -- keep the
+# answer format ([[[N]]]) in sync, and bump DATASET_PROMPT_VERSION on any prompt
+# change so the cached parquet is rebuilt.
+export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
+export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
+curl -sfL "${REWARD_FN_URL}" -o "${TRAINING_CONFIG}/reward.py" \
+    || { echo "FATAL: could not download reward.py from ${REWARD_FN_URL}"; exit 1; }
+grep -q "def compute_reward" "${TRAINING_CONFIG}/reward.py" \
+    || { echo "FATAL: downloaded reward.py has no compute_reward()"; exit 1; }
+curl -sfL "${DATASET_PREPARE_URL}" -o "${TRAINING_CONFIG}/dataset_prepare.py" \
+    || { echo "FATAL: could not download dataset_prepare.py from ${DATASET_PREPARE_URL}"; exit 1; }
+grep -q "SYSTEM_PROMPT" "${TRAINING_CONFIG}/dataset_prepare.py" \
+    || { echo "FATAL: downloaded dataset_prepare.py has no SYSTEM_PROMPT"; exit 1; }
 
-_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
-_FINAL = re.compile(
-    r"(?:final answer|the answer is|answer is|answer:)\D{0,24}(-?\d[\d,]*(?:\.\d+)?)",
-    re.IGNORECASE,
-)
+sbcast -f ${TRAINING_CONFIG}/reward.py ${TRAINING_CONFIG}/reward.py
+sbcast -f ${TRAINING_CONFIG}/dataset_prepare.py ${TRAINING_CONFIG}/dataset_prepare.py
 
-
-def _norm(raw: str) -> Optional[str]:
-    raw = raw.strip().replace(chr(36), "").replace(",", "").rstrip(".").strip()
-    if not raw:
-        return None
-    try:
-        val = float(raw)
-    except ValueError:
-        return raw
-    if not math.isfinite(val):
-        return str(val)
-    return str(int(val)) if val == int(val) else str(val)
-
-
-def _boxed(s: str) -> Optional[str]:
-    i = s.rfind("boxed")
-    if i < 0:
-        return None
-    j = s.find("{", i)
-    k = s.find("}", j) if j >= 0 else -1
-    return s[j + 1:k] if 0 <= j < k else None
-
-
-def extract_model_answer(response: str) -> Optional[str]:
-    # Apertus-v1.5 puts its final answer after the last <|inner_suffix|> delimiter.
-    marker = "<|inner_suffix|>"
-    tail = response.split(marker)[-1] if marker in response else response
-
-    for scope in (tail, response):
-        m = re.findall(r"<answer>(.*?)</answer>", scope, re.DOTALL)
-        if m:
-            return _norm(m[-1])
-    for scope in (tail, response):
-        b = _boxed(scope)
-        if b is not None:
-            return _norm(b)
-    for scope in (tail, response):
-        m = _FINAL.findall(scope)
-        if m:
-            return _norm(m[-1])
-    for scope in (tail, response):
-        nums = _NUM.findall(scope)
-        if nums:
-            return _norm(nums[-1])
-    return None
-
-
-def compute_reward(
-    data_source, solution_str, ground_truth, extra_info=None, **kwargs
-) -> float:
-    # Reasoning opened but never closed (truncated) -> neutral 0.0, not a big
-    # negative, to avoid extreme GRPO advantages that cause gradient spikes.
-    if "<think>" in solution_str and "</think>" not in solution_str:
-        return 0.0
-
-    model_ans = extract_model_answer(solution_str)
-    gt = _norm(str(ground_truth))
-    outcome_reward = 1.0 if (model_ans is not None and gt is not None and model_ans == gt) else 0.0
-
-    # Small shaping bonus for a clearly-delimited final answer (any of the forms
-    # the model actually uses).
-    has_delim = (
-        "boxed{" in solution_str
-        or ("<answer>" in solution_str and "</answer>" in solution_str)
-        or bool(_FINAL.search(solution_str))
-    )
-    format_reward = 0.1 if has_delim else 0.0
-
-    # Smooth length penalty starting at 350 words, max -0.2 at 700 words.
-    words = len(solution_str.split())
-    length_penalty = -0.2 * min(1.0, max(0.0, (words - 350) / 350))
-
-    return outcome_reward + format_reward + length_penalty
-EOF
-
-cat > "${TRAINING_CONFIG}/prepare_gsm8k.py" <<- EOF
-import re
-import os
-import datasets
-import pandas as pd
-from pathlib import Path
-
-SYSTEM_PROMPT = """You are a precise math solver.
-Solve the problem step by step, then give your final answer as a single number inside <answer>...</answer> tags.
-
-Example:
-<answer>42</answer>"""
-
-def extract_ground_truth(solution: str) -> str:
-    """Pull the number after #### from a GSM8K solution string."""
-    match = re.search(r"####\s*([\d,\-\.]+)", solution)
-    return match.group(1).replace(",", "").strip() if match else ""
-
-def make_prompt(question: str) -> list:
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": question},
-    ]
-
-def prepare(split: str, output_path: str):
-    training_home = os.environ.get("TRAINING_HOME", ".")
-    raw_path = os.path.join(training_home, "data/gsm8k_raw")
-
-    if os.path.exists(raw_path):
-        print(f"Loading {split} from local cache: {raw_path}")
-        ds = datasets.load_from_disk(raw_path)[split]
-    else:
-        print(f"Downloading {split} from HuggingFace...")
-        ds = datasets.load_dataset("openai/gsm8k", "main", split=split)
-
-    rows = []
-    skipped = 0
-    for item in ds:
-        gt = extract_ground_truth(item["answer"])
-        if not gt:
-            skipped += 1
-            continue
-        rows.append({
-            "prompt": make_prompt(item["question"]),
-            "data_source": "gsm8k",
-            "reward_model": {"ground_truth": gt},
-        })
-
-    df = pd.DataFrame(rows)
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(output_path, index=False)
-    print(f"[{split}] Saved {len(df)} rows → {output_path} (skipped {skipped})")
-
-if __name__ == "__main__":
-    training_home = os.environ.get("TRAINING_HOME", ".")
-    prepare("train", os.path.join(training_home, "data/gsm8k/train.parquet"))
-    prepare("test",  os.path.join(training_home, "data/gsm8k/test.parquet"))
-EOF
-
-sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
-sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
-
-# Content of example/patches/v1-separate-async-fixes.patch, embedded here
-# rather than read via a script-relative path: under sbatch, BASH_SOURCE[0]
+# Content of apertus-benchmarks/patches/v1-separate-async-fixes.patch, embedded
+# here rather than read via a script-relative path: under sbatch, BASH_SOURCE[0]
 # resolves to the spool-staged copy of this script, not its checkout location,
 # so a script-relative read silently fails on every node (this is the exact
 # failure mode that lost the old sitecustomize.py-based fallback patch in run
 # 3129805 -- see Known hazards in CLAUDE.md). Applied via git apply on the baked
-# v0.9.0 verl tree below, alongside the upstream PR patches -- three real, stable
+# v0.9.0 verl tree below, alongside the upstream PR patches -- two real, stable
 # fixes for the V1 separate-async trainer (hybrid-rollout OOM, stale hybrid
-# weight-sync call, a shape-equality bug in TensorDict construction).
+# weight-sync call). This is the 2-hunk Apertus variant: the third fix
+# (list_of_dict_to_tensordict shape-equality bug) is upstream verl PR #7661,
+# fetched by the PR-patch loop below. The GLM v1-separate recipe still carries
+# the 3-hunk example/patches/ version -- keep the shared hunks 1+2 in sync.
 cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
 # Local fixes for verl v0.9.0's V1 separate-async trainer, discovered debugging
 # train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh (see Known hazards and the
@@ -491,31 +360,15 @@ cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
 #    self.standalone_checkpoint_manager.update_weights(...), the actual sync to
 #    the standalone rollout, is left untouched. Paired with fix 1; same runs.
 #
-# 3. list_of_dict_to_tensordict (verl/utils/tensordict_utils.py): decided
-#    nested-vs-stacked per field by checking `all(item.shape == val_list[0].shape
-#    for item in val_list)` -- trivially true for a length-1 list (this function
-#    is called once per rollout output, so len(list_of_dicts) is often 1) and also
-#    true whenever several ragged items (e.g. GRPO rollout-group responses)
-#    coincidentally share a length, most commonly by all saturating
-#    max_response_length. Silently produced a dense Tensor for fields callers
-#    assume are nested (input_ids, prompts, responses, position_ids), and any
-#    downstream .offsets() call then raised
-#    AttributeError: 'Tensor' object has no attribute 'offsets' (runs 3134772,
-#    3136766, 3137775). Fixed by delegating non-scalar tensor fields
-#    unconditionally to this same file's own nested_tensor_from_tensor_list (used
-#    elsewhere in the file for chunking/dispatch, and already correct there) --
-#    no more shape-equality guessing. This was a real, independent bug, but ended
-#    up never being the sole cause of the offsets crashes in this chain: see
-#    CLAUDE.md's run 3144665/3149736 entries for the actual root cause, a
-#    same-shaped bug in the separately pip-installed TransferQueue==0.1.6 (fixed
-#    upstream in 0.1.7; the training script upgrades the wheel at runtime rather
-#    than patching it here, since it isn't part of this checkout). Confirmed fixed
-#    end-to-end for the whole recipe in run 3149736 (14/231 training steps
-#    completed, sane metrics, zero offsets crashes).
+# (The third fix in this family -- list_of_dict_to_tensordict's shape-equality
+# heuristic in verl/utils/tensordict_utils.py, which silently stacked ragged
+# per-sample tensors into a dense Tensor and broke downstream .offsets() calls --
+# is now upstream verl PR #7661, fetched + git-apply'd by the PR-patch loop
+# below, so it is no longer carried here.)
 #
 # Originally shipped as sitecustomize.py runtime monkeypatches (fast to iterate on
 # mid-debugging -- no hand-crafted diff needed while the exact fix was still
-# changing), converted to this source patch once run 3149736 confirmed all three
+# changing), converted to this source patch once run 3149736 confirmed both
 # were correct and stable: same reasoning as the Apertus benchmark's equivalent
 # conversion (apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch) --
 # a runtime monkeypatch is great for fast iteration but not the form a stable fix
@@ -541,46 +394,6 @@ index 18a06ee2..4c1815a5 100644
 
      def on_train_begin(self):
          if self.config.skip.rollout_tq.enable:
-diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
-index 91d82b15..810ccbee 100644
---- a/verl/utils/tensordict_utils.py
-+++ b/verl/utils/tensordict_utils.py
-@@ -930,20 +930,21 @@ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDic
-     dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
-     batch_size = len(list_of_dicts)
-
--    final_data = {
--        key: (
--            torch.stack(val_list)
--            if val_list
--            and all(isinstance(item, torch.Tensor) for item in val_list)
--            and all(item.shape == val_list[0].shape for item in val_list)
--            else (
--                torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
--                if val_list and all(isinstance(item, torch.Tensor) for item in val_list)
--                else NonTensorStack(*val_list)
--            )
--        )
--        for key, val_list in dict_of_lists.items()
--    }
-+    def _pack(val_list):
-+        if not val_list or not all(isinstance(item, torch.Tensor) for item in val_list):
-+            return NonTensorStack(*val_list)
-+        # Scalar tensors have no dimension to make ragged along.
-+        if all(item.dim() == 0 for item in val_list):
-+            return torch.stack(val_list)
-+        # Always nested -- never guess dense-vs-ragged from shape equality: that
-+        # heuristic is trivially wrong for a length-1 list (every item "matches"
-+        # its own shape) and misfires whenever several ragged items coincidentally
-+        # share a length (e.g. multiple GRPO rollout responses that all saturate
-+        # max_response_length), silently producing a dense Tensor for fields
-+        # callers assume are nested and crashing their .offsets() calls downstream.
-+        return nested_tensor_from_tensor_list(val_list)
-+
-+    final_data = {key: _pack(val_list) for key, val_list in dict_of_lists.items()}
-
-     td = TensorDict(final_data, batch_size=[batch_size])
-
 diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
 index d9beede7..4e2d767e 100644
 --- a/verl/workers/rollout/llm_server.py
@@ -838,17 +651,28 @@ else
     echo "Model already present, skipping download."
 fi
 
-# Prepare dataset (skip if already present)
-if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ]; then
-    echo "Preparing GSM8K dataset..."
+# Prepare dataset. ${TRAINING_HOME}/data/gsm8k persists on Lustre across
+# submissions, so a plain "file exists" check would keep serving a parquet built
+# with an older SYSTEM_PROMPT. Key the cache on DATASET_PROMPT_VERSION: bump it
+# in the same edit as any dataset_prepare.py SYSTEM_PROMPT change and the parquet
+# is rebuilt (same discipline as the wheel-build markers).
+export DATASET_PROMPT_VERSION="v2-triple-bracket"
+if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ] \
+    || [ "$(cat ${TRAINING_HOME}/data/gsm8k/.prompt.version 2>/dev/null)" != "${DATASET_PROMPT_VERSION}" ]; then
+    echo "Preparing GSM8K dataset (SYSTEM_PROMPT ${DATASET_PROMPT_VERSION})..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
+        set -e
+        rm -f ${TRAINING_HOME}/data/gsm8k/train.parquet ${TRAINING_HOME}/data/gsm8k/test.parquet
         # Try loading from cached raw download first, otherwise fetch from HF
-        python ${TRAINING_CONFIG}/prepare_gsm8k.py
+        python ${TRAINING_CONFIG}/dataset_prepare.py
+        echo "${DATASET_PROMPT_VERSION}" > ${TRAINING_HOME}/data/gsm8k/.prompt.version
     '
+    [ -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ] \
+        || { echo "FATAL: GSM8K dataset preparation failed"; exit 1; }
 else
-    echo "Dataset already present, skipping preparation."
+    echo "Dataset already present for SYSTEM_PROMPT ${DATASET_PROMPT_VERSION}, skipping preparation."
 fi
 
 
@@ -871,7 +695,11 @@ export RAY_memory_usage_threshold=0.99
 #             load-bearing for separate-async (v0.9.0 async_sglang_server.py flips
 #             dummy -> auto for every non-hybrid replica, i.e. the standalone rollout).
 #   PR #7423: fix the NCCL deadlock in async disaggregated weight sync.
-for pr in 7421 7422 7423; do
+#   PR #7661: list_of_dict_to_tensordict -- build nested tensors unconditionally
+#             (the 3rd v1-separate-async fix, now upstream; applies clean to the
+#             baked v0.9.0 tree). Superseded the tensordict hunk of
+#             v1-separate-async-fixes.patch, which no longer carries it.
+for pr in 7421 7422 7423 7661; do
     curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
         || { echo "FATAL: could not download PR #${pr}"; exit 1; }
     [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
@@ -911,7 +739,7 @@ for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", 
 # all apply cleanly to the tag. A patch that neither applies nor is already
 # present is fatal -- a cluster where only some ranks carry a patch is worse than
 # one that carries none (run 3124273).
-for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch"; do
+for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch"; do
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied $(basename "$p") on $(hostname)"
     elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then

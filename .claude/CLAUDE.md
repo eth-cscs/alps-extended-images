@@ -363,14 +363,24 @@ entrypoint `python -m verl.trainer.main_ppo`.
   in 0.1.7, and confirmed the sha256 embedded in the script matches the actual downloaded file.
   Unverified end-to-end by a run yet.
   Separately, verl's own `list_of_dict_to_tensordict` (`verl/utils/tensordict_utils.py:918`) had
-  the identical anti-pattern and remains patched (third target in
-  `example/patches/sitecustomize-verl-v0.9.0.py`, targeting `verl.utils.tensordict_utils`,
-  delegating to the module's own `nested_tensor_from_tensor_list`) — a real, independent bug, just
+  the identical anti-pattern and remains patched (one hunk of
+  `example/patches/v1-separate-async-fixes.patch`, delegating non-scalar tensor fields to the
+  module's own `nested_tensor_from_tensor_list`) — a real, independent bug, just
   never the (sole) cause of the crashes in this chain, since TransferQueue's write-time storage
   layer (`_select_by_positions`) always unbinds a batch into individual per-sample raw tensors
   before storing regardless of dense-vs-nested, erasing whatever that function produces at the
   storage boundary either way. `PPO_MINI_BATCH_SIZE` stays at 48 (harmless, no longer load-bearing
   for either bug).
+  **Upstreamed 2026-09-01**: `theely/verl:fix-tensordict-nested-heuristic` (branched off
+  `verl-project/verl@c2429f29`, commit `00aae34a`) replaces the shape-equality heuristic with
+  "non-scalar tensor fields always nested" + a CPU test (`tests/utils/test_tensordict_utils_on_cpu.py`);
+  ruff/mypy/license/naming pre-commit hooks all pass. PR create URL:
+  `https://github.com/verl-project/verl/compare/main...theely:verl:fix-tensordict-nested-heuristic?expand=1`
+  (no `gh` on this machine — the branch is pushed; the PR itself still needs opening in the
+  browser). The other two hunks of `v1-separate-async-fixes.patch` (hybrid-replica no-op +
+  `on_init_end` weight-sync skip) are NOT upstreamable as-is — `worker_group is not None` is also
+  true for `trainer_colocate_async`, whose rollout genuinely *is* those hybrid replicas; the real
+  fix must gate on `separate_async` mode. Flagged for a separate PR.
   General lesson for this whole recipe (see the "no existing recipe" note below): GLM-5.1 is
   trained upstream with Zhipu's own `slime` framework (Megatron+SGLang), not verl, and verl's V1
   trainer + `separate_async` + TransferQueue combination has no reference recipe anywhere
@@ -2658,6 +2668,87 @@ suggest — most of Megatron-Core's actual CUDA-heavy code lives in separate pac
   no new patches, same image. `bash -n` + YAML-indent + backtick sweeps clean.
 - **Commit**: not committed.
 
+### Run `3251006` — 2026-09-01 — CPU-streaming optimizer WORKS (built clean, killed the optimizer.step() OOM) — failure moved EARLIER, to the backward-pass fp32 grad reduce-scatter (the ~37 GiB DDP grad buffer). Next: `main_grads_dtype: bf16`.
+
+- **Log**: `~/Downloads/slurm-3251006.out` (7344 lines). 128 nodes (DP=5),
+  `override_optimizer_config.{optimizer_cpu_offload,optimizer_offload_fraction:1.0,
+  overlap_cpu_optimizer_d2h_h2d,use_precision_aware_optimizer}` all True. ~39 min, FAILED (exit
+  15). All 8 patches 128/128, seed sync clean (157s, all 480 ranks, no hang — 7th clean).
+- **The HybridDeviceOptimizer built cleanly** — `optimizer config after override` shows all 4
+  keys accepted, no `OptimizerConfig` "unexpected keyword argument", no rejection. **This half of
+  the fix works.**
+- **The step-1 `optimizer.step()` OOM is GONE** — 6 prior runs died there; this run got PAST it.
+  CPU-offloading the optimizer state removed the ~38 GiB GPU optimizer transient. `[MEMDUMP]`
+  never fired (it sits just before `optimizer.step()`, which was never reached).
+- **New failure — step 1 dies EARLIER, in the backward-pass DP gradient reduce-scatter**:
+  `forward_backward_batch → finalize_model_grads → finish_grad_sync → start_grad_sync →
+  _coalescing_manager → reduce_scatter_tensor_coalesced` →
+  `torch.distributed.DistBackendError: NCCL error ... unhandled cuda error ... Failed to CUDA
+  calloc async 24320 bytes` (NCCL 2.28.9). A **24 KB** alloc failing inside NCCL = the device is
+  fully exhausted. Hard `unhandled cuda error` (not a clean `torch.OutOfMemoryError`) — poisons
+  the CUDA context, no recovery. No NODE_FAIL / Xid / ECC — pure memory pressure.
+- **Diagnosis**: the new dominant GPU term is the **DDP grad buffer** — fp32, holds grads for all
+  9.24B local params during backward = **~37 GiB**, resident *before* the reduce-scatter shards it
+  to ~7.4 GiB. `grad_offload: True` only offloads it *between* steps; during backward it must be
+  on GPU. Plus params (18.5), NCCL (~12), activation working set, and the HybridDeviceOptimizer's
+  overlap/staging buffers → over 95 GiB.
+- **Fix — NOT applied, needs user decision**: **`main_grads_dtype: bf16`** in
+  `override_optimizer_config` (the precision-aware optimizer's grad-accum dtype; per
+  `verl/workers/config/optimizer.py` it "also drives the DDP grad-bucket dtype so the two stay
+  consistent"). Halves the grad buffer **~37 → ~18.5 GiB** — exactly the relief needed. Numerical
+  risk is low here: `ppo_max_token_len_per_gpu: 4096` + ~2 rows/DP-rank ≈ 1 micro-batch, so there
+  is **no grad accumulation** (bf16 accumulation error only compounds over many micro-batches);
+  the fp32 master-param update still happens. Megatron's precision-aware optimizer is built for
+  exactly this. Watch grad_norm / loss on the first steps. (Alternative/additional: `exp_avg_dtype`
+  / `exp_avg_sq_dtype: bf16` — moments are on CPU now so this mainly trims D2H/H2D bandwidth +
+  staging; smaller win, leave for later.)
+- **Fix applied (user-approved, 2026-09-01)** — two backward-pass activation-memory cuts:
+  1. `override_optimizer_config.main_grads_dtype: bf16` — DDP grad buffer ~37 → ~18.5 GiB.
+  2. `actor_rollout_ref.model.use_fused_kernels: True` — fused linear cross-entropy
+     (`verl/utils/kernel/linear_cross_entropy.py`, via `patch_fused_forward`): computes LM-head
+     logits + log-probs + entropy without materializing the `[num_tokens, vocab~151K]` logits
+     tensor + its bwd copies — several GiB of relief in the exact phase that OOM'd. Prereqs
+     (`use_remove_padding`, not-value-model, `mtp.enable=False`, uniform temp) all confirmed
+     satisfied in the `3251006` config dump; verl auto-disables with a warning if any were unmet.
+  Keeps 128 nodes / DP=5 / CPU-offload optimizer / everything else. `bash -n` + YAML-indent +
+  sweeps clean, same image.
+- **Commit**: not committed.
+
+### Run `3257320` — 2026-09-02 — **GPU BLOCKER SOLVED**: `optimizer.step()` COMPLETED for the first time in 7 runs (CPU-offload optimizer + bf16 grads + fused CE). New failure: host RAM (446/450 GB) in the post-step delta sync.
+
+- **Log**: `~/Downloads/slurm-3257320.out` (2.0 MB). 128 nodes (DP=5),
+  `override_optimizer_config.{optimizer_cpu_offload, optimizer_offload_fraction:1.0,
+  overlap_cpu_optimizer_d2h_h2d, use_precision_aware_optimizer, main_grads_dtype:bf16}`,
+  `model.use_fused_kernels: True`. ~68 min, FAILED (exit 15).
+- **The 7-run GPU-side blocker (step-1 `fused_adam` OOM, runs 3241496–3251006) is GONE.**
+  - HybridDeviceOptimizer built clean, config dump shows all 5 override keys.
+  - `use_fused_kernels: True` on the actor — no auto-disable, no fused-CE warning (all prereqs
+    met as predicted).
+  - Seed sync clean (153s, all 480 ranks, no `gather_from_ep_ranks` — 9th validation).
+  - **`[MEMDUMP]` fired** (free 29–45 GB, torch_alloc 35–38 GB) → step 1's pre-optimizer point
+    reached. **The backward-pass DP grad reduce-scatter PASSED** (where `3251006` died). **Step 1's
+    `optimizer.step()` COMPLETED.** fwd + bwd + optimizer all done — first time ever.
+- **New failure — HOST RAM, not GPU.** Step 1's post-step `delta_sharded` steady weight sync
+  started (`delta-steady tensor#1` on all 479 ranks), then **Ray's memory monitor OOM-killed a
+  `WorkerDict`** on node `172.28.51.225`: node RAM **446.01 / 450.00 GB (99.1%)**, 4 trainer
+  workers at ~90–98 GB each. The killed rank left the delta export's NCCL `GATHER` (SeqNum=11)
+  hanging → 30-min watchdog → `srun` force-terminate. No per-step metrics emitted (they log after
+  the sync). No infra fault.
+- **What's on the ~112 GB/worker host budget**: CPU-offloaded optimizer state (`fraction: 1.0`,
+  fp32 master + `exp_avg` + `exp_avg_sq` ≈ 22 GB) + verl's `param_offload` (~18.5 GB bf16) +
+  `grad_offload` (~18.5 GB) + the delta engine's pinned CPU snapshot for byte-diffing (~18.5 GB) +
+  the delta-sync HF-conversion buckets (`update_weights_bucket_megabytes: 2048`) + Python/torch/
+  Ray overhead. ~4 GB over.
+- **Fix applied (user-approved, 2026-09-02)** — two host-RAM tuning knobs, both low-risk:
+  1. `override_optimizer_config.optimizer_offload_fraction: 1.0 → 0.7` — keeps ~30% of the ~22 GB
+     optimizer state on GPU (which has 22–45 GB free per `[MEMDUMP]`), frees ~7 GB host/rank.
+  2. `rollout.checkpoint_engine.update_weights_bucket_megabytes: 2048 → 512` (added explicitly;
+     was verl's default) — 4× smaller HF-conversion buffer during the sync.
+  ~9–13 GB host relief vs the 4 GB miss. Keeps 128 nodes / everything else. Fallback if not
+  enough: `actor.megatron.param_offload: False` (params back on GPU, −18.5 GB host).
+  `bash -n` + YAML-indent + sweeps clean, same image.
+- **Commit**: not committed.
+
 # Training Apertus v1.5 on verl (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`)
 
 Apertus-v1.5-70B GRPO on GSM8K, CSCS Alps, 16 nodes × 4 GH200 (`clariden`). Script:
@@ -3662,6 +3753,15 @@ migrated on two axes at the user's request (2026-08-31): the **image** and the *
   `v1-separate-async-fixes.patch`) are load-bearing for separate-async; without the latter the
   V1 trainer builds hybrid rollout replicas (trainer-world/rollout-world = 48/16 = 3 here) at
   `gpu_memory_utilization=0.75` on every training GPU and OOMs at init.
+  - **2026-09-01**: this recipe's `v1-separate-async-fixes.patch` is a **2-hunk** variant —
+    checked in as `apertus-benchmarks/patches/v1-separate-async-fixes.patch` (own copy, not the
+    3-hunk `example/patches/` one the GLM recipe still uses). The 3rd hunk
+    (`list_of_dict_to_tensordict` shape-equality bug) was landed upstream as **verl PR #7661**
+    (`[training_utils] fix: ...`, branch `theely/verl:fix-tensordict-nested-heuristic`,
+    `verl-project/verl` #7661) and is now fetched by the recipe's PR-patch loop
+    (`for pr in 7421 7422 7423 7661`) instead. `pull/7661.patch` verified to `git apply` clean +
+    reverse-check on the baked v0.9.0 tree. Recipe heredoc kept byte-identical to the 2-hunk
+    checked-in file. The GLM recipe could do the same once #7661 merges; not done yet.
 - **`checkpoint.strict: False`** + **`save_freq: 100`** (see hazards below).
 - **Reward function rewritten** (see the "The zero-reward chain" section below).
 
@@ -3769,9 +3869,10 @@ gaining a ~12-line `curl compare/…​.diff` + `patch -pN` block.
   + PR #32979, Apertus-v1.5's reasoning delimiters leak into the response text as literal tokens
   (`...candy.<|inner_suffix|>76`). The fork's older image handled them (the model followed the
   prompt's `<answer>` instruction there and RL reinforced it — that's how run `3184869` learned
-  to reward 0.99). Not fixed here — the reward function parses around it (the final answer is the
-  region after the last `<|inner_suffix|>`). A proper fix (verl tokenizer / sglang apertus_mm
-  chat-template wiring) is an open follow-up if `<answer>`-format behavior is wanted.
+  to reward 0.99). Not fixed here — the reward function is delimiter-agnostic (since 2026-09-01
+  it just matches the last `[[[ N ]]]` anywhere in the response, so a leaked `<|inner_suffix|>`
+  before it is harmless). A proper fix (verl tokenizer / sglang apertus_mm chat-template wiring)
+  is an open follow-up if strict output formatting is ever needed.
 - **The `theely/*:apertus1p5-support` branches must exist** before the recipe will run. Run
   `patches/build-apertus1p5-megatron-forks.sh` once (needs push access to the forks). Until then
   the batch-host `curl` of the compare `.diff` 404s → FATAL (loud, not silent).
@@ -3804,13 +3905,44 @@ Apertus-v1.5-70B **solves GSM8K fluently and correctly** but ends its answers wi
 **never** the `<answer>...</answer>` tags the recipe's original `gsm8k_reward.py` (copied from the
 GLM/qwen recipes) demanded. Every rollout scored 0 → no signal. Not a stack bug at all.
 
-**Fix**: `gsm8k_reward.py` rewritten to parse `<answer>` OR `\boxed{}` OR `final answer: N` OR the
-last number, each checked first in the post-`<|inner_suffix|>` region; outcome reward (correct = 1.0)
-now drives training; small shaping bonus for any clear delimiter; length penalty kept. **No
-dataset / system-prompt change** — GSM8K parquet is not regenerated. General lesson: when a
-migrated recipe shows zero reward with visibly-working generations, dump the actual rollout text
-(a `print` in the custom reward fn is the fastest way — verl does not log generations) BEFORE
-assuming a model/weight bug.
+**Fix (validated, runs `3247540`/`3251587`/`3253736`)**: `gsm8k_reward.py` rewritten to parse
+`<answer>` OR `\boxed{}` OR `final answer: N` OR the last number, each checked first in the
+post-`<|inner_suffix|>` region; outcome reward (correct = 1.0) drove training; small shaping bonus
+for any clear delimiter; length penalty kept. No dataset/system-prompt change at that point. General
+lesson: when a migrated recipe shows zero reward with visibly-working generations, dump the actual
+rollout text (a `print` in the custom reward fn is the fastest way — verl does not log generations)
+BEFORE assuming a model/weight bug.
+
+**2026-09-01 — simplified to a single `[[[N]]]` format (user request); VALIDATED run `3257315`
+(2026-09-02): 5 clean steps, `critic/score/max` 1.1 from step 1, `critic/score/mean` 0.52 → 0.90,
+response length compressing — the model adopts `[[[N]]]` immediately, no zero-reward chain. The
+lower `score/mean` start (vs the old lenient parser's ~0.85) is the honest signal: strict
+single-format match leaves real GRPO headroom.** The multi-format parser was replaced:
+`prepare_gsm8k.py`'s `SYSTEM_PROMPT` now asks for the final answer "as a single number inside
+triple square brackets" with an explicit `[[[42]]]` example, and the reward matches *only* the
+last `[[[ ... ]]]` occurrence
+(`re.compile(r"\[\[\[\s*(-?\d[\d,]*(?:\.\d+)?)\s*\]\]\]")`) — one thing to match instead of
+four. `outcome_reward` 1.0 on a correct bracketed number; `format_reward` 0.1 for *any*
+well-formed `[[[ ... ]]]` (bootstrap signal for adopting the format even when the number is
+wrong); truncated-`<think>` guard and the 350→700-word length penalty kept. **The dataset is now
+regenerated** — a `DATASET_PROMPT_VERSION="v2-triple-bracket"` marker (`.prompt.version` next to
+the parquet) forces `prepare_gsm8k.py` to rebuild `train.parquet`/`test.parquet` (the old guard
+was a plain "file exists" check and would have served the stale `<answer>` parquet from Lustre).
+The risk (if Apertus-v1.5-70B ignored `[[[N]]]` the way it ignored `<answer>`, reward goes flat)
+did not materialise — run `3257315` confirmed the model adopts the format from step 1. If it ever
+regresses, watch step-1 `critic/score/max`: 1.1 = working, 0.1-flat = format adopted but numbers
+wrong, 0.0-flat = format not adopted (re-add a `[REWARD-DUMP]` print and reconsider).
+
+**2026-09-02 — reward.py de-embedded (user request).** The reward is no longer a `<<- EOF`
+heredoc in the launch script — it lives at
+`Alps-Images/apps/verl/apertus-benchmarks/reward.py` and the recipe `curl -sfL`s it from this
+repo's raw URL (branch `Add-megatron-rl-recipes`) on the batch host, asserts non-empty + `grep -q
+"def compute_reward"`, then `sbcast`s it (`${TRAINING_CONFIG}/reward.py`; `custom_reward_function.path`
+updated to match). Iterating on the reward now means editing + pushing `reward.py`, no script
+change. **`reward.py` must be committed + pushed to the branch before the next run** (the URL 404s
+otherwise → FATAL, loud). Standard Python file now — no heredoc `$`/backtick constraints.
+`prepare_gsm8k.py` (the `SYSTEM_PROMPT`) stays embedded — it and `reward.py` are coupled on the
+`[[[N]]]` format; keep them in sync and bump `DATASET_PROMPT_VERSION` on any prompt change.
 
 ## Configuration audit (architecture-vs-config) — 2026-08-31
 
