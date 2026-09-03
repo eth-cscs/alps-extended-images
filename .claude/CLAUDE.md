@@ -661,6 +661,18 @@ plus one stale-pin fix found while investigating run `3209484`:
   `transformers==5.12.1` to match sglang 0.5.16, but only AFTER the current `delta_sharded`
   validation run completes — not folded into it, since it's a deliberate re-validation of its
   own.**
+  **Applied, 2026-09-03**: `transformers==5.8.1` → `5.12.1` (Containerfile line ~124), matching
+  sglang 0.5.16's own exact pin — verified directly against the real `v0.5.16` tag's
+  `python/pyproject.toml` (`"transformers==5.12.1"`, not a floor). Considered, not done: bumping
+  further to the real current PyPI latest (`5.16.1`, verified to exist) — that would go 4 minor
+  versions past what sglang 0.5.16 itself was built/tested against, an unvalidated jump with no
+  evidence behind it, unlike this one-step move which just matches sglang's own declared
+  requirement. **Image not yet rebuilt from this change; needs a rebuild + the same
+  megatron-bridge/nvidia-modelopt torch-ABI-stability smoke check the surrounding lines already
+  run, then a real GLM-5.1/Qwen/Apertus-8B recipe run before this is trusted** — none of those
+  recipes have run against 5.12.1 yet. The Apertus-v1.5 benchmark scripts are unaffected either
+  way (they install the swiss-ai transformers fork with `--no-deps`, overriding this pin
+  entirely).
 - `ARG VERL_REF` `"v0.8.0"` → `"v0.9.0"` (line ~25). Every actively-run verl script already does
   a runtime `git checkout -f v0.9.0` of `/workspace/verl` (both GLM v1-separate scripts, the
   qwen-3B v1-separate script, both Apertus v1.5 benchmarks), so this makes the image match what
@@ -2834,7 +2846,94 @@ suggest — most of Megatron-Core's actual CUDA-heavy code lives in separate pac
   parallel `_steady`-gated barrier with its own `VERL_WSYNC_STEADY_BARRIER_EVERY` env, default 1).
   Steady syncs are far smaller than the seed (only changed values), so per-item barriering there
   is cheap. This is the same fix, extended to the one tag it was never applied to.
+- **Fix applied (user-approved, 2026-09-02)**: extended `_wsync_progress_log`'s WORLD barrier to
+  the `"delta-steady"` tag (was `"seed/full"`-only): `_barrier_tag = tag in ("seed/full",
+  "delta-steady")`. Rebuilt `wsync-debug-progress-log.patch` from a fresh v0.9.0 worktree, then
+  rebuilt `step1-oom-memdump.patch` on top of it (its diff context depends on
+  `_wsync_progress_log`'s exact content) — same discipline as every prior patch iteration.
+  Verified the full chain (fresh v0.9.0 → wsync → memdump): `git apply --check` clean on both,
+  combined result compiles, `--reverse --check` detects "already applied". Heredocs in the script
+  re-spliced and confirmed byte-identical to the checked-in files. `bash -n` + stray-quote +
+  backtick sweeps all clean. Keeps 128 nodes / `param_offload: False` / everything else from
+  `3263683`.
 - **Commit**: not committed.
+
+### Run `3264247` — 2026-09-02 — the delta-steady barrier fix was NEVER EXERCISED (untested, not refuted) — a different, known hazard recurred first: the TP=32 SGLang scheduler-watchdog hang, at a 3rd distinct call site (R3's own routed-experts capture).
+
+- **Log**: `~/Downloads/slurm-3264247.out` (1.22 MB). 128 nodes, delta-steady barrier fix applied.
+  ~39 min, FAILED (exit 15). Diagnostic block, 8 patches (128/128, 0 FATAL), DDP grad-buffer
+  (9.24B params, no OOM), GLM5Bridge conversion 6201/6201, **seed sync completed cleanly again**
+  (172s, zero `gather_from_ep_ranks` — the seed barrier holds), `[MEMDUMP]` showed healthy 33–43 GB
+  GPU free before step 1's optimizer, reached `on_step_end()` → `update_weights()` (step 1's
+  fwd+bwd+optimizer.step() implicitly completed).
+- **The headline test (delta-steady sync) never started** — zero `delta-steady tensor#` lines
+  anywhere. So the barrier-extension fix from this session is **still unverified**, not disproven.
+- **Actual cause — a different, ALREADY-DOCUMENTED hazard, at a NEW call site**: the standalone
+  TP=32 SGLang rollout's 300s scheduler watchdog fired simultaneously on all 32 TP ranks
+  (~5 min after `[MEMDUMP]` — plausibly concurrent rollout generation for the next step,
+  overlapping with step 1's training under `separate_async`). py-spy: stuck in
+  `get_topk (state_capturer/base.py:159) → _maybe_collect_routed_experts
+  (batch_result_processor.py:123)` — a CUDA D2H memcpy inside **R3's own routed-experts capture**.
+  Cascaded: TCPStore/NCCL failures across the 8-node replica → SGLang actor `SYSTEM_ERROR` →
+  trainer's `abort_replicas()` hit `ActorDiedError` → job killed. flashinfer 0.6.14 py+cubin both
+  confirmed correctly installed (rules out the earlier MLA `plan()` cause).
+  **This is the 3rd distinct call site for the "TP=32 SGLang" Known-hazards entry** (1st:
+  `_broadcast_reqs_across_ranks`, run `3152802`; 2nd: flashinfer MLA `plan()`, run `3209484`,
+  fixed by the 0.6.14 pin; 3rd: R3's `get_topk`/routed-experts D2H memcpy, this run) — the first
+  one implicating R3's own capture path specifically, not shared infra.
+- **Fix**: none yet. Per this repo's established precedent for this hazard class (retry unmodified
+  to check one-off vs. repeatable — e.g. `3152802`→`3171176`, `3207923`→`3209484`), the config
+  itself (delta-steady barrier) is not implicated by this failure and doesn't need to change; an
+  unmodified retry both re-tests the barrier fix (never reached) and checks whether this new
+  watchdog call site recurs.
+- **Commit**: not committed.
+
+**Diagnostic added, 2026-09-02 (user asked to instrument this hazard rather than keep guessing
+from the stock py-spy dump alone).** SGLang's own `Watchdog`/`WatchdogRaw` class
+(`sglang/srt/utils/watchdog.py`) already has an unused extensibility hook —
+`WatchdogRaw.__init__(..., dump_info: Optional[Callable[[], str]] = None)` — called right before
+the stock py-spy dump on a timeout, but never passed by `_WatchdogReal` (always `None`). Added a
+runtime patch that wires a CSCS-specific `dump_info` callback in, so a future TP=32 SGLang hang
+(any of the 3 call sites) captures more than the stock py-spy trace: `nvidia-smi
+--query-compute-apps` (rules out a co-resident/orphan process the way run `3246683`'s `[MEMDUMP]`
+did for the earlier GPU-OOM chain) plus local CUDA free/total/allocated/reserved and stream-idle
+state. Deliberately conservative — **no NCCL flight-recorder dump attempt inside this hook**: the
+watchdog thread is seconds from SIGQUITing the process, and calling NCCL's trace-dump API ad hoc
+from an arbitrary thread at that point was judged an unnecessary crash/hang risk for a diagnostic
+that has to be safe to run in production. `TORCH_NCCL_TRACE_BUFFER_SIZE`/`TORCH_NCCL_DUMP_ON_TIMEOUT`
+stay as the (separate, torch-triggered-on-its-own-30-min-timeout) NCCL-side signal — this hook
+does not try to force that path early.
+
+Two-part patch, same batch-host-heredoc + srun-`python3 -c` source-patch discipline as every
+other runtime patch in this script:
+1. `${TRAINING_CONFIG}/cscs_watchdog_diag.py` (batch host heredoc, `sbcast`'d) — defines
+   `_cscs_watchdog_dump_info()`.
+2. A `python3 -c "..."` block in the main srun (right after the megatron-bridge filelock patch):
+   finds `sglang.srt.utils.watchdog` via `importlib.util.find_spec`, inserts the diag function
+   body right after `class Watchdog:`, and rewrites the **`WatchdogRaw(...)` call's** `soft=soft,`
+   line to also pass `dump_info=_cscs_watchdog_dump_info`. Best-effort: WARNs and continues on any
+   anchor/call-site mismatch (sglang version drift) rather than aborting — diagnostic-only, not
+   load-bearing.
+
+**Bug caught before wiring in, not by trusting a paraphrase but by fetching and testing against
+the real file**: `soft=soft,` appears **twice** in `watchdog.py` — once inside
+`Watchdog.create()`'s call to `_WatchdogReal(...)` (no `dump_info` parameter; patching there would
+raise `TypeError` on every SGLang worker at startup), and once inside
+`_WatchdogReal.__init__`'s call to `WatchdogRaw(...)` (the real target, which does accept
+`dump_info`). The first patcher draft matched the first (wrong) occurrence. Fixed by
+disambiguating on `call_line = "            soft=soft,\n        )"` — unique to the
+`WatchdogRaw(...)` call, since only that one has `soft=soft,` immediately followed by the closing
+paren (the `_WatchdogReal(...)` call has `test_stuck_time=test_stuck_time,` in between). Verified
+by `curl`-fetching the real `sglang` `v0.5.16` tag source directly (`raw.githubusercontent.com`,
+not a WebFetch paraphrase) and running the actual patcher logic against it: `call_line` now
+matches exactly once, the patched file compiles, and `dump_info=_cscs_watchdog_dump_info` lands
+in the `WatchdogRaw(...)` call (confirmed against the real class signature, which does declare
+`dump_info: Optional[Callable[[], str]] = None`) — not in the unrelated `_WatchdogReal(...)` call.
+`bash -n` + the full stray-single-quote scan of the `srun bash -c '...'` body (also caught and
+fixed two apostrophes in this patch's own comment prose — "Watchdog.create()'s" /
+"_WatchdogReal.__init__'s" — the run-3149339 hazard, same routine as every other edit to this
+file) both pass clean. Entirely unverified end-to-end by a cluster run — needs one, and only
+produces new signal if the TP=32 SGLang watchdog hazard recurs.
 
 # Training Apertus v1.5 on verl (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`)
 
@@ -3955,8 +4054,9 @@ gaining a ~12-line `curl compare/…​.diff` + `patch -pN` block.
   already-existing `on_init_end()` fix (same root cause, second call site, never exercised before
   `test_freq` was ever enabled). `resume_generation_replicas()`/`add_replicas_to_balancer()` right
   below are untouched — confirmed genuinely inert (empty-replica-list `asyncio.gather`), unlike
-  `update_weights`'s naive-backend branch which bypasses that list. Unverified on cluster as of
-  this entry — needs a run with `test_freq` enabled.
+  `update_weights`'s naive-backend branch which bypasses that list. **Validated — run `3262739`
+  (2026-09-02)**: `test_freq: 2` forced `switch_to_rollout()` through 23 mid-run validation
+  cycles instead of the 1 that crashed `3261338`; zero recurrences, 23/23 clean.
 - **`checkpoint.strict: False` is required.** Apertus-v1.5 is multimodal; this recipe deliberately
   does not map the `vision_tokenizer` / `audio_tokenizer` towers (text-only GSM8K). The strict
   HF-checkpoint export then hard-fails at whatever `save_freq` triggers — `RuntimeError: 473
@@ -4336,9 +4436,49 @@ installed 0.6.1** wheel (no fuzz needed — 0.6.0/0.6.1 context identical in the
   `git apply --check` clean, file compiles, `git apply --reverse --check` confirms idempotency;
   recipe heredoc re-verified byte-identical to the checked-in patch file; `bash -n` +
   stray-quote/backtick sweeps clean.
-- **Not yet re-tested**: needs a full ~101-min run to reach step 46 again and confirm the fix
-  clears the crash and produces the final `val-core/gsm8k/acc/mean@1` to compare against the
-  0.4597 baseline.
+- **Fix VALIDATED — run `3262739`, next entry.** Not a one-off: re-tested with `test_freq: 2`
+  (23 mid-run validation cycles instead of 1) specifically to stress it, and every single cycle
+  completed clean.
+- **Commit**: not committed.
+
+### Run `3262739` — 2026-09-02 — FULLY VALIDATED: the `switch_to_rollout` fix holds across 23 mid-run validations; full GSM8K test-set learning curve captured for the first time
+
+- **Log**: `~/Downloads/slurm-3262739.out` (1.33 MB). 16 nodes, `clariden`. Ran ~1h45m, **COMPLETED,
+  exit 0** — the first fully-clean 46/46-step run of this recipe with validation enabled.
+- **The fix held**: `test_freq: 2` deliberately forced `switch_to_rollout()` to run 23 times
+  (steps 2, 4, 6, …, 46) instead of the 1 time that crashed run `3261338`. **Zero** occurrences of
+  `KeyError`, `resume_memory_occupation`, or `offload_tags` anywhere in the log — every
+  trainer↔rollout mode-switch pair completed cleanly, 23/23.
+- **Full held-out GSM8K test accuracy curve** (`val-core/gsm8k/acc/mean@1`, greedy pass@1 —
+  the first time this recipe has ever produced one):
+  baseline (step 0) **0.460** → step 2 **0.846** → step 4 **0.954** → step 6 **0.978** →
+  step 8 **0.989** → step 10 **0.992** → saturates ~0.99–1.01 from step ~14 on (values slightly
+  >1.0 reflect the reward's small format-delimiter bonus baked into this metric, not an accuracy
+  artifact) → final (step 46) **0.998**. Accuracy roughly doubled in the first 10 steps then
+  saturated — a clean, fast, monotonic learning curve on the actual held-out benchmark, not just
+  the train-time reward.
+- **Training**: 46/46 steps, `actor/loss` 0.0102 final (finite throughout, no NaN/Inf ever),
+  `actor/grad_norm` 0.222 final, `critic/score/mean` 0.50 → ~1.02 (same shape as `3261338`),
+  `critic/score/max` flat 1.10 every step. Throughput 116–139 tok/s steps 2–45 (expected
+  megatron-core 0.19 band); step 46 read 39 tok/s only because it includes the one-time 144s
+  checkpoint save. Checkpoint saved at `global_step_46` (the usual non-fatal partial-multimodal-
+  tower export gap, `checkpoint.strict: False`).
+- **Verdict**: this recipe — stock megatron-core 0.19.0/megatron-bridge 0.6.1 + the two
+  `theely/*` compare diffs, downloaded `reward.py`/`dataset_prepare.py`, `[[[N]]]` answer format,
+  `val_before_train` + `test_freq` both enabled — is now **fully validated end-to-end**, including
+  the validation/eval path that every prior run had disabled. Nothing outstanding.
+- **Commit**: not committed.
+
+### Run `3264244` — 2026-09-02 — second independent confirmation, `test_freq: 46` (production-style, 1 validation at the end)
+
+- **Log**: `~/Downloads/slurm-3264244.out` (1.34 MB). 16 nodes, `clariden`. Ran ~97 min,
+  **COMPLETED, exit 0**. Unmodified re-run of the same recipe as `3262739`, except `test_freq`
+  reverted from the stress-test value `2` back to `46` (validate once, at the end).
+- **Result**: 46/46 steps, `val_before_train` baseline **0.4639**, final (step 46) validation
+  **1.0099** (near-saturated, `>1.0` is the small format-shaping bonus, same as `3262739`). Loss/
+  grad_norm finite and stable throughout, zero `KeyError`/FATAL/OOM, no regression from `3262739`.
+- **Verdict**: second consecutive full success confirms the `switch_to_rollout` fix and the whole
+  recipe are solid, not a one-off. This recipe is now considered stable/production-ready.
 - **Commit**: not committed.
 
 # Megatron vs FSDP2
