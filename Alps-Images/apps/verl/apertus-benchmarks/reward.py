@@ -3,17 +3,10 @@ import re
 import math
 from typing import Optional
 
-# Tied to the launch script's ENABLE_THINKING / MAX_RESPONSE_LENGTH (passed
-# through via env.toml's [env] table, read back here from the container env):
-#   thinking OFF -> max_response_length 500 tokens (~350-400 words max) ->
-#     350/700-word thresholds (validated run 3283187: 46/46 steps, healthy).
-#   thinking ON  -> max_response_length 8192 tokens (room for a <think> turn)
-#     -> 2000/4000-word thresholds (validated run 3284608: 92/92 steps, penalty
-#     engaged on genuinely long/degenerate responses without being inert).
-_ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "False").strip().lower() == "true"
-LENGTH_PENALTY_RAMP_START_WORDS = 2000 if _ENABLE_THINKING else 350
-LENGTH_PENALTY_MAX_AT_WORDS = 4000 if _ENABLE_THINKING else 700
 
+_ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "False").strip().lower() == "true"
+LENGTH_PENALTY_RAMP_START_WORDS = 2000 if _ENABLE_THINKING else 1400
+LENGTH_PENALTY_MAX_AT_WORDS = 4000 if _ENABLE_THINKING else 2800
 
 def _norm(raw: str) -> str:
    raw = raw.strip().replace(",", "")
