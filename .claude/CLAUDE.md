@@ -2935,6 +2935,239 @@ fixed two apostrophes in this patch's own comment prose — "Watchdog.create()'s
 file) both pass clean. Entirely unverified end-to-end by a cluster run — needs one, and only
 produces new signal if the TP=32 SGLang watchdog hazard recurs.
 
+# Training DeepSeek-V3 on verl (`train-gsm8k-deepseek-v3-671B-v1-separate-async-megatron.sh`)
+
+DeepSeek-V3 (671B, MoE + MLA) GRPO on GSM8K, CSCS Alps. Script:
+`Alps-Images/apps/verl/example/train-gsm8k-deepseek-v3-671B-v1-separate-async-megatron.sh`.
+**Created 2026-09-03 as a variation of the GLM-5.1 V1 separate-async recipe** (same image
+`verl-cuda:alps7-dev-621fa40275c4f036`, same V1 `separate_async` trainer, same 6 verl source
+patches + PR #7421/#7422/#7423, same 128-node TP=4/PP=3/EP=8/DP=5 layout, same `delta_sharded`
+weight sync, same CPU-offload optimizer / bf16 grads / fused CE / `param_offload: False`
+memory settings). **Entirely UNVERIFIED on the cluster** — a first cut derived from a validated
+recipe, not a validated recipe. Every DeepSeek-specific edit is marked `DeepSeek-V3` in the
+script; the script header lists them and the first-run watch-points.
+
+## What differs from the GLM-5.1 recipe (and why — all checked against real source, not memory)
+
+- **Model**: `deepseek-ai/DeepSeek-V3` (the chat checkpoint; `-Base` would not follow the
+  `<answer>` prompt). `model_type: deepseek_v3`, 61 layers + 1 MTP layer, MLA, 256 routed + 1
+  shared expert, 8 active, `first_k_dense_replace: 3`, yarn RoPE, vocab 129280. `MODEL_NAME` /
+  `MODEL_REPO` are env-overridable (`DeepSeek-V3-0324` is a drop-in).
+- **Bridge**: megatron-bridge 0.6.x ships a native `DeepSeekV3Bridge`
+  (`megatron/bridge/models/deepseek/deepseek_v3_bridge.py`, `register_bridge(source=
+  "DeepseekV3ForCausalLM", provider=MLAModelProvider, model_type="deepseek_v3")`) — no runtime
+  bridge patch, unlike Apertus. The image smoke test now also imports it (non-fatal WARNING if
+  absent) plus `transformers.DeepseekV3Config`.
+- **FP8 checkpoint**: the HF weights are FP8 block-quantized (`quantization_config` e4m3,
+  128x128 blocks, `*_scale_inv` tensors). Trainer side needs nothing: `DeepSeekV3Bridge.
+  maybe_modify_loaded_hf_weight` → `quantization_utils.maybe_dequantize_fp8_blockwise`,
+  gated on the **tensor dtype** (`is_fp8_tensor`), not on config. Rollout side would break:
+  SGLang reads `config.json`, and with `quantization_config` present builds FP8 params
+  expecting `*_scale_inv`, while `load_format: dummy` + the bf16 weight sync feed it bf16.
+  verl's own `examples/grpo_trainer/run_deepseek_v3_671b_megatron.sh` says "remove
+  `quantization_config` from config.json and set `num_nextn_predict_layers=0`". **The script
+  does this on the per-node `/tmp` config mirror only** (`MODEL_LOCAL=/tmp/dsv3_model_<jobid>`,
+  local rank 0, a fatal `python3 -c` right after the `cp`; also drops `auto_map`) — the Lustre
+  checkpoint is untouched. Tested locally against the real `config.json` (idempotent, asserts
+  `model_type`). SGLang serves bf16: 1.34 TB over 32 x 95 GiB x 0.75 ≈ 2.2 TB, fits.
+- **MTP**: verl v0.9.0 `ModelConfig.__post_init__` already zeroes `num_nextn_predict_layers`
+  when `mtp.enable` is False (default), so Megatron builds no MTP block and layer-61 weights are
+  never mapped; the mirror sets it to 0 too so SGLang / the HF export agree. `use_fused_kernels`
+  keeps its `mtp.enable=False` prereq.
+- **Uneven PP** (the one genuinely new mechanism): 61 is prime, so PP=3 needs
+  `override_transformer_config.num_layers_in_first_pipeline_stage: 20` +
+  `num_layers_in_last_pipeline_stage: 20` (middle 21). Validated against `core_v0.19.0`
+  `TransformerConfig.__post_init__`: 61-20-20 = 21 over PP-2 = 1 middle stage is exact; must not
+  be combined with `account_for_embedding/loss_in_pipeline_split`. verl forwards
+  `override_transformer_config` verbatim into `provider.apply_overrides_and_finalize` (v0.9.0
+  `transformer_impl.py:347-392`), so it reaches the bridge provider. Mirrored on `ref.megatron`
+  (ref is never built here — no KL term — but keeps it consistent).
+- **`trust_remote_code: False`** (GLM needed True): transformers has native `deepseek_v3`; the
+  bundled `modeling_deepseek.py` targets transformers 4.33 and must not load under 5.x.
+- **MLA overrides**: `apply_rope_fusion: False` (bridge default, explicit; verl's example does
+  the same) and `moe_router_dtype: fp32` (sigmoid / noaux_tc routing). Bridge defaults left
+  alone otherwise (`alltoall` dispatcher, `moe_shared_expert_overlap: True`,
+  `make_vocab_size_divisible_by: 1280` → 129280 / 4 TP exact).
+- **Per-rank memory**: ~8.3B params/rank at TP4/PP3/EP8 (experts 654B/(4·8·3) + attention
+  11.4B/12 + shared/dense 3.7B/12 + embed/head 0.93B/4 on first/last) vs GLM-5.1's 9.24B — the
+  GLM-validated 128-node layout is conservative here; 104 nodes / DP=4 is the natural follow-up
+  once one run is clean. Batch invariants unchanged (`PPO_MINI_BATCH_SIZE=10` x n=8 = 80 = 2x
+  dp_size 40; `TRAIN_BATCH_SIZE=20`).
+- **PR #7421** (DSA) is not exercised by MLA — kept so the patched verl tree is identical to
+  the validated GLM recipe.
+
+## Configuration audit (architecture-vs-config) — 2026-09-03 (pre-run)
+
+MoE → R3 applies. verl's docs name DeepSeek-V3.2 / GLM-5 / MiMo-V2 as R3 adopters and recommend
+it for any large MoE; DeepSeek-V3 has the same surface (flat `num_hidden_layers` /
+`num_experts_per_tok` for the sglang `RoutedExpertsCapturer`, which hooks the generic `TopK`
+layer; verl replays via its TopKRouter patch). **Kept enabled** (`actor.megatron.router_replay.
+mode: R3` + `rollout.enable_rollout_routing_replay: True`), inherited from GLM where it is
+validated — but **unverified on this model**; the script says to flip both off together for a
+baseline if the first run fails inside R3. `rollout_correction.bypass_mode: True` set. Text-only
+dense-vs-multimodal axis: N/A (text-only). Not checked: whether `moe_shared_expert_overlap: True`
+(bridge default) composes with `recompute_granularity: full` on this stack — verl's own example
+sets it False but under a DeepEP/flex dispatcher this image does not use.
+
+## Verification done before any run
+
+`bash -n`; stray-`'` scan of all 3 `srun bash -c '...'` bodies (caught + fixed two apostrophes in
+the new diagnostic WARNING text — the run-3149339 hazard); backtick / bare-`$(` scan of the 4
+unquoted heredocs (clean; only the intended `$(( SLURM_JOB_NUM_NODES * 2 ))`); the 5 embedded
+patch heredocs byte-identical to `example/patches/*.patch`; the config-sanitiser block extracted
+and run through a real `bash -c` wrapper against the real DeepSeek-V3 `config.json`; the whole
+YAML-generation prefix rendered locally for both scripts and diffed — only the intended keys
+differ. ShellCheck not installed locally.
+
+- **sglang's DeepSeek loader silently drops `q_a_proj`/`kv_a_proj_with_mqa` pairs split across
+  `load_weights` calls (run `3279810`).** `DeepseekV2WeightLoaderMixin.do_load_weights`
+  (`sglang/srt/models/deepseek_common/deepseek_weight_loader.py`, v0.5.16 line ~195) fuses the
+  two into `fused_qkv_a_proj_with_mqa` via `cached_a_proj = {}` — a dict LOCAL to each call; the
+  fused param is written only when both halves of a layer are in the same call. verl's
+  `delta_sharded` sync (`delta_loader.apply_delta`) chunks every flush at 512 MB and the sender
+  buckets at `update_weights_bucket_megabytes`, so the seed arrived as 2386 `load_weights`
+  calls for 45395 tensors — any layer whose pair straddled a boundary kept its `load_format:
+  dummy` random projection. Steady syncs make it worse: they ship only CHANGED params, so a
+  half without its partner in that sync is dropped outright. Applies to ANY `q_lora_rank`
+  model served by sglang under verl's delta engine (DeepSeek-V2/V3 family); GLM-5.1 evidently
+  does not hit it (it learns) — not checked whether that is because it has no `q_lora_rank` or
+  uses a different sglang model class. Fix: `example/patches/sglang-deepseek-qkv-a-cache-fix.py`
+  (persist the cache on the model object; merge NaN-masked deltas on re-arrival), applied
+  fatal-if-missing in the srun before `ray start`. Worth an upstream sglang PR.
+- **Checkpoint save gathers the full HF export through rank 0's host RAM.** With the default
+  `actor.megatron.use_dist_checkpointing: False`, `'model' in save_contents` means
+  `should_save_hf_model` (verl `megatron_checkpoint_manager.py`) → bridge HF export → rank-0
+  WorkerDict at 302 GB, node 446/450 GB, Ray OOM-kill, job dead (step 20 of `3279810`). The
+  GLM-5.1 recipe has the same latent hazard (its `delta_sharded` runs never reached a save).
+  `save_freq: -1` for shakedowns; `use_dist_checkpointing: True` is the real fix (untested).
+
+- **`delta_sharded` steady sync OOMs the wire-master GPU on the first real-gradient sync
+  (run `3289294`).** Under PP>1 `verl/workers/engine/megatron/delta_export.py` merges EVERY
+  param over the WORLD group (480 ranks) and `sparse_gather.gather_slot_entries_to_rank0`
+  allocates `world × max_n` padded idx/val lists on rank 0 per round; `max_round_bytes` was
+  hard-wired to `bucket_size` = `update_weights_bucket_megabytes` (512 MB) → up to 240 GB on
+  rank 0 per round (observed ~77 GB, on ~47 GB free). Never seen before because every prior
+  `delta_sharded` sync in this repo (GLM included) had ~zero weight change (zero reward → zero
+  grads → `changed_elems ~1700`). Fix: `example/patches/delta-sharded-gather-round-size.patch`
+  (new `gather_round_megabytes` engine kwarg, default = old behavior) +
+  `engine_kwargs.delta_sharded.gather_round_megabytes: 16` → rank-0 peak ~9 GB. **The GLM-5.1
+  recipe has the same latent bug** and will hit it the moment a `delta_sharded` run gets a
+  nonzero gradient step followed by a sync — port both the patch and the knob before its next
+  run. Upstreamable; the proper fix is to gather only from contributing ranks.
+
+## Run log
+
+### Run `3289420` — 2026-09-04 — gather-round patch cleared the rank-0 OOM; the first real-gradient steady delta sync then HANGS (30-min NCCL timeout) — rank 0 stuck launching a 480-peer gather-to-one. Same signature as GLM run `3263683`.
+
+- **Log**: `~/Downloads/slurm-3289420.out` (2.18 MB). 128 nodes, `clariden`. ~28 min queued,
+  ran ~50 min, FAILED (exit 15). 0 training steps (no `step:1` metrics line).
+- **Clean up to the steady sync**: `delta-sharded-gather-round-size.patch` + sglang qkv_a fix
+  128/128, 0 FATAL; DDP 7.90B; bridge 4502/4502; SGLang up; seed sync 480/480 + `delta apply
+  v=0 flushes=2386` 32/32; `[REWARD-DUMP]` coherent, 27/28 `parsed == gt`; `[MEMDUMP]` 39–48 GB
+  free; step 1 fwd+bwd+optimizer done. **No OOM anywhere** — the gather-round fix did its job.
+- **Symptom**: all 480 ranks print `delta-steady tensor#1`, then ~30 min silence, then on 479
+  ranks: `Watchdog caught collective operation timeout: WorkNCCL(SeqNum=5, OpType=ALLGATHER,
+  NumelIn=4, NumelOut=1920)` at `sparse_gather.py:85 all_gather` (via the sub-round recursion at
+  `:109`, `_flush :206`, `send_weights :653`) — `last enqueued 5, last completed 4`. **Rank 0
+  (the wire master): `Last enqueued NCCL work: 3, last completed NCCL work: 3` on
+  `default_pg`** — it completed the sub-round-1 index gather (#3) and never enqueued the value
+  gather (#4), which is the immediately following `dist.gather` call with no user code in
+  between → stuck inside NCCL's launch of a 480-peer gather-to-one before the work is recorded.
+  Zero CheckpointEngineWorker / SGLang activity after the CE-group init at sync start (the
+  publish path was never reached). No exception on any rank.
+- **Why this is the real, pre-existing bug behind the "delta-steady hang"**: (1) run `3279810`
+  completed 19 steady syncs over the same 480-rank WORLD gather with `changed_elems ~1700`
+  (tiny payloads, NCCL LL path) — fan-in alone is fine, payload size is the trigger; (2) GLM run
+  `3263683` hung on the identical signature (`ALLGATHER NumelIn=34 NumelOut=16320` = a
+  34-slot count exchange over 480 ranks, the very first steady flush) — the WORLD barrier added
+  after it (`wsync-debug-progress-log.patch`, `"delta-steady"` tag) addressed a misdiagnosed
+  "asymmetric driver drift" and is now known NOT to be the fix; (3) under PP>1
+  `delta_export.py` routes EVERY param's gather over `torch.distributed.group.WORLD`, so each
+  round is a 479→1 point-to-point fan-in into rank 0's GPU over Slingshot/libfabric with
+  ~16 MB per peer. **No `delta_sharded` recipe in this repo has ever completed a
+  real-gradient steady sync.**
+- **Options** (decision pending, see the entry below once made): (A) switch this recipe's
+  `checkpoint_engine.backend` back to `nccl` — full-model streaming via `get_per_tensor_param()`,
+  which now carries the seed-sync WORLD barrier (validated ~10× on both models, ~150 s per sync
+  on DeepSeek-V3, and the qkv_a sglang fix covers its chunked `load_weights` too); slower syncs
+  but a path that has actually trained for 20 steps on GLM. (B) fix the delta engine: replace
+  the WORLD gather with per-class process groups (attention: dp0 × tp × pp = 12 ranks; experts:
+  edp0 × etp × ep × pp = 96; replicated: 3), all containing rank 0, with the param class learned
+  once via an `all_gather_object` at index build so placeholder rows route correctly — real
+  engineering in `delta_export.py` + `delta_checkpoint_engine.py`, cluster-only validation.
+  (C) instrument rank 0 with a periodic `faulthandler` stack dump inside `send_weights` to pin
+  the exact NCCL frame before choosing.
+- **Commit**: not committed.
+
+### Run `3289294` — 2026-09-04 — sglang qkv_a fix CONFIRMED (coherent, correct generations); new blocker: rank-0 GPU OOM in the first steady delta sync (WORLD-group gather × 512 MB rounds)
+
+- **Log**: `~/Downloads/slurm-3289294.out` (843 KB). 128 nodes, `clariden`. No queue wait, ran
+  ~19 min, FAILED (exit 1 on task 0).
+- **Setup all green in ~12 min**: `Applied sglang DeepSeek qkv_a cache fix` 128/128, 3 PRs + 5
+  source patches 128/128, zero FATAL; `DistributedDataParallel contains 7.90B parameters`;
+  bridge load 100% (4502/4502); SGLang HTTP up; seed sync 480/480 + `delta apply v=0` on 32
+  workers, `FULL-SEED v=0 done in 149.1s`; `[MEMDUMP]` 47–51 GB free on lrank 0; step 1
+  fwd+bwd+optimizer completed.
+- **Root cause 1 of `3279810` is confirmed fixed**: 31 `[REWARD-DUMP]` lines, all `parsed == gt`,
+  60–76 words, fluent step-by-step GSM8K with `<answer>N</answer>` (e.g. `gt='10' parsed='10'`:
+  "...Over 4 weeks, his total expenditure is: 2.50 × 4 = 10.00 **Final Answer:**
+  <answer>10.00</answer>"). Previous run: ~256-token garbage on every sample. (No step metrics
+  were emitted — the crash precedes the step-1 metrics line — so `ppo_kl`/`score` are still
+  unmeasured.)
+- **Symptom**: first steady sync (`on_step_end → update_weights → delta_checkpoint_engine.py:636
+  send_weights → _GatherQueue._flush → sparse_gather.py:134 gather_slot_entries_to_rank0`,
+  `idx_list = [torch.zeros(max_n, ...) for _ in range(world)]`):
+  `torch.OutOfMemoryError: Tried to allocate 102.00 MiB ... 94.31 GiB in use, 80.55 GiB
+  allocated by PyTorch` on `WorkerDict pid=266658 ip=172.28.35.100` (global rank 0, the wire
+  master). PyTorch-allocated went ~35 → 80.5 GB inside the gather. → `RayTaskError` →
+  `TaskRunnerV1.run()` died. No watchdog / NCCL timeout / R3 errors.
+- **Root cause 2**: the hazard above (WORLD-group gather with `max_round_bytes` = 512 MB
+  bucket). Fix: `delta-sharded-gather-round-size.patch` (generated from a real v0.9.0 worktree;
+  applies clean, compiles, reverse-check OK, full 6-patch chain verified in order) +
+  `gather_round_megabytes: 16` in the YAML. Unverified on cluster. Expected cost: ~150–1500
+  gather rounds per sync depending on the changed fraction (~0.4 s each), flush bucket unchanged.
+- **Still unmeasured**: `ppo_kl` (should drop from 1.35–1.68 to ≲0.4), `critic/score/max` > 0,
+  steady-sync duration and `checkpoint_engine/changed_ratio` (the bf16-rounding change fraction
+  per Adam step at lr 1e-6 — expected a few %).
+- **Commit**: not committed.
+
+### Run `3279810` — 2026-09-03 — first run: every setup phase clean, 19 steps, but the rollout served a different model (sglang qkv_a fusion cache bug) → reward/grad 0.0; died on host-RAM OOM at the step-20 HF checkpoint export
+
+- **Log**: `~/Downloads/slurm-3279810.out` (1.0 MB). 128 nodes, `clariden`. Queued ~2h20m, ran
+  47.7 min, FAILED (exit 15).
+- **Everything DeepSeek-specific in setup worked, first try**: smoke test `megatron-bridge
+  DeepSeekV3Bridge: OK` / `transformers native deepseek_v3 config: OK` 128/128; 8 patches
+  128/128; config mirror `Sanitized ... ['-quantization_config', '-auto_map',
+  'num_nextn_predict_layers=0'] (num_hidden_layers=61, n_routed_experts=256)` 128/128;
+  `DistributedDataParallel contains 7.90B parameters` (uneven PP 20/21/20 accepted, no
+  divisibility assert); bridge load `100% (4502/4502)` with on-the-fly FP8 dequant (no
+  `weight_scale_inv`/dtype errors); SGLang TP=32 bf16 rollout up (no fp8/quant errors); seed
+  sync `45395 tensors, 151s` on 480/480 ranks, `FULL-SEED v=0 done in 151.4s (flushes=2386
+  wire=1249.9GB)`, `delta apply v=0` on all 32 CE workers, zero `gather_from_ep_ranks`; 19 steady
+  delta syncs clean; `[MEMDUMP]` ~48 GB GPU free; peak GPU 45.5 GB. 45395 = exactly DeepSeek-V3's
+  HF tensor count without the MTP layer / scale_inv tensors, i.e. the bridge exported every
+  weight including `mlp.gate.e_score_correction_bias`.
+- **Symptom 1 — degenerate training, all 19 steps**: `critic/score/{mean,max}` 0.0, `actor/loss`
+  0.0, `actor/grad_norm` 0.0, `pg_clipfrac` 0.0, `response_length/clip_ratio` 0.98–1.0 (nearly
+  every response saturates `max_response_length=256`, min 55), **`actor/ppo_kl` 1.35–1.68**
+  (GLM-5.1 ~0.4, Apertus ~0.001) — the trainer's log-probs of the rollout's tokens strongly
+  disagree with SGLang's, i.e. trainer and rollout are not the same model; steady deltas
+  `changed_elems: 1699` (weights barely move — consistent with zero grads). No R3 /
+  `routed_experts` errors, no SGLang watchdog, no GPU OOM. verl logs no generations, so the
+  text itself was not visible.
+- **Root cause 1 (found by reading sglang v0.5.16 + verl v0.9.0 source, not guessed)**: the
+  qkv_a fusion cache hazard above. Fix: `example/patches/sglang-deepseek-qkv-a-cache-fix.py`
+  (+ script heredoc, byte-identical), tested against the real v0.5.16 file (applies, compiles,
+  idempotent). Also added a rate-limited `[REWARD-DUMP]` print to `gsm8k_reward.py` (6 raw
+  responses per reward process) so the next log shows what the model actually generates.
+- **Symptom 2 / root cause 2**: host-RAM OOM at the step-20 checkpoint save (hazard above):
+  `ray.exceptions.OutOfMemoryError ... 445.86GB / 450.00GB ... 255508 301.99
+  ray::WorkerDict.actor_rollout_save_checkpoint`. Fix: `save_freq: 20 → -1` for the shakedown.
+- **Unverified**: both fixes need a run. If `ppo_kl` drops to the GLM band (~0.4 or lower) and
+  `critic/score/max` > 0 on step 1, root cause 1 is confirmed; if the `[REWARD-DUMP]` text is
+  coherent but still scores 0, the problem is prompt/format, not weights.
+- **Commit**: not committed.
+
 # Training Apertus v1.5 on verl (`rl-bench-apertus-v1.5-70B-sglang-fsdp2-async.sh`)
 
 Apertus-v1.5-70B GRPO on GSM8K, CSCS Alps, 16 nodes × 4 GH200 (`clariden`). Script:

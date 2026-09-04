@@ -64,10 +64,53 @@
 #   "The zero-reward chain"), since fixed and validated (run 3251587, fork wheels).
 # ─────────────────────────────────────────────────────────────────────────────
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-621fa40275c4f036" #verl-cuda image: baked verl v0.9.0 + updated deps (matches train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh)
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-af30d3905eedb02f" #verl-cuda image: baked verl v0.9.0 + updated deps (matches train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh)
 
 export MODEL_NAME="Apertus-v1.5-70B"
 export MODEL_REPO="swiss-ai"
+
+# Optional: load the actor/rollout/ref model from an existing local checkpoint
+# directory (e.g. an SFT checkpoint) instead of downloading MODEL_REPO/MODEL_NAME
+# from HF. Leave empty for the default HF-download behavior. When set, this must
+# be a real HF-format snapshot dir (config.json, tokenizer files, safetensors) --
+# same shape as what `hf download` produces -- and the HF download step below is
+# skipped entirely.
+# Example: /capstor/store/cscs/swissai/infra01/users/xyixuan/rl-bench/models/ap1p5-70b-sft-262k-2700_corr
+# IMPORTANT: do not include a trailing slash in the path.
+export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/users/xyixuan/rl-bench/models/ap1p5-70b-sft-262k-2700_corr"
+
+
+# Passed through to data.apply_chat_template_kwargs.enable_thinking (verl's
+# RLHFDataset forwards this straight into tokenizer.apply_chat_template) --
+# controls whether the chat template opens a <think>/reasoning turn. Harmless
+# to flip on for a template that doesn't branch on this kwarg -- unused
+# template variables are silently ignored.
+export ENABLE_THINKING="False"
+
+# Response-length budget is tied to ENABLE_THINKING:
+#   thinking OFF (short, direct answers): 500 tokens, ppo_max_token_len_per_gpu
+#     16384 -- VALIDATED (run 3283187: 46/46 steps, peak mem 73.9-76.3/95 GiB,
+#     no OOM).
+#   thinking ON (needs room for a <think> turn): 12288 tokens,
+#     ppo_max_token_len_per_gpu 16384 -- UNTESTED. 8192/12288 was validated
+#     (run 3284608: 92/92 steps, peak mem 71.76/95 GiB, no OOM); 16384/20480
+#     reliably OOMs by step 3 as real response length grows toward the cap
+#     (runs 3282747, 3289274) -- the OOM is driven by response length growing
+#     during training, not a fixed one-time cost, so 12288 is a real memory
+#     risk between those two known points, not a safe extrapolation. 16384 for
+#     ppo_max_token_len_per_gpu keeps the same ~3584-token headroom margin as
+#     every previously-validated pairing (floor = 512 + 12288 = 12800).
+#     Watch closely for the same OOM signature on the first run at this value.
+# reward.py reads ENABLE_THINKING back out of the container env (passed via
+# env.toml below) to pick matching length-penalty thresholds -- keep the two
+# in sync if either changes.
+if [ "${ENABLE_THINKING}" = "True" ]; then
+    export MAX_RESPONSE_LENGTH=12288
+    export PPO_MAX_TOKEN_LEN_PER_GPU=16384
+else
+    export MAX_RESPONSE_LENGTH=500
+    export PPO_MAX_TOKEN_LEN_PER_GPU=16384
+fi
 
 export PROJECT_NAME="apertus-benchmarks"
 export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
@@ -75,6 +118,7 @@ export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
+export MODEL_LOAD_PATH="${MODEL_CHECKPOINT_PATH:-${TRAINING_HOME}/models/${MODEL_NAME}}"
 
 
 mkdir -p $TRAINING_HOME
@@ -106,9 +150,18 @@ export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 # activation peak is per-microbatch, not per-mini-batch -- 8x more rows just
 # means more sequential microbatches, same peak.
 export ROLLOUT_N=16                  # responses per prompt (matches 3184869)
+# ppo_mini_batch_size kept at 48 (matches 3184869; this is the actor mini-batch
+# granularity, and dynamic-bsz already caps per-microbatch activation memory
+# regardless of this value -- see the block comment above). To still get
+# data.train_batch_size 96 -> 48 prompts/step (and trainer.total_training_steps
+# 46 -> 92 below -- same total 4416 prompts across the run, just delivered in
+# smaller/more frequent steps), PARAMETER_SYNC_STEP is lowered 2 -> 1 instead:
+# weight sync to the standalone rollout now happens every actor update instead
+# of every 2nd, i.e. fresher (less off-policy) rollout weights, at the cost of
+# more frequent ~9.7s NCCL weight-sync overhead.
 export PPO_MINI_BATCH_SIZE=48        # prompts; x ROLLOUT_N = 768 rows (matches 3184869)
-export PARAMETER_SYNC_STEP=2         # matches 3184869's trigger_parameter_sync_step
-export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))  # 96
+export PARAMETER_SYNC_STEP=1         # was 2 -- see comment above
+export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))  # 48
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
@@ -119,6 +172,7 @@ entrypoint = true
 [env]
 PMIX_MCA_psec = "native"
 HF_TOKEN = "$(cat ~/HF_TOKEN)"
+ENABLE_THINKING = "${ENABLE_THINKING}"  # reward.py reads this to pick length-penalty thresholds
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
@@ -146,10 +200,16 @@ data:
   train_batch_size: ${TRAIN_BATCH_SIZE}   # == parameter_sync_step * ppo_mini_batch_size
   gen_batch_size: 1      # prompts are submitted to the rollout one at a time
   return_raw_chat: True
+  # max_response_length also sets rollout.response_length (oc.select default) --
+  # the SGLang sampling_params.max_new_tokens cap. Tied to ENABLE_THINKING --
+  # see MAX_RESPONSE_LENGTH above for the validated 500/8192 values and why.
+  max_response_length: ${MAX_RESPONSE_LENGTH}
+  apply_chat_template_kwargs:
+    enable_thinking: ${ENABLE_THINKING}
 
 actor_rollout_ref:
   model:
-    path: ${TRAINING_HOME}/models/${MODEL_NAME}
+    path: ${MODEL_LOAD_PATH}
     use_remove_padding: True  # Megatron THD layout requires sequence packing
     # eager, not flash_attention_2/sdpa: the vision tokenizer submodule
     # (instantiated even for this text-only benchmark) supports neither;
@@ -169,7 +229,10 @@ actor_rollout_ref:
       strict: False
     ppo_mini_batch_size: ${PPO_MINI_BATCH_SIZE}
     ppo_micro_batch_size_per_gpu: 1
-    ppo_max_token_len_per_gpu: 16384
+    # Must exceed max_prompt_length(512) + max_response_length above, or a
+    # single near-max-length sequence can't be packed into one microbatch.
+    # Tied to ENABLE_THINKING -- see PPO_MAX_TOKEN_LEN_PER_GPU above.
+    ppo_max_token_len_per_gpu: ${PPO_MAX_TOKEN_LEN_PER_GPU}
     use_dynamic_bsz: True
     # 12 training nodes x 4 GPUs = 48 GPUs; TP=8, PP=1, EP=1 -> 8 GPUs/replica,
     # 6 DP replicas. Apertus-v1.5-70B is dense (no MoE), so EP must be 1. TP=8
@@ -221,7 +284,7 @@ actor_rollout_ref:
 
   ref:
     log_prob_use_dynamic_bsz: True
-    log_prob_max_token_len_per_gpu: 16384
+    log_prob_max_token_len_per_gpu: ${PPO_MAX_TOKEN_LEN_PER_GPU}  # see actor.ppo_max_token_len_per_gpu above
     megatron:
       param_offload: True  # keep ref params on CPU when not computing log probs
       tensor_model_parallel_size: 8
@@ -267,16 +330,17 @@ trainer:
   # ppo_mini_batch_size=6 the multiple was 96 and run 3247540 never came up
   # short in 46 steps, so this was dormant.)
   balance_batch: False
-  # Fixed step cap (overrides the epoch-based count). 46 steps x TRAIN_BATCH_SIZE
-  # (parameter_sync_step 2 x ppo_mini_batch_size 48 = 96 prompts) = 4416 prompts
-  # -- exactly the fully-async recipe's total_rollout_steps: 4416 (job 3184869).
-  total_training_steps: 46
+  # Fixed step cap (overrides the epoch-based count). 92 steps x TRAIN_BATCH_SIZE
+  # (parameter_sync_step 1 x ppo_mini_batch_size 48 = 48 prompts) = 4416 prompts
+  # -- same total as the prior 46 x 96, and the fully-async recipe's
+  # total_rollout_steps: 4416 (job 3184869) -- just twice as many, half-size steps.
+  total_training_steps: 92
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 100  # > total_training_steps: no mid-run checkpoint on the shakedown (faster, cleaner signal). Lower for a real run (actor.checkpoint.strict is False so the multimodal-tower export gap is non-fatal).
-  test_freq: 46
+  test_freq: 92  # == total_training_steps: validate once, at the end
   val_before_train: true   # + a baseline validation before step 1
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
@@ -682,8 +746,15 @@ else
 fi
 
 
-# Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+# Download model (skip if already present, or if MODEL_CHECKPOINT_PATH points at
+# an existing local checkpoint to load from instead -- e.g. an SFT checkpoint).
+if [ -n "${MODEL_CHECKPOINT_PATH}" ]; then
+    if [ ! -d "${MODEL_CHECKPOINT_PATH}" ]; then
+        echo "FATAL: MODEL_CHECKPOINT_PATH=${MODEL_CHECKPOINT_PATH} does not exist"
+        exit 1
+    fi
+    echo "Using model checkpoint at ${MODEL_CHECKPOINT_PATH}, skipping HF download."
+elif [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
