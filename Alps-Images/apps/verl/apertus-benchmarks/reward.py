@@ -24,9 +24,17 @@ def extract_model_answer(response: str) -> Optional[str]:
 
 
 
-def compute_reward(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> float:
+def compute_reward(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> dict:
+   # Returning a dict (score + acc) instead of a bare float, so verl's naive
+   # reward manager (verl/experimental/reward_loop/reward_manager/naive.py)
+   # logs a genuinely clean 0/1 "acc" alongside the shaped training reward,
+   # instead of aliasing the whole shaped score as "acc" (its behavior for a
+   # bare-float return) -- val-core/{data_source}/acc/mean@1 was showing
+   # values like 1.1/0.9/-0.005 because of that, not comparable to a
+   # normalized eval like NeMo's. "score" (unchanged) still drives GRPO/PPO
+   # advantage computation; "acc" is exact-match-only, for eval comparability.
    if "<inner_prefix>" in solution_str and "<inner_suffix>" not in solution_str:
-       return 0.0
+       return {"score": 0.0, "acc": 0.0}
 
 
    model_ans = extract_model_answer(solution_str)
@@ -37,4 +45,4 @@ def compute_reward(data_source, solution_str, ground_truth, extra_info=None, **k
    length_penalty = -0.2 * min(1.0, max(0.0, (words - LENGTH_PENALTY_RAMP_START_WORDS)
                                          / (LENGTH_PENALTY_MAX_AT_WORDS - LENGTH_PENALTY_RAMP_START_WORDS)))
 
-   return outcome_reward + format_reward + length_penalty
+   return {"score": outcome_reward + format_reward + length_penalty, "acc": outcome_reward}
