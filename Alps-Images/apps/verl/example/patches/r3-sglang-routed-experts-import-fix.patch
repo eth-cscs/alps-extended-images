@@ -1,0 +1,76 @@
+# Fixes R3 (Rollout Router Replay)'s rollout-side routed-experts capture for this image's
+# actual SGLang version (0.5.16). Discovered debugging
+# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh -- see CLAUDE.md's Configuration audit
+# and the Run log entries for runs 3199623 / 3207151 and probe job 3199799.
+#
+# Two separate defects in verl v0.9.0's async_sglang_server.py, both fixed here (this patch
+# supersedes the earlier import-path-only version):
+#
+#  1. The `skip_tokenizer_init: True` branch did `captured.numpy()` on
+#     meta_info["routed_experts"], assuming a raw torch tensor. Current sglang stores that
+#     field as a base64-encoded int32 buffer regardless of skip_tokenizer_init (the encode
+#     happens in DetokenizerManager._b64_encode_per_request, which runs even with no
+#     tokenizer) -- so the branch raised `AttributeError: 'str' object has no attribute
+#     'numpy'` on every rollout call, cluster-wide, in run 3207151. This recipe's TP=32
+#     standalone rollout runs with skip_tokenizer_init=True, so it always hit this branch.
+#     Fix: drop the dead tensor branch; always decode via
+#     extract_routed_experts_from_meta_info + reshape (what the other branch already did).
+#
+#  2. The surviving branch imported extract_routed_experts_from_meta_info from
+#     sglang.srt.layers.moe.routed_experts_capturer, a path that does not exist in sglang
+#     0.5.16 -- the module was relocated/renamed to sglang.srt.state_capturer.routed_experts
+#     (confirmed by fetching the real sglang v0.5.16 tag: same function name, same
+#     single-arg signature). Fix: import from the new path, fall back to the old one so the
+#     patch is also correct against an older sglang / usable as an upstream PR.
+#
+# The reshape target -- [num_tokens, num_hidden_layers, num_experts_per_tok] -- matches
+# sglang 0.5.16's own RoutedExpertsCapturer buffer, which is allocated
+# num_layers=hf_text_config.num_hidden_layers wide (dense-layer slots stay zero); confirmed
+# by reading sglang/srt/state_capturer/routed_experts.py at the v0.5.16 tag. GLM-5.1
+# (glm_moe_dsa) exposes num_hidden_layers and num_experts_per_tok as flat top-level config
+# fields (same layout as transformers' glm4_moe), so the hasattr guard passes; if a future
+# checkpoint nests them, the guard raises a clear AttributeError rather than mis-shaping.
+#
+# Generated from a real edited git worktree at the verl v0.9.0 tag (not hand-written),
+# verified against a fresh checkout: applies cleanly (git apply --check), the patched file
+# compiles (python3 -m py_compile), and git apply --reverse --check correctly detects
+# "already applied" -- same verification discipline as this script's other patches.
+#
+# This only fixes the rollout (SGLang) side of R3. The actor-side fused DSA-THD kernel that
+# R3 also needs is covered by this script's megatron-core 0.19.0 + megatron-bridge 0.6.1
+# runtime upgrade block.
+diff --git a/verl/workers/rollout/sglang_rollout/async_sglang_server.py b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+index b3329a8..fe20e55 100644
+--- a/verl/workers/rollout/sglang_rollout/async_sglang_server.py
++++ b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+@@ -658,12 +658,24 @@ class SGLangHttpServer:
+ 
+         routed_experts = None
+         if self.config.enable_rollout_routing_replay:
+-            if self.config.skip_tokenizer_init:
+-                # convert to numpy
+-                captured = output.get("meta_info", {}).get("routed_experts", None)
+-                routed_experts = captured.numpy() if captured is not None else None
+-            else:
+-                from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
++            # sglang stores meta_info["routed_experts"] as a base64-encoded int32
++            # buffer (this is true regardless of skip_tokenizer_init -- the encode
++            # happens in DetokenizerManager._b64_encode_per_request, which runs even
++            # with no tokenizer). Decode + reshape to
++            # [num_tokens, num_hidden_layers, num_experts_per_tok]. The former
++            # skip_tokenizer_init branch assumed a raw tensor exposing .numpy(),
++            # which no current sglang provides -- it raised
++            # AttributeError: 'str' object has no attribute 'numpy'.
++            captured = output.get("meta_info", {}).get("routed_experts", None)
++            if captured is not None:
++                try:
++                    from sglang.srt.state_capturer.routed_experts import (
++                        extract_routed_experts_from_meta_info,
++                    )
++                except ImportError:
++                    from sglang.srt.layers.moe.routed_experts_capturer import (
++                        extract_routed_experts_from_meta_info,
++                    )
+ 
+                 hf_config = self.model_config.hf_config
+                 if not hasattr(hf_config, "num_hidden_layers") or not hasattr(hf_config, "num_experts_per_tok"):

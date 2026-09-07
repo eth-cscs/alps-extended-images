@@ -1,0 +1,113 @@
+# [CSCS, 2026-09-02] Weight-sync per-tensor progress logging + seed AND steady-sync lockstep
+# barrier.
+#
+# (1) DIAGNOSTIC: wraps the two Megatron weight-export generators (get_per_tensor_param = the
+#     full seed export; get_per_tensor_param_delta_shard = the delta_sharded steady export) so a
+#     collective hang shows, per rank, how far streaming got ("[WSYNC-DBG] rank=N ... tensor#K",
+#     every 1000 tensors + on exit). Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE / _DUMP_ON_TIMEOUT
+#     (set in the srun env).
+#
+# (2) FIX: a collective desync during weight sync (CLAUDE.md "Gloo all_gather_object" /
+#     gather_from_ep_ranks NCCL ALLGATHER 30-min timeout in stream_weights_megatron_to_hf, hit on
+#     the SEED path in runs 3141801/3207923/3219811/3240762 -- ~1 run in 2, the single biggest
+#     blocker to a full run for a long stretch). The seed sync (_send_full_seed) streams the full
+#     get_per_tensor_param() HF export, running a chain of PP/EP/TP assembly collectives per HF
+#     tensor; _send_full_seed drives that generator ASYMMETRICALLY -- rank 0 buckets + broadcasts
+#     each flush to the rollout CE group between pulls, every non-master rank just discards its
+#     tensor and pulls the next -- so non-master ranks race ahead in the per-tensor collective
+#     chain until a later cross-group collective deadlocks. Fix: for the seed export,
+#     torch.distributed.barrier() on the trainer WORLD group every VERL_WSYNC_SEED_BARRIER_EVERY
+#     (default 1) HF tensors, AFTER the consumer processed each -- no rank can start tensor K+1's
+#     assembly collectives until every rank finished K, so drift is bounded to
+#     VERL_WSYNC_SEED_BARRIER_EVERY. Validated across 10+ runs with zero recurrence.
+#
+#     Run 3263683 (the first run to ever reach a real, full-scale delta_sharded STEADY sync --
+#     every prior run died earlier, on the seed hang or a step-1 GPU/host-RAM OOM) hit the SAME
+#     desync class there: an NCCL ALLGATHER hang on the steady sync's very first flush. The
+#     steady path's _GatherQueue was assumed "count-lockstepped by design" (CLAUDE.md run
+#     3219811's investigation) and deliberately left unbarriered -- that assumption is now
+#     disproven by direct evidence. Fix: extend the identical barrier to the "delta-steady" tag
+#     too. Steady syncs are far smaller than the seed (only changed values), so per-item
+#     barriering there is cheap.
+#
+# Generated from a real edited git worktree at the verl v0.9.0 tag; verified against a fresh
+# checkout: git apply --check clean, py_compile clean, git apply --reverse --check detects
+# "already applied".
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index e8a6c56..259cdd7 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -87,6 +87,53 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ 
++
++def _wsync_progress_log(gen, tag):
++    """[weight-sync debug + seed/steady-sync lockstep fix, CSCS] Wrap a per-tensor weight-export
++    generator.
++
++    (1) Diagnostic: on a collective hang during weight sync, print per rank how far the
++        streaming got (which tensor / how long). Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE.
++    (2) Fix for megatron-bridge / delta-engine collective desyncs during weight sync (CLAUDE.md:
++        gather_from_ep_ranks / broadcast_obj_from_pp_rank timeout on the seed path, runs
++        3141801 / 3207923 / 3219811 / 3240762; and an NCCL ALLGATHER hang on the delta-STEADY
++        path's very first flush, run 3263683 -- the first run to ever reach that path at real
++        scale). For BOTH the "seed/full" and "delta-steady" exports, torch.distributed.barrier()
++        on the trainer WORLD group every VERL_WSYNC_SEED_BARRIER_EVERY (default 1) items, AFTER
++        the consumer has processed each -- no rank can start the next item's assembly/gather
++        collectives until every rank finished the current one, so drift is bounded to
++        VERL_WSYNC_SEED_BARRIER_EVERY. The seed export drives its generator asymmetrically (rank
++        0 buckets + broadcasts each flush to the rollout CE group between pulls, non-master ranks
++        discard and pull the next) -- the delta-steady _GatherQueue path was assumed
++        "count-lockstepped by design" and left unbarriered, but run 3263683 showed that
++        assumption does not hold at real scale. Steady syncs are far smaller than the seed
++        (only changed values), so per-item barriering there is cheap."""
++    import time as _t
++
++    _rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "?"
++    _barrier_tag = tag in ("seed/full", "delta-steady")
++    try:
++        _every = max(1, int(os.environ.get("VERL_WSYNC_SEED_BARRIER_EVERY", "1")))
++    except ValueError:
++        _every = 1
++    _t0 = _t.time()
++    _n = 0
++    try:
++        for _item in gen:
++            _n += 1
++            if _n % 1000 == 1:
++                try:
++                    _name = getattr(_item, "name", None) or (_item[0] if isinstance(_item, (tuple, list)) else "?")
++                except Exception:
++                    _name = "?"
++                print(f"[WSYNC-DBG] rank={_rank} {tag} tensor#{_n} name={_name} t+{_t.time() - _t0:.0f}s", flush=True)
++            yield _item
++            if _barrier_tag and (_n % _every == 0) and torch.distributed.is_initialized():
++                torch.distributed.barrier()
++    finally:
++        print(f"[WSYNC-DBG] rank={_rank} {tag} generator exited after {_n} tensors, {_t.time() - _t0:.0f}s", flush=True)
++
++
+ def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
+     """Return the scalar temperature required by fused linear cross entropy."""
+     values = torch.as_tensor(temperature).detach().flatten()
+@@ -1042,7 +1089,7 @@ class MegatronEngine(BaseEngine):
+ 
+             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
+ 
+-        return per_tensor_param, peft_config
++        return _wsync_progress_log(per_tensor_param, "seed/full"), peft_config
+ 
+     def _mcore_export_index(self):
+         """Build (once) the per-parameter delta export index: geometry specs and
+@@ -1104,7 +1151,9 @@ class MegatronEngine(BaseEngine):
+ 
+         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
+         gen, _ = self.get_per_tensor_param_shard()
+-        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
++        return _wsync_progress_log(
++            hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), "delta-steady"
++        ), None
+ 
+     def disable_adapter(self) -> ContextManager:
+         return self.peft_cls.disable_adapter(self.module)

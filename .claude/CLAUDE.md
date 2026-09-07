@@ -2943,9 +2943,8 @@ DeepSeek-V3 (671B, MoE + MLA) GRPO on GSM8K, CSCS Alps. Script:
 `verl-cuda:alps7-dev-621fa40275c4f036`, same V1 `separate_async` trainer, same 6 verl source
 patches + PR #7421/#7422/#7423, same 128-node TP=4/PP=3/EP=8/DP=5 layout, same `delta_sharded`
 weight sync, same CPU-offload optimizer / bf16 grads / fused CE / `param_offload: False`
-memory settings). **Entirely UNVERIFIED on the cluster** — a first cut derived from a validated
-recipe, not a validated recipe. Every DeepSeek-specific edit is marked `DeepSeek-V3` in the
-script; the script header lists them and the first-run watch-points.
+memory settings). **VALIDATED 2026-09-07 (run `3309430`: 40/40 steps, exit 0)** after 5 runs and three real
+bugs (see the Run log). Every DeepSeek-specific edit is marked `DeepSeek-V3` in the script.
 
 ## What differs from the GLM-5.1 recipe (and why — all checked against real source, not memory)
 
@@ -3057,6 +3056,83 @@ differ. ShellCheck not installed locally.
 
 ## Run log
 
+### Run `3309430` — 2026-09-07 — **VALIDATED: 40/40 steps, COMPLETED exit 0, 58 min.** The P2P gather fix works; DeepSeek-V3 trains cleanly on the delta_sharded path.
+
+- **Log**: `~/Downloads/slurm-3309430.out` (5.9 MB, 44,292 lines; > the FirecREST `ops/download`
+  limit — fetched via `transfer/download` with `{"sourcePath":..., "transferDirectives":
+  {"transferMethod":"s3"}}` → poll the returned S3 URL until 200). Submitted directly via
+  FirecREST (the train-launcher agents kept stalling on the harness stream watchdog), ~21 h
+  queued, ran 05:38–06:36 UTC.
+- **Everything green**: 8 patches + sglang fix 128/128, 0 FATAL, seed sync clean, SGLang up,
+  `[REWARD-DUMP]` coherent, then **40 training steps, `Training Progress: 100%`**, zero
+  `Watchdog` / OOM / `ActorDiedError` / host-RAM lines. Only NCCL WARN: the benign
+  `NET/OFI GIN only supports RDMA`.
+- **Steady delta syncs (the thing that hung 3 runs in a row): every one completed** —
+  `timing_s/update_weights` **25–34 s**, `checkpoint_engine/changed_ratio` **1.6–2.7 %** per
+  sync (≈ the bf16-rounding estimate), payload 62–103 GB, 120–200 flushes of 512 MB.
+- **Training health**: `actor/ppo_kl` **0.0004–0.0027** (run `3279810`'s broken rollout: 1.35–
+  1.68; GLM-5.1: ~0.4 — DeepSeek-V3 trainer/SGLang agreement is Apertus-grade),
+  `critic/score/max` 1.1 every step, `critic/score/mean` **0.81 → ~1.05** (near-saturated by
+  step ~12; GSM8K is easy for this model), `actor/grad_norm` 0.1–0.55 (one benign 0 at step
+  26), `response_length/mean` **202 → ~110 tokens** with `clip_ratio` 0.27 → 0.006 (classic
+  GRPO compression, as on Apertus), peak GPU 45.6 GB flat. `timing_s/step` ~50–70 s after
+  step 1 (299 s, includes the first generation warm-up): `update_actor` ~25 s, `update_weights`
+  ~25 s, `gen` 0–18 s (overlapped). `perf/throughput` ~1.3 (verl's per-GPU number; not
+  comparable to the Apertus/GLM figures without checking the denominator).
+- **Stall dumper false positives**: 19 `[WSYNC-STALL] ... still inside send_weights` dumps and
+  "finished after 600/900/1200 s" lines even though every sync took < 35 s — the helper checked
+  the *persistent* Ray AsyncIO thread, which by the time it looked (600 s later) was already
+  inside the NEXT sync's `send_weights`. Harmless noise; **retired** (heredoc + apply step +
+  head-node `NCCL_DEBUG` removed from the script; `patches/delta-sharded-steady-stall-diag.patch`
+  kept in the repo for reference, not applied).
+- **Status**: recipe validated. Open follow-ups: (1) checkpoint saving is off (`save_freq: -1`)
+  — enable `actor.megatron.use_dist_checkpointing: True` (untested) before a run that needs
+  checkpoints; (2) node count could come down (peak 45.6 GB/95 GB); (3) **port
+  `delta-sharded-p2p-gather.patch` + `delta-sharded-gather-round-size.patch` + the
+  `gather_round_megabytes` knob to the GLM-5.1 recipe** (same latent bugs — its run `3263683`
+  hang); (4) upstream candidates: the sglang qkv_a cache fix, the P2P gather, the gather-round
+  kwarg; (5) `[REWARD-DUMP]` left in (6 lines per reward process, cheap).
+- **Commit**: not committed.
+
+### Run `3293605` — 2026-09-05 — DIAGNOSTIC run: the stall dumper worked — rank 0 is blocked INSIDE `torch.distributed.gather` (the padded 480-way value gather) before the work is enqueued. Root cause of the steady-sync hang found; fixed by replacing the padded gathers with targeted P2P.
+
+- **Log**: `~/Downloads/slurm-3293605.out` (2.27 MB; pulled directly via FirecREST after the
+  monitor agents repeatedly stalled on the harness side — ~24 h queue, then ran ~50 min,
+  FAILED exit 15, 0 steps). Setup identical to `3289420` and all green (8 patches + sglang fix
+  128/128, 0 FATAL, seed 154.5 s, `[REWARD-DUMP]` coherent, `[MEMDUMP]` fine, step 1 done).
+- **`[WSYNC-STALL]` fired 5× (600/900/1200/1500/1800 s) on rank 0** (`WorkerDict pid=65393
+  ip=172.28.26.100` — NOT the head node this time, so the head-node-only `NCCL_DEBUG=INFO`
+  missed it; the only NCCL WARN anywhere was the benign `NET/OFI GIN only supports RDMA`).
+  `py-spy --native` was refused (`Can't get native stack traces with the --nonblocking
+  option`); faulthandler + python-only py-spy worked. The active thread ("AsyncIO Thread:
+  default"), identical in all 5 dumps:
+  ```
+  gather                          torch/distributed/distributed_c10d.py:4401
+  gather_slot_entries_to_rank0    verl/checkpoint_engine/delta_sync/sparse_gather.py:137   # dist.gather(val_pad, val_list, ...)
+  gather_slot_entries_to_rank0    sparse_gather.py:109                                     # sub-round recursion
+  _flush / put / send_weights     delta_checkpoint_engine.py:274 / :247 / :724
+  update_weights                  verl/workers/engine_workers.py:758
+  ```
+  i.e. rank 0 never returns from the Python `dist.gather` call for the sub-round VALUE gather
+  (the index gather on line 136 completed) — stuck in NCCL's host-side launch of a 480-peer
+  gather-to-one; the work is never enqueued, so the flight recorder could only show "enqueued
+  N, completed N". Other ranks: 6 stuck at `SeqNum=7 GATHER NumelIn=3009803` (their send half
+  of that gather), 6 at `SeqNum=8 ALLGATHER NumelIn=6` (already past it — small sends can
+  complete into NCCL staging buffers without the root's recv). Every other thread on rank 0
+  idle. Confirms the `3289420` reading; it is reproducible (2/2 real-gradient runs + GLM
+  `3263683`).
+- **Fix — `example/patches/delta-sharded-p2p-gather.patch`** (new, touches only
+  `sparse_gather.py`): the counts matrix is already all-gathered, so contributing ranks (those
+  with non-zero totals — ≤ a stage's tp×ep group, typically 4 or 32) send idx then val to rank
+  0 in one `batch_isend_irecv`; rank 0 posts irecvs of exactly their sizes. No `world × max_n`
+  padding, fan-in = contributors instead of 479, rank-0 memory = real bytes. Output
+  bit-identical to the padded version — **verified locally on gloo/CPU, 6 processes, 6 random
+  trials × {no cuts, sub-round cuts}, incl. an all-empty round and ranks with zero entries**
+  (`scratchpad/sg_test.py`). Full 8-patch chain applies + compiles on fresh v0.9.0.
+  `gather_round_megabytes` 16 → 64 (rank 0 no longer pays world× padding). Stall dumper and
+  NCCL debug left in place for one more run. Unverified on cluster.
+- **Commit**: not committed.
+
 ### Run `3289420` — 2026-09-04 — gather-round patch cleared the rank-0 OOM; the first real-gradient steady delta sync then HANGS (30-min NCCL timeout) — rank 0 stuck launching a 480-peer gather-to-one. Same signature as GLM run `3263683`.
 
 - **Log**: `~/Downloads/slurm-3289420.out` (2.18 MB). 128 nodes, `clariden`. ~28 min queued,
@@ -3097,6 +3173,18 @@ differ. ShellCheck not installed locally.
   engineering in `delta_export.py` + `delta_checkpoint_engine.py`, cluster-only validation.
   (C) instrument rank 0 with a periodic `faulthandler` stack dump inside `send_weights` to pin
   the exact NCCL frame before choosing.
+- **Decision (user, 2026-09-04): (C) — instrument first.** Added
+  `example/patches/delta-sharded-steady-stall-diag.patch` (diagnostic only, applied after the
+  gather-round patch, same file): on rank 0's steady `send_weights`, a daemon thread waits
+  600 s and then every 300 s prints all Python thread stacks (`faulthandler`) + `py-spy dump
+  --native` (fallback: python-only) as `[WSYNC-STALL]` lines to stderr → the slurm log, well
+  before the 1800 s watchdog; self-terminates when `send_weights` returns. Verified: applies on
+  v0.9.0 + gather patch, compiles, reverse-check OK, full 7-patch chain applies; helper
+  unit-tested locally (dumps fire while inside `send_weights`, stop after). Plus
+  `NCCL_DEBUG=INFO` / `NCCL_DEBUG_SUBSYS=INIT,NET` exported on the HEAD node only (global rank
+  0 lives there; Ray workers inherit the `ray start` env) for libfabric/CXI transport warnings.
+  `gather_round_megabytes: 16` kept. Expected outcome: the next hang produces rank 0's exact
+  Python + native frames; if it instead completes, the 3289420 hang was a flake.
 - **Commit**: not committed.
 
 ### Run `3289294` — 2026-09-04 — sglang qkv_a fix CONFIRMED (coherent, correct generations); new blocker: rank-0 GPU OOM in the first steady delta sync (WORLD-group gather × 512 MB rounds)

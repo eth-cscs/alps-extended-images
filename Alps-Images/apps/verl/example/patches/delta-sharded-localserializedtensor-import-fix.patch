@@ -1,0 +1,39 @@
+# [CSCS, 2026-08-30] verl v0.9.0's delta_sharded weight-sync path
+# (_update_weights_delta_flush in sglang_rollout.py) hardcodes
+#   from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+# but this image's sglang (0.5.16, the GLM-5.1 DSA build) moved that class to
+#   sglang.srt.model_executor.model_runner_components.weight_updater
+# -- confirmed by reading sglang v0.5.16's own weight_sync/utils.py, which imports it from the
+# new path (line 10-12), and the class definition at model_runner_components/weight_updater.py:370.
+# Same class of verl-vs-sglang import drift as r3-sglang-routed-experts-import-fix.patch. Found by
+# run 3223205: delta_sharded's trainer-side export worked cleanly (no gather_from_ep_ranks hang!)
+# but the first delta flush died on the rollout side with
+#   ImportError: cannot import name 'LocalSerializedTensor' from 'sglang.srt.model_executor.model_runner'
+#
+# Fix: try the new path, fall back to the old (so it also works against an older sglang / as an
+# upstream PR). Only the import moves; the LocalSerializedTensor(values=[...]) construction a few
+# lines below is unchanged. The other three sglang imports in the same function
+# (UpdateWeightsFromTensorReqInput, MultiprocessingSerializer, monkey_patch_torch_reductions) were
+# checked against sglang v0.5.16 and are still at their hardcoded paths.
+#
+# Generated from a real edited git worktree at the verl v0.9.0 tag; verified against a fresh
+# checkout: git apply --check clean, py_compile clean, git apply --reverse --check detects
+# "already applied".
+diff --git a/verl/workers/rollout/sglang_rollout/sglang_rollout.py b/verl/workers/rollout/sglang_rollout/sglang_rollout.py
+index 07e30d0..bf05f07 100644
+--- a/verl/workers/rollout/sglang_rollout/sglang_rollout.py
++++ b/verl/workers/rollout/sglang_rollout/sglang_rollout.py
+@@ -401,7 +401,12 @@ class ServerAdapter(BaseRollout):
+         """
+         import torch.distributed as dist
+         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+-        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
++
++        try:
++            # sglang >= ~0.5.16 (the version this image ships): LocalSerializedTensor moved here
++            from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor
++        except ImportError:
++            from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+         from sglang.srt.utils import MultiprocessingSerializer
+         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+ 

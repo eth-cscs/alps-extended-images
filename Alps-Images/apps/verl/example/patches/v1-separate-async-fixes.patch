@@ -1,0 +1,145 @@
+# Local fixes for verl v0.9.0's V1 separate-async trainer, discovered debugging
+# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh (see Known hazards and the
+# Run log in CLAUDE.md for the full incident history). Re-diff against a newer verl
+# ref if this stops applying.
+#
+# 1. LLMServerManager._initialize_llm_servers (verl/workers/rollout/llm_server.py):
+#    PPOTrainer._setup() always builds hybrid rollout replicas on top of the
+#    training worker group (trainer_world_size / rollout_world_size replicas) *in
+#    addition to* the standalone rollout -- actor_rollout_ref.hybrid_engine is not
+#    consulted anywhere in the V1 path, so this could not be disabled from config.
+#    Those replicas are instantiated at gpu_memory_utilization=0.75 on the training
+#    GPUs during trainer.init(), before the first on_sample_end() ever runs, and
+#    free_cache_engine=false (required for TP=32 SGLang stability) makes their
+#    sleep() a no-op -- so they held ~71 GiB per training GPU for the life of the
+#    run. trainer.init() then needs ~15 GiB back on those same GPUs to stage
+#    Megatron params for the NCCL export to the standalone rollout, and OOMed
+#    (runs 3121001, 3125195, 3129805). separate-async never actually needs the
+#    hybrid engine: get_llm_client() is overridden in PPOTrainerSeparateAsync to
+#    always route through the standalone rollout, so the hybrid replicas existed
+#    only to be immediately put to sleep. Fixed by no-oping hybrid-mode calls
+#    (worker_group is not None); standalone-mode calls (worker_group is None) are
+#    unaffected. Confirmed fixed in run 3134772 (no OOM, training reached step 0).
+#
+# 2. PPOTrainerSeparateAsync.on_init_end (verl/trainer/ppo/v1/trainer_separate_async.py):
+#    drops the self.checkpoint_manager.update_weights(...) call. That manager's
+#    backend is forced to "naive" (trainer_base.py), which pushes weights into
+#    each worker's colocated hybrid engine directly rather than going through a
+#    replica list -- with hybrid replicas disabled by fix 1 above, that colocated
+#    engine is never created, so the call would push into nothing.
+#    self.standalone_checkpoint_manager.update_weights(...), the actual sync to
+#    the standalone rollout, is left untouched. Paired with fix 1; same runs.
+#
+# 3. list_of_dict_to_tensordict (verl/utils/tensordict_utils.py): decided
+#    nested-vs-stacked per field by checking `all(item.shape == val_list[0].shape
+#    for item in val_list)` -- trivially true for a length-1 list (this function
+#    is called once per rollout output, so len(list_of_dicts) is often 1) and also
+#    true whenever several ragged items (e.g. GRPO rollout-group responses)
+#    coincidentally share a length, most commonly by all saturating
+#    max_response_length. Silently produced a dense Tensor for fields callers
+#    assume are nested (input_ids, prompts, responses, position_ids), and any
+#    downstream .offsets() call then raised
+#    AttributeError: 'Tensor' object has no attribute 'offsets' (runs 3134772,
+#    3136766, 3137775). Fixed by delegating non-scalar tensor fields
+#    unconditionally to this same file's own nested_tensor_from_tensor_list (used
+#    elsewhere in the file for chunking/dispatch, and already correct there) --
+#    no more shape-equality guessing. This was a real, independent bug, but ended
+#    up never being the sole cause of the offsets crashes in this chain: see
+#    CLAUDE.md's run 3144665/3149736 entries for the actual root cause, a
+#    same-shaped bug in the separately pip-installed TransferQueue==0.1.6 (fixed
+#    upstream in 0.1.7; the training script upgrades the wheel at runtime rather
+#    than patching it here, since it isn't part of this checkout). Confirmed fixed
+#    end-to-end for the whole recipe in run 3149736 (14/231 training steps
+#    completed, sane metrics, zero offsets crashes).
+#
+# Originally shipped as sitecustomize.py runtime monkeypatches (fast to iterate on
+# mid-debugging -- no hand-crafted diff needed while the exact fix was still
+# changing), converted to this source patch once run 3149736 confirmed all three
+# were correct and stable: same reasoning as the Apertus benchmark's equivalent
+# conversion (apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch) --
+# a runtime monkeypatch is great for fast iteration but not the form a stable fix
+# should end up in. A plain source patch is one less moving part (no
+# sys.meta_path machinery, no PYTHONPATH staging, no import-timing dependency)
+# and the actual behavior is just readable in the file.
+diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
+index 18a06ee2..4c1815a5 100644
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -133,7 +133,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+     def on_init_end(self):
+         # update weights after loading checkpoint
+         self.standalone_checkpoint_manager.update_weights(self.global_steps)
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        # self.checkpoint_manager (the hybrid-replica sync path) is skipped: its
++        # backend is forced to "naive", which pushes weights into each worker's
++        # colocated hybrid engine directly rather than through a replica list --
++        # with LLMServerManager._initialize_llm_servers disabling hybrid replicas
++        # (see llm_server.py), that colocated engine is never created, so this call
++        # would push into nothing. self.standalone_checkpoint_manager.update_weights
++        # above, the actual sync to the standalone rollout, is unaffected.
+
+     def on_train_begin(self):
+         if self.config.skip.rollout_tq.enable:
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+index 91d82b15..810ccbee 100644
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -930,20 +930,21 @@ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDic
+     dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
+     batch_size = len(list_of_dicts)
+
+-    final_data = {
+-        key: (
+-            torch.stack(val_list)
+-            if val_list
+-            and all(isinstance(item, torch.Tensor) for item in val_list)
+-            and all(item.shape == val_list[0].shape for item in val_list)
+-            else (
+-                torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
+-                if val_list and all(isinstance(item, torch.Tensor) for item in val_list)
+-                else NonTensorStack(*val_list)
+-            )
+-        )
+-        for key, val_list in dict_of_lists.items()
+-    }
++    def _pack(val_list):
++        if not val_list or not all(isinstance(item, torch.Tensor) for item in val_list):
++            return NonTensorStack(*val_list)
++        # Scalar tensors have no dimension to make ragged along.
++        if all(item.dim() == 0 for item in val_list):
++            return torch.stack(val_list)
++        # Always nested -- never guess dense-vs-ragged from shape equality: that
++        # heuristic is trivially wrong for a length-1 list (every item "matches"
++        # its own shape) and misfires whenever several ragged items coincidentally
++        # share a length (e.g. multiple GRPO rollout responses that all saturate
++        # max_response_length), silently producing a dense Tensor for fields
++        # callers assume are nested and crashing their .offsets() calls downstream.
++        return nested_tensor_from_tensor_list(val_list)
++
++    final_data = {key: _pack(val_list) for key, val_list in dict_of_lists.items()}
+
+     td = TensorDict(final_data, batch_size=[batch_size])
+
+diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
+index d9beede7..4e2d767e 100644
+--- a/verl/workers/rollout/llm_server.py
++++ b/verl/workers/rollout/llm_server.py
+@@ -523,6 +523,18 @@ class LLMServerManager:
+                 so standalone replicas can avoid Ray named-actor collisions with hybrid
+                 replicas (which start at 0) when both coexist (e.g. separate async).
+         """
++        # separate-async's standalone rollout makes the hybrid replicas this method
++        # would otherwise build on top of the training worker group pure overhead:
++        # get_llm_client() is overridden elsewhere to always route through the
++        # standalone rollout, so hybrid replicas exist only to be put to sleep. Building
++        # them anyway costs ~gpu_memory_utilization worth of every training GPU during
++        # init, which the trainer's own weight-sync needs back (OOM without this).
++        if self.worker_group is not None:
++            self.rollout_replicas = []
++            self.server_handles = []
++            self.server_addresses = []
++            print("LLMServerManager: hybrid replicas disabled (worker_group is set) — skipping init_hybrid()")
++            return
+         if start_rank is None:
+             start_rank = self.start_rank
+         rollout_world_size = (

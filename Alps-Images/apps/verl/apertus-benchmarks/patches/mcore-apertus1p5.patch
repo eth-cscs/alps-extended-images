@@ -1,0 +1,33 @@
+diff --git a/megatron/core/transformer/mlp.py b/megatron/core/transformer/mlp.py
+--- a/megatron/core/transformer/mlp.py
++++ b/megatron/core/transformer/mlp.py
+@@ -234,7 +234,8 @@
+             name=(name + ".linear_fc1") if name is not None else None,
+         )
+ 
+-        if self.config.use_te_activation_func and not (submodules.activation_func is None):
++        self._activation_func_is_module = submodules.activation_func is not None
++        if self._activation_func_is_module:
+             self.activation_func = apply_module(submodules.activation_func(config=self.config))
+         else:
+             self.activation_func = self.config.activation_func
+@@ -265,7 +266,7 @@
+         nvtx_range_pop(suffix="linear_fc1")
+ 
+         nvtx_range_push(suffix="activation")
+-        if self.config.use_te_activation_func:
++        if self.config.use_te_activation_func or self._activation_func_is_module:
+             if bias_parallel is not None:
+                 intermediate_parallel = intermediate_parallel + bias_parallel
+             intermediate_parallel = self.activation_func(intermediate_parallel)
+diff --git a/megatron/core/distributed/finalize_model_grads.py b/megatron/core/distributed/finalize_model_grads.py
+--- a/megatron/core/distributed/finalize_model_grads.py
++++ b/megatron/core/distributed/finalize_model_grads.py
+@@ -451,6 +451,7 @@
+                 # Check if this param needs sum reduction (sequence parallel or qk_layernorm)
+                 elif (config.sequence_parallel and getattr(param, "sequence_parallel", False)) or (
+                     config.qk_layernorm and ("q_layernorm" in name or "k_layernorm" in name)
++                    or getattr(param, "sum_gradients_across_tp_domain", False)
+                 ):
+                     grad_attr = _get_main_grad_attr(param)
+                     grad = getattr(param, grad_attr)

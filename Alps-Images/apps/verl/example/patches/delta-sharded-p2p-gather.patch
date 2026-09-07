@@ -1,0 +1,105 @@
+# [CSCS, 2026-09-06] delta_sharded steady sync: replace the padded group-wide dist.gather pair
+# in sparse_gather.gather_slot_entries_to_rank0 with targeted point-to-point transfers from the
+# ranks that actually hold entries.
+#
+# Found on train-gsm8k-deepseek-v3-671B-v1-separate-async-megatron.sh. Runs 3289420 and 3293605
+# (and GLM-5.1 run 3263683): the first steady delta sync carrying real gradients hangs for the
+# full 30-min NCCL timeout. The rank-0 stall dumper (delta-sharded-steady-stall-diag.patch, run
+# 3293605) pinned it: rank 0 (the wire master) is blocked INSIDE torch.distributed.gather at
+# sparse_gather.py:137 (the value gather of a sub-round; the index gather right before it
+# completed) -- the call never returns and the work is never enqueued, i.e. NCCL's host-side
+# launch of a 480-peer gather-to-one stalls. Under PP>1 delta_export.py merges every param over
+# the WORLD group, so each round was a 479->1 P2P fan-in into one GPU over Slingshot with
+# world x max_n padded receive lists (the OOM of run 3289294, fixed by the gather-round patch,
+# was the same design). Rounds carrying ~1700 changed elements (run 3279810, zero-gradient
+# training) always worked; real payloads never did.
+#
+# Fix: the counts matrix is already all-gathered, so every rank knows which ranks contribute to
+# this round. Contributing ranks (<= a stage's tp x ep group, typically 4 or 32) send idx then
+# val to rank 0 in one batch_isend_irecv; rank 0 posts matching irecvs of exactly their sizes.
+# No padding, no world-wide fan-in, rank-0 memory = the real gathered bytes. Output is
+# bit-identical to the padded version (per slot, pieces concatenated in rank order) --
+# verified locally on gloo/CPU with 6 processes, 6 random trials x {no cuts, sub-round cuts},
+# including an all-empty round and ranks with zero entries. The all_gather of counts, the
+# sub-round cut logic and gather_round_megabytes (now a cap on the real per-round data) are
+# unchanged. Upstreamable.
+#
+# Generated from a real git worktree at verl v0.9.0 (this file is touched by no other patch);
+# git apply --check / py_compile / --reverse --check verified.
+diff --git a/verl/checkpoint_engine/delta_sync/sparse_gather.py b/verl/checkpoint_engine/delta_sync/sparse_gather.py
+index b3ce23f3..2198548d 100644
+--- a/verl/checkpoint_engine/delta_sync/sparse_gather.py
++++ b/verl/checkpoint_engine/delta_sync/sparse_gather.py
+@@ -125,28 +125,56 @@ def gather_slot_entries_to_rank0(
+         empty_v = torch.empty(0, dtype=val_concat.dtype, device=dev)
+         return [(empty_i, empty_v) for _ in range(k)]
+ 
+-    idx_pad = torch.zeros(max_n, dtype=idx_concat.dtype, device=dev)
+-    val_pad = torch.zeros(max_n, dtype=val_concat.dtype, device=dev)
+-    n = int(idx_concat.numel())
+-    idx_pad[:n] = idx_concat
+-    val_pad[:n] = val_concat
+-
+-    idx_list = [torch.zeros(max_n, dtype=idx_pad.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+-    val_list = [torch.zeros(max_n, dtype=val_concat.dtype, device=dev) for _ in range(world)] if rank == 0 else None
+-    dist.gather(idx_pad, idx_list, dst=dst, group=group)
+-    dist.gather(val_pad, val_list, dst=dst, group=group)
++    # [CSCS, 2026-09-06] Targeted point-to-point transfer instead of two padded, group-wide
++    # dist.gather calls. The counts matrix above already tells every rank which ranks hold
++    # entries for this round, so only THOSE ranks send (idx then val, one batched P2P group)
++    # and rank 0 receives exactly their sizes -- no world x max_n padded lists, and the
++    # fan-in is the number of contributing ranks (<= a stage's tp x ep group under PP>1)
++    # instead of the whole group. Under PP>1 the delta export merges every param over the
++    # 480-rank WORLD group; the padded gather-to-one from 479 peers hung inside NCCL's
++    # host-side launch on Slingshot (rank 0 blocked in dist.gather before the work was even
++    # enqueued -- DeepSeek-V3 runs 3289420 / 3293605, GLM-5.1 run 3263683). Output is
++    # bit-identical to the padded version: per slot, the pieces are concatenated in rank order.
++    contributors = [r for r in range(world) if totals[r] > 0]
+     if rank != 0:
++        if totals[rank] > 0:
++            ops = [
++                dist.P2POp(dist.isend, idx_concat.contiguous(), dst, group=group),
++                dist.P2POp(dist.isend, val_concat.contiguous(), dst, group=group),
++            ]
++            for w in dist.batch_isend_irecv(ops):
++                w.wait()
+         return None
+ 
++    recv_idx: dict[int, torch.Tensor] = {}
++    recv_val: dict[int, torch.Tensor] = {}
++    ops = []
++    for r in contributors:
++        if r == 0:
++            recv_idx[0] = idx_concat
++            recv_val[0] = val_concat
++            continue
++        src = dist.get_global_rank(group, r) if group is not None else r
++        recv_idx[r] = torch.empty(totals[r], dtype=idx_concat.dtype, device=dev)
++        recv_val[r] = torch.empty(totals[r], dtype=val_concat.dtype, device=dev)
++        ops.append(dist.P2POp(dist.irecv, recv_idx[r], src, group=group))
++        ops.append(dist.P2POp(dist.irecv, recv_val[r], src, group=group))
++    if ops:
++        for w in dist.batch_isend_irecv(ops):
++            w.wait()
++
+     # per-rank cumulative offsets into each blob, sliced per param then stitched across ranks
+-    offs = [[0] * (k + 1) for _ in range(world)]
+-    for r in range(world):
+-        for i in range(k):
+-            offs[r][i + 1] = offs[r][i] + counts_cpu[r][i]
++    offs = {r: 0 for r in contributors}
+     out = []
+     for i in range(k):
+-        idx_pieces = [idx_list[r][offs[r][i] : offs[r][i + 1]] for r in range(world) if counts_cpu[r][i]]
+-        val_pieces = [val_list[r][offs[r][i] : offs[r][i + 1]] for r in range(world) if counts_cpu[r][i]]
++        idx_pieces = []
++        val_pieces = []
++        for r in contributors:
++            c = counts_cpu[r][i]
++            if c:
++                idx_pieces.append(recv_idx[r][offs[r] : offs[r] + c])
++                val_pieces.append(recv_val[r][offs[r] : offs[r] + c])
++                offs[r] += c
+         if idx_pieces:
+             out.append((torch.cat(idx_pieces), torch.cat(val_pieces)))
+         else:

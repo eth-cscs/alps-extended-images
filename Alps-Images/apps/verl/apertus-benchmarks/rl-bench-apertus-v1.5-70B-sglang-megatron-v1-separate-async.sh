@@ -88,9 +88,12 @@ export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/users/xyixuan/
 export ENABLE_THINKING="False"
 
 # Response-length budget is tied to ENABLE_THINKING:
-#   thinking OFF (short, direct answers): 500 tokens, ppo_max_token_len_per_gpu
-#     16384 -- VALIDATED (run 3283187: 46/46 steps, peak mem 73.9-76.3/95 GiB,
-#     no OOM).
+#   thinking OFF (short, direct answers): 500 -> 2048 tokens,
+#     ppo_max_token_len_per_gpu left at 16384 -- UNTESTED at 2048, but very low
+#     risk: 500/16384 was VALIDATED (run 3283187: 46/46 steps, peak mem
+#     73.9-76.3/95 GiB, no OOM) with 15872 tokens of headroom over the floor
+#     (512+500=1012); 2048 only narrows that to 13824 (floor 512+2048=2560),
+#     still far more headroom than either validated 8192 or 12288 pairing.
 #   thinking ON (needs room for a <think> turn): 12288 tokens,
 #     ppo_max_token_len_per_gpu 16384 -- UNTESTED. 8192/12288 was validated
 #     (run 3284608: 92/92 steps, peak mem 71.76/95 GiB, no OOM); 16384/20480
@@ -108,7 +111,7 @@ if [ "${ENABLE_THINKING}" = "True" ]; then
     export MAX_RESPONSE_LENGTH=12288
     export PPO_MAX_TOKEN_LEN_PER_GPU=16384
 else
-    export MAX_RESPONSE_LENGTH=500
+    export MAX_RESPONSE_LENGTH=2048
     export PPO_MAX_TOKEN_LEN_PER_GPU=16384
 fi
 

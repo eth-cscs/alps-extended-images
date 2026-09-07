@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=128
+#SBATCH --nodes=80
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -43,7 +43,7 @@
 # is the first thing to look at if init OOMs.
 # ─────────────────────────────────────────────────────────────────────────────
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-621fa40275c4f036" #alps7-dev-a9f9e56471c0574e image with update dependencies #alps7-dev-0f334b540ccc7034 image with megatron
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-a9f9e56471c0574e" #alps7-dev-a9f9e56471c0574e image with update dependencies #alps7-dev-0f334b540ccc7034 image with megatron
 
 export MODEL_NAME="GLM-5.1"
 export MODEL_REPO="zai-org"
@@ -62,16 +62,7 @@ cd $TRAINING_HOME
 
 
 # Standalone rollout needs exactly 8 nodes for TP=32 (8 nodes × 4 GPUs = 32 GPUs, 1 replica).
-# Training gets the remaining 120 nodes (480 GPUs) for TP=4, PP=3, EP=8, DP=5.
-# (80->104->128 nodes, 2026-08-31/09-01: the step-1 fused_adam optimizer-state OOM on trainer
-# local-GPU-0. Runs 3241496-3247517 (5x) all die in the first optimizer.step(): [MEMDUMP]
-# (run 3246683/3247517) proved it is a genuine hairline miss -- ~38 GiB free on GPU 0 right
-# before the step, fused_adam then allocates the full ~38 GiB DP-shard optimizer state (fp32
-# master-remainders + exp_avg + exp_avg_sq) and misses by 12-24 MiB, every run. NOT a phantom
-# process (nvidia-smi: one WorkerDict/GPU), NOT fragmentation (unconditional empty_cache()
-# closed the reserved-vs-alloc gap to 0.15 GiB and it still OOM'd), NOT token-dependent
-# (ppo_max_token_len_per_gpu 8192->4096 had zero effect). DP 4->5 shrinks the optimizer shard
-# ~38 -> ~30 GiB -- ~7.6 GiB margin, overwhelming for a MiB miss.)
+# Training gets the remaining 72 nodes (288 GPUs) for TP=4, PP=3, EP=8, DP=3.
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
@@ -94,7 +85,7 @@ export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 # AttributeError: 'Tensor' object has no attribute 'offsets'). That bug is fixed upstream
 # now (TransferQueue 0.1.7), but the >=2x margin costs nothing and remains cheap insurance.
 export ROLLOUT_N=8                   # responses per prompt -- GRPO advantages degenerate at n=1
-export PPO_MINI_BATCH_SIZE=10        # prompts; x ROLLOUT_N = 80 rows = 2x dp_size (DP=5 x EP=8 = 40)
+export PPO_MINI_BATCH_SIZE=6         # prompts; x ROLLOUT_N = 48 rows = 2x dp_size (DP=3 x EP=8 = 24)
 export PARAMETER_SYNC_STEP=2
 export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))
 
@@ -149,50 +140,27 @@ actor_rollout_ref:
     use_remove_padding: True
     use_shm: false
     trust_remote_code: True  # GLM-5.1 uses a custom TokenizersBackend tokenizer
-    # Fused linear cross-entropy (2026-09-01, added after run 3251006's backward-pass OOM):
-    # patches the Megatron forward to compute LM-head logits + log-probs + entropy WITHOUT
-    # materializing the [num_tokens, vocab~151K] logits tensor (and its bwd grad/softmax copies)
-    # -- several GiB of activation relief in exactly the fwd/bwd phase that OOM'd. verl gates it
-    # (verl/workers/engine/megatron/transformer_impl.py:_maybe_enable_fused_kernels) on
-    # use_remove_padding (set), not-value-model (actor), mtp.enable=False (confirmed in the
-    # 3251006 config dump), and uniform temperature (rollout temp 1.0) -- all satisfied. If any
-    # prereq were unmet verl auto-disables with a warning (not fatal). Numerically equivalent.
-    use_fused_kernels: True
 
   actor:
-    # 120 training nodes x 4 GPUs = 480 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=5 (see
-    # TRAINING_NNODES above for the 80->104->128 node history and why DP had to keep growing:
-    # fused_adam optimizer-state init needs ~38 GiB on GPU 0 and DP scaling is the only lever
-    # that shrinks it -- ~38 GiB at DP=4 -> ~30 GiB at DP=5).
+    # 72 training nodes x 4 GPUs = 288 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=3.
+    # Memory at optimizer step: M*(2 + 8/DP) + 11 GiB NCCL = 14.5*(2+2.67)+11 = 78.7 GiB < 95 GiB.
+    # DP=2 was insufficient: 6M+11 = 98 GiB > 95 GiB (4 optimizer tensors + param + grad).
     # EP=8: EP=4 causes megatron-bridge to fail for experts 64-127 (unmapped).
     # PP=3: 78 layers / 3 = 26 layers/stage.
     ppo_mini_batch_size: ${PPO_MINI_BATCH_SIZE}
     ppo_micro_batch_size_per_gpu: 1
-    # 16384 -> 12288 (2026-08-29) -> 8192 -> 4096 (2026-08-31): the Megatron fused_adam
-    # optimizer-state OOM on trainer local-GPU-0. Runs 3241496 / 3243323 / 3244653 / 3246683 all
-    # die in the FIRST optimizer.step(). Run 3246683's [MEMDUMP] proved it is a GENUINE HAIRLINE
-    # MISS (~12-24 MiB), not a phantom co-resident process: nvidia-smi shows exactly one
-    # WorkerDict per GPU, ~35 GiB free right before the step, ~12.3 GiB unavoidable
-    # NCCL/context, and fused_adam then allocates the full ~35 GiB DP-shard optimizer state in
-    # large contiguous blocks. NOT fragmentation (reserved-but-unallocated only ~40-65 MiB at
-    # OOM); expandable_segments would not help and breaks the shared SGLang rollout (run 3219305).
-    # Primary fix: the unconditional empty_cache() in optimizer_step (step1-oom-memdump.patch)
-    # returns ~3 GiB of cached-but-unallocated blocks to the driver first. This 8192->4096 cut is
-    # paired insurance -- lowers the fwd/bwd reserved high-water carried into the optimizer step.
-    ppo_max_token_len_per_gpu: 4096
+    # 16384 -> 12288 (2026-08-29): run 3217439 ran 20 clean steps then CUDA-OOM'd by 24 MiB in the
+    # Megatron optimizer on GPU 0 (the weight-sync coordinator rank) -- torch peak was dead-flat
+    # 77.9 GiB the whole run, the tip-over was ~17 GiB of non-torch NCCL/checkpoint-engine memory
+    # creeping up over the weight syncs. Lowering the dynamic-bsz token budget cuts the actor
+    # fwd/bwd activation peak to open real headroom (paired with expandable_segments in the srun).
+    ppo_max_token_len_per_gpu: 12288
     use_dynamic_bsz: True
     megatron:
       tensor_model_parallel_size: 4
       pipeline_model_parallel_size: 3
       expert_model_parallel_size: 8
-      # param_offload: True -> False (2026-09-02, after run 3262227): the two host-RAM tuning
-      # knobs (optimizer_offload_fraction, update_weights_bucket_megabytes) moved the 446/450 GB
-      # host-RAM ceiling by ~0 -- the HybridDeviceOptimizer apparently keeps its full state
-      # pinned on host regardless of fraction, so that was the wrong lever. Step 1 itself now
-      # completes fully clean with 35-44 GB GPU free at [MEMDUMP], so GPU can afford to keep the
-      # ~18.5 GB bf16 params resident instead of CPU-bouncing them every step -- removes that
-      # chunk from host RAM entirely rather than tuning it.
-      param_offload: False
+      param_offload: True
       grad_offload: True
       optimizer_offload: True
       vanilla_mbridge: False  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge
@@ -213,46 +181,6 @@ actor_rollout_ref:
         use_cpu_initialization: True
         moe_grouped_gemm: True
         moe_permute_fusion: True
-    optim:
-      # CPU-streaming (HybridDevice) optimizer -- the step-1 fused_adam OOM fix, 2026-09-01.
-      # Runs 3241496-3250425 (6x) all die in the first optimizer.step(): [MEMDUMP] (3246683,
-      # 3247517, 3250425) proved it is a genuine hairline miss -- ~40 GiB free on GPU 0 right
-      # before the step, and optimizer.step() then allocates a ~40 GiB transient (exp_avg +
-      # exp_avg_sq creation, grad->fp32-main copy, distributed-optimizer all-gather buffer,
-      # grad-norm + .float() upcast scratch) and misses by ~19 MiB, every run. DP scaling stalled
-      # (3247517 DP=4 / 3250425 DP=5 moved "free" only ~2 GiB -- the all-gather buffer and bf16
-      # params are a fixed floor that DP does not shrink).
-      #
-      # override_optimizer_config is forwarded verbatim to Megatron-core's OptimizerConfig
-      # (verl/utils/megatron/optimizer.py:210). This block is verl's OWN canonical large-MoE
-      # Megatron-async recipe -- see verl/experimental/fully_async_policy/shell/
-      # grpo_30b_a3b_base_math_megatron_96_32_mis.sh (Qwen 30B-A3B MoE, 96+32 nodes) and the
-      # other 30B/35B MoE megatron-async scripts, which all set exactly these four keys.
-      # optimizer_cpu_offload builds Megatron's HybridDeviceOptimizer: the optimizer state lives
-      # on CPU and is streamed bucket-by-bucket during the step, so the GPU never materializes
-      # the full moments. overlap_cpu_optimizer_d2h_h2d hides the transfer. use_precision_aware_
-      # optimizer is required by that path. verl's own megatron.optimizer_offload:True stays on
-      # alongside (its offload code already handles the HybridDeviceOptimizer via
-      # _move_new_state_to_right_device).
-      #
-      # main_grads_dtype: bf16 (2026-09-01, added after run 3251006): the CPU-offload optimizer
-      # above cleared the step-1 optimizer.step() OOM (6 runs died there), and step 1 then died
-      # EARLIER in the backward-pass DP grad reduce-scatter -- the fp32 DDP grad buffer holds
-      # grads for all 9.24B local params (~37 GiB) resident before the reduce-scatter shards it.
-      # bf16 halves it to ~18.5 GiB (this key also drives the DDP grad-bucket dtype). Safe here:
-      # token budget 4096 + ~2 rows/DP-rank = 1 micro-batch, so NO grad accumulation (bf16 error
-      # only compounds over many micro-batches); the fp32 master-param update is unchanged.
-      # Adam moments left fp32 (on CPU now anyway).
-      override_optimizer_config:
-        optimizer_cpu_offload: True
-        # 1.0 -> 0.7 (2026-09-02, after run 3257320): the CPU-offload optimizer + verl param/grad
-        # offload + the delta engine's pinned CPU snapshot tipped trainer node RAM to 446/450 GB
-        # (Ray OOM-killed a WorkerDict, hung the post-step delta sync). Keeping ~30% of the ~22 GB
-        # optimizer state on GPU (which has 22-45 GB free per [MEMDUMP]) frees ~7 GB host/rank.
-        optimizer_offload_fraction: 0.7
-        overlap_cpu_optimizer_d2h_h2d: True
-        use_precision_aware_optimizer: True
-        main_grads_dtype: bf16
 
   rollout:
     name: sglang
@@ -287,10 +215,6 @@ actor_rollout_ref:
     # See CLAUDE.md's Run log / this script's Configuration audit for the full investigation.
     checkpoint_engine:
       backend: delta_sharded  # separate-async rejects "naive"; delta_sharded extends the nccl engine
-      # 2048 -> 512 (2026-09-02, after run 3257320): the per-bucket megatron-bridge HF-conversion
-      # buffer during the weight sync -- 4x smaller cuts host RAM on the trainer nodes (446/450 GB
-      # OOM in the post-step delta sync).
-      update_weights_bucket_megabytes: 512
       engine_kwargs:
         delta_sharded:
           rebuild_group: false
@@ -725,83 +649,39 @@ EOF
 sbcast -f ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch
 
 # example/patches/wsync-debug-progress-log.patch, embedded (same BASH_SOURCE-under-sbatch
-# reason as the patches above). Per-tensor progress logging for the trainer->rollout weight
-# sync (diagnostic) PLUS the seed-sync lockstep barrier that fixes the megatron-bridge
-# collective desync hit in runs 3141801/3207923/3219811/3240762 (see the patch header and
-# CLAUDE.md). Applied after the verl checkout, alongside the other verl-source patches.
+# reason as the patches above). Diagnostic-only: per-tensor progress logging for the
+# trainer->rollout weight sync so the next megatron-bridge collective hang shows where each
+# rank stalled. Applied after the verl checkout, alongside the other verl-source patches.
 cat > "${TRAINING_CONFIG}/wsync-debug-progress-log.patch" <<- 'EOF'
-# [CSCS, 2026-09-02] Weight-sync per-tensor progress logging + seed AND steady-sync lockstep
-# barrier.
-#
-# (1) DIAGNOSTIC: wraps the two Megatron weight-export generators (get_per_tensor_param = the
-#     full seed export; get_per_tensor_param_delta_shard = the delta_sharded steady export) so a
-#     collective hang shows, per rank, how far streaming got ("[WSYNC-DBG] rank=N ... tensor#K",
-#     every 1000 tensors + on exit). Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE / _DUMP_ON_TIMEOUT
-#     (set in the srun env).
-#
-# (2) FIX: a collective desync during weight sync (CLAUDE.md "Gloo all_gather_object" /
-#     gather_from_ep_ranks NCCL ALLGATHER 30-min timeout in stream_weights_megatron_to_hf, hit on
-#     the SEED path in runs 3141801/3207923/3219811/3240762 -- ~1 run in 2, the single biggest
-#     blocker to a full run for a long stretch). The seed sync (_send_full_seed) streams the full
-#     get_per_tensor_param() HF export, running a chain of PP/EP/TP assembly collectives per HF
-#     tensor; _send_full_seed drives that generator ASYMMETRICALLY -- rank 0 buckets + broadcasts
-#     each flush to the rollout CE group between pulls, every non-master rank just discards its
-#     tensor and pulls the next -- so non-master ranks race ahead in the per-tensor collective
-#     chain until a later cross-group collective deadlocks. Fix: for the seed export,
-#     torch.distributed.barrier() on the trainer WORLD group every VERL_WSYNC_SEED_BARRIER_EVERY
-#     (default 1) HF tensors, AFTER the consumer processed each -- no rank can start tensor K+1's
-#     assembly collectives until every rank finished K, so drift is bounded to
-#     VERL_WSYNC_SEED_BARRIER_EVERY. Validated across 10+ runs with zero recurrence.
-#
-#     Run 3263683 (the first run to ever reach a real, full-scale delta_sharded STEADY sync --
-#     every prior run died earlier, on the seed hang or a step-1 GPU/host-RAM OOM) hit the SAME
-#     desync class there: an NCCL ALLGATHER hang on the steady sync's very first flush. The
-#     steady path's _GatherQueue was assumed "count-lockstepped by design" (CLAUDE.md run
-#     3219811's investigation) and deliberately left unbarriered -- that assumption is now
-#     disproven by direct evidence. Fix: extend the identical barrier to the "delta-steady" tag
-#     too. Steady syncs are far smaller than the seed (only changed values), so per-item
-#     barriering there is cheap.
+# [CSCS debug, 2026-08-29] Per-tensor progress logging for the trainer->rollout weight sync, so
+# the next megatron-bridge weight-sync collective hang (see CLAUDE.md: gather_from_ep_ranks NCCL
+# ALLGATHER timeout, hit in runs 3141801 / 3207923 / 3219811, ~1 run in 2) shows WHERE each rank
+# stalled instead of a 30-minute black box. Wraps the two weight-export generators in the
+# Megatron engine (get_per_tensor_param = the full seed export; get_per_tensor_param_delta_shard
+# = the delta_sharded steady export) with a pass-through that prints `[WSYNC-DBG] rank=N ...
+# tensor#K` every 1000 tensors and on generator exit. Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE /
+# TORCH_NCCL_DUMP_ON_TIMEOUT (set in the srun env) which give the per-rank NCCL flight-recorder
+# trace on timeout. Diagnostic only -- remove once the hang is root-caused.
 #
 # Generated from a real edited git worktree at the verl v0.9.0 tag; verified against a fresh
 # checkout: git apply --check clean, py_compile clean, git apply --reverse --check detects
 # "already applied".
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index e8a6c56..259cdd7 100644
+index e8a6c56..0f171d2 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -87,6 +87,53 @@ logger = logging.getLogger(__file__)
+@@ -87,6 +87,30 @@ logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
  
-+
 +def _wsync_progress_log(gen, tag):
-+    """[weight-sync debug + seed/steady-sync lockstep fix, CSCS] Wrap a per-tensor weight-export
-+    generator.
-+
-+    (1) Diagnostic: on a collective hang during weight sync, print per rank how far the
-+        streaming got (which tensor / how long). Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE.
-+    (2) Fix for megatron-bridge / delta-engine collective desyncs during weight sync (CLAUDE.md:
-+        gather_from_ep_ranks / broadcast_obj_from_pp_rank timeout on the seed path, runs
-+        3141801 / 3207923 / 3219811 / 3240762; and an NCCL ALLGATHER hang on the delta-STEADY
-+        path's very first flush, run 3263683 -- the first run to ever reach that path at real
-+        scale). For BOTH the "seed/full" and "delta-steady" exports, torch.distributed.barrier()
-+        on the trainer WORLD group every VERL_WSYNC_SEED_BARRIER_EVERY (default 1) items, AFTER
-+        the consumer has processed each -- no rank can start the next item's assembly/gather
-+        collectives until every rank finished the current one, so drift is bounded to
-+        VERL_WSYNC_SEED_BARRIER_EVERY. The seed export drives its generator asymmetrically (rank
-+        0 buckets + broadcasts each flush to the rollout CE group between pulls, non-master ranks
-+        discard and pull the next) -- the delta-steady _GatherQueue path was assumed
-+        "count-lockstepped by design" and left unbarriered, but run 3263683 showed that
-+        assumption does not hold at real scale. Steady syncs are far smaller than the seed
-+        (only changed values), so per-item barriering there is cheap."""
++    """[weight-sync debug, CSCS] Wrap a per-tensor weight-export generator so a collective hang
++    during weight sync shows, per rank, how far the streaming got (which tensor / how long).
++    Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE. Cheap: one print per 1000 tensors. Remove once the
++    megatron-bridge gather_from_ep_ranks hang (CLAUDE.md) is understood."""
 +    import time as _t
 +
 +    _rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "?"
-+    _barrier_tag = tag in ("seed/full", "delta-steady")
-+    try:
-+        _every = max(1, int(os.environ.get("VERL_WSYNC_SEED_BARRIER_EVERY", "1")))
-+    except ValueError:
-+        _every = 1
 +    _t0 = _t.time()
 +    _n = 0
 +    try:
@@ -814,8 +694,6 @@ index e8a6c56..259cdd7 100644
 +                    _name = "?"
 +                print(f"[WSYNC-DBG] rank={_rank} {tag} tensor#{_n} name={_name} t+{_t.time() - _t0:.0f}s", flush=True)
 +            yield _item
-+            if _barrier_tag and (_n % _every == 0) and torch.distributed.is_initialized():
-+                torch.distributed.barrier()
 +    finally:
 +        print(f"[WSYNC-DBG] rank={_rank} {tag} generator exited after {_n} tensors, {_t.time() - _t0:.0f}s", flush=True)
 +
@@ -823,7 +701,7 @@ index e8a6c56..259cdd7 100644
  def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
      """Return the scalar temperature required by fused linear cross entropy."""
      values = torch.as_tensor(temperature).detach().flatten()
-@@ -1042,7 +1089,7 @@ class MegatronEngine(BaseEngine):
+@@ -1042,7 +1066,7 @@ class MegatronEngine(BaseEngine):
  
              per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
  
@@ -832,7 +710,7 @@ index e8a6c56..259cdd7 100644
  
      def _mcore_export_index(self):
          """Build (once) the per-parameter delta export index: geometry specs and
-@@ -1104,7 +1151,9 @@ class MegatronEngine(BaseEngine):
+@@ -1104,7 +1128,9 @@ class MegatronEngine(BaseEngine):
  
          self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
          gen, _ = self.get_per_tensor_param_shard()
@@ -893,166 +771,6 @@ index 07e30d0..bf05f07 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch ${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch
 
-# example/patches/step1-oom-memdump.patch, embedded (same reason). DIAGNOSTIC ONLY: dumps GPU
-# memory accounting + full nvidia-smi right before the first optimizer.step() to identify the
-# ~19 GiB of non-trainer memory on trainer GPU-0 that OOMs fused_adam at step 1 (runs 3241496 /
-# 3243323 / 3244653). Remove once identified.
-cat > "${TRAINING_CONFIG}/step1-oom-memdump.patch" <<- 'EOF'
-# [CSCS diagnostic, 2026-09-01/02] step-1 GPU memory instrumentation + the empty_cache() fix.
-#
-# _step1_oom_memdump() fires ONCE per rank, right before the first optimizer.step(): prints this
-# process's torch CUDA accounting (every rank) plus a full nvidia-smi -- all GPUs, all compute
-# processes, per-process used_memory (local rank 0 only, i.e. the GPU that used to OOM). The
-# [MEMDUMP] lines land in the main slurm log. This diagnostic block (run 3246683) proved the
-# step-1 GPU OOM (runs 3241496-3246683) was a genuine hairline miss, not a phantom co-resident
-# process -- nvidia-smi always showed exactly one WorkerDict per GPU.
-#
-# Also makes optimizer_step()'s empty_cache() call UNCONDITIONAL (was gated on the unused
-# _distillation_use_topk_active path): returns PyTorch's reserved-but-unallocated cache to the
-# driver right before the optimizer's large contiguous allocations, closing the hairline miss.
-#
-# MUST be applied AFTER wsync-debug-progress-log.patch -- both touch transformer_impl.py and this
-# diff's context lines assume _wsync_progress_log is already present.
-#
-# DIAGNOSTIC (memdump) kept indefinitely for now -- cheap, and useful signal on any future
-# step-1 memory question. Generated from a real edited git worktree at the verl v0.9.0 tag
-# (+ wsync-debug-progress-log.patch applied); git apply --check clean, py_compile clean,
-# git apply --reverse --check detects "already applied".
-diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 259cdd7..fa9d585 100644
---- a/verl/workers/engine/megatron/transformer_impl.py
-+++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -134,6 +134,57 @@ def _wsync_progress_log(gen, tag):
-         print(f"[WSYNC-DBG] rank={_rank} {tag} generator exited after {_n} tensors, {_t.time() - _t0:.0f}s", flush=True)
- 
- 
-+
-+def _step1_oom_memdump(engine):
-+    """[CSCS step-1 OOM diagnostic] Fire once, on this rank's FIRST optimizer.step(), right
-+    before it runs. Dumps this process's torch CUDA accounting + a full nvidia-smi (all GPUs,
-+    all compute processes, per-process used memory) so GPU memory pressure at the optimizer step
-+    can be attributed to a concrete pid/process. Every rank dumps its own torch numbers; only
-+    local rank 0 (the GPU that OOMs) also shells out to nvidia-smi. Remove once no longer needed
-+    for diagnosis."""
-+    if getattr(engine, "_step1_oom_memdump_done", False):
-+        return
-+    engine._step1_oom_memdump_done = True
-+    import subprocess
-+
-+    _rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "?"
-+    _lrank = os.environ.get("LOCAL_RANK", "0")
-+    _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
-+    try:
-+        _dev = torch.cuda.current_device()
-+        _free, _total = torch.cuda.mem_get_info(_dev)
-+        _alloc = torch.cuda.memory_allocated(_dev)
-+        _resv = torch.cuda.memory_reserved(_dev)
-+        print(
-+            f"[MEMDUMP] rank={_rank} lrank={_lrank} pid={os.getpid()} CUDA_VISIBLE_DEVICES={_cvd} "
-+            f"cur_dev={_dev} free={_free / 2**30:.2f}G total={_total / 2**30:.2f}G "
-+            f"gpu_used={(_total - _free) / 2**30:.2f}G torch_alloc={_alloc / 2**30:.2f}G "
-+            f"torch_reserved={_resv / 2**30:.2f}G "
-+            f"non_torch_this_proc={((_total - _free) - _resv) / 2**30:.2f}G(incl other procs)",
-+            flush=True,
-+        )
-+    except Exception as _e:
-+        print(f"[MEMDUMP] rank={_rank} torch mem read failed: {_e}", flush=True)
-+
-+    if str(_lrank) != "0":
-+        return
-+    for _args, _tag in (
-+        (["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-+          "--format=csv,noheader"], "compute-apps"),
-+        (["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
-+          "--format=csv,noheader"], "gpu-mem"),
-+    ):
-+        try:
-+            _out = subprocess.run(_args, capture_output=True, text=True, timeout=25).stdout.strip()
-+            print(f"[MEMDUMP] rank={_rank} nvidia-smi {_tag}:\n{_out}", flush=True)
-+        except Exception as _e:
-+            print(f"[MEMDUMP] rank={_rank} nvidia-smi {_tag} failed: {_e}", flush=True)
-+    try:
-+        print(f"[MEMDUMP] rank={_rank} torch.cuda.memory_summary():\n{torch.cuda.memory_summary()}", flush=True)
-+    except Exception as _e:
-+        print(f"[MEMDUMP] rank={_rank} memory_summary failed: {_e}", flush=True)
-+
-+
- def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
-     """Return the scalar temperature required by fused linear cross entropy."""
-     values = torch.as_tensor(temperature).detach().flatten()
-@@ -733,8 +784,13 @@ class MegatronEngine(BaseEngine):
-         """
-         # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
-         # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
--        if getattr(self, "_distillation_use_topk_active", False):
--            get_torch_device().empty_cache()
-+        # [CSCS] made unconditional (was gated on _distillation_use_topk_active): the
-+        # Megatron distributed-optimizer state init allocates large contiguous blocks on GPU 0
-+        # during the FIRST optimizer.step() and used to OOM a few MiB short against PyTorch's
-+        # reserved-but-unallocated cache (runs 3241496-3246683). Returning that cache to the
-+        # driver first hands the optimizer a clean arena.
-+        get_torch_device().empty_cache()
-+        _step1_oom_memdump(self)
-         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
- 
-         if update_successful:
-EOF
-sbcast -f ${TRAINING_CONFIG}/step1-oom-memdump.patch ${TRAINING_CONFIG}/step1-oom-memdump.patch
-
-# CSCS SGLang scheduler-watchdog diagnostic (2026-09-02, after run 3264247). The TP=32 standalone
-# rollout's own 300s scheduler watchdog has now hung at 3 distinct call sites across this recipe's
-# history (a torch.distributed broadcast, run 3152802; flashinfer MLA plan(), run 3209484, fixed
-# by the flashinfer 0.6.14 pin; R3's routed-experts get_topk D2H copy, run 3264247) -- a real,
-# recurring TP=32 SGLang fragility, not (so far) a single flake. The stock watchdog only py-spy
-# dumps Python stacks on timeout -- shows WHERE a rank is stuck, not the underlying CUDA state,
-# which is what actually found + fixed the flashinfer-MLA occurrence. This file defines an extra
-# diagnostic hook (nvidia-smi + local CUDA memory/stream state) wired into SGLang's own watchdog
-# dump_info callback -- see the srun-side patcher below. Deliberately does NOT attempt an NCCL
-# flight-recorder dump: that API's behavior when called ad hoc (outside torch's own watchdog
-# handler) is not confirmed safe/fast, and this code runs INSIDE the watchdog thread that is
-# about to SIGQUIT the stuck process -- anything slow or blocking here would delay recovery
-# instead of just diagnosing it. Kept to fast, synchronous, local reads only.
-cat > "${TRAINING_CONFIG}/cscs_watchdog_diag.py" <<- 'PYEOF'
-def _cscs_watchdog_dump_info():
-    """[CSCS diagnostic] Extra state captured on any SGLang scheduler watchdog timeout, beyond
-    the stock py-spy dump: nvidia-smi (all GPUs + compute processes) and local CUDA memory/stream
-    state. See CLAUDE.md's "TP=32 SGLang" Known-hazards entry and run 3264247 for why."""
-    import os as _os
-    import subprocess as _sp
-
-    parts = [f"[CSCS-WATCHDOG] pid={_os.getpid()}"]
-    try:
-        import torch as _torch
-
-        if _torch.cuda.is_available():
-            _dev = _torch.cuda.current_device()
-            _free, _total = _torch.cuda.mem_get_info(_dev)
-            parts.append(
-                f"[CSCS-WATCHDOG] cuda dev={_dev} free={_free / 2**30:.2f}G "
-                f"total={_total / 2**30:.2f}G alloc={_torch.cuda.memory_allocated(_dev) / 2**30:.2f}G "
-                f"reserved={_torch.cuda.memory_reserved(_dev) / 2**30:.2f}G "
-                f"stream_idle={_torch.cuda.current_stream().query()}"
-            )
-    except Exception as _e:
-        parts.append(f"[CSCS-WATCHDOG] torch cuda read failed: {_e}")
-    try:
-        _out = _sp.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-                "--format=csv,noheader",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=15,
-        ).stdout.strip()
-        parts.append(f"[CSCS-WATCHDOG] nvidia-smi compute-apps:\n{_out}")
-    except Exception as _e:
-        parts.append(f"[CSCS-WATCHDOG] nvidia-smi failed: {_e}")
-    return "\n".join(parts)
-PYEOF
-sbcast -f ${TRAINING_CONFIG}/cscs_watchdog_diag.py ${TRAINING_CONFIG}/cscs_watchdog_diag.py
-
 # Fetch the upstream PR patches once here and sbcast them to every node, instead of
 # curl-ing them from inside the srun. In run 3124273 each of the 80 nodes downloaded
 # them independently and only ~45/80 succeeded, so the cluster ran mixed verl code:
@@ -1068,12 +786,92 @@ for pr in 7421 7422 7423; do
     sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
 done
 
-# NOTE (2026-08-30): the runtime pip upgrades that used to be here — TransferQueue 0.1.7,
-# megatron-core 0.19.0, megatron-bridge 0.6.1, flashinfer 0.6.14 (matched python+cubin) — are now
-# all baked into the image (tag alps7-dev-a9f9e56471c0574e, built from
-# Alps-Images/apps/verl/Containerfile). Removed. The srun still verifies the versions non-fatally
-# and applies the verl *source* patches (PR #7421/#7422/#7423 + the local .patch files), which
-# are NOT in the image.
+# Upgrade TransferQueue 0.1.6 (pinned in Alps-Images/apps/verl/Containerfile at image
+# build time) to 0.1.7 (the version verl v0.9.0 itself declares in its own
+# requirements.txt — this closes a real image/runtime version gap, it is not a
+# workaround). This script's runtime `git checkout` above only bumps verl's own
+# source, never its pip dependencies, so the image's pinned 0.1.6 would otherwise
+# never move. 0.1.6's AsyncSimpleStorageManager._pack_field_values
+# (transfer_queue/storage/managers/simple_backend_manager.py) has
+# `if all(v.shape == values[0].shape for v in values): return torch.stack(values)` —
+# the same "stack if shapes coincidentally match" bug as verl's own
+# list_of_dict_to_tensordict (patched below), just in a different package — and it is
+# the actual, sole cause of every `AttributeError: 'Tensor' object has no attribute
+# 'offsets'` seen in runs 3134772/3136766/3137775/3139371/3144665 (which call site
+# trips first — engine_workers.py:294 or padding.py:119 — just depends on which field
+# happens to hit the coincidence in a given run). Fixed upstream in 0.1.7's rewritten
+# `simple_storage_manager.py` (renamed file, same class/method names), which always
+# tries `torch.nested.as_nested_tensor(..., layout=jagged)` first. Fetched once here
+# and sbcast, same "fetch once, distribute, apply-or-fail" discipline as the PR
+# patches above — pip installing independently on 80 nodes risks the same
+# mixed-cluster hazard as run 3124273's per-node curl. sha256-verified against the
+# published PyPI digest since this is a binary wheel, not a text patch a `git apply
+# --check` could validate.
+curl -sfL "https://files.pythonhosted.org/packages/16/fe/bc9c75492b15ad90d0c9e97eb8b3ad643c8b2a023e7361c1ff99948a2f96/transferqueue-0.1.7-py3-none-any.whl" \
+    -o "${TRAINING_CONFIG}/transferqueue-0.1.7-py3-none-any.whl" \
+    || { echo "FATAL: could not download TransferQueue 0.1.7 wheel"; exit 1; }
+echo "d0657b107f668a431989a35b555d47425f398655e876f7b12984924f29d6dba2  ${TRAINING_CONFIG}/transferqueue-0.1.7-py3-none-any.whl" | sha256sum -c - \
+    || { echo "FATAL: TransferQueue 0.1.7 wheel failed sha256 verification"; exit 1; }
+sbcast -f "${TRAINING_CONFIG}/transferqueue-0.1.7-py3-none-any.whl" "${TRAINING_CONFIG}/transferqueue-0.1.7-py3-none-any.whl"
+
+# Upgrade megatron-core 0.18.2 -> 0.19.0 AND megatron-bridge 0.5.1 -> 0.6.1 together (2026-08-28,
+# third R3 attempt). Run 3201189 confirmed a megatron-bridge-only upgrade breaks core Megatron
+# model init unconditionally: megatron-bridge 0.6.x is built against megatron-core ~0.19.0 (its
+# own pinned Megatron-LM submodule commit at tag v0.6.0 is a 0.19.0-tagged commit, confirmed
+# directly from the real GitHub repo), not this image's 0.18.2. Validated on a cheap 1-node probe
+# (job 3207095) before touching this script again: both wheels install cleanly with --no-deps
+# --force-reinstall, and every import smoke test passes, including the exact chain that crashed
+# 3201189 (megatron.bridge.training.config.DistributedDataParallelConfig ->
+# megatron.training.models.gpt) and the GLM-5.1 bridge module (megatron.bridge.models.glm_moe_dsa)
+# -- see CLAUDE.md's Configuration audit + Run log entries for the full trace and citations.
+# megatron-core is a real bdist_wheel for this exact platform (cp312, aarch64/manylinux) with only
+# one compiled extension (a CPU-only dataset-helpers .so, no CUDA/ABI-sensitive code) -- much lower
+# risk than a generic "compiled package" swap would suggest. Fetched once here and sbcast, same
+# discipline as the TransferQueue wheel above. megatron-core installed first (matching the
+# validated probe's install order), megatron-bridge second.
+curl -sfL "https://files.pythonhosted.org/packages/d1/75/621dc2772a5aba566a828e10f4772f71ed33d2fa99ad47b2dcc763be7d10/megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl" \
+    -o "${TRAINING_CONFIG}/megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl" \
+    || { echo "FATAL: could not download megatron-core 0.19.0 wheel"; exit 1; }
+echo "25618d4ba1fbed1fd7b00a210905065c1d0479894c1a5f8626c3627844e072fa  ${TRAINING_CONFIG}/megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl" | sha256sum -c - \
+    || { echo "FATAL: megatron-core 0.19.0 wheel failed sha256 verification"; exit 1; }
+sbcast -f "${TRAINING_CONFIG}/megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl" "${TRAINING_CONFIG}/megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl"
+
+curl -sfL "https://files.pythonhosted.org/packages/1d/d0/90c877735309154b26b650f14f17040fb066d7229edb342d6ef24264718d/megatron_bridge-0.6.1-py3-none-any.whl" \
+    -o "${TRAINING_CONFIG}/megatron_bridge-0.6.1-py3-none-any.whl" \
+    || { echo "FATAL: could not download megatron-bridge 0.6.1 wheel"; exit 1; }
+echo "a3ef69c679a786e353f14ecef34329a819598edfaeb51aec02a519ace4c33c89  ${TRAINING_CONFIG}/megatron_bridge-0.6.1-py3-none-any.whl" | sha256sum -c - \
+    || { echo "FATAL: megatron-bridge 0.6.1 wheel failed sha256 verification"; exit 1; }
+sbcast -f "${TRAINING_CONFIG}/megatron_bridge-0.6.1-py3-none-any.whl" "${TRAINING_CONFIG}/megatron_bridge-0.6.1-py3-none-any.whl"
+
+# Upgrade flashinfer 0.6.12 -> 0.6.14, MATCHED python + cubin pair (2026-08-29). The Containerfile
+# pins flashinfer 0.6.12 (added 2026-07-27), but sglang 0.5.16 -- what the image sglang[all] now
+# resolves to -- requires flashinfer_python[cu13]==0.6.14. Run 3209484 hung at TP=32 (~step 13)
+# inside sglang MLA/DSA decode plan() (flashinfer/mla/_core.py:839), the code path this version
+# skew affects. flashinfer 0.6.14 hard-raises at import unless flashinfer_cubin is the *exact*
+# same version (run 3214410). flashinfer_cubin is NOT fully published to PyPI (PyPI stops at
+# 0.6.13) -- its real distribution channel is https://flashinfer.ai/whl, which serves the GitHub
+# release assets (per flashinfer's own install docs; see GitHub issue #2133 for the PyPI gap).
+# flashinfer_cubin-0.6.14 exists there -> install the matched 0.6.14 pair, clean AOT, no
+# version-check bypass needed.
+#
+# Both wheels staged on shared Lustre (${FLASHINFER_WHEEL_DIR}), NOT sbcast: runs 3211735 and
+# 3213313 died with `Bus error (core dumped)` from the flashinfer `sbcast` call -- on the 458 MB
+# cubin AND on the 14.6 MB python wheel whose sha256 verified fine moments earlier -- so it is not
+# wheel size, the Nth-consecutive-sbcast / batch-host /tmp pressure is the problem. Every node
+# reads the wheels directly from Lustre instead; a plain static-file read has none of the
+# flock/write hazards that make Lustre unsafe for other things.
+FLASHINFER_WHEEL_DIR="${TRAINING_HOME}/wheels"
+mkdir -p "${FLASHINFER_WHEEL_DIR}"
+curl -sfL "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_python-0.6.14-py3-none-any.whl" \
+    -o "${FLASHINFER_WHEEL_DIR}/flashinfer_python-0.6.14-py3-none-any.whl" \
+    || { echo "FATAL: could not download flashinfer_python 0.6.14 wheel"; exit 1; }
+echo "d124369346a3d48eac67e31c42f7a3c813bcc0abc10e2e36db413b7b3dfd97df  ${FLASHINFER_WHEEL_DIR}/flashinfer_python-0.6.14-py3-none-any.whl" | sha256sum -c - \
+    || { echo "FATAL: flashinfer_python 0.6.14 wheel failed sha256 verification"; exit 1; }
+curl -sfL "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.6.14/flashinfer_cubin-0.6.14-py3-none-any.whl" \
+    -o "${FLASHINFER_WHEEL_DIR}/flashinfer_cubin-0.6.14-py3-none-any.whl" \
+    || { echo "FATAL: could not download flashinfer_cubin 0.6.14 wheel"; exit 1; }
+echo "7bbed9f3851b59f3f6f6cb344810775bbce8a1c012ecf9a502bebd91cfb6433e  ${FLASHINFER_WHEEL_DIR}/flashinfer_cubin-0.6.14-py3-none-any.whl" | sha256sum -c - \
+    || { echo "FATAL: flashinfer_cubin 0.6.14 wheel failed sha256 verification"; exit 1; }
 
 
 # Download model (skip if already present)
@@ -1120,10 +918,16 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --container-writable bash -c '
 
 
-# verl is baked into the image at v0.9.0 (Containerfile VERL_REF=v0.9.0), editable-installed from
-# /workspace/verl — no runtime checkout needed. The source patches below (PR #7421/#7422/#7423 +
-# the local .patch files) are still applied on top.
-git -C /workspace/verl --no-pager log --oneline -1 || true
+# Upgrade Verl to v0.9.0.
+# The image clones with --branch ${VERL_REF} --depth 1, so no other ref is present
+# locally and the tag has to be fetched explicitly before it can be checked out.
+# verl is installed editable (pip install -e) from /workspace/verl, so the checkout
+# takes effect without reinstalling; -f discards any dirty state in the clone.
+export VERL_REF=v0.9.0
+git -C /workspace/verl fetch --depth 1 origin +refs/tags/${VERL_REF}:refs/tags/${VERL_REF} \
+    && git -C /workspace/verl checkout -f ${VERL_REF} \
+    || { echo "FATAL: could not check out verl ${VERL_REF}"; exit 1; }
+git -C /workspace/verl --no-pager log --oneline -1
 
 
 # Redirect pip cache to local tmpfs — ~/.cache/pip is on Lustre which causes
@@ -1132,33 +936,102 @@ export PIP_CACHE_DIR=/tmp/pip_cache_${SLURM_JOB_ID}
 export TMPDIR=/tmp
 mkdir -p $PIP_CACHE_DIR
 
-# Image-version + import smoke test (diagnostic only, non-fatal). Every dependency below is baked
-# into the image now; this block just makes a wrong image tag obvious in the first ~30 s of the
-# log instead of via a downstream crash. A failure here does NOT stop the job — the real step
-# will fail loudly with a clear error if the image is actually wrong.
+# Upgrade TransferQueue 0.1.6 (baked into the image at build time) to 0.1.7 (the
+# version verl v0.9.0 itself declares in its own requirements.txt) — see the wheel
+# fetch/sbcast above and Known hazards in CLAUDE.md for why: 0.1.6 AsyncSimpleStorageManager
+# _pack_field_values has a genuine upstream bug, already fixed in 0.1.7, that is the actual
+# cause of every offsets AttributeError seen in this recipe so far. --no-deps avoids pulling
+# in an unwanted transitive bump; --force-reinstall makes the upgrade deterministic
+# regardless of what pip thinks 0.1.6 already satisfies.
+pip install --no-deps --force-reinstall "${TRAINING_CONFIG}/transferqueue-0.1.7-py3-none-any.whl" \
+    || { echo "FATAL: could not install TransferQueue 0.1.7 wheel"; exit 1; }
+python3 -c "import importlib.metadata; print(\"TransferQueue version:\", importlib.metadata.version(\"TransferQueue\"))"
+
+
+# Upgrade megatron-core 0.18.2 -> 0.19.0, then megatron-bridge 0.5.1 -> 0.6.1 (see the wheel
+# fetch/sbcast above for the full reasoning and the 1-node probe job 3207095 that validated this
+# exact combination). Order matches the validated probe. MUST both run before the
+# safe_config_loader filelock patch below -- --force-reinstall rewrites every file in the
+# megatron-bridge package, so patching first would just get silently wiped here.
+pip install --no-deps --force-reinstall "${TRAINING_CONFIG}/megatron_core-0.19.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl" \
+    || { echo "FATAL: could not install megatron-core 0.19.0 wheel"; exit 1; }
+pip install --no-deps --force-reinstall "${TRAINING_CONFIG}/megatron_bridge-0.6.1-py3-none-any.whl" \
+    || { echo "FATAL: could not install megatron-bridge 0.6.1 wheel"; exit 1; }
+python3 -c "import importlib.metadata; print(\"megatron-core version:\", importlib.metadata.version(\"megatron-core\"))"
+python3 -c "import importlib.metadata; print(\"megatron-bridge version:\", importlib.metadata.version(\"megatron-bridge\"))"
+
+
+# Upgrade flashinfer to the matched 0.6.14 python + cubin pair (see the wheel fetch above for the
+# full reasoning). sglang 0.5.16 requires flashinfer_python[cu13]==0.6.14; the image stale 0.6.12
+# pin (predates the sglang[all] bump) is the leading suspect for run 3209484 TP=32 MLA plan() hang
+# -- stuck frame inside flashinfer/mla/_core.py:839 plan(). flashinfer 0.6.14 hard-requires an
+# exact python/cubin version match at import (run 3214410), and flashinfer_cubin-0.6.14 is only on
+# https://flashinfer.ai/whl (GitHub release assets), not PyPI -- both wheels are fetched from
+# there above. --no-deps keeps the existing nvidia-cutlass-dsl (already >=4.5.0, what the cu13
+# extra wants); --force-reinstall makes the swap deterministic. Read from shared Lustre (not
+# sbcast -- runs 3211735/3213313 both bus-errored on the flashinfer sbcast); a plain static-file
+# read has none of the flock/write hazards that make Lustre unsafe elsewhere. cubin first (larger
+# payload), then python.
+pip install --no-deps --force-reinstall "${TRAINING_HOME}/wheels/flashinfer_cubin-0.6.14-py3-none-any.whl" \
+    || { echo "FATAL: could not install flashinfer_cubin 0.6.14 wheel"; exit 1; }
+pip install --no-deps --force-reinstall "${TRAINING_HOME}/wheels/flashinfer_python-0.6.14-py3-none-any.whl" \
+    || { echo "FATAL: could not install flashinfer_python 0.6.14 wheel"; exit 1; }
+python3 -c "import importlib.metadata; print(\"flashinfer-python version:\", importlib.metadata.version(\"flashinfer-python\")); print(\"flashinfer-cubin version:\", importlib.metadata.version(\"flashinfer-cubin\"))"
+
+
+# R3 router replay prerequisite checks (diagnostic only, not fatal — see the Configuration
+# audit entry for this script in CLAUDE.md). Confirms both upgrades above actually took, confirms
+# the exact import chain that crashed run 3201189 now resolves (same check the validating probe
+# job 3207095 ran), and confirms whether sglang has the routed-experts-capture feature at the
+# path the r3-sglang-routed-experts-import-fix.patch below expects (applied after the verl
+# checkout, further down) — probe job 3199799 found it at sglang.srt.state_capturer.routed_experts
+# on sglang==0.5.16, but sglang[all] has no version pin in the Containerfile, so that is not
+# guaranteed stable across image rebuilds. If any check below fails, the real step will still fail
+# loudly later with a clear exception rather than silently, so it is safe to let the job continue
+# and read the real error.
 python3 -c "
-import importlib.metadata as _m
-for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", \"flashinfer-python\", \"flashinfer-cubin\", \"sglang\", \"transformers\", \"transformer-engine\", \"transformer-engine-torch\", \"nvidia-cutlass-dsl\"):
-    try:
-        print(f\"  {_p}: {_m.version(_p)}\")
-    except Exception as _e:
-        print(f\"  {_p}: <NOT INSTALLED> ({_e})\")
-# import chains the recipe / source patches depend on:
+import importlib.metadata
+from packaging import version
+v = importlib.metadata.version(\"megatron-bridge\")
+print(\"megatron-bridge version:\", v)
+if version.parse(v) < version.parse(\"0.6.0\"):
+    print(\"WARNING: megatron-bridge < 0.6.0 — GLM THD-packed fused DSA support (needed for \"
+          \"use_remove_padding=True + R3) was only confirmed added in 0.6.0; this build may not have it.\")
+mc = importlib.metadata.version(\"megatron-core\")
+print(\"megatron-core version:\", mc)
+if version.parse(mc) < version.parse(\"0.19.0\"):
+    print(\"WARNING: megatron-core < 0.19.0 — megatron-bridge 0.6.x needs this; the \"
+          \"ModuleNotFoundError from run 3201189 will likely recur.\")
 try:
-    from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, mtp_block_spec  # noqa: F401
-    print(\"  megatron.training.models.gpt: OK\")
-except ImportError as _e:
-    print(f\"  WARNING megatron.training.models.gpt NOT importable ({_e}) — broken image: wrong tag, or transformer-engine trouble: a torch ABI mismatch (run 3235127) or an unpinned TE pulling a cutlass-dsl it needs block_copy from (run 3236353). Check the transformer-engine / nvidia-cutlass-dsl versions above; TE must be 2.12.0.\")
+    from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, mtp_block_spec
+    print(\"megatron.training.models.gpt: OK (the module missing in run 3201189)\")
+except ImportError as e:
+    print(f\"WARNING: megatron.training.models.gpt still not importable ({e}) — the \"
+          \"megatron-core upgrade did not take as expected\")
+"
+python3 -c "
+# Checks the path the r3-sglang-routed-experts-import-fix.patch (applied after the verl
+# checkout, further down) points verl at — sglang.srt.state_capturer.routed_experts, confirmed
+# correct for sglang==0.5.16 via probe job 3199799. Also checks the old
+# sglang.srt.layers.moe.routed_experts_capturer path verl v0.9.0 ships by default, purely as a
+# signal: if THAT one succeeds instead, the deployed sglang changed again and the patch itself
+# (not just this diagnostic) needs re-pointing.
 try:
-    from sglang.srt.state_capturer.routed_experts import extract_routed_experts_from_meta_info  # noqa: F401
-    print(\"  sglang routed_experts capture: OK at sglang.srt.state_capturer.routed_experts\")
-except ImportError as _e:
-    print(f\"  WARNING sglang routed_experts capture NOT at the patched path ({_e}) — r3-sglang-routed-experts-import-fix.patch needs re-pointing\")
+    from sglang.srt.state_capturer.routed_experts import extract_routed_experts_from_meta_info
+    print(\"sglang routed_experts capture: OK at sglang.srt.state_capturer.routed_experts \"
+          \"(the path the source patch below points verl at)\")
+except ImportError as e:
+    print(f\"WARNING: sglang.srt.state_capturer.routed_experts not importable ({e}) — the \"
+          \"r3-sglang-routed-experts-import-fix.patch below points at a path that no longer \"
+          \"exists on this image; R3 will fail once rollout.enable_rollout_routing_replay=True \"
+          \"actually tries to capture routed experts\")
 try:
-    from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor  # noqa: F401
-    print(\"  sglang LocalSerializedTensor: OK at model_runner_components.weight_updater\")
-except ImportError as _e:
-    print(f\"  WARNING sglang LocalSerializedTensor NOT at the patched path ({_e}) — delta-sharded-localserializedtensor-import-fix.patch needs re-pointing\")
+    from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info as _old_path_check
+    print(\"NOTE: the old sglang.srt.layers.moe.routed_experts_capturer path also imports \"
+          \"successfully on this image — unexpected, since probe job 3199799 found it removed; \"
+          \"the source patch below may now be unnecessary or may need reconciling with both paths.\")
+except ImportError:
+    pass
 "
 
 
@@ -1197,48 +1070,6 @@ else:
         print(f\"Patched {n_patched} filelock site(s) in {p}\")
     else:
         print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
-"
-
-# CSCS SGLang scheduler-watchdog diagnostic: wire _cscs_watchdog_dump_info (staged above, see the
-# batch-host heredoc for the full reasoning) into the sglang WatchdogRaw dump_info hook, which
-# is None by default (sglang/srt/utils/watchdog.py never passes it). Best-effort: WARN and
-# continue on any mismatch (sglang version drift) rather than aborting the run -- this is
-# diagnostic-only, not load-bearing.
-python3 -c "
-import importlib.util
-spec = importlib.util.find_spec(\"sglang.srt.utils.watchdog\")
-if not spec:
-    print(\"WARNING: sglang.srt.utils.watchdog not found -- skipping CSCS watchdog diagnostic patch\")
-else:
-    p = spec.origin
-    with open(p) as f:
-        src = f.read()
-    if \"_cscs_watchdog_dump_info\" in src:
-        print(\"CSCS watchdog diagnostic already patched in \" + p)
-    else:
-        anchor = \"class Watchdog:\"
-        # soft=soft, appears twice in this file: once in the Watchdog.create() call to
-        # _WatchdogReal(...) (which has no dump_info parameter -- injecting there would break
-        # sglang startup with a TypeError), and once in the _WatchdogReal.__init__ call to
-        # WatchdogRaw(...) (the real target, which does accept dump_info). Disambiguate by also
-        # matching the closing paren: only the WatchdogRaw(...) call has soft=soft, immediately
-        # followed by the closing paren; the _WatchdogReal(...) call has test_stuck_time=... in
-        # between. Verified against the real sglang v0.5.16 source before wiring this in.
-        call_line = \"            soft=soft,\n        )\"
-        if anchor not in src or call_line not in src:
-            print(\"WARNING: sglang watchdog.py anchor or call-site not found in \" + p + \" -- skipping (sglang version drift?)\")
-        else:
-            with open(\"${TRAINING_CONFIG}/cscs_watchdog_diag.py\") as f:
-                diag_fn = f.read()
-            src = src.replace(anchor, diag_fn + \"\n\n\" + anchor, 1)
-            src = src.replace(
-                call_line,
-                \"            soft=soft,\n            dump_info=_cscs_watchdog_dump_info,\n        )\",
-                1,
-            )
-            with open(p, \"w\") as f:
-                f.write(src)
-            print(\"Patched CSCS watchdog diagnostic hook into \" + p)
 "
 
 # Apply the upstream PR patches sbcast to ${TRAINING_CONFIG} before the srun. They are
@@ -1304,11 +1135,9 @@ else
     exit 1
 fi
 
-# example/patches/wsync-debug-progress-log.patch: per-tensor progress logging for the trainer to
-# rollout weight sync (diagnostic) + the seed-sync WORLD-barrier that bounds rank drift in
-# stream_weights_megatron_to_hf to zero, fixing the ~1-in-2 megatron-bridge collective desync
-# (runs 3141801/3207923/3219811/3240762; see its header and CLAUDE.md). Same apply-or-fail
-# discipline as the patches above.
+# example/patches/wsync-debug-progress-log.patch: diagnostic-only per-tensor progress logging for
+# the trainer to rollout weight sync (see its header, and the weight-sync-hang investigation in
+# CLAUDE.md). Same apply-or-fail discipline as the patches above.
 p="${TRAINING_CONFIG}/wsync-debug-progress-log.patch"
 if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
     git -C /workspace/verl apply "$p" && echo "Applied wsync-debug-progress-log.patch on $(hostname)"
@@ -1329,18 +1158,6 @@ elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
     echo "delta-sharded-localserializedtensor-import-fix.patch already present on $(hostname), skipping"
 else
     echo "FATAL: delta-sharded-localserializedtensor-import-fix.patch neither applies nor is already present on $(hostname)"
-    exit 1
-fi
-
-# example/patches/step1-oom-memdump.patch: DIAGNOSTIC ONLY -- see its header and CLAUDE.md
-# runs 3241496 / 3243323 / 3244653. Same apply-or-fail discipline.
-p="${TRAINING_CONFIG}/step1-oom-memdump.patch"
-if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
-    git -C /workspace/verl apply "$p" && echo "Applied step1-oom-memdump.patch on $(hostname)"
-elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
-    echo "step1-oom-memdump.patch already present on $(hostname), skipping"
-else
-    echo "FATAL: step1-oom-memdump.patch neither applies nor is already present on $(hostname)"
     exit 1
 fi
 
@@ -1397,14 +1214,6 @@ export VERL_LOGGING_LEVEL=INFO
 export TORCH_NCCL_TRACE_BUFFER_SIZE=20000
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1
 export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/tmp/nccl_flightrecorder_${SLURM_JOB_ID}_rank
-
-# NCCL_NVLS_ENABLE=0 (2026-08-31): disable NVLink-multicast (NVLS / NVLink SHARP). On GH200,
-# with the many communicators here -- TP=4, PP=3, EP=8, DP=5, world, CE -- each NVLS-enabled
-# group reserves multicast buffers on device 0, part of the ~12.3 GiB non-PyTorch memory on
-# trainer local-GPU-0 that leaves the step-1 fused_adam optimizer-state alloc 12-24 MiB short
-# (runs 3241496 / 3243323). Pure perf knob -- falls back to ring/tree all-reduce -- no
-# correctness or collective-stability impact. Paired with the precision-aware optimizer above.
-export NCCL_NVLS_ENABLE=0
 
 # NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. Tried in run 3219305 as
 # an OOM mitigation, but this srun body is shared by the SGLang standalone-rollout processes too,

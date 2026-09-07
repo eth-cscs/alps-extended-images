@@ -1,0 +1,67 @@
+# [CSCS, 2026-09-04] delta_sharded steady sync: decouple the per-round GATHER byte budget from
+# the rollout FLUSH bucket. Found debugging train-gsm8k-deepseek-v3-671B-v1-separate-async-
+# megatron.sh run 3289294: the first steady sync with REAL gradients (every prior delta_sharded
+# run in this repo had ~zero weight change, so this path was never exercised at scale) OOMed
+# the wire-master rank 0 GPU:
+#   sparse_gather.py:134 gather_slot_entries_to_rank0
+#     idx_list = [torch.zeros(max_n, ...) for _ in range(world)] if rank == 0 else None
+#   torch.OutOfMemoryError ... 80.55 GiB allocated by PyTorch (was ~35 GiB before the sync)
+# Mechanism: under PP>1 delta_export.py merges EVERY param over the WORLD group (480 ranks
+# here) so the wire master needs no relay; rank 0 then allocates world x max_n padded idx/val
+# lists per round, and max_round_bytes (the per-rank cap on max_n) was hard-wired to
+# self.bucket_size = update_weights_bucket_megabytes (512 MB) -- up to 480 x 512 MB = 240 GB
+# on rank 0 for one round, even though only the owner-stage / non-replica ranks contribute
+# anything but zeros. The observed round (max_n = 26.7M elems, ~160 MB/rank) needed ~77 GB.
+#
+# Fix: new engine kwarg `gather_round_megabytes` (engine_kwargs.delta_sharded.
+# gather_round_megabytes in the rollout config) sizing ONLY the gather round; None keeps the
+# old coupling (behavior-preserving default). Rank-0 peak per round is then
+# ~ (world + contributing) x gather_round_megabytes, independent of the flush bucket shipped to
+# the rollout, which can stay large (fewer update_weights_from_tensor requests). Upstreamable
+# as-is; a fuller fix would gather only from contributing ranks.
+#
+# Generated from a real edited git worktree at the verl v0.9.0 tag (not hand-written);
+# verified: git apply --check clean, py_compile clean, git apply --reverse --check detects
+# "already applied". Touches only delta_checkpoint_engine.py (no overlap with the other
+# patches in this recipe).
+diff --git a/verl/checkpoint_engine/delta_checkpoint_engine.py b/verl/checkpoint_engine/delta_checkpoint_engine.py
+index f15eb357..55663e44 100644
+--- a/verl/checkpoint_engine/delta_checkpoint_engine.py
++++ b/verl/checkpoint_engine/delta_checkpoint_engine.py
+@@ -396,9 +396,26 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
+         logger.info("delta recv v=%s flushes=%d (yielded to server adapter)", global_steps, applied)
+ 
+     def __init__(
+-        self, *args, encoding: str = "indices", batch_gather: int = 32, verify_every: int = 0, **kwargs
++        self,
++        *args,
++        encoding: str = "indices",
++        batch_gather: int = 32,
++        verify_every: int = 0,
++        gather_round_megabytes: int | None = None,
++        **kwargs,
+     ) -> None:
+         super().__init__(*args, **kwargs)
++        # Per-rank byte budget of ONE padded gather round in the steady sync
++        # (sparse_gather.gather_slot_entries_to_rank0's max_round_bytes). Rank 0
++        # allocates world x budget for the padded idx/val gather lists, and under
++        # PP>1 every param merges over the WORLD group (delta_export.py), so with
++        # the default (== bucket_size, the flush size shipped to the rollout) a
++        # 480-rank trainer can need 480 x 512 MB = 240 GB on rank 0 for a single
++        # round. Decoupled so the gather round can be sized to rank 0's headroom
++        # while the rollout flush bucket stays large. None keeps the old coupling.
++        self.gather_round_bytes = (
++            int(gather_round_megabytes) << 20 if gather_round_megabytes else None
++        )
+         assert encoding == "indices", f"delta_sharded ships only the 'indices' position encoding; got {encoding!r}"
+         self.encoding = encoding
+         # every K-th steady sync appends a full state-verification sweep
+@@ -626,7 +643,7 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
+             wire_bytes += int(aidx.numel()) * (4 + aval.element_size())
+             _bucket_sliced(bkt, name, dtype_str, full_shape, aidx, aval)
+ 
+-        gq = _GatherQueue(batch_k, self.bucket_size, is_r0, _bucket_slot_delta)
++        gq = _GatherQueue(batch_k, self.gather_round_bytes or self.bucket_size, is_r0, _bucket_slot_delta)
+ 
+         # ``weights`` is the BACKEND's HF delta stream (hf_delta_export): entries
+         # already carry final HF coordinates -- naming, conversion, diff and

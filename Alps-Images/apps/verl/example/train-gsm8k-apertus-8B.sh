@@ -30,6 +30,7 @@ writable = true
 entrypoint = true
 [env]
 PMIX_MCA_psec = "native"
+CUDA_CACHE_DISABLE = 1
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF

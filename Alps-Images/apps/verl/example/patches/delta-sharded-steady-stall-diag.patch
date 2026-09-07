@@ -1,0 +1,110 @@
+# [CSCS diagnostic, 2026-09-04] Rank-0 stall dumper for the delta_sharded STEADY sync.
+#
+# Run 3289420 (train-gsm8k-deepseek-v3-671B-v1-separate-async-megatron.sh): the first steady
+# delta sync carrying real gradients hung for the full 30-min NCCL timeout. Flight recorder:
+# 479 ranks waiting in the WORLD count all_gather (SeqNum=5); rank 0 (wire master) shows
+# "Last enqueued NCCL work: 3, last completed 3" -- it completed the sub-round index gather and
+# never enqueued the value gather that is the very next dist.gather call, i.e. it is stuck
+# inside NCCL's launch of a 480-peer gather-to-one (delta_export.py routes every param over the
+# WORLD group under PP>1). The recorder cannot show WHERE rank 0 sits. Same signature as GLM run
+# 3263683. Diagnostic only, applied on top of delta-sharded-gather-round-size.patch.
+#
+# What it does: when rank 0 enters a steady send_weights, a daemon thread waits 600 s and then,
+# while that thread is still inside send_weights, every 300 s prints all Python thread stacks
+# (faulthandler) plus `py-spy dump --native` (falls back to a python-only dump) of this process
+# to stderr, which Ray relays into the slurm log as [WSYNC-STALL] lines -- well before the
+# 1800 s watchdog kills the job. Self-terminates when send_weights returns. Not applied on the
+# other ranks (their state is known: blocked in the all_gather).
+#
+# Generated from a real git worktree at verl v0.9.0 + delta-sharded-gather-round-size.patch;
+# git apply --check / py_compile / --reverse --check verified. MUST be applied AFTER
+# delta-sharded-gather-round-size.patch (same file).
+diff --git a/verl/checkpoint_engine/delta_checkpoint_engine.py b/verl/checkpoint_engine/delta_checkpoint_engine.py
+index 55663e44..10c84b91 100644
+--- a/verl/checkpoint_engine/delta_checkpoint_engine.py
++++ b/verl/checkpoint_engine/delta_checkpoint_engine.py
+@@ -68,6 +68,74 @@ from .nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine
+ logger = logging.getLogger(__name__)
+ 
+ 
++def _cscs_steady_stall_diag(tag: str, first_after: float = 600.0, every: float = 300.0) -> None:
++    """[CSCS diagnostic, run 3289420] Rank-0 stall dumper for the STEADY delta sync.
++
++    The first real-gradient steady sync hung for the full 30-min NCCL timeout with rank 0
++    (the wire master) stuck between two adjacent ``dist.gather`` calls in
++    ``sparse_gather.gather_slot_entries_to_rank0`` -- i.e. inside NCCL's launch of a
++    480-peer gather-to-one -- and the flight recorder only shows that the work was never
++    enqueued, not WHERE rank 0 sits. This thread waits ``first_after`` s and then, while
++    the calling thread is still inside ``send_weights``, every ``every`` s prints all
++    Python thread stacks (faulthandler) plus a ``py-spy dump --native`` of this process
++    (C/NCCL/libfabric frames) to stderr, which Ray relays into the job log. Self-terminates
++    once ``send_weights`` returns (no cleanup hook needed). Diagnostic only; remove once
++    the stall is understood."""
++    import faulthandler
++    import os
++    import subprocess
++    import sys
++    import threading
++
++    caller_ident = threading.get_ident()
++    t0 = time.time()
++
++    def _in_send_weights() -> bool:
++        fr = sys._current_frames().get(caller_ident)
++        while fr is not None:
++            if fr.f_code.co_name == "send_weights":
++                return True
++            fr = fr.f_back
++        return False
++
++    def _run() -> None:
++        time.sleep(first_after)
++        while _in_send_weights():
++            el = time.time() - t0
++            print(
++                f"[WSYNC-STALL] {tag} rank0 pid={os.getpid()} still inside send_weights after {el:.0f}s -- "
++                "dumping all Python thread stacks (faulthandler) then py-spy --native",
++                file=sys.stderr,
++                flush=True,
++            )
++            try:
++                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
++            except Exception as e:  # noqa: BLE001
++                print(f"[WSYNC-STALL] faulthandler failed: {e}", file=sys.stderr, flush=True)
++            try:
++                for extra in (["--native"], []):
++                    out = subprocess.run(
++                        ["py-spy", "dump", "--pid", str(os.getpid()), "--nonblocking", *extra],
++                        capture_output=True,
++                        text=True,
++                        timeout=180,
++                    )
++                    print(
++                        f"[WSYNC-STALL] py-spy {' '.join(extra) or '(python only)'} rc={out.returncode}:\n"
++                        f"{out.stdout}\n{out.stderr[-3000:]}",
++                        file=sys.stderr,
++                        flush=True,
++                    )
++                    if out.returncode == 0:
++                        break
++            except Exception as e:  # noqa: BLE001
++                print(f"[WSYNC-STALL] py-spy failed: {e}", file=sys.stderr, flush=True)
++            time.sleep(every)
++        print(f"[WSYNC-STALL] {tag} send_weights finished after {time.time() - t0:.0f}s", file=sys.stderr, flush=True)
++
++    threading.Thread(target=_run, name="cscs-wsync-stall-diag", daemon=True).start()
++
++
+ def _prodshape(shape) -> int:
+     n = 1
+     for x in shape:
+@@ -613,6 +681,9 @@ class DeltaShardedCheckpointEngine(NCCLCheckpointEngine):
+             return metrics
+         weights, _ = engine.get_per_tensor_param_delta_shard()
+         is_r0 = self.is_master
++        if is_r0:
++            # [CSCS diagnostic] see _cscs_steady_stall_diag
++            _cscs_steady_stall_diag(f"v={global_steps}")
+         n_flushes = 0
+         changed_elems = 0
+         total_elems = 0
