@@ -3092,6 +3092,47 @@ differ. ShellCheck not installed locally.
   `gather_round_megabytes` knob to the GLM-5.1 recipe** (same latent bugs — its run `3263683`
   hang); (4) upstream candidates: the sglang qkv_a cache fix, the P2P gather, the gather-round
   kwarg; (5) `[REWARD-DUMP]` left in (6 lines per reward process, cheap).
+- **Upstreaming (2026-09-07) — all three PRs open: verl #7777, verl #7778, sglang #38298**:
+  - **verl PR #7777** (`theely:fix-delta-sharded-p2p-gather`, `00726c2c`): the targeted P2P
+    gather. `pull/7777.patch` applies cleanly to v0.9.0. **verl PR #7778**
+    (`theely:feat-delta-sharded-gather-round-megabytes`, `d18c6c2a`): the kwarg; its
+    `delta_checkpoint_engine.py` context moved on main, so on v0.9.0 it needs `patch -p1
+    --fuzz=3`. Both committed through verl's pre-commit hooks, upstream-style comments.
+  - **sglang**: branch `fix-deepseek-qkv-a-cache-across-load-calls` (`310bee108`, on top of
+    `sgl-project/sglang` main `a8edaff`) now lives in the user's fork clone
+    `~/Documents/sglang` (origin = `theely/sglang`); isort/ruff/ruff-format pass. Pushed and
+    opened by the user as **sglang PR #38298** (GitHub SSH is denied from this environment).
+  - **The DeepSeek recipe now fetches all three fixes from GitHub** (no more embedded copies):
+    `7777` joins the upstream-PR `git apply` loop (`for pr in 7421 7422 7423 7777`); `7778` is
+    fetched in the same batch-host loop but applied by its own block with `patch -p1 --fuzz=3`,
+    gated on `grep -q gather_round_megabytes` (idempotency + post-check — NOT `patch --dry-run
+    -R`, which with fuzz reports "already applied" on an unpatched tree); the sglang fix is
+    fetched as `https://github.com/sgl-project/sglang/pull/38298.patch` (guarded by a
+    `grep "^diff --git a/python/sglang/srt/models/deepseek_common/…"`), applied in the srun
+    with `patch -p2 -d <dist-packages root>` (diff paths are `python/sglang/…`),
+    idempotency/post-check via `grep -q _pending_fused_a_proj`. All three apply paths rehearsed on a
+    fresh v0.9.0 worktree / the real v0.5.16 loader file with the real GitHub patch files,
+    twice each (apply, then skip); the gloo bit-identity test still passes on the resulting
+    `sparse_gather.py`. Reference copies of the retired embedded versions stay in
+    `example/patches/` (`delta-sharded-{p2p-gather,gather-round-size}.patch`,
+    `sglang-deepseek-qkv-a-cache-fix.py`, `delta-sharded-steady-stall-diag.patch`), none applied.
+  - **Cleanup (2026-09-07, user request)**: both scripts rewritten for readability -- the
+    run-by-run comment essays condensed to short rationale lines pointing here, the five
+    identical local-patch apply blocks folded into one loop (same order, same apply-or-fail
+    semantics; rehearsed on fresh v0.9.0), stale notes removed. **Code unchanged for
+    DeepSeek-V3** (rendered YAML byte-identical modulo comments; code-only diff = the loop
+    refactor). **The GLM-5.1 script is now DERIVED from the cleaned DeepSeek-V3 script** with the
+    GLM-specific knobs substituted back (verified: its rendered YAML differs from the previous GLM
+    version only by `gather_round_megabytes: 64` and `save_freq: 20 → -1`; code diff = the new
+    fix blocks + the loop refactor + env-overridable `MODEL_NAME`/`MODEL_REPO`), so GLM-5.1 now
+    also fetches verl #7777/#7778 and sglang #38298 at runtime and has checkpoint saving off
+    (same host-RAM HF-export hazard). **GLM-5.1 has NOT been re-run with these** — its last
+    validation (run `3217439`) predates delta_sharded; a shakedown run is due. The superseded
+    reference copies (`delta-sharded-{p2p-gather,gather-round-size,steady-stall-diag}.patch`,
+    `sglang-deepseek-qkv-a-cache-fix.py`) are tracked (committed by the user in `0ebd0a6`
+    "deepseek v3 working") and left in place, no longer applied by either script -- the PR
+    branches on the `theely/*` forks are the live copies. The `[REWARD-DUMP]` helper
+    (6 lines/process) and the `[MEMDUMP]`/`empty_cache()` patch stay in both scripts.
 - **Commit**: not committed.
 
 ### Run `3293605` — 2026-09-05 — DIAGNOSTIC run: the stall dumper worked — rank 0 is blocked INSIDE `torch.distributed.gather` (the padded 480-way value gather) before the work is enqueued. Root cause of the steady-sync hang found; fixed by replacing the padded gathers with targeted P2P.
@@ -4475,6 +4516,174 @@ change. **`reward.py` must be committed + pushed to the branch before the next r
 otherwise → FATAL, loud). Standard Python file now — no heredoc `$`/backtick constraints.
 `prepare_gsm8k.py` (the `SYSTEM_PROMPT`) stays embedded — it and `reward.py` are coupled on the
 `[[[N]]]` format; keep them in sync and bump `DATASET_PROMPT_VERSION` on any prompt change.
+
+## DAPO-Math benchmark (added 2026-09-07; VALIDATED 2026-09-08, run `3327285`: 20/20 steps, exit 0)
+
+Second benchmark for this recipe, selected with `BENCHMARK=dapo-math` (default stays `gsm8k`):
+- **Data** (`dataset_prepare.py`, fetched from the branch at run time — commit + push before a
+  run): train = `BytedTsinghua-SIA/DAPO-Math-17k`, test = `BytedTsinghua-SIA/AIME-2024`. The Hub
+  parquets are pre-replicated for DAPO's multi-epoch sampling (1,791,700 rows for ~17k problems;
+  960 = 30 AIME problems × 32), so both are de-duplicated by problem text; every row wraps the
+  problem in a fixed `Solve the following math problem step by step … Answer: $Answer …` /
+  `Remember to put your answer on its own line after "Answer:".` instruction, which is stripped
+  (AIME rows also carry `extra_info.raw_problem`). Output `data/dapo-math/{train,test}.parquet`,
+  `data_source` `dapo_math` / `aime_2024`, same `[[[N]]]` SYSTEM_PROMPT as GSM8K → `reward.py`
+  unchanged (all DAPO/AIME ground truths are integers; verified on the real rows: 960 → 30,
+  wrapper stripped, reward 1.1/1.0 on a correct `[[[540]]]`).
+- **Recipe**: `BENCHMARK` case sets `MAX_PROMPT_LENGTH` (512 → 2048; verl `truncation: error`
+  makes an over-long prompt fatal) and the validation sampling `rollout.val_kwargs` (gsm8k: greedy
+  n=1; dapo-math: **n=32, T=1.0, top_p=0.7 = the DAPO recipe's AIME avg@32**, read
+  `val-core/aime_2024/acc/mean@32`). Data paths, the dataset-prep block and the experiment name
+  key off `${BENCHMARK}`. Rendered gsm8k YAML is identical to before except the now-explicit
+  `max_prompt_length: 512` and the default-valued `val_kwargs`.
+- **How to run**: `ENABLE_THINKING=True BENCHMARK=dapo-math` (DAPO problems need reasoning;
+  12288-token responses; `ppo_max_token_len_per_gpu` 16384 ≥ 2048 + 12288). 92 steps × 48
+  prompts ≈ ¼ of the train set. Expect far lower reward than GSM8K (AIME baseline for a 70B
+  non-reasoning model is low single digits to ~10–20 %); the honest signal is the AIME
+  `mean@32` before vs after. Alternative not taken: verl's native DAPO path
+  (`reward_manager: dapo` + `reward_kwargs.overlong_buffer_cfg` + the `math_dapo` `Answer:`
+  scorer, ±1 reward) — literature-comparable, but a second answer format/reward for this model,
+  whose format-following needed the `[[[N]]]` fix in the first place.
+
+### DAPO-Math run `3312610` (2026-09-07, FAILED in 11 s) and `3314817` (FAILED at step 2)
+
+- `3312610`: `FATAL: MODEL_CHECKPOINT_PATH=... does not exist` — the recipe's hard-coded SFT
+  checkpoint lived in another user's `capstor/store` directory (`ls` → Permission denied at
+  every level). User moved it to `/capstor/store/cscs/swissai/infra01/RL_Infra/models/
+  ap1p5-70b-sft-262k-2700_corr` (readable: config.json + 31 shards) and asked for a rerun.
+- `3314817` (`ENABLE_THINKING=True BENCHMARK=dapo-math`, injected as `export` lines after the
+  SBATCH header of the submitted copy; the recipe file keeps defaults — `ENABLE_THINKING` is
+  now `${ENABLE_THINKING:-False}` so it is env-overridable like `BENCHMARK`): **the DAPO-Math
+  pipeline works end to end** — dataset built on the cluster (`17255` unique train problems,
+  1,774,445 replicated rows dropped; `30` AIME test problems), model/rollout up, **baseline
+  `val-core/aime_2024/acc/mean@32 = 0.0146` (best@32 0.135)** for the SFT checkpoint. Step 1:
+  `response_length/mean` **8401**, max 12288, `clip_ratio` **0.44**, `critic/score/mean` −0.06
+  (length penalty), `ppo_kl` 0.001, peak GPU 71.3 GB alloc / 86 GB reserved, **gen 1258 s,
+  step 1578 s** (92 steps would be ~45 h against the 4 h limit). **Step 2: CUDA OOM in the actor
+  backward** (`custom_backward`, 2.46 GiB request, 94.5 GiB in use) — the recipe's own
+  documented hazard for the untested 12288/16384 thinking pairing ("OOM as real response length
+  grows toward the cap"), never triggered by GSM8K's short answers.
+- **Decision (user, 2026-09-07): do NOT change the length parameters; scale out instead.**
+  The proposed 8192/12288 dapo-math pairing was reverted (thinking on stays 12288/16384). Recipe:
+  `#SBATCH --nodes` 16 → **40**, `ROLLOUT_NNODES` now env-overridable with default **16**
+  (was `ceil(0.25 × nodes)`) → 24 training nodes (96 GPUs, TP=8 → DP=12, 768 rows / 12 = 64 per
+  rank) + 16 rollout nodes (16 SGLang TP=4 replicas, 4× generation throughput);
+  `TOTAL_TRAINING_STEPS` env-overridable, default 92 (`test_freq` follows). Submitted as run
+  `3316163` with `TOTAL_TRAINING_STEPS=20` injected (estimate: ~9 min/step + ~8 min per
+  validation on this split → ~20 steps in 4 h). **Risk stated**: the step-2 OOM was
+  per-micro-batch activation memory at the 12288 cap, which more DP does not shrink directly
+  (it halves micro-batches per rank, which helps allocator growth); if it recurs, length, not
+  scale, is the limit — then the 8192/12288 pairing or a DAPO-style overlong buffer is the fix.
+- **OOM fixes added to the recipe (user-approved, 2026-09-07), NOT in run `3316163`** (it was
+  already queued; user: keep it running, resubmit with these only if it crashes):
+  (1) `actor_rollout_ref.model.use_fused_kernels: True` — the recipe never had fused linear CE,
+  so the loss materialized the `[tokens × 131072]` fp32 logits + backward copies (~8.6 GB per
+  copy at 16k tokens; the largest length-dependent activation); prereqs met, validated on
+  DeepSeek-V3. (2) thinking-on `PPO_MAX_TOKEN_LEN_PER_GPU` 16384 → **14336** (= 2048 + 12288):
+  dynamic batching can no longer pack two long samples into one 16k micro-batch. Neither
+  touches the length limits. Third option held back: bf16 grad buffer
+  (`use_precision_aware_optimizer` + `main_grads_dtype: bf16`, −17.6 GB) — dozens of
+  micro-batches per rank here means bf16 accumulation, unlike DeepSeek's single micro-batch.
+- **Run `3316163` (40 nodes 24/16, old memory settings): FAILED at step 1, 0 steps.** Baseline
+  AIME avg@32 1.46% again (best@32 11.8%). Then `RuntimeError: NCCL Error 1: unhandled cuda
+  error` in `finalize_model_grads → finish_grad_sync → start_grad_sync → _coalescing_manager`
+  — the DP gradient reduce-scatter right after the backward pass, the exact frame of DeepSeek
+  run `3251006` (device exhausted; NCCL cannot allocate its scratch). So the failure moved from
+  "OOM inside backward" (step 2, 12-node DP=6) to "no room left for NCCL after backward"
+  (step 1, DP=12): more DP did not cure it, as predicted. Step time on the 40-node split never
+  got measured (died before the step-1 metrics line). **Resubmitted as `3317266`** with the two
+  fixes (fused CE + 14336 cap), per the user's standing "resubmit on crash". If it fails at the
+  same frame, the next lever is the bf16 grad buffer (`use_precision_aware_optimizer` +
+  `main_grads_dtype: bf16`, which is precisely what fixed `3251006`), accepting bf16 gradient
+  accumulation across the ~40 micro-batches per rank.
+- **Run `3317266` (fused CE + 14336 cap): FAILED at the first actor forward — NOT memory.**
+  Baseline AIME avg@32 ~1.5% (best@32 10.6%) again. Then `OSError: [Errno 116] Stale file
+  handle` from `triton/compiler/compiler.py` under `verl/utils/kernel/linear_cross_entropy.py:77
+  forward` ← `fused_output_processor` ← `gpt_model._postprocess`: verl's fused linear
+  cross-entropy is a **Triton** kernel, JIT-compiled at the first actor forward, and its cache
+  defaults to `~/.triton` on Lustre — the recipe's known flock hazard. The Apertus recipe never
+  redirected `TRITON_CACHE_DIR` (unlike the DeepSeek/GLM scripts) because nothing in its actor
+  path compiled Triton before. **Fix**: `export TRITON_CACHE_DIR=/tmp/triton_${SLURM_JOB_ID}`
+  next to `FLASHINFER_WORKSPACE_BASE` in the srun. The memory fixes are therefore still
+  untested; resubmitted as run `3317733` with the redirect (a first attempt was caught by the
+  stray-quote scan — an apostrophe in the new comment inside the srun body — before submission).
+- **Run `3317733` (fused CE + 14336 cap + Triton cache on /tmp): the trainer-side fixes WORK —
+  2 steps completed, then an SGLang rollout OOM.** Baseline AIME avg@32 0.83% (best@32 7.5%;
+  sampling noise around the ~1.5% seen twice before). **Step 1: 526 s** (gen 333 s, update_actor
+  182 s, weight sync 10 s) on the 40-node 24/16 split vs 1578 s on 12/4 — the 3× speed-up the
+  split was meant to buy; peak trainer memory **59.7 GB** allocated (was 71.3 before fused CE),
+  86 GB reserved; step 2: 205 s (gen fully overlapped), 66.3 GB. Both backward passes and the
+  reduce-scatter passed. Response length is growing under training: mean 8563 → 9695 tokens,
+  `clip_ratio` 0.46 → 0.55, `critic/score/mean` −0.04 → −0.11 (length penalty; the DAPO-style
+  overlong buffer remains the open refinement).
+  **Failure**: `OutOfMemoryError: Tried to allocate 2.04 GiB` on all TP ranks of one SGLang
+  replica (`172.28.50.75`) during generation for step 3: the SGLang process held 80.5 GB
+  (0.75 × 95 = 71 GB static weights+KV pool + ~4 GB dynamic), the co-resident verl
+  `CheckpointEngineWorker` (NCCL weight-sync receiver, 2 × 2048 MB buckets + NCCL/context)
+  14.2 GB, 377 MiB free. Cascade: `ActorDiedError` → job FAILED (exit 15, 4229 s).
+  **Fix (recipe)**: `rollout.gpu_memory_utilization` 0.75 → **0.65** (+~9.5 GB dynamic headroom
+  per rollout GPU; less KV per replica, 16 replicas now) and `checkpoint_engine.
+  update_weights_bucket_megabytes` → **512** (CE receive buffers −~3 GB; same as DeepSeek-V3).
+  Lengths untouched. Resubmitted as run `3326537` under the user's standing "resubmit on crash".
+- **Run `3326537` (rollout mem 0.65 + bucket 512): FAILED at step 1, 0 steps — the DP
+  gradient reduce-scatter again.** Baseline AIME avg@32 ~1.5% (best@32 ~11%). Then the same
+  frame as `3316163`: `RuntimeError: NCCL Error 1: unhandled cuda error` in
+  `finalize_model_grads → finish_grad_sync → start_grad_sync → _coalescing_manager`, while the
+  identical trainer config had passed two full steps in `3317733` — i.e. a batch-dependent,
+  marginal condition, not a deterministic OOM. Mechanism (same as DeepSeek run `3251006` and the
+  GLM `3246683` `empty_cache()` fix, one phase earlier): at the step peak the trainer had ~60 GB
+  allocated but ~86 GB RESERVED by the caching allocator; after the backward pass the
+  activations are freed but the cache keeps the high-water mark, and NCCL allocates its
+  reduce-scatter scratch OUTSIDE that cache → `cudaMalloc` fails on a 95 GB GPU although the
+  live tensors fit. **Fix**: new `apertus-benchmarks/patches/grad-sync-empty-cache.patch` —
+  wraps the `config.finalize_model_grads_func` hook verl installs in
+  `verl/utils/megatron_utils.py:register_megatron_training_hooks` so it calls
+  `get_torch_device().empty_cache()` right before `finalize_model_grads` (numerically a no-op,
+  tens of ms per optimizer step). Generated from a v0.9.0 worktree; `git apply --check` /
+  `py_compile` / `--reverse --check` clean; the full chain (PRs 7421/7422/7423/7661 +
+  `v1-separate-async-fixes` + this) rehearsed on a fresh v0.9.0. Embedded in the recipe as a
+  heredoc (byte-identical), `sbcast`, appended to the `git apply` loop. Lengths / nodes /
+  rollout settings untouched. Resubmitted as run `3327285` (standing "resubmit on crash").
+  If the same frame recurs WITH this patch, the next lever is the bf16 grad buffer
+  (`use_precision_aware_optimizer` + `main_grads_dtype: bf16`, −17.6 GB) — a numerics change
+  (bf16 accumulation over ~40 micro-batches/rank) that needs an explicit go-ahead.
+- **Run `3327285` (grad-sync `empty_cache()` patch): COMPLETED, exit 0, 20/20 steps, 2 h 51 min
+  — the DAPO-Math recipe is validated end to end on the 40-node 24/16 split.** Zero NCCL errors /
+  OOM / ActorDiedError / watchdog; the only tracebacks are the known post-`Training Progress:
+  100%` teardown noise (DataLoader worker `Killed`, wandb atexit `BrokenPipeError`). Timeline:
+  load 10:08→10:48 (40 min, see "Model load phase" below), rollout up 10:51, step 1 ~11:00,
+  step 20 ~12:50, final validation, checkpoint at `global_step_20`.
+  **AIME-2024 (30 problems, T=1.0 top_p=0.7)**: `acc/mean@32` **2.08 % → 2.81 %**, `best@32`
+  **18.2 % → 22.8 %** after 20 steps × 48 prompts (~1 350 DAPO problems, <10 % of the set) —
+  a small but positive move; at 30 problems × 32 samples the noise floor is about ±1 pt on
+  mean@32, so treat it as "not worse, probably better", not a result. Training: `grad_norm`
+  0.028–0.059 (finite every step), `ppo_kl` ~0.001, `critic/score/max` 1.1 every step,
+  `critic/score/mean` −0.02 (step 1) → −0.15 (step 2) → −0.04 (step 20) — negative
+  throughout because the length penalty dominates: `response_length/mean` 7.6k → 10.7k (step 2)
+  → ~9.0–9.7k, `clip_ratio` 0.37 → 0.65 → ~0.5–0.6 (half the samples hit the 12288 cap).
+  `timing_s/step` 190–440 s (gen 0–190 s overlapped, `update_actor` 165–210 s, weight sync
+  ~11 s); peak GPU 70.3 GB allocated / 89.4 GB reserved, flat. **Open refinement**: the
+  DAPO-style overlong soft penalty (`overlong_buffer`) instead of the hard 12288 cut + fixed
+  length penalty, so the length signal stops dominating the reward.
+- **Model load phase (analysis 2026-09-08, not yet acted on)**: trainer init → "all initialize
+  finished" takes 30–57 min on every Apertus run (3264244: 30, 3253736: 57, 3317733: 36,
+  3326537: 39, 3327285: 40 min) regardless of node count and of `/capstor/scratch` vs
+  `/capstor/store`; DeepSeek-V3 (671B) loads in ~3.5 min. Cause: megatron-bridge
+  `load_weights_hf_to_megatron` (v0.6.0 `model_bridge.py:1098-1113`) fetches every HF tensor
+  with a full `safe_open().get_tensor()` on every rank that owns the parameter; with PP=1
+  every one of the 96 (or 48) trainer ranks reads the whole 145.6 GB / 31-shard checkpoint
+  from Lustre in the same order (~14 TB aggregate on the same files), although every TP
+  mapping's `hf_to_megatron` only uses `hf_weights` on `tp_rank == 0` (split + scatter;
+  replicated params broadcast from rank 0) — 7 of 8 reads discarded, and the 12 DP replicas
+  repeat the read. Options: (1) one-off conversion to a Megatron torch_dist checkpoint +
+  `actor.megatron.use_dist_checkpointing: True` / `dist_checkpointing_path` (verl
+  `load_mcore_dist_weights` → fully-parallel load, each rank reads ~its own shard; reshardable
+  across TP/PP; verl's `scripts/converter_hf_to_mcore.py` does not know apertus1p5, so the
+  converter must go through `Apertus1p5Bridge` + verl's `save_dist_checkpointing`) — the
+  recommended fix; (2) patch the bridge loop to fetch on `tp_rank == 0` only (+ DP broadcast),
+  upstreamable but touches the mapping contract; (3) Lustre striping / `/iopsstor` — the
+  scratch-vs-store data says the tier is not the limit. No local disk on GH200 nodes;
+  `sbcast` bus-errors at this size.
 
 ## Configuration audit (architecture-vs-config) — 2026-08-31
 

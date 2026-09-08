@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=16
+#SBATCH --nodes=40
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -77,7 +77,7 @@ export MODEL_REPO="swiss-ai"
 # skipped entirely.
 # Example: /capstor/store/cscs/swissai/infra01/users/xyixuan/rl-bench/models/ap1p5-70b-sft-262k-2700_corr
 # IMPORTANT: do not include a trailing slash in the path.
-export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/users/xyixuan/rl-bench/models/ap1p5-70b-sft-262k-2700_corr"
+export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/RL_Infra/models/ap1p5-70b-sft-262k-2700_corr"
 
 
 # Passed through to data.apply_chat_template_kwargs.enable_thinking (verl's
@@ -85,7 +85,7 @@ export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/users/xyixuan/
 # controls whether the chat template opens a <think>/reasoning turn. Harmless
 # to flip on for a template that doesn't branch on this kwarg -- unused
 # template variables are silently ignored.
-export ENABLE_THINKING="False"
+export ENABLE_THINKING="${ENABLE_THINKING:-False}"   # env-overridable (True|False)
 
 # Response-length budget is tied to ENABLE_THINKING:
 #   thinking OFF (short, direct answers): 500 -> 2048 tokens,
@@ -109,14 +109,39 @@ export ENABLE_THINKING="False"
 # in sync if either changes.
 if [ "${ENABLE_THINKING}" = "True" ]; then
     export MAX_RESPONSE_LENGTH=12288
-    export PPO_MAX_TOKEN_LEN_PER_GPU=16384
+    # 16384 -> 14336 (2026-09-07, after run 3314817): exactly max_prompt(2048) + max_response, so
+    # dynamic batching cannot pack two long samples into one 16k-token micro-batch; caps the
+    # backward-pass activation peak at one longest sample. Not a length limit.
+    export PPO_MAX_TOKEN_LEN_PER_GPU=14336
 else
     export MAX_RESPONSE_LENGTH=2048
     export PPO_MAX_TOKEN_LEN_PER_GPU=16384
 fi
 
+# Benchmark dataset (2026-09-07): gsm8k (default) or dapo-math. Both use the same [[[N]]] answer
+# convention and reward.py; dataset_prepare.py builds ${TRAINING_HOME}/data/${BENCHMARK}/.
+#   gsm8k     : openai/gsm8k train (7473) / test (1319), greedy pass@1 validation.
+#   dapo-math : BytedTsinghua-SIA/DAPO-Math-17k train (~17k unique problems, de-duplicated from
+#               the replicated Hub parquet) / AIME-2024 test (30 problems), validated DAPO-style
+#               as avg@32 (val_kwargs n=32, temperature 1.0, top_p 0.7) -> the metric to read is
+#               val-core/aime_2024/acc/mean@32 (the per-sample "acc" from reward.py). Problems
+#               are longer and need real reasoning: run it with ENABLE_THINKING=True (12288-token
+#               responses); the 2048-token prompt budget below fits the longest DAPO prompts and
+#               keeps ppo_max_token_len_per_gpu (16384) above max_prompt + max_response (14336).
+#               92 steps x 48 prompts = 4416 prompts = ~1/4 of the 17k train set.
+# Step budget (env-overridable). dapo-math with thinking on: run 3314817 (16 nodes: 12 train /
+# 4 rollout) measured 26 min/step (21 min generation, mean response 8401 tokens, 44% at the
+# 12288 cap) and ~25 min per AIME avg@32 validation -- size TOTAL_TRAINING_STEPS to the
+# allocation (e.g. ~20 steps in 4 h on the 40-node 24/16 split below).
+export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-92}"
+export BENCHMARK="${BENCHMARK:-gsm8k}"
+case "${BENCHMARK}" in
+    gsm8k)     export MAX_PROMPT_LENGTH=512;  export VAL_N=1;  export VAL_TEMPERATURE=0;   export VAL_TOP_P=1.0; export VAL_DO_SAMPLE=False ;;
+    dapo-math) export MAX_PROMPT_LENGTH=2048; export VAL_N=32; export VAL_TEMPERATURE=1.0; export VAL_TOP_P=0.7; export VAL_DO_SAMPLE=True ;;
+    *) echo "FATAL: unknown BENCHMARK=${BENCHMARK} (gsm8k | dapo-math)"; exit 1 ;;
+esac
 export PROJECT_NAME="apertus-benchmarks"
-export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
+export EXPERIMENT_NAME="${MODEL_NAME}-${BENCHMARK}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
@@ -129,7 +154,11 @@ cd $TRAINING_HOME
 
 
 
-export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
+# Node split (2026-09-07, user decision after run 3314817 where generation was ~80% of a 26 min
+# step on a 12/4 split): 40 nodes = 24 training (96 GPUs, TP=8 -> DP=12; 768 rows / 12 = 64 per
+# rank) + 16 rollout (64 GPUs -> 16 SGLang TP=4 replicas, 4x the generation throughput).
+# ROLLOUT_NNODES is env-overridable; the old default was ceil(0.25 x nodes).
+export ROLLOUT_NNODES="${ROLLOUT_NNODES:-16}"
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
 # V1 separate-async batching contract:
@@ -176,6 +205,7 @@ entrypoint = true
 PMIX_MCA_psec = "native"
 HF_TOKEN = "$(cat ~/HF_TOKEN)"
 ENABLE_THINKING = "${ENABLE_THINKING}"  # reward.py reads this to pick length-penalty thresholds
+BENCHMARK = "${BENCHMARK}"  # dataset_prepare.py reads this (gsm8k | dapo-math)
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
@@ -198,8 +228,9 @@ transfer_queue:
       num_data_storage_units: $(( SLURM_JOB_NUM_NODES * 2 ))
 
 data:
-  train_files: ${TRAINING_HOME}/data/gsm8k/train.parquet
-  val_files:   ${TRAINING_HOME}/data/gsm8k/test.parquet
+  train_files: ${TRAINING_HOME}/data/${BENCHMARK}/train.parquet
+  val_files:   ${TRAINING_HOME}/data/${BENCHMARK}/test.parquet
+  max_prompt_length: ${MAX_PROMPT_LENGTH}  # 512 gsm8k / 2048 dapo-math (verl truncation=error: a longer prompt is fatal)
   train_batch_size: ${TRAIN_BATCH_SIZE}   # == parameter_sync_step * ppo_mini_batch_size
   gen_batch_size: 1      # prompts are submitted to the rollout one at a time
   return_raw_chat: True
@@ -214,6 +245,12 @@ actor_rollout_ref:
   model:
     path: ${MODEL_LOAD_PATH}
     use_remove_padding: True  # Megatron THD layout requires sequence packing
+    # Fused linear cross-entropy (2026-09-07, after run 3314817's step-2 backward OOM at the 12288
+    # thinking cap): computes log-probs + entropy without materializing the [tokens x 131072-vocab]
+    # fp32 logits and their backward copies (~8.6 GB per copy at 16k tokens, the largest
+    # length-dependent activation). Prereqs (THD, actor, no MTP, uniform temperature) all met;
+    # verl auto-disables with a warning otherwise. Numerically equivalent; validated on DeepSeek-V3.
+    use_fused_kernels: True
     # eager, not flash_attention_2/sdpa: the vision tokenizer submodule
     # (instantiated even for this text-only benchmark) supports neither;
     # eager is the one implementation every model supports.
@@ -275,8 +312,20 @@ actor_rollout_ref:
     n_gpus_per_node: 4
     temperature: 1.0
     n: ${ROLLOUT_N} # responses per prompt -- GRPO group size for the relative-advantage baseline
+    # Validation sampling per benchmark (see BENCHMARK above): gsm8k = greedy pass@1 (verl defaults);
+    # dapo-math = AIME avg@32 with the DAPO recipe sampling (n=32, T=1.0, top_p=0.7).
+    val_kwargs:
+      n: ${VAL_N}
+      temperature: ${VAL_TEMPERATURE}
+      top_p: ${VAL_TOP_P}
+      top_k: -1
+      do_sample: ${VAL_DO_SAMPLE}
     tensor_model_parallel_size: 4
-    gpu_memory_utilization: 0.75
+    # 0.75 -> 0.65 (2026-09-08, run 3317733): with 12288-token responses a rollout TP rank OOMed on a
+    # 2 GiB dynamic allocation -- SGLang held 80.5 GB (71 GB static pool + dynamic) and the
+    # co-resident verl CheckpointEngineWorker 14.2 GB, 377 MiB free. Smaller static pool = more room
+    # for prefill/sampling buffers at long sequences; less KV per replica, but there are 16 replicas.
+    gpu_memory_utilization: 0.65
     calculate_log_probs: True   # required: bypass_mode reads rollout_log_probs as old_log_probs
     log_prob_use_dynamic_bsz: True
     checkpoint_engine:
@@ -284,6 +333,9 @@ actor_rollout_ref:
       # GLM recipe switched to (for its ~6000-collective full-model gather hang)
       # does not apply here.
       backend: nccl
+      # 2048 -> 512 (2026-09-08, run 3317733): the NCCL checkpoint-engine receive buffers live on
+      # the rollout GPUs next to SGLang; 4x smaller buckets free ~3 GB there (same as DeepSeek-V3).
+      update_weights_bucket_megabytes: 512
 
   ref:
     log_prob_use_dynamic_bsz: True
@@ -337,13 +389,13 @@ trainer:
   # (parameter_sync_step 1 x ppo_mini_batch_size 48 = 48 prompts) = 4416 prompts
   # -- same total as the prior 46 x 96, and the fully-async recipe's
   # total_rollout_steps: 4416 (job 3184869) -- just twice as many, half-size steps.
-  total_training_steps: 92
+  total_training_steps: ${TOTAL_TRAINING_STEPS}  # env-overridable, default 92
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 100  # > total_training_steps: no mid-run checkpoint on the shakedown (faster, cleaner signal). Lower for a real run (actor.checkpoint.strict is False so the multimodal-tower export gap is non-fatal).
-  test_freq: 92  # == total_training_steps: validate once, at the end
+  test_freq: ${TOTAL_TRAINING_STEPS}  # == total_training_steps: validate once, at the end
   val_before_train: true   # + a baseline validation before step 1
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
@@ -531,6 +583,57 @@ index d9beede7..4e2d767e 100644
          rollout_world_size = (
 EOF
 sbcast -f ${TRAINING_CONFIG}/v1-separate-async-fixes.patch ${TRAINING_CONFIG}/v1-separate-async-fixes.patch
+
+# apertus-benchmarks/patches/grad-sync-empty-cache.patch, embedded (same reason). Fix for the
+# batch-dependent "NCCL Error 1: unhandled cuda error" in the DP gradient reduce-scatter at the
+# 12288-token thinking cap (runs 3316163 / 3326537): empty_cache() before finalize_model_grads so
+# NCCL can allocate its collective buffers outside the PyTorch cache. See the patch header.
+cat > "${TRAINING_CONFIG}/grad-sync-empty-cache.patch" <<- 'EOF'
+# [CSCS, 2026-09-08] Return PyTorch's cached-but-free CUDA blocks to the driver right before the
+# Megatron DP gradient reduce-scatter (finalize_model_grads), by wrapping the hook verl installs
+# in verl/utils/megatron_utils.py:register_megatron_training_hooks.
+#
+# Found on rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh with DAPO-Math at the
+# 12288-token thinking cap (runs 3316163 and 3326537): step 1 dies with
+#   RuntimeError: NCCL Error 1: unhandled cuda error
+#   finalize_model_grads -> finish_grad_sync -> start_grad_sync -> _coalescing_manager
+# while an identical configuration (run 3317733) completed 2 steps -- a batch-dependent, marginal
+# condition. At the step peak the trainer had ~60 GB allocated but ~86 GB RESERVED by the caching
+# allocator; after the backward pass the activations are freed but the cache keeps holding the
+# high-water mark, and NCCL's own CUDA allocations for the reduce-scatter happen outside that
+# cache -> cudaMalloc fails on a 95 GB GPU even though the live tensors fit. Same mechanism and
+# same remedy as the DeepSeek-V3 recipe's unconditional empty_cache() before optimizer.step().
+# Numerically a no-op; cost is one empty_cache() per optimizer step (tens of ms).
+#
+# Generated from a real git worktree at verl v0.9.0; git apply --check / py_compile /
+# --reverse --check verified. Touches only verl/utils/megatron_utils.py (no overlap with the other
+# patches this recipe applies).
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497c..016e8f2d 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -1689,7 +1689,18 @@ def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
+     for one_model in model:
+         config = get_model_config(one_model)
+         config.grad_scale_func = optimizer.scale_loss
+-        config.finalize_model_grads_func = finalize_model_grads
++
++        def _finalize_model_grads_with_empty_cache(*args, **kwargs):
++            # Return PyTorch's cached-but-free blocks to CUDA before the DP gradient
++            # reduce-scatter: after the backward pass the caching allocator still holds
++            # the activation high-water mark, and NCCL's own CUDA allocations for the
++            # collective happen outside that cache. On long-sequence RL steps this
++            # otherwise fails with "NCCL Error 1: unhandled cuda error" even though the
++            # step's live tensors fit. Numerically a no-op.
++            get_torch_device().empty_cache()
++            return finalize_model_grads(*args, **kwargs)
++
++        config.finalize_model_grads_func = _finalize_model_grads_with_empty_cache
+ 
+         overlap_param_gather = getattr(optimizer.config, "overlap_param_gather", False)
+         overlap_grad_reduce = getattr(one_model.ddp_config, "overlap_grad_reduce", False)
+EOF
+sbcast -f ${TRAINING_CONFIG}/grad-sync-empty-cache.patch ${TRAINING_CONFIG}/grad-sync-empty-cache.patch
 
 # ══════════════════════════════════════════════════════════════════════════
 # Add Apertus 1.5 support.
@@ -770,28 +873,28 @@ else
     echo "Model already present, skipping download."
 fi
 
-# Prepare dataset. ${TRAINING_HOME}/data/gsm8k persists on Lustre across
-# submissions, so a plain "file exists" check would keep serving a parquet built
-# with an older SYSTEM_PROMPT. Key the cache on DATASET_PROMPT_VERSION: bump it
-# in the same edit as any dataset_prepare.py SYSTEM_PROMPT change and the parquet
-# is rebuilt (same discipline as the wheel-build markers).
+# Prepare the ${BENCHMARK} dataset. ${TRAINING_HOME}/data/${BENCHMARK} persists on Lustre across
+# submissions; a .prompt.version marker forces a rebuild whenever dataset_prepare.py's
+# SYSTEM_PROMPT changes (bump DATASET_PROMPT_VERSION in the same edit as any prompt change --
+# the old plain "file exists" guard silently served a stale parquet).
 export DATASET_PROMPT_VERSION="v2-triple-bracket"
-if [ ! -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ] \
-    || [ "$(cat ${TRAINING_HOME}/data/gsm8k/.prompt.version 2>/dev/null)" != "${DATASET_PROMPT_VERSION}" ]; then
-    echo "Preparing GSM8K dataset (SYSTEM_PROMPT ${DATASET_PROMPT_VERSION})..."
+export DATASET_DIR="${TRAINING_HOME}/data/${BENCHMARK}"
+if [ ! -f "${DATASET_DIR}/train.parquet" ] \
+    || [ "$(cat ${DATASET_DIR}/.prompt.version 2>/dev/null)" != "${DATASET_PROMPT_VERSION}" ]; then
+    echo "Preparing ${BENCHMARK} dataset (SYSTEM_PROMPT ${DATASET_PROMPT_VERSION})..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         set -e
-        rm -f ${TRAINING_HOME}/data/gsm8k/train.parquet ${TRAINING_HOME}/data/gsm8k/test.parquet
-        # Try loading from cached raw download first, otherwise fetch from HF
+        rm -f ${DATASET_DIR}/train.parquet ${DATASET_DIR}/test.parquet
+        # BENCHMARK selects the source (gsm8k | dapo-math); cached raw downloads are reused when present
         python ${TRAINING_CONFIG}/dataset_prepare.py
-        echo "${DATASET_PROMPT_VERSION}" > ${TRAINING_HOME}/data/gsm8k/.prompt.version
+        echo "${DATASET_PROMPT_VERSION}" > ${DATASET_DIR}/.prompt.version
     '
-    [ -f "${TRAINING_HOME}/data/gsm8k/train.parquet" ] \
-        || { echo "FATAL: GSM8K dataset preparation failed"; exit 1; }
+    [ -f "${DATASET_DIR}/train.parquet" ] \
+        || { echo "FATAL: ${BENCHMARK} dataset preparation failed"; exit 1; }
 else
-    echo "Dataset already present for SYSTEM_PROMPT ${DATASET_PROMPT_VERSION}, skipping preparation."
+    echo "Dataset ${BENCHMARK} already present for SYSTEM_PROMPT ${DATASET_PROMPT_VERSION}, skipping preparation."
 fi
 
 
@@ -858,7 +961,7 @@ for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", 
 # all apply cleanly to the tag. A patch that neither applies nor is already
 # present is fatal -- a cluster where only some ranks carry a patch is worse than
 # one that carries none (run 3124273).
-for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch"; do
+for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch"; do
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied $(basename "$p") on $(hostname)"
     elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
@@ -980,6 +1083,12 @@ patch -p2 -d /usr/local/lib/python3.12/dist-packages < ${TRAINING_CONFIG}/sglang
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}
 mkdir -p $FLASHINFER_WORKSPACE_BASE
+# Triton JIT cache off Lustre (2026-09-07, run 3317266): use_fused_kernels compiles the verl fused
+# linear-cross-entropy Triton kernel at the first actor forward; the default ~/.triton cache on
+# Lustre fails with OSError Errno 116 Stale file handle (the same flock hazard as flashinfer).
+# Same redirect the DeepSeek-V3 / GLM-5.1 recipes use.
+export TRITON_CACHE_DIR=/tmp/triton_${SLURM_JOB_ID}
+mkdir -p $TRITON_CACHE_DIR
 
 # Pre-warm FlashInfer JIT cache to avoid contention during training
 python3 -c "
