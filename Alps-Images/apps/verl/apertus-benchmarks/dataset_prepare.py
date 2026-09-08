@@ -5,7 +5,9 @@ Selected by the BENCHMARK env var (set by the launch script):
   dapo-math  BytedTsinghua-SIA/DAPO-Math-17k (train) + BytedTsinghua-SIA/AIME-2024 (test)
              -> data/dapo-math/{train,test}.parquet
 
-Both benchmarks use the same SYSTEM_PROMPT / [[[N]]] answer convention, so reward.py is shared.
+GSM8K and the DAPO-Math training rows use the [[[N]]] SYSTEM_PROMPT (or \\boxed{N} with
+ANSWER_MARKER=boxed); the AIME-2024 eval rows always use the \\boxed{} prompt. reward.py routes
+the marker on data_source, so it is shared.
 The DAPO parquets on the Hub are pre-replicated for DAPO's multi-epoch sampling (DAPO-Math-17k
 has ~1.79M rows for ~17k problems; AIME-2024 has 960 rows for 30 problems), so both are
 de-duplicated by problem text here; per-problem repeats for the AIME avg@k evaluation come from
@@ -18,11 +20,28 @@ import os
 import pandas as pd
 from pathlib import Path
 
-SYSTEM_PROMPT = """You are a precise math solver.
+# Answer marker per split, mirrored by reward.py (which routes on data_source): the AIME-2024
+# eval set always gets the \\boxed{} prompt; GSM8K and the DAPO-Math training rows get the
+# [[[N]]] prompt unless ANSWER_MARKER=boxed. Bump DATASET_PROMPT_VERSION in the launch script
+# on any prompt change.
+ANSWER_MARKER = os.environ.get("ANSWER_MARKER", "bracket").strip().lower()
+if ANSWER_MARKER not in ("bracket", "boxed"):
+    raise SystemExit(f"ANSWER_MARKER must be 'bracket' or 'boxed', got {ANSWER_MARKER!r}")
+
+SYSTEM_PROMPTS = {
+    "bracket": """You are a precise math solver.
 Solve the problem step by step, then give your final answer as a single number inside triple square brackets.
 
 Example:
-[[[42]]]"""
+[[[42]]]""",
+    "boxed": """You are a precise math solver.
+Solve the problem step by step, then give your final answer inside \\boxed{}.
+
+Example:
+\\boxed{42}""",
+}
+SYSTEM_PROMPT = SYSTEM_PROMPTS[ANSWER_MARKER]      # training rows / gsm8k
+AIME_SYSTEM_PROMPT = SYSTEM_PROMPTS["boxed"]      # aime_2024 eval rows
 
 DAPO_PREFIX = (
     "Solve the following math problem step by step. The last line of your response should be of "
@@ -37,9 +56,9 @@ def extract_ground_truth(solution: str) -> str:
     return match.group(1).replace(",", "").strip() if match else ""
 
 
-def make_prompt(question: str) -> list:
+def make_prompt(question: str, system_prompt: str = SYSTEM_PROMPT) -> list:
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": question},
     ]
 
@@ -57,7 +76,7 @@ def dapo_problem_text(item: dict) -> str:
     return content.strip()
 
 
-def dapo_rows(items, data_source: str) -> tuple[list, int, int]:
+def dapo_rows(items, data_source: str, system_prompt: str = SYSTEM_PROMPT) -> tuple[list, int, int]:
     """Convert DAPO-style rows to the benchmark format, de-duplicated by problem text.
 
     Returns (rows, n_duplicates_dropped, n_skipped_no_answer)."""
@@ -73,7 +92,7 @@ def dapo_rows(items, data_source: str) -> tuple[list, int, int]:
             continue
         seen.add(problem)
         rows.append({
-            "prompt": make_prompt(problem),
+            "prompt": make_prompt(problem, system_prompt),
             "data_source": data_source,
             "reward_model": {"ground_truth": gt},
         })
@@ -119,12 +138,12 @@ def prepare_dapo_math(split: str, output_path: str):
     import datasets
 
     if split == "train":
-        hub, data_source = "BytedTsinghua-SIA/DAPO-Math-17k", "dapo_math"
+        hub, data_source, system_prompt = "BytedTsinghua-SIA/DAPO-Math-17k", "dapo_math", SYSTEM_PROMPT
     else:
-        hub, data_source = "BytedTsinghua-SIA/AIME-2024", "aime_2024"
+        hub, data_source, system_prompt = "BytedTsinghua-SIA/AIME-2024", "aime_2024", AIME_SYSTEM_PROMPT
     print(f"Downloading {hub} from HuggingFace...")
     ds = datasets.load_dataset(hub, split="train")
-    rows, dups, skipped = dapo_rows(ds, data_source)
+    rows, dups, skipped = dapo_rows(ds, data_source, system_prompt)
     write_parquet(rows, output_path, split, f" ({data_source}; {dups} replicated rows dropped, {skipped} skipped)")
 
 

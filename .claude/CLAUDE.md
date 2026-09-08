@@ -4517,6 +4517,51 @@ otherwise → FATAL, loud). Standard Python file now — no heredoc `$`/backtick
 `prepare_gsm8k.py` (the `SYSTEM_PROMPT`) stays embedded — it and `reward.py` are coupled on the
 `[[[N]]]` format; keep them in sync and bump `DATASET_PROMPT_VERSION` on any prompt change.
 
+**2026-09-08 — reward.py aligned with the NeMo-RL side of the benchmark + `\boxed{}` support
+(user request; UNVERIFIED on cluster, needs commit+push before it takes effect).** Compared
+against `Alvorecer721/Nemo-RL@6196eab nemo_rl/environments/bracket_math_reward.py` (itself a
+port of ours). Differences found and resolved:
+- **Bug in ours**: the truncated-thinking guard tested `"<inner_prefix>"`/`"<inner_suffix>"`
+  WITHOUT the pipes; the real Apertus tokens are `<|inner_prefix|>`/`<|inner_suffix|>` (run
+  `3246622`'s `[REWARD-DUMP]` shows them reaching `solution_str`; verl's
+  `skip_special_tokens=True` decode does not strip them) → the guard never fired, and the
+  bracket search ran over the whole response including the deliberation. Now: NeMo's
+  `completed_final_text()` — the answer and the format marker are searched only in text
+  OUTSIDE completed `<|inner_prefix|>…<|inner_suffix|>` spans; an unfinished or malformed span
+  (e.g. a response cut at the 12288 cap mid-thinking, or a stray `<|inner_suffix|>` with no
+  prefix) gets neither outcome nor format reward (the length penalty still applies).
+- **Length schedule unified** to 2000→4000 words for both thinking on and off (ours had
+  1400→2800 with thinking off; NeMo is fixed 2000/4000). GSM8K rewards recorded before this
+  date used the 1400/2800 ramp.
+- **`\boxed{}` marker added, routed per data_source** (NeMo's `extract_boxed_answer`: last
+  balanced `\boxed{…}`, LaTeX noise/`\text{}` wrappers stripped, numeric normalisation).
+  **User spec (2026-09-08): the AIME-2024 eval rows (`data_source: aime_2024`) use the prompt
+  "You are a precise math solver. / Solve the problem step by step, then give your final answer
+  inside \boxed{}. / (blank line) / For example: \boxed{42}" (exact text, user-specified) and
+  are scored with the boxed marker; everything else (gsm8k, the
+  dapo_math training rows) keeps the `[[[42]]]` prompt + bracket marker.** `reward.py`:
+  `marker_for(data_source)` = boxed if the source is in `BOXED_DATA_SOURCES` (env, default
+  `aime_2024`) else `ANSWER_MARKER` (env, default `bracket`); `dataset_prepare.py` builds the
+  AIME split with `AIME_SYSTEM_PROMPT` (boxed) and the rest with `SYSTEM_PROMPT` (bracket, or
+  boxed if `ANSWER_MARKER=boxed`). Recipe: `export ANSWER_MARKER="${ANSWER_MARKER:-bracket}"`
+  forwarded via `env.toml [env]`; `DATASET_PROMPT_VERSION` keyed on `BENCHMARK-ANSWER_MARKER`:
+  gsm8k-bracket `v2-triple-bracket` (unchanged → cached gsm8k parquets stay valid), gsm8k-boxed
+  `v3-boxed`, **dapo-math-bracket `v3-bracket-train-boxed-aime` (forces a rebuild of the cached
+  DAPO parquets, whose AIME rows carried the bracket prompt)**, dapo-math-boxed
+  `v3-boxed-train-boxed-aime`. Routing tested locally: bracket answers score 0 on aime_2024,
+  boxed answers score 0 on dapo_math/gsm8k, 21/21 parity with NeMo across the three sources.
+- **Parity verified locally**: 18 inputs × 2 markers, `score`/`acc` identical to NeMo's
+  `reward`/`outcome` in all 36 (`bash -n`, stray-quote/backtick scans, env.toml render clean).
+- **Behavioural caveat**: a leaked `<|inner_suffix|>` with no prefix (the documented
+  chat-template leak, seen in 1 of 4 dumped GSM8K samples in `3246622`, thinking off) now
+  zeroes the sample's outcome+format instead of being ignored — identical to NeMo, but it can
+  lower the GSM8K training reward vs the earlier runs if the leak is still frequent on this
+  image. Check with a `[REWARD-DUMP]`-style print on the next GSM8K run.
+- **Timing hazard**: the recipe `curl`s `reward.py`/`dataset_prepare.py` from the branch when
+  the job STARTS (batch script), not at submission — pushing this while a job is PENDING
+  changes that job's reward. Run `3328808` (92-step DAPO benchmark) was PENDING at the time
+  of this edit.
+
 ## DAPO-Math benchmark (added 2026-09-07; VALIDATED 2026-09-08, run `3327285`: 20/20 steps, exit 0)
 
 Second benchmark for this recipe, selected with `BENCHMARK=dapo-math` (default stays `gsm8k`):
@@ -4531,9 +4576,14 @@ Second benchmark for this recipe, selected with `BENCHMARK=dapo-math` (default s
   unchanged (all DAPO/AIME ground truths are integers; verified on the real rows: 960 → 30,
   wrapper stripped, reward 1.1/1.0 on a correct `[[[540]]]`).
 - **Recipe**: `BENCHMARK` case sets `MAX_PROMPT_LENGTH` (512 → 2048; verl `truncation: error`
-  makes an over-long prompt fatal) and the validation sampling `rollout.val_kwargs` (gsm8k: greedy
-  n=1; dapo-math: **n=32, T=1.0, top_p=0.7 = the DAPO recipe's AIME avg@32**, read
-  `val-core/aime_2024/acc/mean@32`). Data paths, the dataset-prep block and the experiment name
+  makes an over-long prompt fatal), the training rollout sampling (`ROLLOUT_N` /
+  `ROLLOUT_TEMPERATURE` / `ROLLOUT_TOP_P`, `top_k: -1` always) and the validation sampling
+  `rollout.val_kwargs`. **Since 2026-09-08 (user's benchmark spec)**: gsm8k train n=16 T=1.0
+  top_p=1.0, val greedy n=1; **dapo-math train n=16 T=1.0 top_p=1.0 (n=32 was specified first,
+  then reverted to 16 by the user the same day — n=32 would double the ~5.5 min/step and push 92
+  steps past the 12 h ceiling), AIME-2024 val n=32 T=0.6 top_p=0.95** (read
+  `val-core/aime_2024/acc/mean@32`). Runs `3314817`–`3327285` used val T=1.0 / top_p=0.7, so
+  their AIME numbers are not directly comparable with runs on the new spec. Data paths, the dataset-prep block and the experiment name
   key off `${BENCHMARK}`. Rendered gsm8k YAML is identical to before except the now-explicit
   `max_prompt_length: 512` and the default-valued `val_kwargs`.
 - **How to run**: `ENABLE_THINKING=True BENCHMARK=dapo-math` (DAPO problems need reasoning;
@@ -4684,6 +4734,19 @@ Second benchmark for this recipe, selected with `BENCHMARK=dapo-math` (default s
   upstreamable but touches the mapping contract; (3) Lustre striping / `/iopsstor` — the
   scratch-vs-store data says the tier is not the limit. No local disk on GH200 nodes;
   `sbcast` bus-errors at this size.
+- **Run `3328808` (2026-09-08) — the full 92-step DAPO-Math benchmark run.** (`3328762`, the
+  first submission at 12 h, was cancelled while PENDING when the user asked for 16 h; Slurm
+  then rejected 16/15/14/13 h with "Requested time limit is invalid (missing or exceeds some
+  limit)" — **12 h is the hard maximum for this account/partition on clariden**.) Same recipe
+  and fixes as `3327285`; submitted copy differs only in `#SBATCH --time` 4:00:00 → **12:00:00**
+  (20 steps took ~110 min of stepping → 92 steps ≈ 8 h + 40 min load + 2 AIME validations
+  ≈ 9 h) and no `TOTAL_TRAINING_STEPS` override (recipe default 92). Sync every step is the
+  recipe default (`PARAMETER_SYNC_STEP=1`, 48 prompts/step, 4416 prompts total). Validation at
+  step 0 and step 92 only (`test_freq: 92`), final checkpoint at `global_step_92`. **Outcome:
+  CANCELLED by the user while still PENDING (never ran)** — superseded by the new sampling
+  spec (train n=32; AIME val T=0.6 / top_p=0.95), which its frozen script did not carry, and by
+  the 12 h ceiling: at n=32 a 92-step run does not fit one job (options recorded in the
+  session: accept a TIMEOUT / periodic checkpoints + resume across two jobs / 46 steps).
 
 ## Configuration audit (architecture-vs-config) — 2026-08-31
 
