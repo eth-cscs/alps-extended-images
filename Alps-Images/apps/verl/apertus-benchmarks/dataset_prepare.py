@@ -41,7 +41,9 @@ Example:
 \\boxed{42}""",
 }
 SYSTEM_PROMPT = SYSTEM_PROMPTS[ANSWER_MARKER]      # training rows / gsm8k
-AIME_SYSTEM_PROMPT = SYSTEM_PROMPTS["boxed"]      # aime_2024 eval rows
+AIME_SYSTEM_PROMPT = SYSTEM_PROMPTS[ANSWER_MARKER]  # aime_2024 eval rows -- follows ANSWER_MARKER
+# like the training rows, so a bracket-marker run evaluates AIME with the same convention it
+# trains on (was hardcoded to "boxed" regardless of ANSWER_MARKER; see CLAUDE.md 2026-09-09).
 
 DAPO_PREFIX = (
     "Solve the following math problem step by step. The last line of your response should be of "
