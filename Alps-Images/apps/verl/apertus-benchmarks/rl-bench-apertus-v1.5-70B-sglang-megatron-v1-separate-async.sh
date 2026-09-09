@@ -86,6 +86,12 @@ export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/RL_Infra/model
 # to flip on for a template that doesn't branch on this kwarg -- unused
 # template variables are silently ignored.
 export ENABLE_THINKING="${ENABLE_THINKING:-False}"   # env-overridable (True|False)
+# Default final-answer marker for the TRAINING rows (gsm8k / dapo_math), read by reward.py AND
+# dataset_prepare.py (SYSTEM_PROMPT) from the container env: bracket = [[[N]]] (the benchmark
+# original), boxed = \boxed{N}. The AIME-2024 eval rows (data_source aime_2024) are ALWAYS
+# prompted for and scored with \boxed{} regardless of this switch (reward.py routes on
+# data_source). Same convention as the NeMo-RL side of the benchmark.
+export ANSWER_MARKER="${ANSWER_MARKER:-bracket}"     # env-overridable (bracket|boxed)
 
 # Response-length budget is tied to ENABLE_THINKING:
 #   thinking OFF (short, direct answers): 500 -> 2048 tokens,
@@ -134,10 +140,22 @@ fi
 # 12288 cap) and ~25 min per AIME avg@32 validation -- size TOTAL_TRAINING_STEPS to the
 # allocation (e.g. ~20 steps in 4 h on the 40-node 24/16 split below).
 export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-92}"
+# Minor actor hyper-parameters, env-overridable for A/B benchmark runs (defaults = verl v0.9.0
+# stock values used by every run up to 3330187): ACTOR_LR (actor.optim.lr, 1e-6) and
+# CLIP_RATIO_HIGH (actor.clip_ratio_high, 0.2 -- DAPO "clip-higher" uses 0.28; clip_ratio_low
+# stays 0.2).
+export ACTOR_LR="${ACTOR_LR:-1e-6}"
+export CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.2}"
 export BENCHMARK="${BENCHMARK:-gsm8k}"
 case "${BENCHMARK}" in
-    gsm8k)     export MAX_PROMPT_LENGTH=512;  export VAL_N=1;  export VAL_TEMPERATURE=0;   export VAL_TOP_P=1.0; export VAL_DO_SAMPLE=False ;;
-    dapo-math) export MAX_PROMPT_LENGTH=2048; export VAL_N=32; export VAL_TEMPERATURE=1.0; export VAL_TOP_P=0.7; export VAL_DO_SAMPLE=True ;;
+    # Training rollout sampling (ROLLOUT_*: GRPO group size n, temperature, top_p; top_k is
+    # always disabled) and validation sampling (VAL_*). gsm8k: n=16 (matches 3184869), greedy
+    # val. dapo-math (2026-09-08, benchmark spec): train n=16 T=1.0 top_p=1.0; AIME-2024 val
+    # n=32 T=0.6 top_p=0.95 (read val-core/aime_2024/acc/mean@32).
+    gsm8k)     export MAX_PROMPT_LENGTH=512;  export ROLLOUT_N=16; export ROLLOUT_TEMPERATURE=1.0; export ROLLOUT_TOP_P=1.0
+               export VAL_N=1;  export VAL_TEMPERATURE=0;   export VAL_TOP_P=1.0;  export VAL_DO_SAMPLE=False ;;
+    dapo-math) export MAX_PROMPT_LENGTH=2048; export ROLLOUT_N=16; export ROLLOUT_TEMPERATURE=1.0; export ROLLOUT_TOP_P=1.0
+               export VAL_N=32; export VAL_TEMPERATURE=0.6; export VAL_TOP_P=0.95; export VAL_DO_SAMPLE=True ;;
     *) echo "FATAL: unknown BENCHMARK=${BENCHMARK} (gsm8k | dapo-math)"; exit 1 ;;
 esac
 export PROJECT_NAME="apertus-benchmarks"
@@ -181,7 +199,7 @@ export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 # dynamic-bsz caps each MICRObatch at ppo_max_token_len_per_gpu=16384 so the
 # activation peak is per-microbatch, not per-mini-batch -- 8x more rows just
 # means more sequential microbatches, same peak.
-export ROLLOUT_N=16                  # responses per prompt (matches 3184869)
+# ROLLOUT_N (responses per prompt) is set per benchmark in the BENCHMARK case above.
 # ppo_mini_batch_size kept at 48 (matches 3184869; this is the actor mini-batch
 # granularity, and dynamic-bsz already caps per-microbatch activation memory
 # regardless of this value -- see the block comment above). To still get
@@ -191,7 +209,7 @@ export ROLLOUT_N=16                  # responses per prompt (matches 3184869)
 # weight sync to the standalone rollout now happens every actor update instead
 # of every 2nd, i.e. fresher (less off-policy) rollout weights, at the cost of
 # more frequent ~9.7s NCCL weight-sync overhead.
-export PPO_MINI_BATCH_SIZE=48        # prompts; x ROLLOUT_N = 768 rows (matches 3184869)
+export PPO_MINI_BATCH_SIZE=48        # prompts; x ROLLOUT_N (16) = 768 rows
 export PARAMETER_SYNC_STEP=1         # was 2 -- see comment above
 export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))  # 48
 
@@ -204,7 +222,8 @@ entrypoint = true
 [env]
 PMIX_MCA_psec = "native"
 HF_TOKEN = "$(cat ~/HF_TOKEN)"
-ENABLE_THINKING = "${ENABLE_THINKING}"  # reward.py reads this to pick length-penalty thresholds
+ENABLE_THINKING = "${ENABLE_THINKING}"  # chat-template thinking switch (reward.py no longer reads it)
+ANSWER_MARKER = "${ANSWER_MARKER}"  # reward.py + dataset_prepare.py read this (bracket | boxed)
 BENCHMARK = "${BENCHMARK}"  # dataset_prepare.py reads this (gsm8k | dapo-math)
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -267,6 +286,10 @@ actor_rollout_ref:
       # HF-checkpoint export then fails ("473 tensors ... not written", run
       # 3240861). strict: False saves the LM-only partial checkpoint instead.
       strict: False
+    optim:
+      lr: ${ACTOR_LR}  # default 1e-6 (verl stock); env-overridable
+    clip_ratio_low: 0.2
+    clip_ratio_high: ${CLIP_RATIO_HIGH}  # default 0.2 (verl stock); 0.28 = DAPO clip-higher; env-overridable
     ppo_mini_batch_size: ${PPO_MINI_BATCH_SIZE}
     ppo_micro_batch_size_per_gpu: 1
     # Must exceed max_prompt_length(512) + max_response_length above, or a
@@ -310,10 +333,12 @@ actor_rollout_ref:
     # rollout pool size from here instead of a top-level rollout: block.
     nnodes: ${ROLLOUT_NNODES}
     n_gpus_per_node: 4
-    temperature: 1.0
-    n: ${ROLLOUT_N} # responses per prompt -- GRPO group size for the relative-advantage baseline
+    temperature: ${ROLLOUT_TEMPERATURE}
+    top_p: ${ROLLOUT_TOP_P}
+    top_k: -1  # disabled
+    n: ${ROLLOUT_N} # responses per prompt -- GRPO group size for the relative-advantage baseline (per benchmark)
     # Validation sampling per benchmark (see BENCHMARK above): gsm8k = greedy pass@1 (verl defaults);
-    # dapo-math = AIME avg@32 with the DAPO recipe sampling (n=32, T=1.0, top_p=0.7).
+    # dapo-math = AIME-2024 avg@32 (n=32, T=0.6, top_p=0.95, top_k disabled).
     val_kwargs:
       n: ${VAL_N}
       temperature: ${VAL_TEMPERATURE}
@@ -417,8 +442,9 @@ EOF
 # internet inside the srun"), sanity-checked, sbcast below. It must define
 # compute_reward(data_source, solution_str, ground_truth, ...) -- see
 # actor_rollout_ref.reward_model / custom_reward_function in grpo_gsm8k.yaml.
-# NOTE: reward.py and dataset_prepare.py's SYSTEM_PROMPT are coupled -- keep the
-# answer format ([[[N]]]) in sync, and bump DATASET_PROMPT_VERSION on any prompt
+# NOTE: reward.py and dataset_prepare.py's SYSTEM_PROMPT are coupled -- [[[N]]] for training
+# rows (or \boxed{N} with ANSWER_MARKER=boxed), \boxed{} for the AIME-2024 eval rows; keep
+# them in sync, and bump DATASET_PROMPT_VERSION on any prompt
 # change so the cached parquet is rebuilt.
 export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
 export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
@@ -877,7 +903,13 @@ fi
 # submissions; a .prompt.version marker forces a rebuild whenever dataset_prepare.py's
 # SYSTEM_PROMPT changes (bump DATASET_PROMPT_VERSION in the same edit as any prompt change --
 # the old plain "file exists" guard silently served a stale parquet).
-export DATASET_PROMPT_VERSION="v2-triple-bracket"
+case "${BENCHMARK}-${ANSWER_MARKER}" in
+    gsm8k-bracket)     export DATASET_PROMPT_VERSION="v2-triple-bracket" ;;   # unchanged: cached gsm8k parquets stay valid
+    gsm8k-boxed)       export DATASET_PROMPT_VERSION="v3-boxed" ;;
+    dapo-math-bracket) export DATASET_PROMPT_VERSION="v3-bracket-train-boxed-aime" ;;  # 2026-09-08: AIME rows now use the boxed prompt -> rebuild
+    dapo-math-boxed)   export DATASET_PROMPT_VERSION="v3-boxed-train-boxed-aime" ;;
+    *) echo "FATAL: unsupported BENCHMARK/ANSWER_MARKER combination ${BENCHMARK}/${ANSWER_MARKER}"; exit 1 ;;
+esac
 export DATASET_DIR="${TRAINING_HOME}/data/${BENCHMARK}"
 if [ ! -f "${DATASET_DIR}/train.parquet" ] \
     || [ "$(cat ${DATASET_DIR}/.prompt.version 2>/dev/null)" != "${DATASET_PROMPT_VERSION}" ]; then
