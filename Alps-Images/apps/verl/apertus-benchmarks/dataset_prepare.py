@@ -5,9 +5,10 @@ Selected by the BENCHMARK env var (set by the launch script):
   dapo-math  BytedTsinghua-SIA/DAPO-Math-17k (train) + BytedTsinghua-SIA/AIME-2024 (test)
              -> data/dapo-math/{train,test}.parquet
 
-GSM8K and the DAPO-Math training rows use the [[[N]]] SYSTEM_PROMPT (or \\boxed{N} with
-ANSWER_MARKER=boxed); the AIME-2024 eval rows always use the \\boxed{} prompt. reward.py routes
-the marker on data_source, so it is shared.
+Simplified 2026-09-09 (user request) to a single \\boxed{N} SYSTEM_PROMPT for every split
+(gsm8k, dapo_math training rows, aime_2024 eval rows) -- matching reward.py, which now scores
+only \\boxed{}. The earlier bracket/boxed marker split was found not to explain the AIME
+regression (the model never adopted the bracket marker even after bracket-only RL training).
 The DAPO parquets on the Hub are pre-replicated for DAPO's multi-epoch sampling (DAPO-Math-17k
 has ~1.79M rows for ~17k problems; AIME-2024 has 960 rows for 30 problems), so both are
 de-duplicated by problem text here; per-problem repeats for the AIME avg@k evaluation come from
@@ -20,30 +21,13 @@ import os
 import pandas as pd
 from pathlib import Path
 
-# Answer marker per split, mirrored by reward.py (which routes on data_source): the AIME-2024
-# eval set always gets the \\boxed{} prompt; GSM8K and the DAPO-Math training rows get the
-# [[[N]]] prompt unless ANSWER_MARKER=boxed. Bump DATASET_PROMPT_VERSION in the launch script
-# on any prompt change.
-ANSWER_MARKER = os.environ.get("ANSWER_MARKER", "bracket").strip().lower()
-if ANSWER_MARKER not in ("bracket", "boxed"):
-    raise SystemExit(f"ANSWER_MARKER must be 'bracket' or 'boxed', got {ANSWER_MARKER!r}")
-
-SYSTEM_PROMPTS = {
-    "bracket": """You are a precise math solver.
-Solve the problem step by step, then give your final answer as a single number inside triple square brackets.
-
-Example:
-[[[42]]]""",
-    "boxed": """You are a precise math solver.
+# Single answer marker, all splits (2026-09-09; was per-split/env-selectable). Bump
+# DATASET_PROMPT_VERSION in the launch script on any prompt change.
+SYSTEM_PROMPT = """You are a precise math solver.
 Solve the problem step by step, then give your final answer inside \\boxed{}.
 
 Example:
-\\boxed{42}""",
-}
-SYSTEM_PROMPT = SYSTEM_PROMPTS[ANSWER_MARKER]      # training rows / gsm8k
-AIME_SYSTEM_PROMPT = SYSTEM_PROMPTS[ANSWER_MARKER]  # aime_2024 eval rows -- follows ANSWER_MARKER
-# like the training rows, so a bracket-marker run evaluates AIME with the same convention it
-# trains on (was hardcoded to "boxed" regardless of ANSWER_MARKER; see CLAUDE.md 2026-09-09).
+\\boxed{42}"""
 
 DAPO_PREFIX = (
     "Solve the following math problem step by step. The last line of your response should be of "
@@ -140,12 +124,12 @@ def prepare_dapo_math(split: str, output_path: str):
     import datasets
 
     if split == "train":
-        hub, data_source, system_prompt = "BytedTsinghua-SIA/DAPO-Math-17k", "dapo_math", SYSTEM_PROMPT
+        hub, data_source = "BytedTsinghua-SIA/DAPO-Math-17k", "dapo_math"
     else:
-        hub, data_source, system_prompt = "BytedTsinghua-SIA/AIME-2024", "aime_2024", AIME_SYSTEM_PROMPT
+        hub, data_source = "BytedTsinghua-SIA/AIME-2024", "aime_2024"
     print(f"Downloading {hub} from HuggingFace...")
     ds = datasets.load_dataset(hub, split="train")
-    rows, dups, skipped = dapo_rows(ds, data_source, system_prompt)
+    rows, dups, skipped = dapo_rows(ds, data_source)
     write_parquet(rows, output_path, split, f" ({data_source}; {dups} replicated rows dropped, {skipped} skipped)")
 
 

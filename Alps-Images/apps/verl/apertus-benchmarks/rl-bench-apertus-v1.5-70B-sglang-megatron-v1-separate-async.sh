@@ -86,13 +86,6 @@ export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/RL_Infra/model
 # to flip on for a template that doesn't branch on this kwarg -- unused
 # template variables are silently ignored.
 export ENABLE_THINKING="${ENABLE_THINKING:-False}"   # env-overridable (True|False)
-# Default final-answer marker for the TRAINING rows (gsm8k / dapo_math), read by reward.py AND
-# dataset_prepare.py (SYSTEM_PROMPT) from the container env: bracket = [[[N]]] (the benchmark
-# original), boxed = \boxed{N}. The AIME-2024 eval rows (data_source aime_2024) are ALWAYS
-# prompted for and scored with \boxed{} regardless of this switch (reward.py routes on
-# data_source). Same convention as the NeMo-RL side of the benchmark.
-export ANSWER_MARKER="${ANSWER_MARKER:-bracket}"     # env-overridable (bracket|boxed)
-
 # Response-length budget is tied to ENABLE_THINKING:
 #   thinking OFF (short, direct answers): 500 -> 2048 tokens,
 #     ppo_max_token_len_per_gpu left at 16384 -- UNTESTED at 2048, but very low
@@ -140,12 +133,44 @@ fi
 # 12288 cap) and ~25 min per AIME avg@32 validation -- size TOTAL_TRAINING_STEPS to the
 # allocation (e.g. ~20 steps in 4 h on the 40-node 24/16 split below).
 export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-92}"
+# Default TEST_FREQ divides the default TOTAL_TRAINING_STEPS(92) evenly into 4 -- validations
+# at steps 23/46/69/92, plus the val_before_train baseline at step 0. Override both together
+# if TOTAL_TRAINING_STEPS changes, to keep the validation cadence sane.
+export TEST_FREQ="${TEST_FREQ:-23}"
 # Minor actor hyper-parameters, env-overridable for A/B benchmark runs (defaults = verl v0.9.0
 # stock values used by every run up to 3330187): ACTOR_LR (actor.optim.lr, 1e-6) and
 # CLIP_RATIO_HIGH (actor.clip_ratio_high, 0.2 -- DAPO "clip-higher" uses 0.28; clip_ratio_low
 # stays 0.2).
 export ACTOR_LR="${ACTOR_LR:-1e-6}"
 export CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.2}"
+# ENTROPY_COEFF (2026-09-09, repetition-collapse mitigation): actor.entropy_coeff, 0 by default
+# in verl and left at 0 by DAPO's own canonical recipe (verl-recipe/dapo/run_dapo_qwen2.5_32b.sh)
+# -- DAPO's paper explicitly flags naive entropy bonuses as a risk (entropy explosion / training
+# instability) and uses Clip-Higher (CLIP_RATIO_HIGH above) as its preferred fix instead. Set to a
+# small positive value here as a second, independent lever against the repetition-loop pathology
+# found in runs 3330187/3331427's AIME evals (model loops on one phrase/expression for the full
+# 12288-token budget on hard problems) -- watch actor/entropy and grad_norm on the first run for
+# a runaway increase; revert to 0 if entropy climbs instead of stabilizing.
+export ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
+# ROLLOUT_REPETITION_PENALTY (2026-09-09, same mitigation, decoding-time lever): SGLang
+# sampling-level repetition_penalty, applied at generation time regardless of why the policy
+# wants to loop. verl's RolloutConfig has a repetition_penalty field (default 1.0 = off), but the
+# V1 separate-async trainer's agent_loop_tq.py hardcodes 1.0 in the sampling_params dict it
+# builds and never reads the config value -- patches/repetition-penalty-fix.patch (below) fixes
+# that one line so this setting actually takes effect. 1.1 is a moderate first value (SGLang
+# docs: >1.0 discourages repeated tokens); applies to both training rollout and AIME/GSM8K
+# validation sampling (SamplingConfig, used for val_kwargs, has no separate override field).
+export ROLLOUT_REPETITION_PENALTY="${ROLLOUT_REPETITION_PENALTY:-1.1}"
+# REWARD_MODE (2026-09-09, A/B on reward SHAPING itself): forwarded to reward.py via env.toml.
+#   shaped (default): outcome + 0.1 format bonus + up-to-0.2 length penalty (what every run up
+#                      to 3330187/3331427 used).
+#   binary:           outcome only (1.0/0.0), no format bonus, no length penalty -- tests
+#                      whether the length penalty specifically is what pushes the model toward
+#                      answering more confidently-but-wrongly on hard AIME problems after RL
+#                      (the SFT-baseline-vs-post-RL comparison in this session's run history
+#                      showed RL cut the repetition/looping rate roughly in half but also cut
+#                      per-attempt accuracy -- reward shaping is the leading unconfirmed cause).
+export REWARD_MODE="${REWARD_MODE:-shaped}"
 export BENCHMARK="${BENCHMARK:-gsm8k}"
 case "${BENCHMARK}" in
     # Training rollout sampling (ROLLOUT_*: GRPO group size n, temperature, top_p; top_k is
@@ -159,9 +184,9 @@ case "${BENCHMARK}" in
     *) echo "FATAL: unknown BENCHMARK=${BENCHMARK} (gsm8k | dapo-math)"; exit 1 ;;
 esac
 export PROJECT_NAME="apertus-benchmarks"
-export EXPERIMENT_NAME="${MODEL_NAME}-${BENCHMARK}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
+export EXPERIMENT_NAME="${MODEL_NAME}-${BENCHMARK}-${REWARD_MODE}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
-export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
+export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL-debug/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
 export MODEL_LOAD_PATH="${MODEL_CHECKPOINT_PATH:-${TRAINING_HOME}/models/${MODEL_NAME}}"
@@ -223,8 +248,8 @@ entrypoint = true
 PMIX_MCA_psec = "native"
 HF_TOKEN = "$(cat ~/HF_TOKEN)"
 ENABLE_THINKING = "${ENABLE_THINKING}"  # chat-template thinking switch (reward.py no longer reads it)
-ANSWER_MARKER = "${ANSWER_MARKER}"  # reward.py + dataset_prepare.py read this (bracket | boxed)
 BENCHMARK = "${BENCHMARK}"  # dataset_prepare.py reads this (gsm8k | dapo-math)
+REWARD_MODE = "${REWARD_MODE}"  # reward.py reads this (shaped | binary)
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
@@ -290,6 +315,12 @@ actor_rollout_ref:
       lr: ${ACTOR_LR}  # default 1e-6 (verl stock); env-overridable
     clip_ratio_low: 0.2
     clip_ratio_high: ${CLIP_RATIO_HIGH}  # default 0.2 (verl stock); 0.28 = DAPO clip-higher; env-overridable
+    # entropy_coeff/calculate_entropy (2026-09-09, see ENTROPY_COEFF above): confirmed wired into
+    # the loss (verl/workers/utils/losses.py: policy_loss -= entropy_coeff * entropy_loss) and
+    # compatible with model.use_fused_kernels above -- the fused LinearCrossEntropy kernel
+    # returns entropy as a first-class output, no auto-disable gate references entropy anywhere.
+    entropy_coeff: ${ENTROPY_COEFF}
+    calculate_entropy: True
     ppo_mini_batch_size: ${PPO_MINI_BATCH_SIZE}
     ppo_micro_batch_size_per_gpu: 1
     # Must exceed max_prompt_length(512) + max_response_length above, or a
@@ -336,6 +367,10 @@ actor_rollout_ref:
     temperature: ${ROLLOUT_TEMPERATURE}
     top_p: ${ROLLOUT_TOP_P}
     top_k: -1  # disabled
+    # repetition_penalty (2026-09-09, see ROLLOUT_REPETITION_PENALTY above): requires
+    # patches/repetition-penalty-fix.patch below -- verl's agent_loop_tq.py (the V1
+    # separate-async generation path) otherwise hardcodes 1.0 and ignores this field entirely.
+    repetition_penalty: ${ROLLOUT_REPETITION_PENALTY}
     n: ${ROLLOUT_N} # responses per prompt -- GRPO group size for the relative-advantage baseline (per benchmark)
     # Validation sampling per benchmark (see BENCHMARK above): gsm8k = greedy pass@1 (verl defaults);
     # dapo-math = AIME-2024 avg@32 (n=32, T=0.6, top_p=0.95, top_k disabled).
@@ -346,6 +381,17 @@ actor_rollout_ref:
       top_k: -1
       do_sample: ${VAL_DO_SAMPLE}
     tensor_model_parallel_size: 4
+    # Fixed engine-level seed (2026-09-09, user request), forwarded verbatim into SGLang's
+    # server_args (async_sglang_server.py merges engine_kwargs.sglang into the dict it passes
+    # to the engine). verl itself never sets this -- SGLang's own default is
+    # random.randint(0, 1<<30) at every engine start, so validation sampling was never
+    # reproducible run-to-run before this. Caveat: this seeds the engine's RNG at startup, not
+    # each request individually -- under concurrent multi-request scheduling this gives
+    # best-effort, not bit-exact, reproducibility (request arrival order / batching can still
+    # vary run-to-run). No equivalent field exists on val_kwargs/SamplingConfig.
+    engine_kwargs:
+      sglang:
+        random_seed: 41
     # 0.75 -> 0.65 (2026-09-08, run 3317733): with 12288-token responses a rollout TP rank OOMed on a
     # 2 GiB dynamic allocation -- SGLang held 80.5 GB (71 GB static pool + dynamic) and the
     # co-resident verl CheckpointEngineWorker 14.2 GB, 377 MiB free. Smaller static pool = more room
@@ -397,7 +443,7 @@ trainer:
       parameter_sync_step: ${PARAMETER_SYNC_STEP}
     sampler:
       # staleness bound, in model versions, for a trajectory to remain usable
-      max_off_policy_threshold: 8
+      max_off_policy_threshold: 2  # 8 -> 2 (2026-09-09, user request): drop trajectories more than 2 model versions stale
       max_off_policy_strategy: drop
   total_epochs: 3
   # _balance_batch (trainer_base.py:1467, on by default) reads tag["seq_len"] on
@@ -420,7 +466,14 @@ trainer:
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
   save_freq: 100  # > total_training_steps: no mid-run checkpoint on the shakedown (faster, cleaner signal). Lower for a real run (actor.checkpoint.strict is False so the multimodal-tower export gap is non-fatal).
-  test_freq: ${TOTAL_TRAINING_STEPS}  # == total_training_steps: validate once, at the end
+  # 2026-09-09 (user request): validate periodically during training, not just at the end,
+  # to track AIME accuracy over the run. verl always validates on the last step regardless
+  # (trainer_base.py: is_last_step or global_steps % test_freq == 0), so TEST_FREQ dividing
+  # TOTAL_TRAINING_STEPS evenly gives clean, evenly-spaced points. Budget check (12 h ceiling,
+  # see CLAUDE.md): ~25 min/AIME-avg@32 validation x 5 passes (baseline + 4 during/after
+  # training) = ~125 min, + ~40 min load + ~92 steps x ~5.5 min ~= 506 min training ~= 671 min
+  # (~11.2 h) total -- fits with margin. Raise TEST_FREQ (fewer points) if a run times out.
+  test_freq: ${TEST_FREQ}
   val_before_train: true   # + a baseline validation before step 1
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
@@ -442,10 +495,10 @@ EOF
 # internet inside the srun"), sanity-checked, sbcast below. It must define
 # compute_reward(data_source, solution_str, ground_truth, ...) -- see
 # actor_rollout_ref.reward_model / custom_reward_function in grpo_gsm8k.yaml.
-# NOTE: reward.py and dataset_prepare.py's SYSTEM_PROMPT are coupled -- [[[N]]] for training
-# rows (or \boxed{N} with ANSWER_MARKER=boxed), \boxed{} for the AIME-2024 eval rows; keep
-# them in sync, and bump DATASET_PROMPT_VERSION on any prompt
-# change so the cached parquet is rebuilt.
+# NOTE: reward.py and dataset_prepare.py's SYSTEM_PROMPT are coupled -- both use a single
+# \boxed{N} convention for every split (2026-09-09: simplified from a per-split bracket/boxed
+# switch); keep them in sync, and bump DATASET_PROMPT_VERSION on any prompt change so the
+# cached parquet is rebuilt.
 export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
 export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
 curl -sfL "${REWARD_FN_URL}" -o "${TRAINING_CONFIG}/reward.py" \
@@ -660,6 +713,41 @@ index 0358497c..016e8f2d 100644
          overlap_grad_reduce = getattr(one_model.ddp_config, "overlap_grad_reduce", False)
 EOF
 sbcast -f ${TRAINING_CONFIG}/grad-sync-empty-cache.patch ${TRAINING_CONFIG}/grad-sync-empty-cache.patch
+
+# apertus-benchmarks/patches/repetition-penalty-fix.patch, embedded (same reason). Makes
+# rollout.repetition_penalty (see ROLLOUT_REPETITION_PENALTY above) actually take effect on the
+# V1 separate-async generation path, a decoding-time mitigation for the repetition-collapse
+# pathology found in runs 3330187/3331427's AIME evals (model loops on one phrase/expression for
+# the full 12288-token budget on hard problems instead of reaching any answer marker).
+cat > "${TRAINING_CONFIG}/repetition-penalty-fix.patch" <<- 'EOF'
+# [CSCS, 2026-09-09] verl v0.9.0's V1 separate-async generation path
+# (verl/trainer/ppo/v1/agent_loop_tq.py:AgentLoopWorkerTQ.generate_sequences) hardcodes
+# repetition_penalty=1.0 (off) in the sampling_params dict it builds for SGLang, never reading
+# RolloutConfig.repetition_penalty (verl/workers/config/rollout.py, a real field, default 1.0) at
+# all -- so setting actor_rollout_ref.rollout.repetition_penalty in config has zero effect on this
+# trainer path. Confirmed by contrast: the vLLM async server path (vllm_async_server.py) DOES read
+# config.repetition_penalty correctly; only this SGLang/V1/TransferQueue path is stale. One-line
+# fix: read the config value instead of the literal. Safe by default (config value is 1.0 unless
+# explicitly set, i.e. unchanged behavior for every other recipe that does not set it).
+#
+# Generated from a real git worktree at verl v0.9.0; git apply --check / py_compile /
+# --reverse --check verified. Touches only verl/trainer/ppo/v1/agent_loop_tq.py (no overlap with
+# the other patches this recipe applies).
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 05f5604..715c2d7 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -65,7 +65,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             temperature=config.temperature,
+             top_p=config.top_p,
+             top_k=config.top_k,
+-            repetition_penalty=1.0,
++            repetition_penalty=config.repetition_penalty,
+             logprobs=config.calculate_log_probs,
+         )
+ 
+EOF
+sbcast -f ${TRAINING_CONFIG}/repetition-penalty-fix.patch ${TRAINING_CONFIG}/repetition-penalty-fix.patch
 
 # ══════════════════════════════════════════════════════════════════════════
 # Add Apertus 1.5 support.
@@ -903,12 +991,10 @@ fi
 # submissions; a .prompt.version marker forces a rebuild whenever dataset_prepare.py's
 # SYSTEM_PROMPT changes (bump DATASET_PROMPT_VERSION in the same edit as any prompt change --
 # the old plain "file exists" guard silently served a stale parquet).
-case "${BENCHMARK}-${ANSWER_MARKER}" in
-    gsm8k-bracket)     export DATASET_PROMPT_VERSION="v2-triple-bracket" ;;   # unchanged: cached gsm8k parquets stay valid
-    gsm8k-boxed)       export DATASET_PROMPT_VERSION="v3-boxed" ;;
-    dapo-math-bracket) export DATASET_PROMPT_VERSION="v3-bracket-train-boxed-aime" ;;  # 2026-09-08: AIME rows now use the boxed prompt -> rebuild
-    dapo-math-boxed)   export DATASET_PROMPT_VERSION="v3-boxed-train-boxed-aime" ;;
-    *) echo "FATAL: unsupported BENCHMARK/ANSWER_MARKER combination ${BENCHMARK}/${ANSWER_MARKER}"; exit 1 ;;
+case "${BENCHMARK}" in
+    gsm8k)     export DATASET_PROMPT_VERSION="v4-boxed-everywhere" ;;  # 2026-09-09: single boxed convention for every split, was bracket -> rebuild
+    dapo-math) export DATASET_PROMPT_VERSION="v4-boxed-everywhere" ;;
+    *) echo "FATAL: unsupported BENCHMARK ${BENCHMARK}"; exit 1 ;;
 esac
 export DATASET_DIR="${TRAINING_HOME}/data/${BENCHMARK}"
 if [ ! -f "${DATASET_DIR}/train.parquet" ] \
@@ -993,7 +1079,7 @@ for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", 
 # all apply cleanly to the tag. A patch that neither applies nor is already
 # present is fatal -- a cluster where only some ranks carry a patch is worse than
 # one that carries none (run 3124273).
-for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch"; do
+for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch" "${TRAINING_CONFIG}/repetition-penalty-fix.patch"; do
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied $(basename "$p") on $(hostname)"
     elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then

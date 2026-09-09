@@ -1,24 +1,34 @@
-"""Marked-answer reward for the Apertus GRPO benchmarks (verl side).
+"""Boxed-answer reward for the Apertus GRPO benchmarks (verl side).
 
-Kept in lockstep with the NeMo-RL side of the framework benchmark
-(nemo_rl/environments/bracket_math_reward.py in Alvorecer721/Nemo-RL): the final answer is
-the last marker span in the text OUTSIDE the model's native deliberation
-(<|inner_prefix|> ... <|inner_suffix|>), numbers are compared after comma stripping and float
-normalisation, a 0.1 format bonus rewards any marker, and a length penalty of up to -0.2 ramps
-from 2000 to 4000 words of the whole response. An unfinished or malformed deliberation span
-(e.g. a response truncated at the length cap while still thinking) earns neither outcome nor
-format reward.
+Simplified 2026-09-09 (user request) to a single answer convention, \\boxed{answer}, for BOTH
+training and evaluation rows -- the form Apertus produces on its own (confirmed this session:
+the model never adopts a bracket-only marker even when RL-trained on it, and the earlier
+bracket-vs-boxed train/eval mismatch was found NOT to explain the AIME regression; the real
+cause is degenerate repetition on hard problems). dataset_prepare.py builds every split
+(gsm8k, dapo_math, aime_2024) with the matching \\boxed{} SYSTEM_PROMPT -- keep the two files in
+sync and bump DATASET_PROMPT_VERSION in the launch script on any prompt change.
 
-The marker is chosen per data_source: the AIME-2024 evaluation set (data_source "aime_2024",
-see BOXED_DATA_SOURCES) is prompted for and scored with \\boxed{answer}, the form Apertus
-produces on its own; every other source (gsm8k, dapo_math training rows) uses [[[answer]]],
-the benchmark's original convention, unless ANSWER_MARKER=boxed is set in the container env
-(like ENABLE_THINKING / BENCHMARK). dataset_prepare.py builds the matching SYSTEM_PROMPT per
-split -- keep both in sync and bump DATASET_PROMPT_VERSION in the launch script on any prompt
-change.
+The final answer is the last \\boxed{...} span in the text OUTSIDE the model's native
+deliberation (<|inner_prefix|> ... <|inner_suffix|>), numbers are compared after comma
+stripping and float normalisation. An unfinished or malformed deliberation span (e.g. a
+response truncated at the length cap while still thinking) earns no reward -- there is no
+answer to score, in either mode below.
 
-verl calls compute_reward(); it returns {"score": shaped training reward, "acc": exact-match
-0/1} so val-core/<benchmark>/acc/* is a clean accuracy while "score" drives GRPO.
+REWARD_MODE (env, 2026-09-09: A/B test for whether reward SHAPING itself is teaching the model
+to answer more confidently-but-wrongly on hard problems -- see the SFT-baseline vs. post-RL
+AIME comparison in the session that motivated this):
+  shaped (default): outcome (1.0 correct / 0.0 wrong) + a 0.1 format bonus for any \\boxed{}
+                     + a length penalty of up to -0.2 ramping from 2000 to 4000 words of the
+                     whole response. This is what every run up to and including 3330187/3331427
+                     used.
+  binary:           outcome only (1.0 / 0.0), no format bonus, no length penalty -- the
+                     simplest possible outcome-only RLVR reward. The \\boxed{} extraction logic
+                     is unchanged in both modes (it is the only way to know if the answer is
+                     correct, not a "format" reward in the shaping sense).
+
+verl calls compute_reward(); it returns {"score": training reward (== outcome in binary mode,
+outcome+format+length_penalty in shaped mode), "acc": exact-match 0/1} so val-core/<benchmark>/
+acc/* is a clean accuracy in both modes while "score" drives GRPO.
 """
 
 import math
@@ -26,25 +36,13 @@ import os
 import re
 from typing import Optional
 
-ANSWER_MARKER = os.environ.get("ANSWER_MARKER", "bracket").strip().lower()  # default marker
-if ANSWER_MARKER not in ("bracket", "boxed"):
-    raise ValueError(f"ANSWER_MARKER must be 'bracket' or 'boxed', got {ANSWER_MARKER!r}")
-# data_sources that are always prompted for / scored with \boxed{} (the AIME-2024 eval set).
-BOXED_DATA_SOURCES = frozenset(
-    x.strip() for x in os.environ.get("BOXED_DATA_SOURCES", "aime_2024").split(",") if x.strip()
-)
-
-
-def marker_for(data_source) -> str:
-    return "boxed" if str(data_source) in BOXED_DATA_SOURCES else ANSWER_MARKER
-
+REWARD_MODE = os.environ.get("REWARD_MODE", "shaped")  # "shaped" | "binary"
 FORMAT_REWARD = 0.1
 OUTCOME_REWARD = 1.0
 LENGTH_PENALTY_MAX = 0.2
 LENGTH_PENALTY_START_WORDS = 2000
 LENGTH_PENALTY_SPAN_WORDS = 2000
 
-_BRACKET_ANSWER = re.compile(r"\[\[\[(.*?)\]\]\]", re.DOTALL)
 _BOXED = "\\boxed"
 _LATEX_WRAPPERS = re.compile(r"\\(?:text|textbf|mathrm|mathbf)\{([^{}]*)\}")
 _LATEX_NOISE = re.compile(r"\\left|\\right|\\[$%,;!]|[$~]")
@@ -60,11 +58,6 @@ def normalize_number(raw: str) -> str:
     if not math.isfinite(value):
         return str(value)
     return str(int(value)) if value == int(value) else str(value)
-
-
-def extract_bracket_answer(response: str) -> Optional[str]:
-    matches = _BRACKET_ANSWER.findall(response)
-    return normalize_number(matches[-1]) if matches else None
 
 
 def _last_boxed_content(response: str) -> Optional[str]:
@@ -104,16 +97,8 @@ def extract_boxed_answer(response: str) -> Optional[str]:
     return normalize_number(content)
 
 
-def has_marker(response: str, marker: str = ANSWER_MARKER) -> bool:
-    if marker == "bracket":
-        return "[[[" in response and "]]]" in response
+def has_marker(response: str) -> bool:
     return _BOXED + "{" in response
-
-
-def extract_answer(response: str, marker: str = ANSWER_MARKER) -> Optional[str]:
-    if marker == "bracket":
-        return extract_bracket_answer(response)
-    return extract_boxed_answer(response)
 
 
 def completed_final_text(response: str) -> Optional[str]:
@@ -134,15 +119,23 @@ def completed_final_text(response: str) -> Optional[str]:
     return None if in_thinking else "".join(visible)
 
 
-def score_marked_answer(response: str, ground_truth: str, marker: str = ANSWER_MARKER) -> dict:
+def score_boxed_answer(response: str, ground_truth: str) -> dict:
     final_text = completed_final_text(response)
-    extracted = extract_answer(final_text, marker) if final_text is not None else None
-    format_reward = FORMAT_REWARD if final_text is not None and has_marker(final_text, marker) else 0.0
+    extracted = extract_boxed_answer(final_text) if final_text is not None else None
     outcome = (
         OUTCOME_REWARD
         if extracted is not None and extracted == normalize_number(str(ground_truth))
         else 0.0
     )
+    if REWARD_MODE == "binary":
+        return {
+            "reward": outcome,
+            "outcome": outcome,
+            "format": 0.0,
+            "length_penalty": 0.0,
+            "extracted_answer": extracted,
+        }
+    format_reward = FORMAT_REWARD if final_text is not None and has_marker(final_text) else 0.0
     words = len(response.split())
     overflow = (words - LENGTH_PENALTY_START_WORDS) / LENGTH_PENALTY_SPAN_WORDS
     length_penalty = -LENGTH_PENALTY_MAX * min(1.0, max(0.0, overflow))
@@ -156,5 +149,5 @@ def score_marked_answer(response: str, ground_truth: str, marker: str = ANSWER_M
 
 
 def compute_reward(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> dict:
-    s = score_marked_answer(solution_str, ground_truth, marker_for(data_source))
+    s = score_boxed_answer(solution_str, ground_truth)
     return {"score": s["reward"], "acc": s["outcome"]}
