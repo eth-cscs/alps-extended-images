@@ -143,15 +143,19 @@ export TEST_FREQ="${TEST_FREQ:-23}"
 # stays 0.2).
 export ACTOR_LR="${ACTOR_LR:-1e-6}"
 export CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.2}"
-# ENTROPY_COEFF (2026-09-09, repetition-collapse mitigation): actor.entropy_coeff, 0 by default
-# in verl and left at 0 by DAPO's own canonical recipe (verl-recipe/dapo/run_dapo_qwen2.5_32b.sh)
-# -- DAPO's paper explicitly flags naive entropy bonuses as a risk (entropy explosion / training
-# instability) and uses Clip-Higher (CLIP_RATIO_HIGH above) as its preferred fix instead. Set to a
-# small positive value here as a second, independent lever against the repetition-loop pathology
-# found in runs 3330187/3331427's AIME evals (model loops on one phrase/expression for the full
-# 12288-token budget on hard problems) -- watch actor/entropy and grad_norm on the first run for
-# a runaway increase; revert to 0 if entropy climbs instead of stabilizing.
-export ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
+# ENTROPY_COEFF (2026-09-09, repetition-collapse mitigation; REVERTED 2026-09-11 after run
+# 3351313): actor.entropy_coeff, 0 by default in verl and left at 0 by DAPO's own canonical
+# recipe (verl-recipe/dapo/run_dapo_qwen2.5_32b.sh) -- DAPO's paper explicitly flags naive
+# entropy bonuses as a risk (entropy explosion / training instability) and uses Clip-Higher
+# (CLIP_RATIO_HIGH above) as its preferred fix instead. Tried at 0.001 as a second lever against
+# the repetition-loop pathology; run 3351313 (REWARD_MODE=shaped, 92 steps) confirmed the exact
+# risk DAPO warned about, not just theoretically: actor/entropy_loss climbed monotonically the
+# entire run (6.87 -> 9.86, steps 43->92, never plateaued), response_length/mean grew 750 -> 2200
+# words, and BOTH the training reward (critic/score/mean 0.11 -> 0.0018) and held-out AIME
+# accuracy (val-core/aime_2024/acc/mean@32 11.1% baseline -> 0.0% final, best@32 47.3% -> 0.0%)
+# collapsed. Back to 0 (disabled) -- Clip-Higher (CLIP_RATIO_HIGH) and the repetition_penalty
+# decoding-time lever below are the remaining, non-training-destabilizing mitigations.
+export ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
 # ROLLOUT_REPETITION_PENALTY (2026-09-09, same mitigation, decoding-time lever): SGLang
 # sampling-level repetition_penalty, applied at generation time regardless of why the policy
 # wants to loop. verl's RolloutConfig has a repetition_penalty field (default 1.0 = off), but the
