@@ -93,8 +93,275 @@ PY
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
     register_rocm_sdk_ldconfig
+    install_amdsmi_python
+    link_amdsmi_package_library
+    patch_torch_rocm_disable_implicit_amdsmi
+    smoke_check_amdsmi_python
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
+}
+
+install_amdsmi_python() {
+    local candidate amdsmi_src=""
+
+    for candidate in \
+        "${ROCM_CORE_PREFIX:-}/share/amd_smi" \
+        "${ROCM_CORE_DIR:-}/_rocm_sdk_core/share/amd_smi" \
+        "${ROCM_SDK_ROOT:-}/share/amd_smi"; do
+        [[ -d "${candidate}" ]] || continue
+        amdsmi_src="${candidate}"
+        break
+    done
+
+    [[ -n "${amdsmi_src}" ]] || die "Could not find AMD SMI Python sources in ROCm Core SDK"
+    "${ROCM_PYTHON}" -m pip install --no-cache-dir --no-deps "${amdsmi_src}"
+    check_amdsmi_python_version
+}
+
+check_amdsmi_python_version() {
+    ROCM_EXPECTED_VERSION="${ROCM_VERSION}" \
+        ROCM_EXPECTED_COMMIT="${ROCM_SYSTEMS_COMMIT:-}" \
+        "${ROCM_PYTHON}" - <<'PY'
+import os
+from importlib.metadata import PackageNotFoundError, version
+
+for dist_name in ("amdsmi", "amd-smi"):
+    try:
+        installed = version(dist_name)
+        break
+    except PackageNotFoundError:
+        continue
+else:
+    raise SystemExit("amdsmi distribution was not installed")
+
+expected_commit = os.environ.get("ROCM_EXPECTED_COMMIT", "")
+if expected_commit:
+    expected_local = expected_commit[:8]
+    local_version = installed.split("+", 1)[1] if "+" in installed else ""
+    if local_version != expected_local:
+        raise SystemExit(
+            f"amdsmi version {installed} does not match ROCm Systems commit "
+            f"{expected_commit}"
+        )
+
+print(
+    f"amdsmi Python package version: {installed} "
+    f"(ROCm SDK {os.environ['ROCM_EXPECTED_VERSION']})"
+)
+PY
+}
+
+smoke_check_amdsmi_python() {
+    "${ROCM_PYTHON}" - <<'PY'
+import amdsmi
+
+print("amdsmi import ok")
+try:
+    amdsmi.amdsmi_init()
+except Exception as exc:
+    print(f"amdsmi init skipped without visible ROCm devices: {exc}")
+else:
+    try:
+        handles = amdsmi.amdsmi_get_processor_handles()
+        print(f"amdsmi device count: {len(handles)}")
+    finally:
+        shutdown = getattr(amdsmi, "amdsmi_shut_down", None)
+        if shutdown is not None:
+            try:
+                shutdown()
+            except Exception:
+                pass
+PY
+}
+
+link_amdsmi_package_library() {
+    local amdsmi_pkg_dir amdsmi_lib="" amdsmi_sysdeps_root="" wrapper preload_file needed
+    local candidate lib prefix sysdeps_dir name
+    local -a sysdeps_fallbacks=() sysdeps_dirs=() candidates=() ordered=() preload_names=()
+
+    amdsmi_pkg_dir="$(${ROCM_PYTHON} - <<'PY'
+import importlib.util
+
+spec = importlib.util.find_spec("amdsmi")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("amdsmi package was not found")
+print(next(iter(spec.submodule_search_locations)))
+PY
+)"
+    [[ -d "${amdsmi_pkg_dir}" ]] || die "amdsmi package directory not found: ${amdsmi_pkg_dir}"
+
+    # The ROCm runtime stack (librccl, libamdhip64 consumers) resolves
+    # libamd_smi.so.26 through RPATHs that point into the ROCm core SDK
+    # (e.g. $ORIGIN/../../_rocm_sdk_core/lib), so that is the copy mapped
+    # into any process that imports torch. The amdsmi Python package must
+    # load the same file: loading the byte-identical devel copy from a
+    # different inode maps the same SONAME twice (ODR violation), which
+    # corrupts libnl global state and segfaults at process exit once both
+    # torch and amdsmi are imported (vLLM imports both). Prefer the core
+    # prefix, then libraries, then the remaining candidates.
+
+    while IFS= read -r prefix; do
+        [[ -n "${prefix}" ]] || continue
+        candidates+=("${prefix}")
+    done < <(rocm_sdk_prefix_candidates)
+    if [[ -n "${ROCM_CORE_PREFIX:-}" ]]; then
+        ordered+=("${ROCM_CORE_PREFIX}")
+        [[ -n "${ROCM_LIBRARIES_PREFIX:-}" ]] && ordered+=("${ROCM_LIBRARIES_PREFIX}")
+        for prefix in "${candidates[@]}"; do
+            case " ${ordered[*]} " in
+                *" ${prefix} "*) ;;
+                *) ordered+=("${prefix}") ;;
+            esac
+        done
+        candidates=("${ordered[@]}")
+    fi
+
+    while IFS= read -r candidate; do
+        [[ -n "${candidate}" ]] || continue
+        lib="$(find "${candidate}" -maxdepth 2 \
+            \( -type f -o -type l \) -name 'libamd_smi.so*' -print -quit 2>/dev/null || true)"
+        if [[ -n "${lib}" && -z "${amdsmi_lib}" ]]; then
+            amdsmi_lib="${lib}"
+            amdsmi_sysdeps_root="${candidate}"
+        fi
+        for sysdeps_dir in "${candidate}/lib/rocm_sysdeps/lib" "${candidate}/lib64/rocm_sysdeps/lib"; do
+            [[ -d "${sysdeps_dir}" ]] || continue
+            compgen -G "${sysdeps_dir}/librocm_sysdeps_*.so*" >/dev/null || continue
+            case " ${sysdeps_fallbacks[*]} " in
+                *" ${sysdeps_dir} "*) ;;
+                *) sysdeps_fallbacks+=("${sysdeps_dir}") ;;
+            esac
+            # Collect sysdeps directories that match the selected library's
+            # root first, so the preload maps the same files the RPATH of
+            # libamd_smi.so resolves to. Other prefixes stay as fallbacks.
+            if [[ "${candidate}" == "${amdsmi_sysdeps_root}" ]]; then
+                sysdeps_dirs+=("${sysdeps_dir}")
+            fi
+        done
+    done < <(printf '%s\n' "${candidates[@]}")
+    if [[ "${#sysdeps_dirs[@]}" -eq 0 ]]; then
+        sysdeps_dirs=("${sysdeps_fallbacks[@]}")
+    fi
+    [[ -n "${amdsmi_lib}" ]] || die "libamd_smi.so* not found after installing amdsmi"
+
+    ln -sf "${amdsmi_lib}" "${amdsmi_pkg_dir}/libamd_smi.so"
+
+    # Derive the preload list from the ELF NEEDED entries of the selected
+    # libamd_smi.so plus the DRM library it dlopens without a NEEDED entry
+    # (used for amdgpu_device_initialize paths such as VRAM-usage queries), so
+    # SONAME bumps in future ROCm releases are followed automatically.
+    needed="$(readelf -d "${amdsmi_lib}" 2>/dev/null | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | grep '^librocm_sysdeps_' || true)"
+    [[ -n "${needed}" ]] || die "no rocm_sysdeps NEEDED entries found in ${amdsmi_lib}"
+    while IFS= read -r name; do
+        [[ -n "${name}" ]] || continue
+        case " ${preload_names[*]:-} " in
+            *" ${name} "*) ;;
+            *) preload_names+=("${name}") ;;
+        esac
+    done <<<"${needed}"
+    # dlopen-only dependency: not in NEEDED; required for DRM-backed queries
+    # and to keep libamd_smi's opportunistic loader from warning per process.
+    [[ " ${preload_names[*]} " == *" librocm_sysdeps_drm_amdgpu.so.1 "* ]] \
+        || preload_names+=("librocm_sysdeps_drm_amdgpu.so.1")
+    if ! find "${sysdeps_dirs[@]}" -maxdepth 1 -name 'librocm_sysdeps_drm_amdgpu.so*' -print -quit 2>/dev/null | grep -q .; then
+        echo "WARNING: no librocm_sysdeps_drm_amdgpu.so* found in sysdeps dirs; DRM-backed amdsmi queries will degrade" >&2
+    fi
+
+    preload_file="${amdsmi_pkg_dir}/_alps_amdsmi_preload.py"
+    {
+        printf 'import ctypes\n'
+        printf 'import sys\n'
+        printf 'from pathlib import Path\n\n'
+        printf '_SYSDEPS_DIRS = (\n'
+        for sysdeps_dir in "${sysdeps_dirs[@]}"; do
+            printf '    "%s",\n' "${sysdeps_dir}"
+        done
+        printf ')\n'
+        printf '_REQUIRED = (\n'
+        for name in "${preload_names[@]}"; do
+            printf '    "%s",\n' "${name}"
+        done
+        printf ')\n\n'
+        printf 'def preload_amdsmi_dependencies():\n'
+        printf '    for name in _REQUIRED:\n'
+        printf '        for directory in _SYSDEPS_DIRS:\n'
+        printf '            path = Path(directory) / name\n'
+        printf '            if path.exists():\n'
+        printf '                ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)\n'
+        printf '                break\n'
+        printf '        else:\n'
+        printf '            print(f"WARNING: amdsmi preload: {name} not found in any of {_SYSDEPS_DIRS}", file=sys.stderr)\n'
+    } > "${preload_file}"
+
+    wrapper="${amdsmi_pkg_dir}/amdsmi_wrapper.py"
+    [[ -f "${wrapper}" ]] || die "amdsmi wrapper not found: ${wrapper}"
+    "${ROCM_PYTHON}" - "${wrapper}" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text()
+if "_alps_amdsmi_preload" not in text:
+    marker = "import ctypes\n"
+    replacement = (
+        marker
+        + "from ._alps_amdsmi_preload import preload_amdsmi_dependencies\n"
+        + "preload_amdsmi_dependencies()\n"
+    )
+    if marker not in text:
+        raise SystemExit(f"could not patch {path}: import marker not found")
+    path.write_text(text.replace(marker, replacement, 1))
+PY
+
+    echo "Linked amdsmi package library: ${amdsmi_pkg_dir}/libamd_smi.so -> ${amdsmi_lib}"
+    echo "Patched amdsmi dependency preload: ${preload_file}"
+}
+
+
+patch_torch_rocm_disable_implicit_amdsmi() {
+    "${ROCM_PYTHON}" - <<'PY'
+import site
+from pathlib import Path
+
+roots = [Path(p) for p in site.getsitepackages()]
+user_site = site.getusersitepackages()
+if user_site:
+    roots.append(Path(user_site))
+
+for root in roots:
+    path = root / "torch" / "cuda" / "__init__.py"
+    if path.exists():
+        break
+else:
+    print("PyTorch CUDA module not found; skipping ROCm amdsmi import patch")
+    raise SystemExit(0)
+
+text = path.read_text()
+patched = """        else:
+            # Alps: block the implicit amdsmi import. Loading amdsmi here maps
+            # a second copy of libamd_smi's sysdeps (libnl) next to the copy
+            # the ROCm runtime stack loads via RPATH, corrupting libnl state
+            # and segfaulting at exit. The amdsmi package remains importable
+            # directly; vLLM's platform probe loads it explicitly and safely
+            # because its preload maps the core-SDK copies first.
+            raise ModuleNotFoundError(
+                "amdsmi auto-import disabled in Alps ROCm images"
+            )
+"""
+if patched in text:
+    print(f"PyTorch ROCm amdsmi auto-import already disabled: {path}")
+    raise SystemExit(0)
+
+old = """        else:
+            import ctypes
+            from pathlib import Path
+"""
+if old not in text:
+    raise SystemExit(f"could not patch {path}: amdsmi auto-import marker not found")
+
+path.write_text(text.replace(old, patched, 1))
+print(f"Disabled PyTorch ROCm amdsmi auto-import: {path}")
+PY
 }
 
 persist_rocm_sdk_env() {
@@ -124,8 +391,9 @@ persist_rocm_sdk_env() {
     } > /opt/alps/env/alps-rocm-build.env
 }
 
-rocm_sdk_ldconfig_dirs() {
-    local candidate libdir seen=""
+rocm_sdk_prefix_candidates() {
+    local candidate
+    local -A emitted=()
 
     for candidate in \
         "${ROCM_BUILD_PREFIX:-}" \
@@ -136,6 +404,17 @@ rocm_sdk_ldconfig_dirs() {
         "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
         "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
         "${ROCM_LIBRARIES_DIR:-}/_rocm_sdk_libraries"; do
+        [[ -n "${candidate}" ]] || continue
+        [[ -n "${emitted[${candidate}]:-}" ]] && continue
+        emitted["${candidate}"]=1
+        printf '%s\n' "${candidate}"
+    done
+}
+
+rocm_sdk_ldconfig_dirs() {
+    local candidate libdir seen=""
+
+    while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
         for libdir in "${candidate}" "${candidate}/lib" "${candidate}/lib64"; do
             [[ -d "${libdir}" ]] || continue
@@ -148,7 +427,7 @@ rocm_sdk_ldconfig_dirs() {
                     ;;
             esac
         done
-    done
+    done < <(rocm_sdk_prefix_candidates)
 }
 
 register_rocm_sdk_ldconfig() {
@@ -184,15 +463,7 @@ load_rocm_sdk_env() {
 
 discover_rocm_build_prefix() {
     local candidate libdir
-    for candidate in \
-        "${ROCM_BUILD_PREFIX:-}" \
-        "${ROCM_DEVEL_PREFIX:-}" \
-        "${ROCM_CORE_PREFIX:-}" \
-        "${ROCM_SDK_ROOT:-}" \
-        "${ROCM_LIBRARIES_PREFIX:-}" \
-        "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
-        "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
-        "${ROCM_LIBRARIES_DIR:-}/_rocm_sdk_libraries"; do
+    while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
         [[ -f "${candidate}/include/hip/hip_runtime_api.h" ]] || continue
         [[ -f "${candidate}/include/hip/hip_runtime.h" ]] || continue
@@ -210,7 +481,7 @@ discover_rocm_build_prefix() {
             printf '%s\n' "${candidate}"
             return 0
         fi
-    done
+    done < <(rocm_sdk_prefix_candidates)
     return 1
 }
 
