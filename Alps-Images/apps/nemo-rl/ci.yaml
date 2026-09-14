@@ -1,0 +1,20 @@
+tests:
+  cuda:
+    - name: vetnode
+      kind: cuda-vetnode
+    - name: imports
+      runner: cuda
+      timeout: 30m
+      script:
+        - /opt/tests/nemo-rl/import-smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+    - name: ray-head
+      runner: cuda
+      timeout: 30m
+      script:
+        - /opt/tests/nemo-rl/ray-head-smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
