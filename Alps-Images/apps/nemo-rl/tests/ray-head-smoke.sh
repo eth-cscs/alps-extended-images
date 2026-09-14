@@ -5,20 +5,29 @@
 # owns worker placement), start a head, run one GPU actor, stop.
 set -euo pipefail
 
-RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray-nemo-rl-smoke}"
+# Per job, so two runners on one node do not share a temp dir.
+RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray-nemo-rl-smoke-${SLURM_JOB_ID:-$$}}"
 export RAY_TMPDIR
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 
 rm -rf "${RAY_TMPDIR}"
 ray stop --force >/dev/null 2>&1 || true
-trap 'ray stop --force >/dev/null 2>&1 || true' EXIT
+trap 'ray stop --force >/dev/null 2>&1 || true; rm -rf "${RAY_TMPDIR}"' EXIT
 
-while IFS='=' read -r _name _; do
-  case "${_name}" in PMI*|PMIX*|MPI*|OMPI*|SLURM_*) unset "${_name}" ;; esac
+while IFS='=' read -r name _; do
+  [[ -n "${name}" ]] || continue
+  case "${name}" in PMI*|PMIX*|MPI*|OMPI*|SLURM_*) unset "${name}" ;; esac
 done < <(env)
 
-node_ip="$(hostname -i | awk '{print $1}')"
+# -I, not -i: -i resolves the hostname through /etc/hosts, which inside a container
+# maps to 127.0.0.1, and a head bound to loopback is unreachable from any other node.
+node_ip="$(hostname -I | awk '{print $1}')"
+[[ -n "${node_ip}" ]] || { echo "no routable address from hostname -I" >&2; exit 1; }
+
+# Without this, num_gpus=0 leaves the actor unschedulable and the test hangs
+# instead of reporting the one thing it exists to check.
 num_gpus="$(python3 -c 'import torch; print(torch.cuda.device_count())')"
+[[ "${num_gpus}" -gt 0 ]] || { echo "no CUDA devices visible to the container" >&2; exit 1; }
 
 ray start --head \
   --disable-usage-stats \

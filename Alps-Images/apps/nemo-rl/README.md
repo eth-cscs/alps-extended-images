@@ -27,7 +27,7 @@ podman build -f Alps-Images/apps/nemo-rl/Containerfile \
 | TransformerEngine | `v2.17` | CUDA graph support; this is megachonk's TE, one minor above the `te212` sibling image |
 | DeepGEMM | `FFGGSSJJ/DeepGEMM@559d79fb` | FP8 grouped GEMM |
 | grouped_gemm | `FFGGSSJJ/grouped_gemm@45118e54` | MoE GEMM with gradient-accumulation fusion |
-| nvidia-resiliency-ext | `0.6.0` | the version Megatron-LM pins; older ones break async checkpoint save |
+| nvidia-resiliency-ext | `0.6.0` | first release containing the commit Megatron-LM pins (`15a85156`); older ones break async checkpoint save |
 | Emerging-Optimizers | `FFGGSSJJ@cc1385ee` | decoupled Muon (`md_decoupling`) |
 | flash-linear-attention | `v0.5.2` | KDA kernels |
 | ray | `2.56.1` | NeMo-RL worker runtime; not in the base image |
@@ -37,10 +37,12 @@ podman build -f Alps-Images/apps/nemo-rl/Containerfile \
 | uv | `0.11.23` | installs everything in this image, and is what NeMo Gym shells out to at run time to build its per-server venvs |
 
 Installs go through `uv pip install --system`, not pip: it resolves the whole
-dependency set at once rather than package by package. Versions that affect the
-validated kernel and NeMo-RL stack are pinned inline. The image intentionally
-does not use `--exclude-newer`: JFrog metadata for some required build packages
-does not include upload dates, causing uv to exclude those packages entirely.
+dependency set at once rather than package by package. Every package is pinned to
+an exact version and every source build to a commit sha or release tag, so a
+rebuild reproduces the validated image rather than whatever the index serves that
+day. The image intentionally does not use `--exclude-newer`: JFrog metadata for
+some required build packages does not include upload dates, causing uv to exclude
+those packages entirely.
 uv is bootstrapped with the repository's `pip_install` helper because nothing
 else exists at that point, and `UV_DEFAULT_INDEX` points at the same CSCS JFrog
 mirror so Gym venvs built at run time resolve through it too.
@@ -48,8 +50,10 @@ mirror so Gym venvs built at run time resolve through it too.
 Every install is additionally run against `/opt/alps/base-pins.txt`, a constraints
 file generated from the selected base image's own
 `torch`/`torchvision`/`triton`/`numpy` versions. A transitive dependency therefore
-cannot drag in a PyPI torch wheel and shadow that NGC stack, and a final build
-check verifies that those versions remained unchanged during installation.
+cannot drag in a PyPI torch wheel and shadow that NGC stack. A final build check
+verifies both that those versions are unchanged and that every pinned layer still
+holds the version it asked for: a later `uv pip install` is free to upgrade an
+earlier package, and only a check after the last layer sees it.
 
 ## What the image does not contain
 

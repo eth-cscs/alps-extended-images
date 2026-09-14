@@ -104,16 +104,24 @@ RUN set -eux; \
 # wrapper Megatron's flex dispatcher imports), so jobs need no PYTHONPATH entry
 # and no per-job srun build.
 ARG UCCL_REPO=https://github.com/swiss-ai/uccl.git
-ARG UCCL_BRANCH=slingshot-dev-clean
-ARG UCCL_REF=fa4c325c
+ARG UCCL_REF=fa4c325c6113b798ae0a009ef8239e07352264fb
+ARG NANOBIND_VERSION=3.0.1
 ARG UCCL_NVL_PEERS=4     # NVLink peers per node (GH200: 4 GPUs/node)
 ARG UCCL_CUDA_ARCH=9.0   # GH200 = Hopper (sm_90)
-ARG UCCL_MAX_JOBS=32     # ninja parallelism; the default is one job per core (288 here)
-# NB: the last three are deliberately NOT named NUM_MAX_NVL_PEERS /
-# TORCH_CUDA_ARCH_LIST / MAX_JOBS. An ENV in the base image beats an ARG of the
-# same name, and this image ships TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0 10.0 11.0
-# 12.0+PTX" — which silently won, built all seven gencodes, and exhausted the
-# container fd limit mid-build.
+# ninja parallelism. ep has 16 translation units, so nothing above 16 is used, and
+# each nvcc job is memory-hungry enough that the default (one per core, 288 here)
+# gets the build OOM-killed.
+ARG UCCL_MAX_JOBS=16
+# NB: UCCL_NVL_PEERS / UCCL_CUDA_ARCH / UCCL_MAX_JOBS are deliberately NOT named
+# NUM_MAX_NVL_PEERS / TORCH_CUDA_ARCH_LIST / MAX_JOBS. An ENV in the base image
+# beats an ARG of the same name, and this image ships TORCH_CUDA_ARCH_LIST="8.0 8.6
+# 9.0 10.0 11.0 12.0+PTX" — which silently won, built all seven gencodes, and
+# exhausted the container fd limit mid-build.
+#
+# Sources are fetched by commit sha into an empty repo rather than cloned: a full
+# clone pulls history for a tree discarded in the same layer, and a shallow clone
+# of a branch cannot reach a pinned older commit. DeepGEMM, grouped_gemm and
+# FlashKDA below use the same shape.
 #
 # ep/setup.py picks -DUSE_GRACE_HOPPER from `nvidia-smi --query-gpu=name` (GH200 +
 # aarch64) and offers no env override, but the build host has no GPU — without a
@@ -121,12 +129,17 @@ ARG UCCL_MAX_JOBS=32     # ninja parallelism; the default is one job per core (2
 # queries setup.py makes and is removed inside the same layer, so it can never
 # shadow the real nvidia-smi at run time.
 RUN set -eux; \
-    ulimit -n "$(ulimit -Hn)" || true; \
+    hard="$(ulimit -Hn)"; \
+    if [[ "${hard}" == unlimited ]]; then hard=65536; fi; \
+    ulimit -n "${hard}"; \
     uv pip uninstall --system deep_ep uccl; \
-    uv pip install --system --no-cache -c /opt/alps/base-pins.txt nanobind; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt "nanobind==${NANOBIND_VERSION}"; \
     SITE="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
-    git clone --single-branch --branch "${UCCL_BRANCH}" "${UCCL_REPO}" /tmp/uccl; \
-    git -C /tmp/uccl checkout -q "${UCCL_REF}"; \
+    mkdir -p /tmp/uccl; \
+    git -C /tmp/uccl init -q .; \
+    git -C /tmp/uccl remote add origin "${UCCL_REPO}"; \
+    git -C /tmp/uccl fetch -q --depth 1 origin "${UCCL_REF}"; \
+    git -C /tmp/uccl checkout -q FETCH_HEAD; \
     mkdir -p /tmp/gpustub "${SITE}/uccl"; \
     printf '#!/bin/sh\ncase "$*" in\n*query-gpu=name*) echo "NVIDIA GH200 120GB";;\n*query-gpu=compute_cap*) echo "9.0";;\n*) exit 1;;\nesac\n' > /tmp/gpustub/nvidia-smi; \
     chmod +x /tmp/gpustub/nvidia-smi; \
@@ -179,8 +192,11 @@ ARG DEEPGEMM_REPO=https://github.com/FFGGSSJJ/DeepGEMM.git
 ARG DEEPGEMM_COMMIT=559d79fb6994a58b8a15b4b93bf13ccc16edf247
 RUN set -eux; \
     uv pip uninstall --system deep_gemm; \
-    git clone "${DEEPGEMM_REPO}" /tmp/DeepGEMM; \
-    git -C /tmp/DeepGEMM checkout -q "${DEEPGEMM_COMMIT}"; \
+    mkdir -p /tmp/DeepGEMM; \
+    git -C /tmp/DeepGEMM init -q .; \
+    git -C /tmp/DeepGEMM remote add origin "${DEEPGEMM_REPO}"; \
+    git -C /tmp/DeepGEMM fetch -q --depth 1 origin "${DEEPGEMM_COMMIT}"; \
+    git -C /tmp/DeepGEMM checkout -q FETCH_HEAD; \
     git -C /tmp/DeepGEMM submodule update --init --recursive --depth 1; \
     uv pip install --system --no-cache --no-build-isolation \
       -c /opt/alps/base-pins.txt /tmp/DeepGEMM; \
@@ -191,8 +207,11 @@ ARG GROUPED_GEMM_REPO=https://github.com/FFGGSSJJ/grouped_gemm.git
 ARG GROUPED_GEMM_COMMIT=45118e547923803ed52f80f240cf974620c9bdc5
 RUN set -eux; \
     uv pip uninstall --system grouped_gemm nv-grouped-gemm; \
-    git clone "${GROUPED_GEMM_REPO}" /tmp/grouped_gemm; \
-    git -C /tmp/grouped_gemm checkout -q "${GROUPED_GEMM_COMMIT}"; \
+    mkdir -p /tmp/grouped_gemm; \
+    git -C /tmp/grouped_gemm init -q .; \
+    git -C /tmp/grouped_gemm remote add origin "${GROUPED_GEMM_REPO}"; \
+    git -C /tmp/grouped_gemm fetch -q --depth 1 origin "${GROUPED_GEMM_COMMIT}"; \
+    git -C /tmp/grouped_gemm checkout -q FETCH_HEAD; \
     # setup.py includes third_party/cutlass/include directly, so the submodule
     # must be present or every .cu fails on "cutlass/bfloat16.h: No such file".
     git -C /tmp/grouped_gemm submodule update --init --recursive --depth 1; \
@@ -206,12 +225,17 @@ RUN set -eux; \
 # _get_write_results_queue from filesystem_async, so Megatron's nvrx import fails
 # and is masked as "package is not installed"
 # (dist_checkpointing/strategies/torch.py). Needed by any recipe with async_save.
-ARG NVRX_VERSION=0.6.0
+#
+# NOT named NVRX_VERSION: the base image exports ENV NVRX_VERSION=0.5.0, an ENV
+# beats an ARG of the same name, and the layer then installs 0.5.0 while its own
+# assert -- reading the same shadowed variable -- agrees with it. Same trap as the
+# MAX_JOBS args above. The assert spells the version out for that reason.
+ARG NVRESILIENCY_VERSION=0.6.0
 RUN set -eux; \
     uv pip uninstall --system nvidia-resiliency-ext; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
-      "nvidia-resiliency-ext==${NVRX_VERSION}"; \
-    python3 -c "import nvidia_resiliency_ext as n; assert n.__version__ == '${NVRX_VERSION}', n.__version__"
+      "nvidia-resiliency-ext==${NVRESILIENCY_VERSION}"; \
+    python3 -c "import nvidia_resiliency_ext as n; assert n.__version__ == '0.6.0', n.__version__"
 
 # ---- Emerging-Optimizers (community fork: Muon / md_decoupling) -------------
 # Provides the decoupled-Muon optimizer the Apertus2 KDA runs train with.
@@ -240,6 +264,7 @@ RUN set -eux; \
 # every Gym child venv unresolvable. NeMo-RL core never imports openai.
 ARG RAY_VERSION=2.56.1
 ARG FLASHINFER_VERSION=0.6.18.post1
+ARG TVM_FFI_VERSION=0.1.9
 RUN set -eux; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
       "ray[default]==${RAY_VERSION}" \
@@ -253,10 +278,26 @@ RUN set -eux; \
       "zstandard==0.25.0" \
       "openai==2.7.2" \
       "colored==2.2.3" \
-      pybase64 msgspec pyzmq pyyaml \
-      wandb datasets accelerate tensorboard torchdata \
-      nvidia-ml-py tiktoken sentencepiece blobfile debugpy nvtx \
-      matplotlib plotly sympy num2words rich
+      "pybase64==1.5.0" \
+      "msgspec==0.21.1" \
+      "pyzmq==27.1.0" \
+      "pyyaml==6.0.3" \
+      "wandb==0.30.0" \
+      "datasets==4.4.1" \
+      "accelerate==1.15.0" \
+      "tensorboard==2.20.0" \
+      "torchdata==0.11.0" \
+      "nvidia-ml-py==13.590.44" \
+      "tiktoken==0.14.0" \
+      "sentencepiece==0.2.2" \
+      "blobfile==3.3.0" \
+      "debugpy==1.8.19" \
+      "nvtx==0.2.14" \
+      "matplotlib==3.10.8" \
+      "plotly==7.0.0" \
+      "sympy==1.14.0" \
+      "num2words==0.5.14" \
+      "rich==14.2.0"
 
 # flashinfer is installed --no-deps so its dependency metadata (which names torch
 # and the cu12 nvidia-* wheels) cannot touch the NGC stack; tvm_ffi is its only
@@ -264,7 +305,8 @@ RUN set -eux; \
 RUN set -eux; \
     uv pip install --system --no-cache --no-deps \
       "flashinfer-python==${FLASHINFER_VERSION}"; \
-    uv pip install --system --no-cache -c /opt/alps/base-pins.txt apache-tvm-ffi
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "apache-tvm-ffi==${TVM_FFI_VERSION}"
 
 # ---- refit / data-plane transports -------------------------------------------
 # Not reachable on the Megatron-generation path (it does no weight refit, and
@@ -272,11 +314,13 @@ RUN set -eux; \
 # NeMo-RL's base dependencies, so a worker venv or a config flip finds them here
 # rather than failing at run time. Specs match NeMo-RL's pyproject.
 ARG NIXL_VERSION=1.3.0
+ARG AWSCRT_VERSION=0.36.3
+ARG NCCL4PY_VERSION=0.5.0
 ARG TRANSFER_QUEUE_COMMIT=c51614308b68c8d7a87c9b3ef62d59e14c69bde2
 RUN set -eux; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
-      "awscrt>=0.35.0" \
-      nccl4py \
+      "awscrt==${AWSCRT_VERSION}" \
+      "nccl4py==${NCCL4PY_VERSION}" \
       "nixl==${NIXL_VERSION}" \
       "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@${TRANSFER_QUEUE_COMMIT}"
 
@@ -310,8 +354,11 @@ RUN set -eux; \
 ARG FLASH_KDA_REPO=https://github.com/MoonshotAI/FlashKDA.git
 ARG FLASH_KDA_COMMIT=7afb9f454f160a6c4bbc0999beca0a8c40a38934
 RUN set -eux; \
-    git clone "${FLASH_KDA_REPO}" /tmp/flash-kda; \
-    git -C /tmp/flash-kda checkout -q "${FLASH_KDA_COMMIT}"; \
+    mkdir -p /tmp/flash-kda; \
+    git -C /tmp/flash-kda init -q .; \
+    git -C /tmp/flash-kda remote add origin "${FLASH_KDA_REPO}"; \
+    git -C /tmp/flash-kda fetch -q --depth 1 origin "${FLASH_KDA_COMMIT}"; \
+    git -C /tmp/flash-kda checkout -q FETCH_HEAD; \
     git -C /tmp/flash-kda submodule update --init --recursive --depth 1; \
     FLASH_KDA_CUDA_ARCHS=90 \
     MAX_JOBS="${KERNEL_MAX_JOBS}" \
@@ -322,17 +369,25 @@ RUN set -eux; \
 # ---- CUTLASS DSL -------------------------------------------------------------
 # Pure-python wheel (py3-none-any). flashinfer imports without it on TE 2.17, but
 # the te212 pin overlay carried it and some CUTLASS-backed kernels expect it.
+#
+# The [cu13] extra is not optional on this base. nvidia-cutlass-dsl requires
+# nvidia-cutlass-dsl-libs-cu12 unconditionally and gates the cu13 libs behind that
+# extra, so the plain spec installs CUDA 12 binaries against a CUDA 13.1 toolkit.
 ARG CUTLASS_DSL_VERSION=4.7.1
 RUN set -eux; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
-      "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}"
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
 
 # The Megatron generation backend's OpenAI-compatible HTTP server (the endpoint
 # NeMo Gym drives when mcore_generation_config.expose_http_server is true) is
 # served by Quart under hypercorn; without them Megatron raises
 # "Web backend framework (Quart) not available" and no rollout can reach the policy.
+ARG QUART_VERSION=0.22.0
+ARG HYPERCORN_VERSION=0.18.0
 RUN set -eux; \
-    uv pip install --system --no-cache -c /opt/alps/base-pins.txt quart hypercorn
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "quart==${QUART_VERSION}" \
+      "hypercorn==${HYPERCORN_VERSION}"
 
 # ---- runtime defaults -------------------------------------------------------
 # The point of this image is that every NeMo-RL dependency is already importable,
@@ -346,9 +401,11 @@ ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1 \
     UV_LINK_MODE=copy
 
 # ---- verification -----------------------------------------------------------
-# Fails the build if any install above moved the NGC torch stack. Imports are not
-# checked here: the build host has no GPU, so tests/import-smoke.sh asserts them
-# on a compute node instead.
+# Fails the build if any install above moved the NGC torch stack, or if a layer
+# resolved to a version other than the one it asked for -- a later `uv pip install`
+# is free to upgrade an earlier package, and only a check after the last layer
+# catches that. Imports are not checked here: the build host has no GPU, so
+# tests/import-smoke.sh asserts them on a compute node instead.
 RUN set -eux; \
     python3 - <<'VERIFY'
 import importlib.metadata as md
@@ -358,12 +415,30 @@ for pkg, want in pins.items():
     got = md.version(pkg)
     assert got == want, f"{pkg} moved: {want} -> {got}"
 
-assert md.version("transformer_engine").startswith("2.17"), md.version("transformer_engine")
-assert md.version("ray").startswith("2.56."), md.version("ray")
-assert md.version("openai") == "2.7.2", md.version("openai")
+PREFIXES = {
+    "transformer_engine": "2.17.",
+    "ray": "2.56.",
+    "openai": "2.7.2",
+    "flashinfer-python": "0.6.18",
+    "nvidia-resiliency-ext": "0.6.0",
+    "causal-conv1d": "1.7.0",
+    "mamba-ssm": "2.3.2",
+    "nixl": "1.3.0",
+    "nvidia-cutlass-dsl": "4.7.1",
+    "transformers": "5.8.1",
+    "megatron-energon": "7.4.0",
+    "hydra-core": "1.3.2",
+}
+for pkg, prefix in PREFIXES.items():
+    got = md.version(pkg)
+    assert got.startswith(prefix), f"{pkg}: expected {prefix}*, got {got}"
+
 print("torch stack unchanged:", pins)
 VERIFY
 
-# Tests shipped with the image
+# Tests shipped with the image. `a+rX` alone is not enough: capital X only adds the
+# bit where one already exists, so a 0644 checkout stays unrunnable.
 COPY Alps-Images/apps/nemo-rl/tests/ /opt/tests/nemo-rl/
-RUN chmod -R a+rX /opt/tests/nemo-rl
+RUN set -eux; \
+    chmod -R a+rX /opt/tests/nemo-rl; \
+    find /opt/tests/nemo-rl -name '*.sh' -exec chmod a+rx {} +
