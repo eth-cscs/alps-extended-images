@@ -429,7 +429,27 @@ algorithm:
     target_kl: 0.05
     horizon: 10000
   rollout_correction:
-    bypass_mode: True   # required for off-policy log prob correction
+    # bypass_mode: True -> False (2026-09-14). This flag was mislabeled: True means BYPASS the
+    # correction (2-policy mode, old_log_probs := rollout_log_probs, no IS weighting at all) --
+    # every run of this recipe through 3355993/3355994 trained with the correction fully off.
+    # False is verl's own stock default ("decoupled" mode: old_log_probs recomputed by the
+    # trainer, sequence-level Truncated Importance Sampling applied at rollout_is_threshold,
+    # citing "When Speed Kills Stability: Demystifying RL Collapse from the Training-Inference
+    # Mismatch"). Comparison against the NeMo-RL Apertus-v1.5-70B recipe
+    # (grpo-apertus1p5-70b-16n4g-tp2pp4-gsm8k-2k-windowed-optimized.yaml, which generalizes
+    # DAPO-Math training to held-out AIME where this verl recipe collapses) found the reward
+    # function is byte-identical and reference_policy_kl_penalty is 0 on both sides -- but NeMo-RL
+    # runs use_importance_sampling_correction=true + truncated_importance_sampling_ratio=2.0,
+    # i.e. exactly this correction, while this recipe explicitly disabled it. Measured
+    # training/off_policy/trajectory_staleness/mean sits at 0.90-0.98 nearly every step in this
+    # recipe (near the max_off_policy_threshold=2 cap), i.e. genuinely off-policy training with
+    # no correction applied -- the training-inference mismatch regime the correction exists for.
+    # Cost: a real extra actor forward pass per step (old_log_probs can no longer be reused from
+    # rollout for free) -- watch timing_s/old_log_prob and step time. Never run on this recipe's
+    # V1 separate_async architecture before -- needs a real test, not just a flag flip.
+    bypass_mode: False
+    rollout_is: sequence       # verl default; matches NeMo-RL's sequence-level TIS
+    rollout_is_threshold: 2.0  # verl default; matches NeMo-RL's truncated_importance_sampling_ratio
 
 reward:
   custom_reward_function:
