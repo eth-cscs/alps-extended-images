@@ -4394,6 +4394,82 @@ gaining a ~12-line `curl compare/…​.diff` + `patch -pN` block.
 
 ## Known hazards (this recipe specifically)
 
+- **`algorithm.rollout_correction.bypass_mode: False` (decoupled/3-policy IS correction) leaks
+  host RAM via `save_model_to_cpu`, ~120 GB/node/step at `PARAMETER_SYNC_STEP=1` — OOMs by
+  step 3.** Found in run `3405628` (2026-09-15, DAPO-Math, `bypass_mode: False` +
+  `rollout_is: token` + `actor.megatron.param_offload: False`): 2 clean, stable training steps
+  (`critic/score/mean` 0.061/-0.0026, `actor/grad_norm` 0.073/0.065, `rollout_corr/*` fields
+  populated and sane — `rollout_actor_probs_pearson_corr: 0.969`, `rollout_is_mean: 0.974` — so
+  the decoupled-IS math itself is NOT the bug), then `ray.exceptions.OutOfMemoryError: 3
+  worker(s) were killed due to the node running low on memory (448.88GB / 450.00GB)` at the
+  start of step 3, traced to `verl/trainer/ppo/v1/trainer_separate_async.py:119
+  _compute_old_log_prob → self.actor_rollout_wg.save_model_to_cpu(0)`.
+  **Root cause, traced through real v0.9.0 source** (`verl/experimental/separation/engine_workers.py`
+  `DetachActorWorker.save_model_to_cpu`/`restore_model_from_cpu`/`clear_cpu_model`, and
+  `verl/utils/megatron_utils.py:copy_megatron_model_to_cpu`): `_compute_old_log_prob`'s
+  non-bypass branch has two paths — `local_trigger_step == 0` (save π_old, compute directly, NO
+  restore/clear needed since GPU already holds what was just saved) vs `local_trigger_step >= 1`
+  (save current → restore π_old → compute → restore current → `clear_cpu_model`, correctly
+  bounded). **At `PARAMETER_SYNC_STEP=1` (this recipe's DAPO-Math default, sync every step),
+  `local_trigger_step` is ALWAYS 0** — every single step takes the first branch, calling
+  `save_model_to_cpu(0)` → `self.cpu_saved_models[0] = self.copy_handler(...)` →
+  `copy_megatron_model_to_cpu`'s `buffer.param_data.data.cpu().clone().pin_memory()` — a
+  **brand-new pinned host allocation every step**, for the full per-rank DDP param buffer. The
+  old dict value is dropped (Python refcount → 0) but PyTorch's pinned-memory `CachingHostAllocator`
+  does not return freed page-locked memory to the OS on dealloc — it pools it for reuse, and
+  the observed +121 GB/step growth means these blocks are not being reused/reclaimed, only
+  accumulating. **Not yet root-caused to the exact allocator mechanism** (would need a
+  `[MEMDUMP]`-style diagnostic patch printing pinned-allocator/RSS stats around each
+  `save_model_to_cpu` call, per this repo's established practice for memory mysteries — see the
+  GLM step-1-OOM chain, runs `3241496`-`3247517`, for the precedent) — this entry records the
+  precise mechanism found from source, not a confirmed fix. **This is a real, previously
+  unexercised verl code path**: every prior validated run in this whole project uses
+  `bypass_mode: True` (copies rollout log-probs, never touches `save_model_to_cpu` at all), so
+  this is the first time `_compute_old_log_prob`'s decoupled branch has run at any real scale
+  with Megatron + `separate_async`. Options for a retry, not yet chosen: (a) diagnostic patch
+  first (safest, matches established practice); (b) raise `PARAMETER_SYNC_STEP` above 1 (slows
+  the per-wall-clock leak rate proportionally, does not fix the underlying per-call allocation
+  growth); (c) a verl-side fix to `copy_megatron_model_to_cpu` reusing a persistent pinned
+  buffer instead of allocating fresh each call (real engineering, upstreamable like the
+  `delta_sharded`/qkv_a fixes on the DeepSeek-V3 recipe); (d) drop `bypass_mode: False` testing
+  given this is the third distinct bug found in this code path (after the `rollout_is: sequence`
+  numerical underflow and the `param_offload: True` host-RAM interaction, both already fixed) —
+  a genuine investment-vs-abandon decision, not yet made.
+  **Diagnostic run `3406732` (2026-09-15) confirmed the exact mechanism with hard numbers**:
+  `pinned_this_call_gb` was **identical (18.208 GB) on every single call**, every rank, all 3
+  step-attempts — proving "same fixed-size buffer, freshly allocated every step, never
+  reclaimed" over any growing-allocation theory. RSS climbed ~40 → ~82 → 104–115 GB (aborted
+  mid-step-3) — never resetting. **Fix implemented**: `decoupled-cpu-snapshot-reuse-fix.patch`
+  (supersedes the diagnostic-only `decoupled-cpu-snapshot-memdump.patch`, kept as an unapplied
+  reference) — `copy_megatron_model_to_cpu` now accepts an optional `cache` (a prior call's own
+  return value) and does an in-place `copy_()` into the same pinned tensor for any buffer whose
+  shape/dtype still matches, falling back to a fresh allocation only on genuine mismatch or the
+  first call; `DetachActorWorker` keeps a persistent `_cpu_pinned_pool` dict (keyed by the same
+  slot as `cpu_saved_models`) that survives `clear_cpu_model`, so a given slot's pinned buffer is
+  reused indefinitely instead of reallocated every step. Scoped to `actor.strategy == "megatron"`
+  only — FSDP/FSDP2/VeOmni paths untouched. Verified locally (no GPU/megatron needed for this
+  part): extracted the two changed functions into an isolated module and exercised them against
+  real `torch` tensors with a hand-built DDP-buffer mock — confirmed correct reuse
+  (identity-checked via `is`, not just value equality), correct value updates after reuse,
+  correct fallback on shape mismatch, and correct behavior in both the DDP and non-DDP
+  (`named_parameters`) branches plus the `storage()`-empty (`cpu_data`) fallback branch.
+  **VALIDATED on a real cluster run — job `3408011` (2026-09-15), COMPLETED, exit 0, ~92 min,
+  5/5 capped training steps + checkpoint save + AIME validation, all clean.** Confirmed by two
+  independent signals: (1) `[CPU-SNAPSHOT-DIAG]` — the first `save_model_to_cpu` call shows
+  `buffers_reused=0 buffers_freshly_allocated=1` (nothing cached yet, as expected), and **every
+  call after that shows `buffers_reused=1 buffers_freshly_allocated=0`** — zero fresh
+  allocations past step 1; `rss_after_gb` steps up once to ~40 GB then stays flat in a
+  **49–52 GB band across all 5 steps** (vs. run `3406732`'s pre-fix 40→82→104+ GB climb that
+  OOM'd at step 3). (2) verl's own independent `actor/perf/cpu_memory_used_gb` metric: 575.1 →
+  585.2 → 583.9 → 581.8 → 559.4 GB across steps 1–5 — also flat, no upward trend. Training itself
+  stayed healthy throughout (`actor/grad_norm` 0.059–0.072, `actor/loss` 0.23–0.26, no NaN/Inf),
+  got past the step-3 wall that killed both `3405628` and `3406732`, and produced the recipe's
+  first-ever `bypass_mode: False` end-of-run AIME-2024 result:
+  `val-core/aime_2024/acc/mean@32 = 0.108`, `best@32 = 0.448`. This was a 5-step shakedown, not
+  the full 92-step DAPO-Math benchmark — the host-RAM leak is fixed and the recipe is now safe to
+  run at full length, but the actual "does `bypass_mode: False` generalize DAPO training to AIME
+  better than `bypass_mode: True`" question (the original motivation for this whole investigation
+  — see the NeMo-RL comparison above) is still open and needs a full-length run to answer.
 - **`switch_to_rollout()` crashes the standalone rollout the first time it ever runs mid-training
   — i.e. the first `test_freq` validation after training has started.** Root-caused from real
   v0.9.0 source (not guessed) after run `3261338` crashed here at 45/46 steps — see the Run log
@@ -4747,6 +4823,126 @@ Second benchmark for this recipe, selected with `BENCHMARK=dapo-math` (default s
   spec (train n=32; AIME val T=0.6 / top_p=0.95), which its frozen script did not carry, and by
   the 12 h ceiling: at n=32 a 92-step run does not fit one job (options recorded in the
   session: accept a TIMEOUT / periodic checkpoints + resume across two jobs / 46 steps).
+- **Run `3330187` (2026-09-08) — the full 92-step DAPO-Math benchmark run, second attempt.**
+  Submitted after the user pushed the aligned `reward.py` + `dataset_prepare.py` (commit
+  `d31d953`; branch verified byte-identical to the locally tested files). Settings: 40 nodes
+  (24/16), `--time=12:00:00` (the ceiling), `ENABLE_THINKING=True BENCHMARK=dapo-math`, train
+  n=16 T=1.0 top_p=1.0, AIME-2024 val n=32 T=0.6 top_p=0.95 top_k off, sync every step, 92 × 48
+  prompts, validation at step 0 and 92, final checkpoint only. First run on the NeMo-aligned
+  reward (deliberation-span exclusion, 2000→4000 length ramp) and on the boxed AIME prompt —
+  the cached DAPO parquets are rebuilt at job start (`v3-bracket-train-boxed-aime`), so the
+  step-0 AIME number is NOT comparable with `3327285`'s 2.1 % (different prompt, marker and
+  sampling temperature). Monitored by a terminal-state-only FirecREST poll (no per-step
+  events); the log is processed once at the end. Outcome: pending.
+
+## Standalone AIME eval-only script (`eval-aime-standalone.sh`, added 2026-09-09)
+
+Diagnoses whether runs `3330187`/`3331427`'s AIME avg@32 regression after DAPO-Math RL (9-10% ->
+3%) is a real reasoning loss or a **train/eval prompt-marker mismatch**: training only ever
+rewards `[[[N]]]` (dapo_math rows use the bracket prompt), while AIME eval prompts for `\boxed{}`
+-- GRPO could plausibly have taught the policy to always emit brackets regardless of the eval
+prompt, in which case `reward.py`'s boxed-only AIME scorer zeroes correct-but-bracket-formatted
+answers (a scoring artifact, not a capability loss). Neither training run saved validation
+generations (`val_generations: 0`, `rollout_data_dir`/`validation_data_dir`: null), so this dumps
+raw per-sample text instead of re-running training.
+
+Uses `verl.trainer.main_generation_server` (NOT the training recipe) -- no Megatron, no V1
+trainer, no TransferQueue, no weight sync: SGLang loads the checkpoint's HF export directly
+(`load_format=auto`) and just serves it. Reuses only the parent recipe's Group 1 (Apertus 1.5
+SGLang support: swiss-ai transformers wheel + SGLang PR #32979 + local fixes) -- Group 2
+(Megatron/Bridge), xielu, and every V1-trainer/TransferQueue patch are dropped as inapplicable
+(confirmed: xielu is `MCoreXIELU`-specific -- Megatron-Bridge only -- transformers' own
+`XIELUActivation` pure-pytorch fallback is what SGLang's apertus1p5 model reuses, already
+validated by the FSDP2 recipe running without the xielu wheel).
+
+- Usage: `CKPT_RUN_ID=<training job id> sbatch eval-aime-standalone.sh` (checkpoint path built
+  from the known `Apertus-v1.5-70B-dapo-math-verl-sglang-megatron-v1-separate-async-40n-run-<id>`
+  naming convention; `CKPT_PATH` overrides directly). Reads the AIME-2024 test parquet already on
+  Lustre from the training run (same boxed prompt, not rebuilt). Same AIME sampling as training
+  validation: n=32, T=0.6, top_p=0.95, top_k off. 4 nodes (4 SGLang TP=4 replicas), 1.5 h.
+- Dumps raw generations to `${TRAINING_HOME}/eval-gen/<run>-<step>-aime-gen.parquet`, then scores
+  in-job: classifies every one of the 30x32 responses as bracket-only / boxed-only / both /
+  neither, and prints the last 400 chars of the first 6 responses for a human sanity check.
+- **Verification before submitting**: found and fixed a real bug while authoring -- the scoring
+  step originally used an UNQUOTED `<<PYEOF` heredoc, which would have let the shell's heredoc
+  backslash-collapsing rules mangle the regex patterns before Python ever saw them, and separately
+  a literal `'` inside it would have prematurely closed the outer single-quoted `srun ... bash -c
+  '...'` argument (the same class of hazard as run 3149339) -- switched to a quoted `<<- "PYEOF"`
+  delimiter (no shell expansion at all) and moved the output path to `os.environ` instead of
+  heredoc-interpolating it, eliminating both the escaping ambiguity and the stray quote. Also
+  caught a Python-version-dependent f-string bug (a backslash-containing dict lookup inside an
+  f-string expression, invalid before PEP 701/Python 3.12) and rewrote it portably. Verified:
+  `bash -n`, the repo's standard stray-single-quote scanner (clean on both `--container-writable
+  bash -c '...'` regions), the local-fixes diff hunk content confirmed identical to the
+  already-cluster-validated parent recipe's copy (comment wording differs only), and the exact
+  heredoc-delivered Python source extracted and run end-to-end against a synthetic parquet with
+  bracket-only / boxed-only / both / neither samples -- classified all four correctly.
+- **Not yet validated on cluster** — this is the first run of this script.
+
+### Runs `3336603` (ckpt `3330187`, baseline) / `3336604` (ckpt `3331427`, clip-higher) — 2026-09-09
+
+Submitted together, one per checkpoint (`CKPT_RUN_ID` injected as an export line after the
+`#SBATCH` header of each submitted copy, same convention as every other run this session).
+Outcome: pending (terminal-state-only watches, no per-step events since this is a single
+generation pass, not a training loop).
+
+**Both FAILED (hung, user-reported "both job failed") -- a genuine bug in the local-fixes.diff I
+authored, found and fixed same day.** Log showed, on all 4 nodes: `patch: **** malformed patch at
+line 33` from the `sglang-apertus1p5-local-fixes.diff` apply step, then no further output and no
+FATAL -- both jobs sat RUNNING for 20+ min with zero progress. Root cause: while trimming the
+parent recipe's 4-line explanatory comment down to 3 lines inside the diff's `+` hunk body, I
+did not update the hunk header (`@@ -301,9 +305,16 @@` still claimed 16 new lines; the body only
+had 15) -- confirmed locally by reproducing the exact "malformed patch at line N" message with a
+synthetic off-by-one hunk. Confirmed `patch`'s own exit code is 2 (nonzero) in that case and the
+`|| { FATAL; exit 1; }` guard fires correctly in isolation, so the observed no-FATAL / stuck-
+RUNNING symptom on cluster was not fully explained by the header bug alone -- most likely an
+interactive-prompt hang inside the container's `patch` on this specific parse-error path (not
+reproduced locally, but consistent with all evidence: no FATAL, no exit, job stuck RUNNING).
+Both jobs cancelled (`3336603`/`3336604`, CANCELLED by user request, no useful output).
+**Fix**: restored the diff body to be byte-identical to the already-cluster-validated parent
+recipe's copy (verified with a real diff against the parent, not just eyeballing), and added
+`patch --batch` to all three patch invocations in this script as defense-in-depth against any
+future interactive-prompt hang, regardless of root cause. **Verified for real this time, not
+just arithmetically**: fetched the actual `sgl-project/sglang#32979` diff, reconstructed
+`apertus_mm.py`'s real post-PR content locally, and ran `patch --batch -p2 < restored-diff`
+against it -- exit 0, both hunks applied cleanly, and the patched file parses as valid Python
+(`ast.parse`). Resubmitted as `3336713` (ckpt `3330187`) / `3336714` (ckpt `3331427`).
+
+**`3336713`/`3336714` FAILED too (exit 15) — real progress this time (patches applied, model
+loaded, SGLang HTTP server up), new failure downstream**: every generate call hit
+`AttributeError: 'NoneType' object has no attribute 'apply_chat_template'` inside sglang's
+`serving_chat.py:_apply_jinja_template` (`self.tokenizer_manager.tokenizer` is `None`). Root
+cause: `RolloutConfig.skip_tokenizer_init` defaults to `True` for the `sglang` rollout backend
+(`verl/workers/config/rollout.py:259`) -- correct/intended for verl's own RL rollout path (which
+tokenizes/detokenizes itself and only needs SGLang's raw `/generate`), but `main_generation_server.py`'s
+own `/v1/chat/completions` HTTP path needs a real tokenizer to `apply_chat_template` server-side.
+verl's own canonical generation example (`examples/generation/run_deepseek_llm_7b.sh`) sidesteps
+this entirely by using `rollout.name=vllm` (`vllm_async_server.py` hardcodes
+`skip_tokenizer_init: False` unconditionally) -- not an option here since Apertus1p5 has no vLLM
+support, only the SGLang PR #32979 patch. Confirmed from source that `SGLangReplica` (the same
+class both the RL path and `main_generation_server`'s standalone mode use,
+`async_sglang_server.py:314`) reads `skip_tokenizer_init` straight from `actor_rollout_ref.rollout`,
+so a plain CLI override applies to this generation-only invocation without needing new code.
+**Fix**: added `actor_rollout_ref.rollout.skip_tokenizer_init=False` to the `main_generation_server`
+invocation. Confirmed the checkpoint's HF export actually has `tokenizer.json` /
+`tokenizer_config.json` / `chat_template.jinja` (so this will have something real to load).
+Resubmitted as `3336917` (ckpt `3330187`) / `3336918` (ckpt `3331427`).
+- **Runs `3331427` / `3331428` (2026-09-08) — two more 92-step DAPO-Math benchmark runs, one
+  minor hyper-parameter change each vs `3330187`** (user: "schedule two more runs, so that
+  hopefully we get 3 successful runs; minor hyperparam that might have a positive impact on
+  the final score"). The recipe gained two env-overridable knobs with verl-stock defaults
+  (`ACTOR_LR` → `actor.optim.lr`, default 1e-6; `CLIP_RATIO_HIGH` → `actor.clip_ratio_high`,
+  default 0.2, with `clip_ratio_low: 0.2` now explicit) — the default render is byte-equivalent
+  to what `3330187` runs. `3331427`: **`CLIP_RATIO_HIGH=0.28`** (DAPO "clip-higher"; widens the
+  upward PPO clip so low-probability tokens can be reinforced — the DAPO paper's largest single
+  AIME gain; no memory/time cost). `3331428`: **`ACTOR_LR=2e-6`** (2× the stock 1e-6).
+  Everything else identical to `3330187` (12 h, 40 nodes, n=16, boxed AIME val T=0.6/top_p=0.95).
+  Mishap on the way: the first pair (`3331424`/`3331425`) was submitted from copies whose recipe
+  edit had silently failed (the `actor:` block anchor did not match, so the knobs were exported
+  but never consumed — identical to baseline); caught by the post-submit check, both cancelled
+  while PENDING (elapsed 0), recipe fixed (anchored on `ppo_mini_batch_size`), resubmitted.
+  Lesson: verify the rendered YAML of a submission copy BEFORE the POST, not after. Outcome:
+  pending (terminal-state-only watches).
 
 ## Configuration audit (architecture-vs-config) — 2026-08-31
 
@@ -5285,3 +5481,80 @@ Implemented the checksum diagnostic proposed above, rather than a separate short
   OOM before resubmitting, or resubmit unmodified first (same "retry once to check if it's a
   one-off" approach already validated elsewhere in this repo) is an open decision, not yet made.
 - **Commit**: not committed.
+## Bracket-everywhere cross-check via the training recipe unchanged (2026-09-09)
+
+Second, independent way to test the same train/eval prompt-marker-mismatch hypothesis (see the
+"Standalone AIME eval-only script" section above), using
+`rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh` **completely unmodified** (user
+request: "leverages the existing [recipe] without the need to make any change") -- rather than
+the new, still-shaking-out `eval-aime-standalone.sh`. Idea: resume from the run `3330187` step-92
+checkpoint, rebuild the DAPO-Math dataset so AIME ALSO gets the `[[[N]]]` bracket prompt (matching
+what training itself rewards), and let `val_before_train`'s baseline evaluation (which runs BEFORE
+any new training step, straight off the loaded checkpoint weights) answer the question -- no new
+training actually needs to complete for this diagnostic.
+
+- **`dataset_prepare.py` fix** (needs commit + push before job `3337054` reaches its dataset-prep
+  step): `AIME_SYSTEM_PROMPT` was hardcoded to `SYSTEM_PROMPTS["boxed"]` regardless of
+  `ANSWER_MARKER` -- changed to `SYSTEM_PROMPTS[ANSWER_MARKER]`, so with the recipe's default
+  `ANSWER_MARKER=bracket`, AIME now gets `[[[42]]]` too (boxed runs are unaffected: `SYSTEM_PROMPTS["boxed"]`
+  either way). Verified locally for both marker values.
+- **Zero changes to the tracked recipe .sh** -- only a throwaway submission copy differs, at
+  exactly 2 hardcoded-value lines plus one injected env line:
+  1. `MODEL_CHECKPOINT_PATH` -> the run `3330187` step-92 HF export
+     (`.../checkpoints/Apertus-v1.5-70B-dapo-math-verl-sglang-megatron-v1-separate-async-40n-run-3330187/global_step_92/actor/model/huggingface`,
+     confirmed to exist) instead of the original SFT checkpoint. This line is a hard literal
+     `export`, not `${VAR:-default}`, so (unlike `ENABLE_THINKING`/`BENCHMARK`/`ANSWER_MARKER`) an
+     early-injected override would just get clobbered -- the submission copy edits the line's
+     VALUE directly instead.
+  2. `TRAINING_HOME` -> an ISOLATED sibling directory
+     (`/capstor/scratch/cscs/palmee/RL/Apertus-v1.5-70B-bracket-aime-check`, confirmed not to
+     exist yet) instead of the shared `Apertus-v1.5-70B` home the concurrently-running
+     `eval-aime-standalone.sh` jobs (`3336917`/`3336918`) are ALSO reading data from -- both
+     `3336917`/`3336918` were still PENDING (elapsed 0) when this job was built, so overwriting
+     the shared `data/dapo-math/test.parquet` in place would have risked serving THEM the new
+     bracket-AIME rows instead of the boxed ones they are specifically testing. Cost: this job
+     rebuilds the swiss-ai transformers/xielu wheels and the Megatron compare-diff patches fresh
+     under the new home (one-time, a few minutes, same well-trodden path every fresh TRAINING_HOME
+     already takes) -- no functional risk.
+  3. `TOTAL_TRAINING_STEPS=1` injected as an env line after `#SBATCH` (uses the recipe's existing
+     `${TOTAL_TRAINING_STEPS:-92}` pattern, safe) -- `test_freq` follows it, so this also gets one
+     post-step-1 validation, but the one that actually answers the question is `val_before_train`'s
+     PRE-training baseline, which needs no training at all to be meaningful.
+- **Verified before submitting**: `bash -n`, the stray-single-quote scanner, and the unquoted-
+  heredoc backtick/bare-`$` scan (env.toml, grpo_gsm8k.yaml, gsm8k_reward.py, prepare_gsm8k.py
+  equivalents) all clean; `diff` against the tracked recipe shows exactly the 3 intended lines
+  differ; the checkpoint directory confirmed to exist via `ops/stat`; the new `TRAINING_HOME`
+  confirmed NOT to exist yet (true isolation, not accidentally reusing stale state).
+- Submitted as run `3337054`. Outcome: pending.
+
+### Result: format-mismatch hypothesis DISPROVEN; real cause is repetition collapse on AIME (2026-09-09)
+
+`3336917` (ckpt `3330187`, boxed AIME) and `3336918` (ckpt `3331427`, boxed AIME) both
+**COMPLETED**. Marker-usage classification across 960 generations each:
+
+| ckpt | bracket-only | boxed-only | both | neither |
+|---|---|---|---|---|
+| `3330187` | 0 | 502 (52%) | 0 | 458 (48%) |
+| `3331427` | 0 | 507 (53%) | 0 | 453 (47%) |
+
+**Zero bracket usage in either** -- the "RL training taught the policy to always emit `[[[N]]]`
+regardless of the eval prompt" hypothesis is disproven; both checkpoints still try to follow the
+`\boxed{}` instruction. The other ~48% ("neither") is **repetition collapse**, confirmed by
+reading the raw dumped text: the model loops on a single line/expression for the entire
+12288-token budget on problems it cannot solve (e.g. `4105 / 3 = 1368.333...` repeated
+continuously, `w^2\bar w^2=256` repeated, a rational-function line repeated) -- never reaching
+any answer marker at all, so `reward.py` correctly scores these 0 (there is genuinely no answer to
+extract, not a scoring-format artifact). This is a real DAPO-Math-RL-induced behavioral
+regression on AIME's harder problems (the model appears to have learned "be short and confident"
+from problems it can solve, and generalizes that into "loop instead of admit not knowing" on ones
+it cannot) -- distinct from both the format-mismatch hypothesis and a simple capability loss.
+
+**`3337054` (the training-recipe cross-check, first attempt) COMPLETED but is INVALID -- a
+self-inflicted submission bug, not a result.** The isolated submission copy set `MODEL_CHECKPOINT_PATH`
+/ `TRAINING_HOME` / `TOTAL_TRAINING_STEPS=1` correctly but never injected `BENCHMARK=dapo-math`
+(or `ENABLE_THINKING=True`), so it silently ran on the recipe default (`gsm8k`) instead --
+confirmed from the log (`val-core/gsm8k/acc/mean@1`, zero `aime_2024`/`mean@32` occurrences
+anywhere). Tells us nothing about AIME. Fixed (added both missing exports) and resubmitted as
+`3338099` -- same checkpoint/isolated-TRAINING_HOME/step-count, now actually pointed at
+DAPO-Math/AIME. The isolated TRAINING_HOME's wheels are already built from the failed attempt, so
+this resubmit skips that cost. Outcome: pending.
