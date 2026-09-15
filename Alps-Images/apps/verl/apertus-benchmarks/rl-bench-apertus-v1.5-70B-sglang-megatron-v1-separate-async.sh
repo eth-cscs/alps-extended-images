@@ -350,7 +350,15 @@ actor_rollout_ref:
       # activation memory, which override_transformer_config.recompute_granularity:
       # full below already delivers.
       sequence_parallel: False
-      param_offload: True
+      # param_offload: True -> False (2026-09-15, run 3397346): rollout_correction.bypass_mode:
+      # False (below) makes trainer_separate_async.py's _compute_old_log_prob save a stable
+      # pi_old snapshot to host RAM every step (save_model_to_cpu/restore_model_from_cpu, needed
+      # because the actor's live weights move between parameter_sync_step syncs but the decoupled
+      # correction needs a fixed anchor) -- a genuine extra ~18GB+/rank on top of the existing
+      # offload budget, which tipped a node to 448.87/450GB and OOM'd. Keeping params resident on
+      # GPU frees that host-RAM commitment entirely; GPU has headroom (peak 57.5/95 GB at step 1
+      # in run 3397346). Same fix, same symptom, as the GLM-5.1 recipe's run 3263683.
+      param_offload: False
       grad_offload: True
       optimizer_offload: True
       vanilla_mbridge: False  # route through megatron-bridge AutoBridge -> the vendored Apertus1p5Bridge (Group 2 below)
@@ -448,7 +456,18 @@ algorithm:
     # rollout for free) -- watch timing_s/old_log_prob and step time. Never run on this recipe's
     # V1 separate_async architecture before -- needs a real test, not just a flag flip.
     bypass_mode: False
-    rollout_is: sequence       # verl default; matches NeMo-RL's sequence-level TIS
+    # rollout_is: sequence -> token (2026-09-15, run 3397346): sequence-level IS sums the
+    # log-ratio over the WHOLE response before exponentiating (log_ratio_sum = masked_sum(...);
+    # exp(log_ratio_sum)) -- for this recipe's long chain-of-thought responses (mean 4857 tokens
+    # at step 1 with ENABLE_THINKING=True) that sum compounds across thousands of tokens and
+    # underflows to numerical zero (observed rollout_is_max: 8.5e-14), silently killing the
+    # entire training gradient (actor/pg_loss, actor/grad_norm, actor/ppo_kl all ~0 at step 1
+    # despite rollout_corr/kl:0.18 showing a real, non-trivial policy gap). token-level IS
+    # exponentiates per-token (never compounds across the sequence) -- biased but numerically
+    # stable for long responses; verl's own docs list this as the standard alternative. verl's
+    # "sequence" default is presumably validated against much shorter typical RLHF responses,
+    # not this recipe's long-CoT setting.
+    rollout_is: token
     rollout_is_threshold: 2.0  # verl default; matches NeMo-RL's truncated_importance_sampling_ratio
 
 reward:
