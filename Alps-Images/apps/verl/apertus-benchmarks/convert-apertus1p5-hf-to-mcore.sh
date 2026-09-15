@@ -42,7 +42,7 @@ set -o pipefail
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-af30d3905eedb02f"
 export MODEL_NAME="Apertus-v1.5-70B"
-export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL-debug/${MODEL_NAME}
+export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 mkdir -p ${TRAINING_HOME}
 cd ${TRAINING_HOME}
