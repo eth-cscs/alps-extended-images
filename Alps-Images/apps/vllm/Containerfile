@@ -20,7 +20,7 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 ARG VLLM_REPO="https://github.com/vllm-project/vllm.git"
-ARG VLLM_REF="v0.27.1"
+ARG VLLM_REF="v0.29.0"
 ARG VLLM_TARGET_DEVICE="cuda"
 ARG VLLM_CUDA_ARCH_LIST="9.0"
 ARG VLLM_TORCH_CUDA_ARCH_LIST="9.0"
@@ -37,7 +37,6 @@ ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
     CCACHE_NOHASHDIR="true"
 
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
-COPY Alps-Images/apps/vllm/patches /opt/alps-vllm-patches
 
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
@@ -77,8 +76,6 @@ RUN set -eux; \
     cd /tmp/vllm; \
     git checkout -q "${VLLM_REF}"; \
     git submodule update --init --recursive; \
-    shopt -s nullglob; patch_files=(/opt/alps-vllm-patches/*.patch); shopt -u nullglob; \
-    for patch_file in "${patch_files[@]}"; do echo "Checking vLLM patch: ${patch_file}"; git apply --check "${patch_file}"; git apply --verbose "${patch_file}"; done; \
     grep -n 'CUDA_ARCH_LIST' CMakeLists.txt; \
     python use_existing_torch.py --prefix || python use_existing_torch.py; \
     if [ -z "${VLLM_VERSION_OVERRIDE}" ] && [[ "${VLLM_REF}" == v[0-9]* ]]; then \

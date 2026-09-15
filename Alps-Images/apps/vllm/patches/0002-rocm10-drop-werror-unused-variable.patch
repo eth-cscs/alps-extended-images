@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000002 Mon Sep 17 00:00:00 2001
+From: Alps Extended Images <noreply@cscs.ch>
+Date: Sat, 13 Sep 2026 00:00:00 +0000
+Subject: [PATCH] cmake: do not promote unused-variable to error on HIP
+
+clang 23 emits an unused-variable warning inside ROCm 10's own
+hip/amd_detail/amd_warp_sync_functions.h header (lastLane in
+__warp_wave_bcast_permute). vLLM's HIP build adds
+-Werror=unused-variable to every GPU target, so including that header
+aborts the build. Keep the warning, drop the error promotion.
+---
+ cmake/utils.cmake | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/cmake/utils.cmake b/cmake/utils.cmake
+--- a/cmake/utils.cmake
++++ b/cmake/utils.cmake
+@@ -157,7 +157,6 @@
+       "-DUSE_ROCM"
+       "-DENABLE_FP8"
+       "-U__HIP_NO_HALF_CONVERSIONS__"
+       "-U__HIP_NO_HALF_OPERATORS__"
+-      "-Werror=unused-variable"
+       "-fno-gpu-rdc")
+ 
+   endif()

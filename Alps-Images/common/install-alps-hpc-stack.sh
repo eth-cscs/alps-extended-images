@@ -199,7 +199,7 @@ build_boost() {
     local jobs="${BOOST_BUILD_JOBS:-$(nproc)}"
 
     wget https://archives.boost.io/release/${BOOST_VER}/source/boost_${BOOST_VER//./_}.tar.bz2 -O /tmp/boost.tar.bz2
-    tar -xjf /tmp/boost.tar.bz2 -C /tmp
+    tar --no-same-owner -xjf /tmp/boost.tar.bz2 -C /tmp
     pushd "/tmp/boost_${BOOST_VER//./_}"
     ./bootstrap.sh
     ./b2 \
@@ -304,7 +304,7 @@ build_ucx_common() {
 
     rm -rf "${UCX_PREFIX}"
     curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" -o /tmp/ucx.tar.gz
-    tar -C /tmp -xzf /tmp/ucx.tar.gz
+    tar --no-same-owner -C /tmp -xzf /tmp/ucx.tar.gz
     pushd "/tmp/ucx-${UCX_VERSION}"
     mkdir -p build && cd build
     ../configure \
@@ -342,7 +342,7 @@ build_ompi5_common() {
 
     rm -rf "${OMPI_PREFIX}"
     curl -fsSL "https://download.open-mpi.org/release/open-mpi/v5.0/openmpi-${OMPI_VER}.tar.gz" -o /tmp/ompi.tar.gz
-    tar -C /tmp -xzf /tmp/ompi.tar.gz
+    tar --no-same-owner -C /tmp -xzf /tmp/ompi.tar.gz
     pushd "/tmp/openmpi-${OMPI_VER}"
     ./configure \
         --prefix="${OMPI_PREFIX}" \

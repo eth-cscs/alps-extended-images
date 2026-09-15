@@ -155,6 +155,17 @@ class Worker:
         os.environ.setdefault("NCCL_DEBUG", "WARN")
 
         torch.cuda.set_device(0)
+        aiter_version = None
+        if torch.version.hip is not None:
+            import aiter
+            from vllm._aiter_ops import is_aiter_found_and_supported
+
+            arch = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+            if arch != "gfx942":
+                raise AssertionError(f"expected MI300 gfx942, got {arch}")
+            if not is_aiter_found_and_supported():
+                raise AssertionError("vLLM does not recognize the installed AITER package")
+            aiter_version = getattr(aiter, "__version__", "unknown")
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
@@ -175,6 +186,7 @@ class Worker:
             "host": socket.gethostname(),
             "torch": torch.__version__,
             "vllm": getattr(vllm, "__version__", "unknown"),
+            "aiter": aiter_version,
         }
 
 

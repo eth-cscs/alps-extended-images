@@ -20,6 +20,7 @@ Each variant corresponds to an NGC CUDA container extended with the Alps HPC sta
 
 | Image | NGC Base | Use Case |
 |---------|----------|----------|
+| `pytorch-cuda:26.07-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:26.07-py3`             | GPU-accelerated PyTorch workloads |
 | `pytorch-cuda:26.06-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:26.06-py3`             | GPU-accelerated PyTorch workloads |
 | `pytorch-cuda:26.02-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:26.02-py3`             | GPU-accelerated PyTorch workloads |
 | `pytorch-cuda:26.01-py3-alps7-dev` | `nvcr.io/nvidia/pytorch:26.01-py3`             | GPU-accelerated PyTorch workloads |
@@ -34,6 +35,7 @@ Each variant corresponds to an AMD ROCm container extended with the Alps HPC sta
 
 | Image | ROCm Base | Use Case |
 |-------|-----------|----------|
+| `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13-alps7-dev` | `docker.io/rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0` | ROCm PyTorch workloads on MI300-class systems |
 | `pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11-alps7-dev` | `docker.io/rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0` | ROCm PyTorch workloads on MI300-class systems |
 
 ### Application Images
@@ -46,8 +48,8 @@ Application images are built on top of accelerator-specific base images and incl
 | `apertus-2-cuda:alps7-dev`   | `pytorch-cuda:26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 | `sfttrainer-cuda:alps7-dev`  | `pytorch-cuda:26.02-py3` | Supervised fine-tuning trainer image |
 | `verl-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | VeRL reinforcement learning workloads |
-| `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | vLLM serving workloads built from source with Alps/NVIDIA PyTorch compatibility patches |
-| `vllm-rocm:alps7-dev`        | `pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11` | vLLM serving workloads built from source for ROCm/MI300 |
+| `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.07-py3` | vLLM serving workloads built from source (v0.29.0, Torch 2.13 stable-libtorch APIs) |
+| `vllm-rocm:alps7-dev`        | `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` | vLLM serving workloads built from source for ROCm/MI300 (v0.29.0) |
 
 ## HPC Stack Components
 
@@ -68,6 +70,8 @@ The base installers use shared defaults from `common/alps-stack-versions.env`, s
 | OSU Micro-benchmarks | 7.5.2 | Point-to-point latency and bandwidth measurements |
 
 CUDA components are compiled with CUDA support and architecture-specific flags for NVIDIA Hopper (SM90/SM90a). ROCm components keep the bundled RCCL by default, build aws-ofi-rccl against the Alps libfabric stack, and build rccl-tests for MI250/MI300 targets (`gfx90a`, `gfx942`) using the ROCm SDK from the image profile. RCCL rebuilds are opt-in with `ROCM_REBUILD_RCCL=1`.
+
+The ROCm 10.0 base ships only runtime SDK wheels (there is no public `rocm-sdk-devel` for ROCm 10), so its profile pins the matching `rocm-libraries` source tag (`ROCM_LIBRARIES_REPO`/`ROCM_LIBRARIES_COMMIT`) and the build generates the missing devel payload from it: CMake package configs for every package torch's `LoadHIP` requires, the public math-library headers, and dev-name library symlinks, mirrored at both `/opt/rocm` and the wheel install prefix. ROCm 7.x profiles use the real `rocm-sdk-devel` wheel instead and need no such pin.
 
 Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained under `Alps-Images/patches/` and are included in base image hashes. Application-specific patches are kept under `Alps-Images/apps/<app>/patches/` and are included in app image hashes.
 

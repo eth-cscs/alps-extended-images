@@ -306,6 +306,9 @@ validate_rocm_profile() {
   [[ "${ROCM_REBUILD_RCCL:-0}" == "0" || "${ROCM_REBUILD_RCCL:-0}" == "1" ]] || { echo "ERROR: ROCM_REBUILD_RCCL must be 0 or 1 in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_REPO:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_REPO must be set in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_COMMIT:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_COMMIT must be set in $profile_file" >&2; return 1; }
+  if [[ -n "${ROCM_LIBRARIES_REPO:-}" || -n "${ROCM_LIBRARIES_COMMIT:-}" ]]; then
+    [[ -n "${ROCM_LIBRARIES_REPO:-}" && -n "${ROCM_LIBRARIES_COMMIT:-}" ]] || { echo "ERROR: ROCM_LIBRARIES_REPO and ROCM_LIBRARIES_COMMIT must be set together in $profile_file" >&2; return 1; }
+  fi
   [[ -n "${RCCL_GPU_TARGETS:-}" ]] || { echo "ERROR: RCCL_GPU_TARGETS must be set in $profile_file" >&2; return 1; }
   [[ -n "${RCCL_TESTS_GPU_TARGETS:-}" ]] || { echo "ERROR: RCCL_TESTS_GPU_TARGETS must be set in $profile_file" >&2; return 1; }
 }
@@ -317,6 +320,8 @@ load_rocm_profile() {
   ROCM_REBUILD_RCCL="0"
   ROCM_SYSTEMS_REPO=""
   ROCM_SYSTEMS_COMMIT=""
+  ROCM_LIBRARIES_REPO=""
+  ROCM_LIBRARIES_COMMIT=""
   RCCL_GPU_TARGETS=""
   RCCL_TESTS_GPU_TARGETS=""
   # shellcheck disable=SC1090
@@ -333,6 +338,8 @@ rocm_base_build_args() {
   --build-arg ROCM_REBUILD_RCCL="$ROCM_REBUILD_RCCL" \\
   --build-arg ROCM_SYSTEMS_REPO="$ROCM_SYSTEMS_REPO" \\
   --build-arg ROCM_SYSTEMS_COMMIT="$ROCM_SYSTEMS_COMMIT" \\
+  --build-arg ROCM_LIBRARIES_REPO="$ROCM_LIBRARIES_REPO" \\
+  --build-arg ROCM_LIBRARIES_COMMIT="$ROCM_LIBRARIES_COMMIT" \\
   --build-arg RCCL_GPU_TARGETS="$RCCL_GPU_TARGETS" \\
   --build-arg RCCL_TESTS_GPU_TARGETS="$RCCL_TESTS_GPU_TARGETS" \\
   --build-arg ROCM_PYPI_INDEX_URL="$ROCM_PYPI_INDEX_URL" \\
@@ -348,6 +355,8 @@ ROCM_VERSION=$ROCM_VERSION
 ROCM_REBUILD_RCCL=$ROCM_REBUILD_RCCL
 ROCM_SYSTEMS_REPO=$ROCM_SYSTEMS_REPO
 ROCM_SYSTEMS_COMMIT=$ROCM_SYSTEMS_COMMIT
+ROCM_LIBRARIES_REPO=$ROCM_LIBRARIES_REPO
+ROCM_LIBRARIES_COMMIT=$ROCM_LIBRARIES_COMMIT
 RCCL_GPU_TARGETS=$RCCL_GPU_TARGETS
 RCCL_TESTS_GPU_TARGETS=$RCCL_TESTS_GPU_TARGETS
 ROCM_PYPI_INDEX_URL=$ROCM_PYPI_INDEX_URL
@@ -393,7 +402,7 @@ rocm_base_refs() {
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
   local h
-  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
