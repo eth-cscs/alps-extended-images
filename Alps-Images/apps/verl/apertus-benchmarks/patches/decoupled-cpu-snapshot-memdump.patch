@@ -1,0 +1,108 @@
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index 68f3286..0d4d402 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -30,6 +30,32 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ device_name = get_device_name()
+ 
++
++def _cpu_saved_models_diag_gb(cpu_saved_models):
++    """Sum of bytes across all currently-held CPU snapshots, in GB. Diagnostic-only."""
++    total = 0
++    for state in cpu_saved_models.values():
++        for chunk in state.values():
++            if chunk.get("is_ddp"):
++                for blist in chunk["buffer_states"]:
++                    for bstate in blist:
++                        total += bstate["param_data"].numel() * bstate["param_data"].element_size()
++            else:
++                for pstate in chunk["model_state"].values():
++                    total += pstate["data"].numel() * pstate["data"].element_size()
++    return total / 1e9
++
++
++def _cpu_saved_models_diag_rss_mb():
++    try:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1]) / 1024.0
++    except Exception:
++        pass
++    return -1.0
++
+ __all__ = ["DetachActorWorker"]
+ 
+ 
+@@ -135,6 +161,12 @@ class DetachActorWorker(ActorRolloutRefWorker):
+             self.cpu_saved_models = {}
+ 
+         self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
++        print(
++            f"[CPU-SNAPSHOT-DIAG] save_model_to_cpu(n={n}) keys={list(self.cpu_saved_models.keys())} "
++            f"held_gb={_cpu_saved_models_diag_gb(self.cpu_saved_models):.3f} "
++            f"rss_gb={_cpu_saved_models_diag_rss_mb() / 1024.0:.3f}",
++            flush=True,
++        )
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def restore_model_from_cpu(self, n):
+@@ -167,3 +199,9 @@ class DetachActorWorker(ActorRolloutRefWorker):
+         """
+         if n in self.cpu_saved_models:
+             del self.cpu_saved_models[n]
++        print(
++            f"[CPU-SNAPSHOT-DIAG] clear_cpu_model(n={n}) keys={list(self.cpu_saved_models.keys())} "
++            f"held_gb={_cpu_saved_models_diag_gb(self.cpu_saved_models):.3f} "
++            f"rss_gb={_cpu_saved_models_diag_rss_mb() / 1024.0:.3f}",
++            flush=True,
++        )
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497..f35bda8 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -1860,6 +1860,18 @@ def patch_engine_mtp(module, model_config):
+             patch_mtp_layer_get_embeddings(m)
+ 
+ 
++def _cpu_snapshot_diag_rss_mb():
++    """Read this process's resident set size (VmRSS) from /proc, in MB. Diagnostic-only."""
++    try:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1]) / 1024.0
++    except Exception:
++        pass
++    return -1.0
++
++
+ @torch.no_grad()
+ def copy_megatron_model_to_cpu(models):
+     """
+@@ -1905,6 +1917,24 @@ def copy_megatron_model_to_cpu(models):
+ 
+             cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
+ 
++    try:
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
++    except Exception:
++        rank = -1
++    _total_bytes = 0
++    for _chunk in cpu_state.values():
++        if _chunk.get("is_ddp"):
++            for _blist in _chunk["buffer_states"]:
++                for _bstate in _blist:
++                    _total_bytes += _bstate["param_data"].numel() * _bstate["param_data"].element_size()
++        else:
++            for _pstate in _chunk["model_state"].values():
++                _total_bytes += _pstate["data"].numel() * _pstate["data"].element_size()
++    print(
++        f"[CPU-SNAPSHOT-DIAG] copy_megatron_model_to_cpu rank={rank} "
++        f"pinned_this_call_gb={_total_bytes / 1e9:.3f} rss_after_gb={_cpu_snapshot_diag_rss_mb() / 1024.0:.3f}",
++        flush=True,
++    )
+     return cpu_state
+ 
+ 

@@ -190,7 +190,7 @@ esac
 export PROJECT_NAME="apertus-benchmarks"
 export EXPERIMENT_NAME="${MODEL_NAME}-${BENCHMARK}-${REWARD_MODE}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
-export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL-debug/${MODEL_NAME}
+export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 export CHECKPOINT_HOME=${TRAINING_HOME}/checkpoints/${EXPERIMENT_NAME}-run-${SLURM_JOB_ID} #remove "run-${SLURM_JOB_ID}" to enable checkpoint resuming
 export MODEL_LOAD_PATH="${MODEL_CHECKPOINT_PATH:-${TRAINING_HOME}/models/${MODEL_NAME}}"
@@ -792,6 +792,138 @@ index 05f5604..715c2d7 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/repetition-penalty-fix.patch ${TRAINING_CONFIG}/repetition-penalty-fix.patch
 
+# apertus-benchmarks/patches/decoupled-cpu-snapshot-memdump.patch, embedded (same reason).
+# Diagnostic-only instrumentation for the host-RAM leak found in run 3405628
+# (algorithm.rollout_correction.bypass_mode: False + PARAMETER_SYNC_STEP=1): every training step
+# takes the local_trigger_step==0 branch of _compute_old_log_prob (since sync-every-step means
+# local_trigger_step is always 0), calling save_model_to_cpu(0) ->
+# the buffer.param_data.data.cpu().clone().pin_memory() call inside copy_megatron_model_to_cpu -- a brand-new
+# pinned host allocation every single step, ~121 GB/step observed, OOMing the node (450 GB) by
+# step 3. This patch adds [CPU-SNAPSHOT-DIAG] print lines (pinned bytes this call + process RSS)
+# to verl/utils/megatron_utils.py:copy_megatron_model_to_cpu and
+# verl/experimental/separation/engine_workers.py:{save_model_to_cpu,clear_cpu_model} so the next
+# next run log shows definitively whether the pinned-memory allocator is failing to reuse
+# same-sized blocks across steps (the leading theory) or something else is accumulating --
+# before attempting a real fix. No behavior change, print-only. Only meaningful when
+# bypass_mode: False is set; harmless (never fires) otherwise, since save_model_to_cpu is never
+# called in bypass mode. See the Known-hazards entry in CLAUDE.md for this recipe for the full trace.
+#
+# Generated from a real git worktree at verl v0.9.0; git apply --check / py_compile /
+# --reverse --check verified against both files (fetched fresh from GitHub, not from local
+# memory). Touches verl/utils/megatron_utils.py and verl/experimental/separation/engine_workers.py
+# (no overlap with any other patch this recipe applies).
+cat > "${TRAINING_CONFIG}/decoupled-cpu-snapshot-memdump.patch" <<- 'EOF'
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index 68f3286..0d4d402 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -30,6 +30,32 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ device_name = get_device_name()
+ 
++
++def _cpu_saved_models_diag_gb(cpu_saved_models):
++    """Sum of bytes across all currently-held CPU snapshots, in GB. Diagnostic-only."""
++    total = 0
++    for state in cpu_saved_models.values():
++        for chunk in state.values():
++            if chunk.get("is_ddp"):
++                for blist in chunk["buffer_states"]:
++                    for bstate in blist:
++                        total += bstate["param_data"].numel() * bstate["param_data"].element_size()
++            else:
++                for pstate in chunk["model_state"].values():
++                    total += pstate["data"].numel() * pstate["data"].element_size()
++    return total / 1e9
++
++
++def _cpu_saved_models_diag_rss_mb():
++    try:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1]) / 1024.0
++    except Exception:
++        pass
++    return -1.0
++
+ __all__ = ["DetachActorWorker"]
+ 
+ 
+@@ -135,6 +161,12 @@ class DetachActorWorker(ActorRolloutRefWorker):
+             self.cpu_saved_models = {}
+ 
+         self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
++        print(
++            f"[CPU-SNAPSHOT-DIAG] save_model_to_cpu(n={n}) keys={list(self.cpu_saved_models.keys())} "
++            f"held_gb={_cpu_saved_models_diag_gb(self.cpu_saved_models):.3f} "
++            f"rss_gb={_cpu_saved_models_diag_rss_mb() / 1024.0:.3f}",
++            flush=True,
++        )
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def restore_model_from_cpu(self, n):
+@@ -167,3 +199,9 @@ class DetachActorWorker(ActorRolloutRefWorker):
+         """
+         if n in self.cpu_saved_models:
+             del self.cpu_saved_models[n]
++        print(
++            f"[CPU-SNAPSHOT-DIAG] clear_cpu_model(n={n}) keys={list(self.cpu_saved_models.keys())} "
++            f"held_gb={_cpu_saved_models_diag_gb(self.cpu_saved_models):.3f} "
++            f"rss_gb={_cpu_saved_models_diag_rss_mb() / 1024.0:.3f}",
++            flush=True,
++        )
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497..f35bda8 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -1860,6 +1860,18 @@ def patch_engine_mtp(module, model_config):
+             patch_mtp_layer_get_embeddings(m)
+ 
+ 
++def _cpu_snapshot_diag_rss_mb():
++    """Read this process's resident set size (VmRSS) from /proc, in MB. Diagnostic-only."""
++    try:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1]) / 1024.0
++    except Exception:
++        pass
++    return -1.0
++
++
+ @torch.no_grad()
+ def copy_megatron_model_to_cpu(models):
+     """
+@@ -1905,6 +1917,24 @@ def copy_megatron_model_to_cpu(models):
+ 
+             cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
+ 
++    try:
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
++    except Exception:
++        rank = -1
++    _total_bytes = 0
++    for _chunk in cpu_state.values():
++        if _chunk.get("is_ddp"):
++            for _blist in _chunk["buffer_states"]:
++                for _bstate in _blist:
++                    _total_bytes += _bstate["param_data"].numel() * _bstate["param_data"].element_size()
++        else:
++            for _pstate in _chunk["model_state"].values():
++                _total_bytes += _pstate["data"].numel() * _pstate["data"].element_size()
++    print(
++        f"[CPU-SNAPSHOT-DIAG] copy_megatron_model_to_cpu rank={rank} "
++        f"pinned_this_call_gb={_total_bytes / 1e9:.3f} rss_after_gb={_cpu_snapshot_diag_rss_mb() / 1024.0:.3f}",
++        flush=True,
++    )
+     return cpu_state
+ 
+ 
+EOF
+sbcast -f ${TRAINING_CONFIG}/decoupled-cpu-snapshot-memdump.patch ${TRAINING_CONFIG}/decoupled-cpu-snapshot-memdump.patch
+
 # ══════════════════════════════════════════════════════════════════════════
 # Add Apertus 1.5 support.
 # ══════════════════════════════════════════════════════════════════════════
@@ -1122,7 +1254,7 @@ for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", 
 # all apply cleanly to the tag. A patch that neither applies nor is already
 # present is fatal -- a cluster where only some ranks carry a patch is worse than
 # one that carries none (run 3124273).
-for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch" "${TRAINING_CONFIG}/repetition-penalty-fix.patch"; do
+for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch" "${TRAINING_CONFIG}/repetition-penalty-fix.patch" "${TRAINING_CONFIG}/decoupled-cpu-snapshot-memdump.patch"; do
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied $(basename "$p") on $(hostname)"
     elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
