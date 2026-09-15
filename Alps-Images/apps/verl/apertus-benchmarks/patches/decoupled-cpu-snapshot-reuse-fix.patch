@@ -1,0 +1,167 @@
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index 68f3286..925b123 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -134,7 +134,23 @@ class DetachActorWorker(ActorRolloutRefWorker):
+         if not hasattr(self, "cpu_saved_models"):
+             self.cpu_saved_models = {}
+ 
+-        self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
++        if self.config.actor.strategy == "megatron":
++            # Reuse pinned CPU buffers across calls for the same slot `n` instead of allocating
++            # fresh ones every time -- see CLAUDE.md's "algorithm.rollout_correction.bypass_mode:
++            # False" hazard entry. `_cpu_pinned_pool` is intentionally a SEPARATE dict from
++            # `cpu_saved_models`: clear_cpu_model() below only ever removes the `cpu_saved_models`
++            # alias (the "currently active" snapshot for slot n), never this pool, so the
++            # underlying pinned tensors for slot n survive to be reused the next time slot n is
++            # saved again -- correct as long as a given slot n is never saved-to while a PREVIOUS
++            # snapshot under that same slot is still being read elsewhere, which is already the
++            # existing calling contract for save_model_to_cpu/restore_model_from_cpu/
++            # clear_cpu_model (see _compute_old_log_prob in trainer_separate_async.py).
++            if not hasattr(self, "_cpu_pinned_pool"):
++                self._cpu_pinned_pool = {}
++            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module, self._cpu_pinned_pool.get(n))
++            self._cpu_pinned_pool[n] = self.cpu_saved_models[n]
++        else:
++            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def restore_model_from_cpu(self, n):
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497..f3b8ed1 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -1860,8 +1860,35 @@ def patch_engine_mtp(module, model_config):
+             patch_mtp_layer_get_embeddings(m)
+ 
+ 
++def _cpu_snapshot_diag_rss_mb():
++    """Read this process's resident set size (VmRSS) from /proc, in MB. Diagnostic-only."""
++    try:
++        with open("/proc/self/status") as f:
++            for line in f:
++                if line.startswith("VmRSS:"):
++                    return int(line.split()[1]) / 1024.0
++    except Exception:
++        pass
++    return -1.0
++
++
++def _reuse_or_alloc_pinned(cached_tensor, src):
++    """Copy `src` (GPU or CPU) into `cached_tensor` in place if shapes/dtypes match, avoiding a
++    fresh pinned-host allocation; otherwise allocate a new pinned CPU tensor (first call, or a
++    genuine shape/dtype change). Returns the tensor now holding the data.
++    """
++    if (
++        cached_tensor is not None
++        and cached_tensor.shape == src.shape
++        and cached_tensor.dtype == src.dtype
++    ):
++        cached_tensor.copy_(src)
++        return cached_tensor
++    return src.cpu().clone().pin_memory()
++
++
+ @torch.no_grad()
+-def copy_megatron_model_to_cpu(models):
++def copy_megatron_model_to_cpu(models, cache=None):
+     """
+     Copy Megatron model parameters to CPU memory (non-destructive copy).
+     Unlike offload_megatron_model_to_cpu which moves data, this function creates
+@@ -1869,42 +1896,86 @@ def copy_megatron_model_to_cpu(models):
+ 
+     Args:
+         models: List of model chunks (DDP-wrapped or unwrapped)
++        cache: Optional cpu_state dict from a PREVIOUS call (same models, same structure) whose
++            pinned CPU tensors should be reused in place instead of allocating fresh ones. Pass
++            the same cache object back in on every call for a given snapshot slot to keep host
++            pinned-memory usage bounded to one copy per slot instead of growing every call (see
++            CLAUDE.md's "algorithm.rollout_correction.bypass_mode: False" hazard entry -- the
++            original always-allocate-fresh version leaked ~18 GB/rank/call because PyTorch's
++            pinned-memory allocator never reclaimed the previous call's freed blocks). Any
++            buffer missing from `cache` (or with a mismatched shape/dtype -- should not happen
++            mid-training, but handled safely) falls back to a fresh allocation, exactly matching
++            the original unconditional behavior when `cache` is None.
+ 
+     Returns:
+-        dict: CPU state containing copied parameters and buffers
++        dict: CPU state containing copied parameters and buffers. Pass this same dict back in as
++            `cache` on the next call for the same slot to reuse its pinned buffers.
+     """
+     cpu_state = {}
++    cache = cache or {}
++    _reused = 0
++    _allocated = 0
+ 
+     for model_idx, model_chunk in enumerate(models):
++        chunk_key = f"model_chunk_{model_idx}"
++        cached_chunk = cache.get(chunk_key) or {}
++
+         if isinstance(model_chunk, DDP):
+             # Handle DDP-wrapped models
+             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
++            cached_buffer_states = cached_chunk.get("buffer_states") or [[], []]
+             buffer_states = []
+ 
+-            for buffers in model_chunk_all_buffers:
++            for group_idx, buffers in enumerate(model_chunk_all_buffers):
++                cached_group = cached_buffer_states[group_idx] if group_idx < len(cached_buffer_states) else []
+                 buffer_list = []
+-                for buffer in buffers:
++                for buf_idx, buffer in enumerate(buffers):
++                    cached_bstate = cached_group[buf_idx] if buf_idx < len(cached_group) else {}
+                     buffer_state = {}
+ 
+-                    # Copy parameter data to CPU
++                    # Copy parameter data to CPU, reusing a previously-pinned destination buffer
++                    # when available (see `_reuse_or_alloc_pinned`).
+                     if buffer.param_data.storage().size() > 0:
+-                        buffer_state["param_data"] = buffer.param_data.data.cpu().clone().pin_memory()
++                        src = buffer.param_data.data
+                     else:
+-                        buffer_state["param_data"] = buffer.param_data.cpu_data.clone().pin_memory()
++                        src = buffer.param_data.cpu_data
++                    cached_tensor = cached_bstate.get("param_data")
++                    dst = _reuse_or_alloc_pinned(cached_tensor, src)
++                    if dst is cached_tensor:
++                        _reused += 1
++                    else:
++                        _allocated += 1
++                    buffer_state["param_data"] = dst
+ 
+                     buffer_list.append(buffer_state)
+                 buffer_states.append(buffer_list)
+ 
+-            cpu_state[f"model_chunk_{model_idx}"] = {"buffer_states": buffer_states, "is_ddp": True}
++            cpu_state[chunk_key] = {"buffer_states": buffer_states, "is_ddp": True}
+         else:
+             # Handle non-DDP models (ref module)
++            cached_model_state = cached_chunk.get("model_state") or {}
+             model_state = {}
+             for name, param in model_chunk.named_parameters():
+-                param_state = {"data": param.data.cpu().clone().pin_memory()}
+-                model_state[name] = param_state
++                cached_tensor = (cached_model_state.get(name) or {}).get("data")
++                dst = _reuse_or_alloc_pinned(cached_tensor, param.data)
++                if dst is cached_tensor:
++                    _reused += 1
++                else:
++                    _allocated += 1
++                model_state[name] = {"data": dst}
+ 
+-            cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
++            cpu_state[chunk_key] = {"model_state": model_state, "is_ddp": False}
+ 
++    try:
++        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
++    except Exception:
++        rank = -1
++    print(
++        f"[CPU-SNAPSHOT-DIAG] copy_megatron_model_to_cpu rank={rank} "
++        f"buffers_reused={_reused} buffers_freshly_allocated={_allocated} "
++        f"rss_after_gb={_cpu_snapshot_diag_rss_mb() / 1024.0:.3f}",
++        flush=True,
++    )
+     return cpu_state
+ 
+ 
