@@ -792,219 +792,6 @@ index 05f5604..715c2d7 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/repetition-penalty-fix.patch ${TRAINING_CONFIG}/repetition-penalty-fix.patch
 
-# apertus-benchmarks/patches/decoupled-cpu-snapshot-reuse-fix.patch, embedded (same reason).
-# REAL FIX (supersedes the earlier decoupled-cpu-snapshot-memdump.patch, which was diagnostic
-# print-only) for the host-RAM leak found in run 3405628 and root-caused with hard numbers in
-# run 3406732 (algorithm.rollout_correction.bypass_mode: False + PARAMETER_SYNC_STEP=1): every
-# training step takes the local_trigger_step==0 branch of _compute_old_log_prob (sync-every-step
-# means local_trigger_step is always 0), calling save_model_to_cpu(0) ->
-# copy_megatron_model_to_cpu, which called buffer.param_data.data.cpu().clone().pin_memory() --
-# a brand-new pinned host allocation every single call. Run 3406732's [CPU-SNAPSHOT-DIAG] lines
-# proved this precisely: pinned_this_call_gb was EXACTLY 18.208 GB on every call (same size every
-# time, ruling out a growing-allocation theory), while process RSS climbed ~40 -> ~82 ->
-# 104-115 GB across 3 step-attempts before the node hit its 450 GB ceiling -- i.e. PyTorch's
-# pinned-memory allocator was never reclaiming/reusing the previous call's freed blocks.
-#
-# Fix: copy_megatron_model_to_cpu now accepts an optional `cache` argument (a previous call's
-# returned cpu_state) and, for any buffer whose shape/dtype still matches, does an in-place
-# copy_() into the SAME pinned tensor instead of allocating a new one -- falling back to a fresh
-# allocation only on a genuine mismatch (should not happen mid-training) or the first-ever call,
-# exactly matching the original unconditional behavior when no cache is passed. DetachActorWorker
-# (engine_workers.py) keeps a separate, persistent _cpu_pinned_pool dict (keyed by the same slot
-# `n` as cpu_saved_models) that survives clear_cpu_model -- clear_cpu_model only ever drops the
-# "active" cpu_saved_models alias, never this pool, so the underlying pinned buffer for a given
-# slot n is reused indefinitely across calls to that slot. This is scoped to
-# actor.strategy == "megatron" only; the FSDP/FSDP2/VeOmni save/restore paths (used by other
-# recipes) are completely untouched.
-#
-# Verified locally before wiring in (no GPU/megatron install needed for this part): extracted the
-# two changed functions into an isolated module and exercised them against real torch tensors
-# with a hand-built DDP-buffer-shaped mock -- confirmed (1) a first call with no cache allocates
-# fresh pinned tensors with correct values, (2) a second call passing the first call's own return
-# value back as `cache` REUSES the identical tensor objects (checked via `is`, not just value
-# equality) and updates them to the new values correctly, (3) a shape-mismatched buffer correctly
-# falls back to a fresh allocation instead of corrupting data, (4) both the DDP and non-DDP
-# (plain named_parameters) branches and the storage()-empty (cpu_data) fallback branch all behave
-# correctly under reuse. Generated from a real git worktree at verl v0.9.0 (fetched fresh from
-# GitHub); git apply --check / py_compile / --reverse --check all verified against a separate
-# fresh checkout.
-#
-# UNVERIFIED ON A REAL CLUSTER RUN -- the local tests above prove the reuse/fallback LOGIC is
-# correct, but the actual pinned-memory-reclamation behavior (whether this genuinely stops the
-# RSS growth) can only be confirmed by rerunning the same diagnostic recipe and watching
-# rss_after_gb hold flat across steps instead of climbing. The updated [CPU-SNAPSHOT-DIAG] print
-# (now reporting buffers_reused / buffers_freshly_allocated instead of pinned_this_call_gb) makes
-# that trivial to read off the next run log.
-cat > "${TRAINING_CONFIG}/decoupled-cpu-snapshot-reuse-fix.patch" <<- 'EOF'
-diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
-index 68f3286..925b123 100644
---- a/verl/experimental/separation/engine_workers.py
-+++ b/verl/experimental/separation/engine_workers.py
-@@ -134,7 +134,23 @@ class DetachActorWorker(ActorRolloutRefWorker):
-         if not hasattr(self, "cpu_saved_models"):
-             self.cpu_saved_models = {}
- 
--        self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
-+        if self.config.actor.strategy == "megatron":
-+            # Reuse pinned CPU buffers across calls for the same slot `n` instead of allocating
-+            # fresh ones every time -- see CLAUDE.md's "algorithm.rollout_correction.bypass_mode:
-+            # False" hazard entry. `_cpu_pinned_pool` is intentionally a SEPARATE dict from
-+            # `cpu_saved_models`: clear_cpu_model() below only ever removes the `cpu_saved_models`
-+            # alias (the "currently active" snapshot for slot n), never this pool, so the
-+            # underlying pinned tensors for slot n survive to be reused the next time slot n is
-+            # saved again -- correct as long as a given slot n is never saved-to while a PREVIOUS
-+            # snapshot under that same slot is still being read elsewhere, which is already the
-+            # existing calling contract for save_model_to_cpu/restore_model_from_cpu/
-+            # clear_cpu_model (see _compute_old_log_prob in trainer_separate_async.py).
-+            if not hasattr(self, "_cpu_pinned_pool"):
-+                self._cpu_pinned_pool = {}
-+            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module, self._cpu_pinned_pool.get(n))
-+            self._cpu_pinned_pool[n] = self.cpu_saved_models[n]
-+        else:
-+            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
- 
-     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-     def restore_model_from_cpu(self, n):
-diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
-index 0358497..f3b8ed1 100644
---- a/verl/utils/megatron_utils.py
-+++ b/verl/utils/megatron_utils.py
-@@ -1860,8 +1860,35 @@ def patch_engine_mtp(module, model_config):
-             patch_mtp_layer_get_embeddings(m)
- 
- 
-+def _cpu_snapshot_diag_rss_mb():
-+    """Read this process's resident set size (VmRSS) from /proc, in MB. Diagnostic-only."""
-+    try:
-+        with open("/proc/self/status") as f:
-+            for line in f:
-+                if line.startswith("VmRSS:"):
-+                    return int(line.split()[1]) / 1024.0
-+    except Exception:
-+        pass
-+    return -1.0
-+
-+
-+def _reuse_or_alloc_pinned(cached_tensor, src):
-+    """Copy `src` (GPU or CPU) into `cached_tensor` in place if shapes/dtypes match, avoiding a
-+    fresh pinned-host allocation; otherwise allocate a new pinned CPU tensor (first call, or a
-+    genuine shape/dtype change). Returns the tensor now holding the data.
-+    """
-+    if (
-+        cached_tensor is not None
-+        and cached_tensor.shape == src.shape
-+        and cached_tensor.dtype == src.dtype
-+    ):
-+        cached_tensor.copy_(src)
-+        return cached_tensor
-+    return src.cpu().clone().pin_memory()
-+
-+
- @torch.no_grad()
--def copy_megatron_model_to_cpu(models):
-+def copy_megatron_model_to_cpu(models, cache=None):
-     """
-     Copy Megatron model parameters to CPU memory (non-destructive copy).
-     Unlike offload_megatron_model_to_cpu which moves data, this function creates
-@@ -1869,42 +1896,86 @@ def copy_megatron_model_to_cpu(models):
- 
-     Args:
-         models: List of model chunks (DDP-wrapped or unwrapped)
-+        cache: Optional cpu_state dict from a PREVIOUS call (same models, same structure) whose
-+            pinned CPU tensors should be reused in place instead of allocating fresh ones. Pass
-+            the same cache object back in on every call for a given snapshot slot to keep host
-+            pinned-memory usage bounded to one copy per slot instead of growing every call (see
-+            CLAUDE.md's "algorithm.rollout_correction.bypass_mode: False" hazard entry -- the
-+            original always-allocate-fresh version leaked ~18 GB/rank/call because PyTorch's
-+            pinned-memory allocator never reclaimed the previous call's freed blocks). Any
-+            buffer missing from `cache` (or with a mismatched shape/dtype -- should not happen
-+            mid-training, but handled safely) falls back to a fresh allocation, exactly matching
-+            the original unconditional behavior when `cache` is None.
- 
-     Returns:
--        dict: CPU state containing copied parameters and buffers
-+        dict: CPU state containing copied parameters and buffers. Pass this same dict back in as
-+            `cache` on the next call for the same slot to reuse its pinned buffers.
-     """
-     cpu_state = {}
-+    cache = cache or {}
-+    _reused = 0
-+    _allocated = 0
- 
-     for model_idx, model_chunk in enumerate(models):
-+        chunk_key = f"model_chunk_{model_idx}"
-+        cached_chunk = cache.get(chunk_key) or {}
-+
-         if isinstance(model_chunk, DDP):
-             # Handle DDP-wrapped models
-             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
-+            cached_buffer_states = cached_chunk.get("buffer_states") or [[], []]
-             buffer_states = []
- 
--            for buffers in model_chunk_all_buffers:
-+            for group_idx, buffers in enumerate(model_chunk_all_buffers):
-+                cached_group = cached_buffer_states[group_idx] if group_idx < len(cached_buffer_states) else []
-                 buffer_list = []
--                for buffer in buffers:
-+                for buf_idx, buffer in enumerate(buffers):
-+                    cached_bstate = cached_group[buf_idx] if buf_idx < len(cached_group) else {}
-                     buffer_state = {}
- 
--                    # Copy parameter data to CPU
-+                    # Copy parameter data to CPU, reusing a previously-pinned destination buffer
-+                    # when available (see `_reuse_or_alloc_pinned`).
-                     if buffer.param_data.storage().size() > 0:
--                        buffer_state["param_data"] = buffer.param_data.data.cpu().clone().pin_memory()
-+                        src = buffer.param_data.data
-                     else:
--                        buffer_state["param_data"] = buffer.param_data.cpu_data.clone().pin_memory()
-+                        src = buffer.param_data.cpu_data
-+                    cached_tensor = cached_bstate.get("param_data")
-+                    dst = _reuse_or_alloc_pinned(cached_tensor, src)
-+                    if dst is cached_tensor:
-+                        _reused += 1
-+                    else:
-+                        _allocated += 1
-+                    buffer_state["param_data"] = dst
- 
-                     buffer_list.append(buffer_state)
-                 buffer_states.append(buffer_list)
- 
--            cpu_state[f"model_chunk_{model_idx}"] = {"buffer_states": buffer_states, "is_ddp": True}
-+            cpu_state[chunk_key] = {"buffer_states": buffer_states, "is_ddp": True}
-         else:
-             # Handle non-DDP models (ref module)
-+            cached_model_state = cached_chunk.get("model_state") or {}
-             model_state = {}
-             for name, param in model_chunk.named_parameters():
--                param_state = {"data": param.data.cpu().clone().pin_memory()}
--                model_state[name] = param_state
-+                cached_tensor = (cached_model_state.get(name) or {}).get("data")
-+                dst = _reuse_or_alloc_pinned(cached_tensor, param.data)
-+                if dst is cached_tensor:
-+                    _reused += 1
-+                else:
-+                    _allocated += 1
-+                model_state[name] = {"data": dst}
- 
--            cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
-+            cpu_state[chunk_key] = {"model_state": model_state, "is_ddp": False}
- 
-+    try:
-+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-+    except Exception:
-+        rank = -1
-+    print(
-+        f"[CPU-SNAPSHOT-DIAG] copy_megatron_model_to_cpu rank={rank} "
-+        f"buffers_reused={_reused} buffers_freshly_allocated={_allocated} "
-+        f"rss_after_gb={_cpu_snapshot_diag_rss_mb() / 1024.0:.3f}",
-+        flush=True,
-+    )
-     return cpu_state
- 
- 
-EOF
-sbcast -f ${TRAINING_CONFIG}/decoupled-cpu-snapshot-reuse-fix.patch ${TRAINING_CONFIG}/decoupled-cpu-snapshot-reuse-fix.patch
 
 # ══════════════════════════════════════════════════════════════════════════
 # Add Apertus 1.5 support.
@@ -1296,7 +1083,20 @@ export RAY_memory_usage_threshold=0.99
 #             (the 3rd v1-separate-async fix, now upstream; applies clean to the
 #             baked v0.9.0 tree). Superseded the tensordict hunk of
 #             v1-separate-async-fixes.patch, which no longer carries it.
-for pr in 7421 7422 7423 7661; do
+#   PR #7881: reuse pinned CPU snapshot buffers in Decoupled PPO instead of
+#             allocating fresh ones every save_model_to_cpu call -- fixes the
+#             host-RAM leak found in runs 3405628/3406732 (~18 GB/step, OOM by
+#             step 3 with PARAMETER_SYNC_STEP=1) and validated fixed in run
+#             3408011 (RSS flat 49-52 GB across 5 steps). Authored from this
+#             recipe's own decoupled-cpu-snapshot-reuse-fix.patch (kept in
+#             apertus-benchmarks/patches/ as an unapplied reference, along with
+#             the earlier diagnostic-only decoupled-cpu-snapshot-memdump.patch)
+#             -- opened as https://github.com/verl-project/verl/pull/7881,
+#             stripped of this recipe's [CPU-SNAPSHOT-DIAG] debug prints for
+#             upstream (a hot-path library function should not print on every
+#             call); all pre-commit hooks (ruff, mypy, license, naming, etc.)
+#             pass on the upstream branch.
+for pr in 7421 7422 7423 7661 7881; do
     curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
         || { echo "FATAL: could not download PR #${pr}"; exit 1; }
     [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
@@ -1336,7 +1136,7 @@ for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", 
 # all apply cleanly to the tag. A patch that neither applies nor is already
 # present is fatal -- a cluster where only some ranks carry a patch is worse than
 # one that carries none (run 3124273).
-for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch" "${TRAINING_CONFIG}/repetition-penalty-fix.patch" "${TRAINING_CONFIG}/decoupled-cpu-snapshot-reuse-fix.patch"; do
+for p in "${TRAINING_CONFIG}/7421.patch" "${TRAINING_CONFIG}/7422.patch" "${TRAINING_CONFIG}/7423.patch" "${TRAINING_CONFIG}/7661.patch" "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" "${TRAINING_CONFIG}/grad-sync-empty-cache.patch" "${TRAINING_CONFIG}/repetition-penalty-fix.patch" "${TRAINING_CONFIG}/7881.patch"; do
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied $(basename "$p") on $(hostname)"
     elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
