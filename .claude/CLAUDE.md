@@ -4470,6 +4470,19 @@ gaining a ~12-line `curl compare/…​.diff` + `patch -pN` block.
   run at full length, but the actual "does `bypass_mode: False` generalize DAPO training to AIME
   better than `bypass_mode: True`" question (the original motivation for this whole investigation
   — see the NeMo-RL comparison above) is still open and needs a full-length run to answer.
+  **Upstreamed 2026-09-16**: opened as
+  [`verl-project/verl#7881`](https://github.com/verl-project/verl/pull/7881) (branch
+  `theely/verl:fix-decoupled-cpu-snapshot-pinned-leak`, off the current tip of
+  `verl-project/verl@main`) — a clean version of the reuse-buffer fix with this recipe's own
+  `[CPU-SNAPSHOT-DIAG]` debug prints stripped out (not appropriate for a hot-path library
+  function upstream). All pre-commit hooks pass (ruff, ruff-format, mypy, license,
+  device-API-usage, naming-conventions, etc.). The recipe now fetches
+  `https://github.com/verl-project/verl/pull/7881.patch` in the same PR-fetch loop as
+  #7421/#7422/#7423/#7661, replacing the local embedded-heredoc patch; both local patch files
+  (`decoupled-cpu-snapshot-reuse-fix.patch` with diagnostics,
+  `decoupled-cpu-snapshot-memdump.patch`) stay in `apertus-benchmarks/patches/` as unapplied
+  references. Verified the real PR patch (fetched fresh from GitHub, not the local copy) applies
+  cleanly against the baked v0.9.0 tree before wiring it in.
 - **`switch_to_rollout()` crashes the standalone rollout the first time it ever runs mid-training
   — i.e. the first `test_freq` validation after training has started.** Root-caused from real
   v0.9.0 source (not guessed) after run `3261338` crashed here at 45/46 steps — see the Run log
