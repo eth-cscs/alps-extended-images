@@ -16,6 +16,11 @@ import ctypes
 import socket
 import sys
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 
 def get_ip():
     try:
@@ -26,6 +31,8 @@ def get_ip():
         return socket.gethostbyname(socket.gethostname())
 
 
+# Import torch before mooncake, matching vLLM. On rocm the reverse order maps
+# the devel ROCm SDK tree next to torch's core tree and aborts in LLVM.
 from mooncake.engine import TransferEngine
 from mooncake.store import MooncakeDistributedStore  # noqa: F401
 
@@ -55,11 +62,6 @@ if bytes(dst[:256]) != b"A" * 256:
 print("mooncake CXI host-memory self-transfer ok (1 MiB)")
 engine.unregister_memory(ctypes.addressof(src))
 engine.unregister_memory(ctypes.addressof(dst))
-
-try:
-    import torch
-except ImportError:
-    torch = None
 
 if torch is not None and torch.cuda.is_available():
     numel = 32 * 1024 * 1024  # 32 MiB of uint8
