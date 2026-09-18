@@ -5571,3 +5571,70 @@ anywhere). Tells us nothing about AIME. Fixed (added both missing exports) and r
 `3338099` -- same checkpoint/isolated-TRAINING_HOME/step-count, now actually pointed at
 DAPO-Math/AIME. The isolated TRAINING_HOME's wheels are already built from the failed attempt, so
 this resubmit skips that cost. Outcome: pending.
+
+## First full 92-step run with `bypass_mode: False` — run `3420549` (2026-09-17/18): infra clean, RL outcome is a regression, not the hoped-for improvement
+
+**Context**: this run was meant to answer the original motivating question for the whole
+`bypass_mode: False` investigation (see the "algorithm.rollout_correction.bypass_mode: False"
+hazard entry and the NeMo-RL comparison above) -- does verl's decoupled/TIS correction
+generalize DAPO-Math training to AIME better than the recipe's old `bypass_mode: True` baseline
+(run `3327285`, 20/20 steps: AIME `acc/mean@32` 2.08% -> 2.81%, `best@32` 18.2% -> 22.8%)? Three
+real bugs were found and fixed getting to this point (sequence-vs-token IS numerical underflow,
+a `param_offload` host-RAM interaction, and the `save_model_to_cpu` pinned-memory leak fixed
+upstream as `verl-project/verl#7881`, validated on a 5-step shakedown, job `3408011`).
+
+- **Submission**: 40 nodes, `--time=12:00:00` (submission-copy override, tracked script stays at
+  4h default), `BENCHMARK=dapo-math ENABLE_THINKING=True`, full `TOTAL_TRAINING_STEPS=92`
+  default, `TEST_FREQ=23` default (4 AIME validations at steps 23/46/69/92). Hit CSCS's own
+  filesystem outage before submitting (`/capstor/scratch/cscs` and
+  `/capstor/store/cscs/swissai` unhealthy ~14:45 UTC 2026-09-17) -- waited ~24h for it to clear
+  (four separate monitoring-agent stalls along the way, all harness/tooling watchdog issues, not
+  CSCS or job problems -- see the "Bash access to FirecREST credentials" note below), then
+  submitted cleanly once `/status/systems` reported all-healthy.
+- **Result: `COMPLETED`, exit 0, 3h44m (16,979s), well under the 12h cap.** All 92/92 steps
+  completed, final checkpoint saved, zero NaN/Inf, zero FATAL/Traceback/OOM/NCCL-timeout
+  anywhere in the log -- **the `bypass_mode: False` decoupled-PPO path itself is confirmed
+  stable end-to-end at full length for the first time**, and PR #7881's fix held for the entire
+  run (no host-RAM OOM recurrence, unlike every attempt before the fix).
+- **But the actual AIME-2024 result is a clear regression, not an improvement**:
+  | checkpoint | acc/mean@32 | best@32 |
+  |---|---|---|
+  | baseline (pre-training) | 10.21% | 47.41% |
+  | step 23 | 9.48% | 44.14% |
+  | step 46 | 5.83% | 23.45% |
+  | step 69 | 5.63% | 26.84% |
+  | step 92 (final) | 4.58% | 23.60% |
+  Monotonic decline across all 4 checkpoints -- the model got steadily WORSE at AIME as DAPO-Math
+  training progressed, the opposite of the hoped-for outcome. (Not directly comparable to run
+  `3327285`'s numbers -- different prompt marker and val sampling config were in effect then, per
+  the "DAPO-Math benchmark" section's own note above.)
+- **Root cause, visible directly in the training metrics, not a `bypass_mode`/correctness bug**:
+  `response_length/mean` collapsed from ~5700 tokens (step 23) to ~510 tokens (step 92) while
+  `critic/score/mean` (the training reward) kept climbing 0.05 -> 0.14 and `grad_norm` crept up
+  0.06 -> 0.25-0.36 -- classic reward-hacking/length-collapse: the model learned to produce
+  short, low-effort responses that score well under the shaped training reward while actual
+  problem-solving on the harder, out-of-distribution AIME set got worse. **This is the same
+  failure mode already documented above** (runs `3336917`/`3336918`'s raw-generation analysis of
+  earlier `bypass_mode: True` checkpoints found the model looping/repeating on hard problems
+  instead of admitting it can't solve them) -- confirming this repetition/length-collapse
+  pathology is a property of this recipe's DAPO-Math training setup (prompt/reward shaping)
+  in general, not something introduced or fixed by the `bypass_mode` correction either way.
+- **Verdict on the original question**: still unanswered. This run validates that
+  `bypass_mode: False` + PR #7881 is computationally solid for a full-length run, but the
+  reward/length-collapse problem dominates the actual RL outcome badly enough that no
+  conclusion can be drawn about whether the importance-sampling correction itself helps or hurts
+  generalization -- the signal is confounded. Before trying `bypass_mode: False` again to answer
+  the original question, the length-collapse/reward-shaping issue needs its own fix first (e.g.
+  the DAPO-style overlong-response soft penalty already flagged as an open refinement in the
+  "DAPO-Math benchmark" section above, instead of the current hard 12288-token cutoff + fixed
+  length penalty) -- otherwise any future full run will likely reproduce the same collapse
+  regardless of the correction mode.
+- **Tooling note, not a CSCS or job issue**: four consecutive monitoring-agent dispatches in this
+  session stalled on the harness's 600s "no progress" watchdog while waiting on the CSCS outage
+  and, later, while polling the running job's log -- including one dispatch that hit a genuine
+  bug (FirecREST's `ops/view` endpoint returns `output` as a plain string, not the
+  `{content, endPosition, ...}` object shape its own OpenAPI schema implied, so an
+  offset-tracking log-poll parser silently never advanced) and one dispatch that was denied by
+  the Claude Code permission classifier on a routine, value-never-printed credential-file check
+  (resolved once the user confirmed credentials access was fine). None of these were CSCS or
+  recipe problems -- the job itself ran and completed cleanly throughout.
