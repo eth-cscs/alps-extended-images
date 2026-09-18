@@ -11,6 +11,14 @@ tests:
         SLURM_JOB_NUM_NODES: "2"
         SLURM_NTASKS: "2"
         VLLM_RAY_NCCL_WORLD_SIZE: "8"
+    - name: mooncake-cxi
+      runner: cuda
+      timeout: 15m
+      script:
+        - /opt/tests/vllm/mooncake_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
   rocm:
     - name: ray-rccl
       runner: rocm
@@ -21,3 +29,11 @@ tests:
         SLURM_JOB_NUM_NODES: "2"
         SLURM_NTASKS: "2"
         VLLM_RAY_NCCL_WORLD_SIZE: "8"
+    - name: mooncake-cxi
+      runner: rocm
+      timeout: 15m
+      script:
+        - /opt/tests/vllm/mooncake_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"

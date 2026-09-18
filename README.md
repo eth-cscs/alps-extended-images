@@ -46,8 +46,8 @@ Application images are built on top of accelerator-specific base images and incl
 | `apertus-2-cuda:alps7-dev`   | `pytorch-cuda:26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 | `sfttrainer-cuda:alps7-dev`  | `pytorch-cuda:26.02-py3` | Supervised fine-tuning trainer image |
 | `verl-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | VeRL reinforcement learning workloads |
-| `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | vLLM serving workloads built from source with Alps/NVIDIA PyTorch compatibility patches |
-| `vllm-rocm:alps7-dev`        | `pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11` | vLLM serving workloads built from source for ROCm/MI300 |
+| `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | vLLM serving workloads built from source with Alps/NVIDIA PyTorch compatibility patches and Mooncake CXI KV transfer |
+| `vllm-rocm:alps7-dev`        | `pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11` | vLLM serving workloads built from source for ROCm/MI300 with Mooncake CXI KV transfer |
 
 ## HPC Stack Components
 

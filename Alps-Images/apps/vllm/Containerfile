@@ -136,6 +136,13 @@ RUN set -eux; \
     fi; \
     echo "OK: vLLM smoke checks passed"
 
+# Mooncake transfer engine (CXI)
+COPY Alps-Images/apps/vllm/sources/install-mooncake.sh /opt/alps/install-mooncake.sh
+
+RUN set -eux; \
+    chmod +x /opt/alps/install-mooncake.sh; \
+    /opt/alps/install-mooncake.sh cuda
+
 # Tests shipped with the image
 COPY Alps-Images/apps/vllm/tests/ /opt/tests/vllm/
 RUN chmod -R a+rX /opt/tests/vllm

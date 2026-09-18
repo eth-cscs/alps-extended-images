@@ -114,6 +114,13 @@ RUN set -eux; \
     fi; \
     echo "OK: vLLM ROCm smoke checks passed"
 
+# Mooncake transfer engine (CXI)
+COPY Alps-Images/apps/vllm/sources/install-mooncake.sh /opt/alps/install-mooncake.sh
+
+RUN set -eux; \
+    chmod +x /opt/alps/install-mooncake.sh; \
+    /opt/alps/install-mooncake.sh rocm
+
 # Tests shipped with the image
 COPY Alps-Images/apps/vllm/tests/ /opt/tests/vllm/
 RUN chmod -R a+rX /opt/tests/vllm
