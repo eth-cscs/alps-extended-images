@@ -163,8 +163,19 @@ git -C "${src_dir}" submodule update --init --recursive
 cmake -S "${src_dir}" -B "${build_dir}" "${cmake_args[@]}"
 cmake --build "${build_dir}" -j"${MOONCAKE_BUILD_JOBS}"
 
-grep -q '^USE_CXI:BOOL=ON$' "${build_dir}/CMakeCache.txt" \
-    || die "Mooncake was not configured with USE_CXI=ON"
+# USE_CXI is cached as UNINITIALIZED (no option() declaration); the cxi
+# object files prove the flag actually took effect.
+mooncake_use_cxi="$(grep -E '^USE_CXI:' "${build_dir}/CMakeCache.txt" \
+    | head -n 1 | cut -d= -f2- || true)"
+case "${mooncake_use_cxi}" in
+    ON|on|TRUE|true|YES|yes|1) ;;
+    *) die "Mooncake was not configured with USE_CXI=ON (CMakeCache: ${mooncake_use_cxi:-unset})" ;;
+esac
+cxi_object_count="$(find "${build_dir}/mooncake-transfer-engine/src/transport/cxi_transport" \
+    -name '*.o' 2>/dev/null | wc -l)"
+[[ "${cxi_object_count}" -gt 0 ]] \
+    || die "cxi_transport produced no object files; USE_CXI did not take effect"
+echo "INFO: cxi_transport built (${cxi_object_count} objects)"
 
 # Stage the artifacts that upstream's scripts/build_wheel.sh ships in its
 # wheels. Mooncake links statically by default, so engine.so and store.so are
