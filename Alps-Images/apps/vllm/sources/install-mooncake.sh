@@ -234,9 +234,9 @@ libfabric_needed="$({ ldd "${mooncake_pkg_dir}/engine.so" 2>/dev/null || true; }
     || die "mooncake engine.so does not link libfabric; USE_CXI build is broken"
 echo "INFO: mooncake engine links ${libfabric_needed}"
 
-# Mark every dpkg-owned library that the installed Mooncake modules and tools
-# link against as manually installed, so the cleanup autoremove below cannot
-# remove them once the matching -dev packages are purged.
+# Mark dpkg-owned runtime libraries of the installed modules as manual so the
+# autoremove below keeps them. Resolve owners by soname, not by ldd's
+# resolved path (/lib vs /usr/lib trips dpkg -S on merged-/usr systems).
 mapfile -t mooncake_elf_files < <(
     find "${mooncake_pkg_dir}" -type f \
         \( -name '*.so' -o -name 'mooncake_master' -o -name 'mooncake_client' \
@@ -245,18 +245,18 @@ mapfile -t mooncake_elf_files < <(
 runtime_packages="$(mktemp)"
 for elf_file in "${mooncake_elf_files[@]}"; do
     { ldd "${elf_file}" 2>/dev/null || true; } \
-        | awk '/=> \// { print $3 } /^\/.*\.so/ { print $1 }' \
+        | awk '/=> \// { print $1 } /^\/.*\.so/ { n = split($1, p, "/"); print p[n] }' \
         | sort -u \
-        | while IFS= read -r lib_file; do
-            dpkg -S "${lib_file}" 2>/dev/null | head -n 1 | cut -d: -f1 || true
+        | while IFS= read -r soname; do
+            dpkg -S "${soname}" 2>/dev/null | head -n 1 | cut -d: -f1 || true
         done >> "${runtime_packages}"
 done
 sort -u "${runtime_packages}" -o "${runtime_packages}"
-if [[ -s "${runtime_packages}" ]]; then
-    mapfile -t runtime_pkg_list < "${runtime_packages}"
-    echo "INFO: keeping mooncake runtime library packages: ${runtime_pkg_list[*]}"
-    apt_mark manual "${runtime_pkg_list[@]}"
-fi
+[[ -s "${runtime_packages}" ]] \
+    || die "could not resolve runtime library packages for mooncake"
+mapfile -t runtime_pkg_list < "${runtime_packages}"
+echo "INFO: keeping mooncake runtime library packages: ${runtime_pkg_list[*]}"
+apt_mark manual "${runtime_pkg_list[@]}"
 rm -f "${runtime_packages}"
 
 cleanup_new_apt_build_deps /tmp/mooncake-apt-before.txt "${mooncake_apt_build_deps[@]}"
