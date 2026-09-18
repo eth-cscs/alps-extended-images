@@ -395,11 +395,16 @@ rocm_sdk_prefix_candidates() {
     local candidate
     local -A emitted=()
 
+    # Runtime trees first: the ldconfig cache must map shared sonames
+    # (amdhip64, hsa-runtime, comgr) to the same trees torch resolves via
+    # RPATH; devel first maps them into both trees and LLVM aborts on
+    # duplicate options when a non-torch consumer (e.g. mooncake) loads
+    # before torch. Devel is still found for builds: only it ships headers.
     for candidate in \
-        "${ROCM_BUILD_PREFIX:-}" \
-        "${ROCM_DEVEL_PREFIX:-}" \
         "${ROCM_CORE_PREFIX:-}" \
         "${ROCM_LIBRARIES_PREFIX:-}" \
+        "${ROCM_DEVEL_PREFIX:-}" \
+        "${ROCM_BUILD_PREFIX:-}" \
         "${ROCM_SDK_ROOT:-}" \
         "${ROCM_DEVEL_DIR:-}/_rocm_sdk_devel" \
         "${ROCM_CORE_DIR:-}/_rocm_sdk_core" \
