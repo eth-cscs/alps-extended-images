@@ -5638,3 +5638,57 @@ upstream as `verl-project/verl#7881`, validated on a 5-step shakedown, job `3408
   the Claude Code permission classifier on a routine, value-never-printed credential-file check
   (resolved once the user confirmed credentials access was fine). None of these were CSCS or
   recipe problems -- the job itself ran and completed cleanly throughout.
+
+## `REWARD_MODE` A/B RESOLVED — the shaped reward's length penalty was causing the AIME regression (runs `3420549` shaped vs `3430098` binary, 2026-09-18/21)
+
+**The question**: run `3420549` (92/92 steps, `REWARD_MODE=shaped`) completed cleanly but AIME-2024
+accuracy *declined* monotonically while `response_length/mean` collapsed ~5700 -> ~510 tokens and the
+training reward climbed -- classic reward hacking. Was the shaped reward's length penalty the cause, or
+was something more fundamental wrong with the DAPO-Math -> AIME setup? `reward.py`'s `REWARD_MODE=binary`
+(outcome only, 1.0/0.0 -- no format bonus, no length penalty; the `\boxed{}`/`[[[N]]]` extraction logic is
+unchanged, it is the only way to score correctness at all) was built for exactly this A/B and had never
+been run. Run `3430098` is that run: identical config to `3420549` (40 nodes, `bypass_mode: False` +
+`rollout_is: token` + `param_offload: False`, verl PR #7881, `BENCHMARK=dapo-math ENABLE_THINKING=True`,
+92 steps, `TEST_FREQ=23`), changing **only** `REWARD_MODE`.
+
+**Answer: the length penalty was the cause. Binary mode inverted both failure modes.**
+
+| | `3420549` shaped | `3430098` binary |
+|---|---|---|
+| AIME `mean@32` baseline | 10.21% | 9.79% |
+| step 23 | 9.48% | **11.98%** |
+| step 46 | 5.83% | **15.31%** |
+| step 69 | 5.63% | **16.98%** |
+| step 92 | 4.58% | (never reached -- died at step 81) |
+| AIME `best@32` @ last checkpoint | 23.60% | **48.72%** |
+| `response_length/mean` | 5700 -> **510** (collapse) | 4679 -> **9589** (2x growth) |
+| verdict | monotonic regression | **monotonic improvement, +7.2 pts / +73% rel.** |
+
+- **Length**: binary grew monotonically (step 1: 4679 -> 10: 5811 -> 20: 6055 -> 40: 8052 -> 60: 9154 ->
+  80: 9589), with `clip_ratio` rising 0.001 -> 0.48 (~half of samples now hitting the 12288 cap) and
+  entropy declining smoothly 3.23 -> 1.69. The model is learning to *reason longer*, the opposite of
+  shaped mode's short-and-confident collapse.
+- **Health**: `critic/score/mean` 0.115 -> ~0.16-0.24 late (step 79: 0.240), `actor/grad_norm` 0.028-0.062
+  all run (final 0.032), `ppo_kl` ~0 throughout, zero NaN/Inf, zero OOM, step time 250-350s, flat memory.
+- **This also finally answers the original `bypass_mode` question, indirectly**: run `3420549`'s verdict
+  ("signal confounded by length collapse, no conclusion possible about the IS correction") is now
+  resolved -- with the confound removed, `bypass_mode: False` + binary reward produces clean, monotonic
+  AIME generalization from DAPO-Math training. The decoupled/TIS correction is not the problem and
+  plausibly part of why this works.
+
+**Terminal state: `FAILED` (exit 15) at step 81 of 92, after 7h31m of a 12h limit -- infrastructure, not
+training.** A 30-minute NCCL `ALLREDUCE` watchdog timeout (`Timeout(ms)=1800000`, `NumelIn=101908480`) on
+`TENSOR_MODEL_PARALLEL_GROUP` inside `compute_log_prob` -> `forward_backward_batch`
+(`transformer_impl.py:949`): one rank never posted its collective, the watchdog killed the process ->
+`ActorDiedError` cascade. Same collective-hang class already documented repeatedly in this file
+(`3141801`/`3207923`/`3219811`/`3240762` on the weight-sync path; this one is on the log-prob forward
+path). Not numerics, not memory. **4.5h of wall clock unused and every metric healthy through step 80, so
+an unmodified resubmit should plausibly reach 92/92** -- the only missing datum is the step-92 checkpoint,
+and the step-23/46/69 trend is already unambiguous.
+
+**Recommendation going forward**: `REWARD_MODE=binary` should become this recipe's default for DAPO-Math
+(the shaped reward is actively harmful here), and the "open refinement" noted in the DAPO-Math benchmark
+section -- adopting DAPO's own Overlong Reward Shaping (`reward_manager: dapo` + `overlong_buffer_cfg`, a
+*soft* penalty inside a buffer window, which the DAPO authors designed precisely because a naive length
+penalty causes this exact hacking) -- is now the natural next experiment if length control is ever wanted
+back, rather than the hand-written linear penalty that caused this.
