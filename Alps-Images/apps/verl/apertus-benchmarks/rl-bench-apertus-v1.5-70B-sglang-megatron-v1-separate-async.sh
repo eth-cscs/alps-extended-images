@@ -165,16 +165,27 @@ export ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
 # docs: >1.0 discourages repeated tokens); applies to both training rollout and AIME/GSM8K
 # validation sampling (SamplingConfig, used for val_kwargs, has no separate override field).
 export ROLLOUT_REPETITION_PENALTY="${ROLLOUT_REPETITION_PENALTY:-1.1}"
-# REWARD_MODE (2026-09-09, A/B on reward SHAPING itself): forwarded to reward.py via env.toml.
-#   shaped (default): outcome + 0.1 format bonus + up-to-0.2 length penalty (what every run up
-#                      to 3330187/3331427 used).
-#   binary:           outcome only (1.0/0.0), no format bonus, no length penalty -- tests
-#                      whether the length penalty specifically is what pushes the model toward
-#                      answering more confidently-but-wrongly on hard AIME problems after RL
-#                      (the SFT-baseline-vs-post-RL comparison in this session's run history
-#                      showed RL cut the repetition/looping rate roughly in half but also cut
-#                      per-attempt accuracy -- reward shaping is the leading unconfirmed cause).
-export REWARD_MODE="${REWARD_MODE:-shaped}"
+# REWARD_MODE (2026-09-09 as an A/B on reward SHAPING itself; A/B RESOLVED 2026-09-21 and the
+# default flipped shaped -> binary). Forwarded to reward.py via env.toml.
+#   binary (default): outcome only (1.0/0.0), no format bonus, no length penalty. The
+#                      boxed/[[[N]]] extraction logic is unchanged -- that is how correctness is
+#                      scored at all, not a "format" reward in the shaping sense.
+#   shaped:           outcome + 0.1 format bonus + up-to-0.2 length penalty ramping over
+#                      2000-4000 words (what every run up to 3420549 used).
+# Why binary is now the default -- runs 3420549 (shaped) vs 3430098 (binary), identical configs
+# except this flag, 92-step DAPO-Math with AIME-2024 validation every 23 steps:
+#   AIME mean@32   shaped 10.21% -> 9.48% -> 5.83% -> 5.63% -> 4.58%   (monotonic REGRESSION)
+#                  binary  9.79% -> 11.98% -> 15.31% -> 16.98%          (monotonic improvement)
+#   resp length    shaped 5700 -> 510 tokens (collapse -- reward hacking: short confident answers
+#                                             score well under the length penalty while actual
+#                                             problem-solving degrades)
+#                  binary 4679 -> 9589 tokens (2x growth; clip_ratio 0.001 -> 0.48)
+# i.e. the hand-written linear length penalty was itself teaching the model to stop reasoning.
+# If length control is ever wanted back, use DAPO own Overlong Reward Shaping
+# (reward_manager: dapo + reward_kwargs.overlong_buffer_cfg -- a SOFT penalty inside a buffer
+# window, designed by the DAPO authors precisely because naive length penalties hack like this),
+# not this shaped mode. See the "REWARD_MODE A/B RESOLVED" section in CLAUDE.md.
+export REWARD_MODE="${REWARD_MODE:-binary}"
 export BENCHMARK="${BENCHMARK:-gsm8k}"
 case "${BENCHMARK}" in
     # Training rollout sampling (ROLLOUT_*: GRPO group size n, temperature, top_p; top_k is
