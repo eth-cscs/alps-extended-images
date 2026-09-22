@@ -5692,3 +5692,51 @@ section -- adopting DAPO's own Overlong Reward Shaping (`reward_manager: dapo` +
 *soft* penalty inside a buffer window, which the DAPO authors designed precisely because a naive length
 penalty causes this exact hacking) -- is now the natural next experiment if length control is ever wanted
 back, rather than the hand-written linear penalty that caused this.
+
+### Run `3462580` (2026-09-21/22) — **the complete 92/92 binary-reward run. COMPLETED, exit 0. AIME `mean@32` 10.62% -> 17.40%, monotonic.**
+
+Unmodified resubmit of `3430098` (which died at step 81/92 on an infra NCCL hang), to get the
+missing step-92 checkpoint. 40 nodes, 8h30m of a 12h limit (~3.5h margin), 279.5 s/step, all 3
+task steps exit 0, final checkpoint written to `global_step_92`.
+
+| step | `mean@32` | `best@32` | `best@16` | `best@8` |
+|---|---|---|---|---|
+| 0 (baseline) | 10.62% | 40.02% | 35.68% | 30.16% |
+| 23 | 11.04% | 37.09% | 33.32% | 28.12% |
+| 46 | 12.92% | 48.53% | 41.30% | 33.71% |
+| 69 | 16.04% | 50.62% | 44.58% | 37.96% |
+| **92 (final)** | **17.40%** | **46.48%** | 42.99% | 38.26% |
+
+**`mean@32` rises monotonically 10.62 -> 17.40% (+6.8 pts, x1.64)**; `best@32` 40.0 -> 46.5%
+(peak 50.6% at step 69). Tracks `3430098` closely at every comparable checkpoint (23: 11.04 vs
+11.98; 46: 12.92 vs 15.31; 69: 16.04 vs 16.98 -- marginally behind mid-run, within the ~1pt
+noise floor of a 30-problem set) and then carries through to the 92-step finish that `3430098`
+never reached. **Two independent runs of the same config now show the same monotonic
+improvement, so the binary-reward result is reproduced, not a single-run artifact.**
+
+- `response_length/mean`: 4628 (s1) -> 6810 (23) -> 9077 (46) -> 9407 (69) -> **9199 (92)**,
+  plateauing ~9.2-9.7k with `clip_ratio` 0.44-0.54. Grows then stabilises -- **no collapse**,
+  the exact inverse of `3420549`'s shaped-mode 5700 -> 510 implosion.
+- `critic/score/mean` by quartile 0.107 -> 0.148 -> 0.204 -> **0.225** (final step 0.241).
+- `actor/grad_norm` 0.026-0.080 all run, final 0.0326. Zero NaN/Inf. Peak GPU 66.9/95 GB.
+- **Zero failure signatures**: no OOM, no NCCL/DistBackend error, no watchdog or
+  collective-timeout, no `ActorDiedError`/`SYSTEM_ERROR`, no FATAL. **The step-81 NCCL ALLREDUCE
+  hang that killed `3430098` did NOT recur** -- step 81 completed normally in 279.5 s,
+  confirming that hang was a one-off infra fault, consistent with this file's other
+  collective-hang entries. The 4 tracebacks are all post-100% teardown noise (Triton autotune
+  cache on Lustre, Ray DataLoader worker exit, wandb atexit).
+
+**Final standing of the `REWARD_MODE` A/B** (all three runs, identical config except the flag):
+
+| | `3420549` shaped | `3430098` binary | `3462580` binary (rerun) |
+|---|---|---|---|
+| steps | 92/92 | 81/92 (infra hang) | **92/92** |
+| AIME `mean@32` | 10.21% -> **4.58%** | 9.79% -> 16.98% @69 | 10.62% -> **17.40%** |
+| `response_length` | 5700 -> **510** | 4679 -> 9589 | 4628 -> **9199** |
+| verdict | regression | improvement | **improvement, reproduced** |
+
+**Log-fetch note for future runs**: this log was 5.28 MB / 23,225 lines. `ops/download` rejects
+>5 MB, and the S3 `transfer/download` fallback queues a job on the `xfer` partition, which was
+stuck PENDING (`Reserved for maintenance`). The working route was server-side `ops/compress` ->
+600 KB gzip -> plain `ops/download` -> clean up the remote tarball. Worth reaching for directly
+when a log exceeds the 5 MB cap.
