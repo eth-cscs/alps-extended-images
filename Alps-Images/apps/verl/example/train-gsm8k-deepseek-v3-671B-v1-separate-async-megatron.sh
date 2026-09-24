@@ -109,7 +109,12 @@ export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-40}"
 # checks it against dp_size (DP=5 x EP=8 = 40). Keep rows >= 2x dp_size so every DP rank gets
 # >= 2 rows per mini-batch (cheap insurance against length-1 batch edge cases).
 export ROLLOUT_N=8                   # responses per prompt -- GRPO advantages degenerate at n=1
-export PPO_MINI_BATCH_SIZE=10        # prompts; x ROLLOUT_N = 80 rows = 2x dp_size (DP=5 x EP=8 = 40)
+# prompts; x ROLLOUT_N = rows, kept >= 2x dp_size (dp_size = DP x EP). At the default 128 nodes
+# DP=5 so dp_size=40 and 10 x 8 = 80 rows. Env-overridable because dp_size moves with the node
+# count: a smaller-DP layout needs a smaller mini-batch to stay inside verl's assertion (e.g. a
+# 56-node probe -> 48 trainer nodes -> 192 GPUs / (TP4 x PP3 x EP8) -> DP=2 -> dp_size=16 ->
+# PPO_MINI_BATCH_SIZE=4 gives 32 rows = 2x).
+export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-10}"
 export PARAMETER_SYNC_STEP=2
 export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))
 
