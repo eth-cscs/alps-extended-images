@@ -119,8 +119,16 @@ COPY Alps-Images/apps/vllm/sources/install-mooncake.sh /opt/alps/install-mooncak
 COPY Alps-Images/apps/vllm/patches/mooncake /opt/alps/mooncake-patches
 
 RUN set -eux; \
-    chmod +x /opt/alps/install-mooncake.sh; \
+    chmod u+x /opt/alps/install-mooncake.sh; \
     /opt/alps/install-mooncake.sh rocm
+
+# AITER kernels (MLA prefill/decode, fused MoE, norms); see sources/install-aiter.sh.
+ENV AITER_JIT_DIR="/opt/aiter-jit"
+COPY Alps-Images/apps/vllm/sources/install-aiter.sh /opt/alps/install-aiter.sh
+
+RUN set -eux; \
+    chmod u+x /opt/alps/install-aiter.sh; \
+    /opt/alps/install-aiter.sh
 
 # Tests shipped with the image
 COPY Alps-Images/apps/vllm/tests/ /opt/tests/vllm/
