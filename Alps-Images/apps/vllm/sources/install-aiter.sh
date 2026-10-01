@@ -4,8 +4,7 @@
 #
 # AITER is installed editable from /opt/aiter: its JIT compiles kernels from those sources
 # with hipcc on first use and caches the resulting modules in AITER_JIT_DIR. This script
-# imports AITER and resolves vLLM's AITER MLA prefill backend once, so the modules those
-# steps need are compiled into AITER_JIT_DIR at image build time.
+# pre-compiles the core module into AITER_JIT_DIR at image build time.
 #
 # Environment overrides:
 #   AITER_REPO      git remote (default: upstream GitHub)
@@ -32,13 +31,30 @@ git -C "${src_dir}" submodule update --init --recursive --depth 1
 cd "${src_dir}"
 pip_install python --no-cache-dir --no-build-isolation -e .
 
-# Import compiles AITER's core module into the image (GPU_ARCHS pinned above).
+# Build the core module through jit/core.py loaded standalone, as setup.py's PREBUILD_KERNELS
+# does: `import aiter` probes for a GPU at import time and the CI builder has none.
 mkdir -p "${AITER_JIT_DIR}"
-python -c "import aiter"
-python -c "
-from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum as B
-B.ROCM_AITER_FA.get_class()
-"
+python - <<PY
+import sys
+sys.path.insert(0, "${src_dir}/aiter")
+from jit import core
+
+args = core.get_args_of_build("module_aiter_core")
+core.build_module(
+    md_name="module_aiter_core",
+    srcs=args["srcs"],
+    flags_extra_cc=args["flags_extra_cc"],
+    flags_extra_hip=args["flags_extra_hip"],
+    blob_gen_cmd=args["blob_gen_cmd"],
+    extra_include=args["extra_include"],
+    extra_ldflags=args["extra_ldflags"],
+    verbose=False,
+    is_python_module=True,
+    is_standalone=False,
+    torch_exclude=args["torch_exclude"],
+    third_party=args["third_party"],
+)
+PY
 
 shopt -s nullglob
 baked_modules=("${AITER_JIT_DIR}"/*.so)
