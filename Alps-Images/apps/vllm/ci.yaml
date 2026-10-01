@@ -37,3 +37,11 @@ tests:
       variables:
         SLURM_JOB_NUM_NODES: "1"
         SLURM_NTASKS: "1"
+    - name: aiter
+      runner: rocm
+      timeout: 15m
+      script:
+        - /opt/tests/vllm/aiter_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
