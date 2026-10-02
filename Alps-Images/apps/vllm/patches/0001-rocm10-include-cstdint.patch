@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Alps Extended Images <noreply@cscs.ch>
+Date: Fri, 12 Sep 2026 00:00:00 +0000
+Subject: [PATCH] csrc: include <cstdint> for int64_t
+
+clang 23 (ROCm 10) does not transitively define int64_t through the
+HIP runtime headers anymore. cuda_utils.h declares int64_t functions
+with only <stdio.h> included, so the hipified ROCm build fails with
+"unknown type name 'int64_t'".
+---
+ csrc/cuda_utils.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/csrc/cuda_utils.h b/csrc/cuda_utils.h
+--- a/csrc/cuda_utils.h
++++ b/csrc/cuda_utils.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
+ #include <stdio.h>
++#include <cstdint>
+ 
+ #if defined(__HIPCC__)

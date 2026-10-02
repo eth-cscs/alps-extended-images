@@ -1,0 +1,35 @@
+From 72dd70c7782078b953b49f1a3b6845d1fcd3ea65 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 22 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: allow explicit Grace Hopper build target
+
+Container image builds do not reliably expose the allocated GPU to nvidia-smi.
+Allow the GH200 target to be selected explicitly so ARM builds still compile
+the unified-memory and host-pointer paths required on Grace Hopper.
+---
+ ep/setup.py | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/ep/setup.py b/ep/setup.py
+index f21cdb1..e73c076 100644
+--- a/ep/setup.py
++++ b/ep/setup.py
+@@ -243,9 +243,13 @@ if __name__ == "__main__":
+         except Exception as e:
+             print(f"Warning: Could not detect GPU info via nvidia-smi: {e}")
+ 
+-        # GH200 (Grace Hopper) Detection
+-        has_gh200 = cpu_is_arm64 and gpu_is_hopper
+-        if has_gh200:
++        # GH200 (Grace Hopper) Detection. Container builds often have no GPU
++        # visibility, so allow the target platform to be selected explicitly.
++        force_grace_hopper = int(os.getenv("UCCL_EP_FORCE_GRACE_HOPPER", "0"))
++        has_gh200 = bool(force_grace_hopper) or (cpu_is_arm64 and gpu_is_hopper)
++        if force_grace_hopper:
++            print("GH200 support forced by UCCL_EP_FORCE_GRACE_HOPPER")
++        elif has_gh200:
+             print(
+                 f"GH200 detected (GPU: {gpu_name}, CPU: {arch}), building with GH200 support"
+             )
+-- 
+2.51.0

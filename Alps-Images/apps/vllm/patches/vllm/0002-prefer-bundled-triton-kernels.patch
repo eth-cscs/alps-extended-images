@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 29 Sep 2026 00:00:00 +0000
+Subject: [PATCH] import_utils: prefer bundled Triton kernels
+
+The NGC torch package exposes a top-level triton_kernels package but does not
+ship matmul_ogs, which vLLM's MoE implementation requires. Prefer the copy
+pinned and bundled by vLLM so an incomplete base package cannot shadow it.
+---
+ vllm/utils/import_utils.py | 16 ++++++++--------
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/vllm/utils/import_utils.py b/vllm/utils/import_utils.py
+--- a/vllm/utils/import_utils.py
++++ b/vllm/utils/import_utils.py
+@@ -59,20 +59,20 @@ def import_triton_kernels():
+     """
+-    For convenience, prioritize triton_kernels that is available in
+-    `site-packages`. Use `vllm.third_party.triton_kernels` as a fall-back.
++    Prefer the Triton kernels pinned and bundled by vLLM. Use a package from
++    `site-packages` only as a fall-back.
+     """
+-    if _has_module("triton_kernels"):
+-        import triton_kernels
++    if _has_module("vllm.third_party.triton_kernels"):
++        import vllm.third_party.triton_kernels as triton_kernels
+ 
+         logger.debug_once(
+             f"Loading module triton_kernels from {triton_kernels.__file__}.",
+         )
+-    elif _has_module("vllm.third_party.triton_kernels"):
+-        import vllm.third_party.triton_kernels as triton_kernels
++        sys.modules["triton_kernels"] = triton_kernels
++    elif _has_module("triton_kernels"):
++        import triton_kernels
+ 
+         logger.debug_once(
+             f"Loading module triton_kernels from {triton_kernels.__file__}.",
+         )
+-        sys.modules["triton_kernels"] = triton_kernels
+     else:
+         logger.info_once(
+             "triton_kernels unavailable in this build. "
+-- 
+2.51.0

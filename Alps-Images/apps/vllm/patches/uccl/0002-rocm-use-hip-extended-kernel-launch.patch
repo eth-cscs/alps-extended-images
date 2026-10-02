@@ -1,0 +1,52 @@
+From 8642288a041993652bdd2b765aeb48dedf1c0814 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 15 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: use HIP extended kernel launch on AMD
+
+PyTorch's HIP source conversion does not translate the CUDA 12 extended
+launch types or cudaLaunchKernelEx API. Select the ROCm equivalents explicitly
+so EP kernels compile with the ROCm 10 toolchain.
+---
+ ep/include/ep_launch.cuh | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/ep/include/ep_launch.cuh b/ep/include/ep_launch.cuh
+index b80131e..c872af3 100644
+--- a/ep/include/ep_launch.cuh
++++ b/ep/include/ep_launch.cuh
+@@ -2,6 +2,15 @@
+ #include "exception.cuh"
+ 
+ #ifndef SETUP_LAUNCH_CONFIG
++#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
++#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                    \
++  hipLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
++  hipLaunchAttribute attr[1];                                                \
++  attr[0].id = hipLaunchAttributeCooperative;                                \
++  attr[0].val.cooperative = 1;                                               \
++  cfg.attrs = attr;                                                          \
++  cfg.numAttrs = 1
++#else
+ #ifndef DISABLE_SM90_FEATURES
+ #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                     \
+   cudaLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
+@@ -24,11 +33,17 @@
+   cfg.numAttrs = 1
+ #endif
+ #endif
++#endif
+ 
+ #ifndef LAUNCH_KERNEL
++#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
++#define LAUNCH_KERNEL(config, kernel, ...) \
++  CUDA_CHECK(hipLaunchKernelEx(config, kernel, ##__VA_ARGS__))
++#else
+ #define LAUNCH_KERNEL(config, kernel, ...) \
+   CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
+ #endif
++#endif
+ 
+ #ifndef SET_SHARED_MEMORY_FOR_TMA
+ #ifndef DISABLE_SM90_FEATURES
+-- 
+2.51.0

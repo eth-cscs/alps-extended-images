@@ -33,7 +33,12 @@ COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    pip_install python sglang[all]
+    # Pin sglang to a release that pins torch==2.11.0, matching the NGC 26.02 base
+    # wheel. Unpinned resolution drifts to newer sglang releases that require newer
+    # pypi torch (e.g. 0.5.19 -> torch==2.13.0), replacing the NGC torch and breaking
+    # the NGC flash_attn_2_cuda binary shipped in the base (undefined symbol
+    # c10::impl::cow::materialize_cow_storage at transformers' flash-attn import).
+    pip_install python "sglang[all]==0.5.17"
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python flash-attn --no-build-isolation

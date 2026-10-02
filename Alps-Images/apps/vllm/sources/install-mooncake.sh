@@ -155,6 +155,12 @@ case "${accel}" in
         ;;
 esac
 
+ibverbs_apt_build_deps=(
+    libibverbs-dev
+    libnl-3-dev
+    libnl-route-3-dev
+)
+
 mooncake_apt_build_deps=(
     cmake
     git
@@ -174,10 +180,22 @@ mooncake_apt_build_deps=(
     pkg-config
     python3-dev
 )
+# The CUDA base supplies an RDMA development package set at version 63
+# alongside its DOCA/rdma-core runtime, while the configured Ubuntu
+# repositories offer version 50. Keep the matching base packages across the
+# vLLM build rather than trying to reinstall incompatible versions here.
+if [[ "${accel}" == "cuda" ]]; then
+    for pkg in "${ibverbs_apt_build_deps[@]}"; do
+        dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null \
+            | grep -q '^ii ' \
+            || die "matching CUDA base package ${pkg} is not installed"
+    done
+fi
+
 snapshot_apt_packages /tmp/mooncake-apt-before.txt
 apt_get update
 apt_get install -y --no-install-recommends \
-    ca-certificates libibverbs-dev "${mooncake_apt_build_deps[@]}"
+    ca-certificates "${ibverbs_apt_build_deps[@]}" "${mooncake_apt_build_deps[@]}"
 rm -rf /var/lib/apt/lists/*
 
 # The NGC base images carry an NVIDIA/DOCA libibverbs-dev whose unversioned
@@ -325,6 +343,14 @@ apt_mark manual "${runtime_pkg_list[@]}"
 rm -f "${runtime_packages}"
 
 cleanup_new_apt_build_deps /tmp/mooncake-apt-before.txt "${mooncake_apt_build_deps[@]}"
+APT_CLEANUP_HOLD_PACKAGES="libibverbs1 ibverbs-providers libnl-3-200 libnl-route-3-200" \
+    cleanup_apt_build_deps "${ibverbs_apt_build_deps[@]}"
+for pkg in "${ibverbs_apt_build_deps[@]}"; do
+    if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null \
+        | grep -q '^ii '; then
+        die "${pkg} remains installed after Mooncake build"
+    fi
+done
 ldconfig
 
 # Final verification against the post-cleanup image content.
