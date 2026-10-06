@@ -89,8 +89,13 @@ case "${BENCHMARK}" in
     # each problem in a fixed instruction block and needs 2048.
     # ppo_max_token_len_per_gpu must be >= max_prompt_length + max_response_length so a single
     # full-length sequence fits one micro-batch under use_dynamic_bsz.
-    gsm8k)     export MAX_PROMPT_LENGTH=512;  export MAX_RESPONSE_LENGTH=2048;  export PPO_MAX_TOKEN_LEN=4096 ;;
-    dapo-math) export MAX_PROMPT_LENGTH=2048; export MAX_RESPONSE_LENGTH=12288; export PPO_MAX_TOKEN_LEN=14336 ;;
+    # Validation sampling: gsm8k = greedy pass@1 (verl defaults); dapo-math = AIME-2024 avg@32
+    # (n=32, T=0.6, top_p=0.95, top_k off), same as the Apertus recipe -> read
+    # val-core/aime_2024/acc/mean@32.
+    gsm8k)     export MAX_PROMPT_LENGTH=512;  export MAX_RESPONSE_LENGTH=2048;  export PPO_MAX_TOKEN_LEN=4096
+               export VAL_N=1;  export VAL_TEMPERATURE=0;   export VAL_TOP_P=1.0;  export VAL_DO_SAMPLE=False ;;
+    dapo-math) export MAX_PROMPT_LENGTH=2048; export MAX_RESPONSE_LENGTH=12288; export PPO_MAX_TOKEN_LEN=14336
+               export VAL_N=${VAL_N:-32}; export VAL_TEMPERATURE=0.6; export VAL_TOP_P=0.95; export VAL_DO_SAMPLE=True ;;
     *) echo "FATAL: unknown BENCHMARK=${BENCHMARK} (gsm8k | dapo-math)"; exit 1 ;;
 esac
 # Reward function: gsm8k keeps the embedded heredoc (validated); dapo-math uses the shared
@@ -103,6 +108,15 @@ fi
 # Fixed step count (overrides epochs; also sizes the LR schedule). Env-overridable so a short
 # memory-fit probe can run a handful of steps without editing the recipe.
 export TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-40}"
+# Validation schedule (env-overridable). Off by default: on gsm8k, greedy decode over 1319 samples
+# hung at 24 min (cuEventSynchronize deadlock). Mid-run validation needs the switch_to_rollout
+# hunk of v1-separate-async-fixes.patch (added 2026-09-30).
+export TEST_FREQ="${TEST_FREQ:--1}"
+export VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-false}"
+# SGLang attention backend for the rollout (see engine_kwargs.sglang below). flashinfer = verl own
+# default and what run 3309430 validated. fa3 is unavailable in this image (no sgl_kernel FA3 ops);
+# triton works but decodes far slower and did not avoid the TP=32 hang (run 3554110).
+export ROLLOUT_ATTENTION_BACKEND="${ROLLOUT_ATTENTION_BACKEND:-flashinfer}"
 
 # Batching contract (verl asserts it): train_batch_size == parameter_sync_step * ppo_mini_batch_size.
 # Both are PROMPT counts; verl multiplies ppo_mini_batch_size by rollout.n for the row count and
@@ -239,6 +253,12 @@ actor_rollout_ref:
     nnodes: ${ROLLOUT_NNODES}
     n_gpus_per_node: 4
     temperature: 1.0
+    val_kwargs:            # per-benchmark, see the BENCHMARK case above
+      n: ${VAL_N}
+      temperature: ${VAL_TEMPERATURE}
+      top_p: ${VAL_TOP_P}
+      top_k: -1
+      do_sample: ${VAL_DO_SAMPLE}
     n: ${ROLLOUT_N} # responses per prompt — GRPO group size for the relative-advantage baseline
     # One TP=32 replica on 32 GPUs. DeepSeek-V3 is served in bf16 (quantization_config stripped from
     # the config mirror; the weight sync pushes bf16): ~1.34 TB over 32 x 95 GiB x 0.75 -- fits.
@@ -266,6 +286,14 @@ actor_rollout_ref:
       sglang:
         watchdog_timeout: 300
         disable_cuda_graph: true
+        # verl v0.9.0 forces attention_backend=flashinfer on sglang>=0.5.12 (FA3 CUDA-graph capture
+        # bug, #22800 -- moot here, CUDA graphs are disabled). SGLang's own default for MLA on Hopper
+        # is fa3, but this image's sgl_kernel has no FA3 ops (run 3552393: "cannot import name
+        # flash_ops from sgl_kernel" on every rank). triton is SGLang's own non-Hopper MLA fallback,
+        # no sgl_kernel dependency. flashinfer MLA decode hung at plan() during the AIME validation
+        # of run 3551338, triton hung in MoE topk (run 3554110) -- the hang is not the attention
+        # kernel, so the default is back to flashinfer.
+        attention_backend: ${ROLLOUT_ATTENTION_BACKEND}
         max_running_requests: 128  # limit concurrent decode batch; keeps per-step latency and KV usage manageable
 
   ref:
@@ -327,8 +355,8 @@ trainer:
   # export gathered through rank-0 HOST RAM (302 GB -> node OOM, run 3279810). For checkpoints, try
   # actor.megatron.use_dist_checkpointing: True (untested).
   save_freq: -1
-  test_freq: -1   # disable validation — greedy decode over 1319 samples hangs at 24min (cuEventSynchronize deadlock)
-  val_before_train: false
+  test_freq: ${TEST_FREQ}               # see TEST_FREQ above (default -1 = off)
+  val_before_train: ${VAL_BEFORE_TRAIN}
   default_local_dir: ${CHECKPOINT_HOME}
   logger: ["console", "wandb"]
 
@@ -563,8 +591,10 @@ cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
 # should end up in. A plain source patch is one less moving part (no
 # sys.meta_path machinery, no PYTHONPATH staging, no import-timing dependency)
 # and the actual behavior is just readable in the file.
+# (2026-09-30) Also drops the same naive update_weights call from switch_to_rollout,
+# ported from apertus-benchmarks/patches/v1-separate-async-fixes.patch (run 3261338),
+# so test_freq validation can run mid-training.
 diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
-index 18a06ee2..4c1815a5 100644
 --- a/verl/trainer/ppo/v1/trainer_separate_async.py
 +++ b/verl/trainer/ppo/v1/trainer_separate_async.py
 @@ -133,7 +133,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
@@ -582,6 +612,25 @@ index 18a06ee2..4c1815a5 100644
 
      def on_train_begin(self):
          if self.config.skip.rollout_tq.enable:
+@@ -179,7 +185,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+
+     def switch_to_rollout(self):
+         # TODO: disable auto offload in config and offload according to the switch strategy
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        # self.checkpoint_manager.update_weights(...) is skipped for the same reason
++        # as on_init_end above: backend="naive" bypasses the (empty) hybrid replica
++        # list and pushes mode="naive" onto every actor rank, which unconditionally
++        # calls rollout.resume(tags=["weights"]) -- resuming a tag never released,
++        # since this recipe's real weight sync (standalone_checkpoint_manager, nccl
++        # backend, on_step_end) never touches memory-occupation tags at all. Left
++        # unpatched, this crashes SGLang's resume_memory_occupation with
++        # KeyError: 'weights' the first time switch_to_rollout runs -- which, since
++        # should_switch_to_rollout() is a hardcoded False stub, is only ever at
++        # validation (run 3261338: 45/46 steps clean, crashed here at the final val).
+         self.checkpoint_manager.resume_generation_replicas()
+         self.add_replicas_to_balancer()
+         self.current_mode = HybridEngineMode.ROLLOUT
+
 diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
 index 91d82b15..810ccbee 100644
 --- a/verl/utils/tensordict_utils.py

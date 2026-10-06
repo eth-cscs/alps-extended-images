@@ -7,46 +7,40 @@
 #SBATCH --time=5:00:00
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Copy of train-gsm8k-glm5.1-700B-full-async-megatron.sh switched from the
-# experimental fully-async recipe (verl.experimental.fully_async_policy) to the
-# V1 trainer (verl/trainer/ppo/v1) in separate-async mode:
+# GLM-5.1 (~744B MoE, DSA attention) GRPO on GSM8K -- verl V1 trainer in separate_async mode,
+# Megatron actor (TP=4 / PP=3 / EP=8 / DP=5 on 120 nodes) + one standalone SGLang TP=32
+# rollout replica (8 nodes), delta_sharded weight sync, R3 router replay. The DeepSeek-V3
+# recipe (train-gsm8k-deepseek-v3-671B-v1-separate-async-megatron.sh) is derived from this
+# one; the two share everything except the model-specific knobs (marked "GLM-5.1" /
+# "DeepSeek-V3").
 #
-#   trainer.use_v1=True
-#   trainer.v1.trainer_mode=separate_async
+# Status: the last full GLM-5.1 validation (20 clean R3+THD steps, run 3217439) predates the
+# delta_sharded / CPU-offload-optimizer settings below; the delta_sharded steady sync was only
+# ever completed on DeepSeek-V3 (run 3309430) after the verl PR #7777/#7778 fixes, which are
+# applied here too (2026-09-07) but not yet re-validated on GLM-5.1. History: the "Debugging
+# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh" section of .claude/CLAUDE.md.
 #
-# What changed relative to the fully-async script:
-#   * entrypoint      : verl.experimental.fully_async_policy.fully_async_main
-#                       -> verl.trainer.main_ppo
-#   * async_training  : the whole block is gone; the equivalent knobs are
-#                       trainer.v1.separate_async.* and trainer.v1.sampler.*
-#   * top-level rollout: gone; the standalone rollout resources are now declared
-#                       in actor_rollout_ref.rollout.{nnodes,n_gpus_per_node}
-#   * data batching   : the V1 separate-async trainer asserts
-#                       train_batch_size == parameter_sync_step * ppo_mini_batch_size
-#                       (fully-async required train_batch_size=0)
-#   * TransferQueue   : V1 stores all experience in TransferQueue; it is forced on
-#                       by main_ppo, we set it explicitly and size the storage units
-#   * old_log_probs   : driven by rollout.calculate_log_probs + algorithm.rollout_correction
-#                       (actor.use_rollout_log_probs is unused by V1)
-#   * lr schedule     : V1 sets actor.optim.total_training_steps in _init_dataloader,
-#                       i.e. before the workers are created, so the lr_decay_steps
-#                       workaround the fully-async script needed is dropped.
+# GLM-5.1 specifics, in one place:
+#   * model_type glm_moe_dsa: DSA attention (verl PR #7421 is load-bearing), custom tokenizer
+#     (trust_remote_code: True), 78 layers -> PP=3 is 26 layers per stage, EP=8 (EP=4 leaves
+#     experts 64-127 unmapped in megatron-bridge). Per-rank params 9.24B.
+#   * megatron-core 0.19.0 / megatron-bridge 0.6.1 / sglang 0.5.16 / flashinfer 0.6.14 are baked
+#     into the image (older flashinfer hung the TP=32 MLA/DSA decode plan()).
+#   * Checkpoint saving disabled (save_freq: -1): the HF export gathers the full model through
+#     rank-0 HOST RAM (302 GB on DeepSeek-V3, run 3279810; GLM-5.1 is bigger). Use
+#     actor.megatron.use_dist_checkpointing: True (untested) for a run that needs checkpoints.
 #
-# CAVEAT — the V1 separate-async trainer is *not* a pure disaggregated setup:
-# PPOTrainer._setup() always builds hybrid rollout replicas on top of the training
-# worker group (trainer world size / rollout world size = 288/32 = 9 replicas here)
-# *in addition to* the standalone rollout on ROLLOUT_NNODES. actor_rollout_ref.
-# hybrid_engine is not consulted anywhere in the V1 path, so this cannot be turned
-# off from the config. Those replicas are put to sleep as soon as the first sample
-# batch is drawn (should_switch_to_rollout() is hard-coded to False), but they are
-# instantiated at init with gpu_memory_utilization=0.75 on the training GPUs — this
-# is the first thing to look at if init OOMs.
+# verl V1 separate_async notes (vs the fully-async recipe this descends from):
+#   * data.train_batch_size == parameter_sync_step * ppo_mini_batch_size (asserted by verl).
+#   * old_log_probs come from rollout.calculate_log_probs + algorithm.rollout_correction.bypass_mode.
+#   * PPOTrainer._setup() also builds HYBRID rollout replicas on the training GPUs (not
+#     configurable) -- v1-separate-async-fixes.patch below no-ops them; without it init OOMs.
 # ─────────────────────────────────────────────────────────────────────────────
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-621fa40275c4f036" #alps7-dev-a9f9e56471c0574e image with update dependencies #alps7-dev-0f334b540ccc7034 image with megatron
 
-export MODEL_NAME="GLM-5.1"
-export MODEL_REPO="zai-org"
+export MODEL_NAME="${MODEL_NAME:-GLM-5.1}"
+export MODEL_REPO="${MODEL_REPO:-zai-org}"
 
 export PROJECT_NAME="async-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-verl-sglang-megatron-v1-separate-async-${SLURM_JOB_NUM_NODES}n"
@@ -60,39 +54,17 @@ mkdir -p $TRAINING_HOME
 cd $TRAINING_HOME
 
 
-
-# Standalone rollout needs exactly 8 nodes for TP=32 (8 nodes × 4 GPUs = 32 GPUs, 1 replica).
-# Training gets the remaining 120 nodes (480 GPUs) for TP=4, PP=3, EP=8, DP=5.
-# (80->104->128 nodes, 2026-08-31/09-01: the step-1 fused_adam optimizer-state OOM on trainer
-# local-GPU-0. Runs 3241496-3247517 (5x) all die in the first optimizer.step(): [MEMDUMP]
-# (run 3246683/3247517) proved it is a genuine hairline miss -- ~38 GiB free on GPU 0 right
-# before the step, fused_adam then allocates the full ~38 GiB DP-shard optimizer state (fp32
-# master-remainders + exp_avg + exp_avg_sq) and misses by 12-24 MiB, every run. NOT a phantom
-# process (nvidia-smi: one WorkerDict/GPU), NOT fragmentation (unconditional empty_cache()
-# closed the reserved-vs-alloc gap to 0.15 GiB and it still OOM'd), NOT token-dependent
-# (ppo_max_token_len_per_gpu 8192->4096 had zero effect). DP 4->5 shrinks the optimizer shard
-# ~38 -> ~30 GiB -- ~7.6 GiB margin, overwhelming for a MiB miss.)
+# 8 rollout nodes = one SGLang TP=32 replica (the model needs all 32 GPUs). The remaining 120
+# nodes (480 GPUs) train at TP=4 x PP=3 x EP=8 -> DP=5. The node count grew 80 -> 104 -> 128 while
+# chasing the step-1 optimizer-state OOM on GPU 0; the CPU-offload optimizer below is what fixed
+# it (see CLAUDE.md), so fewer nodes should work now -- untested.
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
-# V1 separate-async batching contract:
-#   data.train_batch_size == trainer.v1.separate_async.parameter_sync_step * actor.ppo_mini_batch_size
-# parameter_sync_step is the number of actor updates between two weight syncs to the
-# standalone rollout (the fully-async script called this trigger_parameter_sync_step).
-#
-# Both train_batch_size and ppo_mini_batch_size are PROMPT counts, not row counts:
-# actor.ppo_mini_batch_size gets multiplied by actor_rollout_ref.rollout.n internally
-# (verl/trainer/ppo/v1/trainer_base.py:1652) to get the actual row count fed to the
-# DP-parallel actor mini-batch, and that product is what the dp_size sizing constraint
-# (trainer_base.py:1441-1447, _get_required_batch_multiple) actually checks. Keep
-# ppo_mini_batch_size * rollout.n at least 2x dp_size (DP=3 x EP=8 = 24) — not just
-# >= dp_size, and not just checking ppo_mini_batch_size in isolation: at exactly 1x, every
-# DP rank gets exactly 1 row per mini-batch, and (historically, before the real fix in the
-# "TransferQueue==0.1.6 shape-equality bug" hazard above) a length-1 list made verl's/
-# TransferQueue's nested-vs-stacked batch assembly stack a plain Tensor instead of building
-# a jagged NestedTensor, crashing engine_workers.py's train_mini_batch (run 3134772:
-# AttributeError: 'Tensor' object has no attribute 'offsets'). That bug is fixed upstream
-# now (TransferQueue 0.1.7), but the >=2x margin costs nothing and remains cheap insurance.
+# Batching contract (verl asserts it): train_batch_size == parameter_sync_step * ppo_mini_batch_size.
+# Both are PROMPT counts; verl multiplies ppo_mini_batch_size by rollout.n for the row count and
+# checks it against dp_size (DP=5 x EP=8 = 40). Keep rows >= 2x dp_size so every DP rank gets
+# >= 2 rows per mini-batch (cheap insurance against length-1 batch edge cases).
 export ROLLOUT_N=8                   # responses per prompt -- GRPO advantages degenerate at n=1
 export PPO_MINI_BATCH_SIZE=10        # prompts; x ROLLOUT_N = 80 rows = 2x dp_size (DP=5 x EP=8 = 40)
 export PARAMETER_SYNC_STEP=2
@@ -133,77 +105,43 @@ data:
   train_batch_size: ${TRAIN_BATCH_SIZE}   # == parameter_sync_step * ppo_mini_batch_size
   gen_batch_size: 1      # prompts are submitted to the rollout one at a time
   return_raw_chat: True
-  max_response_length: 256  # reduced from 1024 — at ~10 tok/s for 744B TP=32, 1024 tokens takes 83min for 48 samples
+  max_response_length: 256  # GSM8K answers fit; 1024 made generation the bottleneck at TP=32
 
 actor_rollout_ref:
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
-    # DSA attention + THD (packed-sequence): re-enabled 2026-08-28, third attempt. Run 3201189
-    # (2026-08-27) found megatron-bridge 0.6.1 alone breaks core Megatron model init unconditionally
-    # — it needs megatron-core ~0.19.0, not the 0.18.2 this image ships. This script now upgrades
-    # both together; validated on a cheap 1-node probe (job 3207095) before this re-enable: both
-    # wheels install cleanly, and every import smoke test passes, including the exact chain that
-    # crashed 3201189 and the GLM-5.1 bridge module itself. See CLAUDE.md's Configuration audit +
-    # Run log entries for the full trace. Still unverified end-to-end on the real 80-node recipe —
-    # the probe only exercised imports, not actual model construction/training.
+    # THD packed sequences: required by R3 router replay and by use_fused_kernels. Works with DSA
+    # on megatron-core 0.19.0 + megatron-bridge 0.6.1 (the image); it did not on older versions.
     use_remove_padding: True
     use_shm: false
     trust_remote_code: True  # GLM-5.1 uses a custom TokenizersBackend tokenizer
-    # Fused linear cross-entropy (2026-09-01, added after run 3251006's backward-pass OOM):
-    # patches the Megatron forward to compute LM-head logits + log-probs + entropy WITHOUT
-    # materializing the [num_tokens, vocab~151K] logits tensor (and its bwd grad/softmax copies)
-    # -- several GiB of activation relief in exactly the fwd/bwd phase that OOM'd. verl gates it
-    # (verl/workers/engine/megatron/transformer_impl.py:_maybe_enable_fused_kernels) on
-    # use_remove_padding (set), not-value-model (actor), mtp.enable=False (confirmed in the
-    # 3251006 config dump), and uniform temperature (rollout temp 1.0) -- all satisfied. If any
-    # prereq were unmet verl auto-disables with a warning (not fatal). Numerically equivalent.
+    # Fused linear cross-entropy: never materializes the [tokens, vocab] logits tensor (several GiB
+    # of activation relief). verl auto-disables it (with a warning) if any prerequisite is unmet.
     use_fused_kernels: True
 
   actor:
-    # 120 training nodes x 4 GPUs = 480 GPUs; TP=4, PP=3, EP=8 -> 4x3x8=96, DP=5 (see
-    # TRAINING_NNODES above for the 80->104->128 node history and why DP had to keep growing:
-    # fused_adam optimizer-state init needs ~38 GiB on GPU 0 and DP scaling is the only lever
-    # that shrinks it -- ~38 GiB at DP=4 -> ~30 GiB at DP=5).
-    # EP=8: EP=4 causes megatron-bridge to fail for experts 64-127 (unmapped).
-    # PP=3: 78 layers / 3 = 26 layers/stage.
+    # 480 training GPUs: TP=4 x PP=3 x EP=8 = 96 -> DP=5. GLM-5.1: PP=3 -> 78 / 3 = 26 layers per
+    # stage; EP=8 (EP=4 leaves experts 64-127 unmapped in megatron-bridge).
     ppo_mini_batch_size: ${PPO_MINI_BATCH_SIZE}
     ppo_micro_batch_size_per_gpu: 1
-    # 16384 -> 12288 (2026-08-29) -> 8192 -> 4096 (2026-08-31): the Megatron fused_adam
-    # optimizer-state OOM on trainer local-GPU-0. Runs 3241496 / 3243323 / 3244653 / 3246683 all
-    # die in the FIRST optimizer.step(). Run 3246683's [MEMDUMP] proved it is a GENUINE HAIRLINE
-    # MISS (~12-24 MiB), not a phantom co-resident process: nvidia-smi shows exactly one
-    # WorkerDict per GPU, ~35 GiB free right before the step, ~12.3 GiB unavoidable
-    # NCCL/context, and fused_adam then allocates the full ~35 GiB DP-shard optimizer state in
-    # large contiguous blocks. NOT fragmentation (reserved-but-unallocated only ~40-65 MiB at
-    # OOM); expandable_segments would not help and breaks the shared SGLang rollout (run 3219305).
-    # Primary fix: the unconditional empty_cache() in optimizer_step (step1-oom-memdump.patch)
-    # returns ~3 GiB of cached-but-unallocated blocks to the driver first. This 8192->4096 cut is
-    # paired insurance -- lowers the fwd/bwd reserved high-water carried into the optimizer step.
+    # Token budget per micro-batch: 4096 keeps the fwd/bwd reserved high-water low ahead of the
+    # optimizer step (memory history in CLAUDE.md); with ~2 rows per DP rank this is 1 micro-batch.
     ppo_max_token_len_per_gpu: 4096
     use_dynamic_bsz: True
     megatron:
       tensor_model_parallel_size: 4
       pipeline_model_parallel_size: 3
       expert_model_parallel_size: 8
-      # param_offload: True -> False (2026-09-02, after run 3262227): the two host-RAM tuning
-      # knobs (optimizer_offload_fraction, update_weights_bucket_megabytes) moved the 446/450 GB
-      # host-RAM ceiling by ~0 -- the HybridDeviceOptimizer apparently keeps its full state
-      # pinned on host regardless of fraction, so that was the wrong lever. Step 1 itself now
-      # completes fully clean with 35-44 GB GPU free at [MEMDUMP], so GPU can afford to keep the
-      # ~18.5 GB bf16 params resident instead of CPU-bouncing them every step -- removes that
-      # chunk from host RAM entirely rather than tuning it.
+      # Params stay on GPU (bf16, ~17 GB/rank): offloading them tipped trainer-node host RAM over
+      # 450 GB together with the CPU-offloaded optimizer state and the delta-sync snapshot.
       param_offload: False
       grad_offload: True
       optimizer_offload: True
-      vanilla_mbridge: False  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge
-      # R3 (Rollout Router Replay) — verl's MoE routing-alignment mechanism, appropriate for this
-      # model per verl's own docs (GLM-5 named as an adopter). Re-enabled 2026-08-28, third
-      # attempt — see the model.use_remove_padding comment above and this script's Configuration
-      # audit / Run log entries in CLAUDE.md for the full trace of what broke it twice before and
-      # what changed (megatron-core now upgraded alongside megatron-bridge, validated on a cheap
-      # probe first). The correct config path, confirmed against v0.9.0 source, is
-      # router_replay/mode: R3 right here under actor.megatron — not the top-level
-      # actor.router_replay.mode field. Still unverified on the real 80-node recipe.
+      vanilla_mbridge: False  # GLM-5.1 (glm_moe_dsa) needs megatron-bridge
+      # R3 (Rollout Router Replay): replays the rollout's expert routing in the trainer -- verl's
+      # recommended alignment for large MoE. Needs use_remove_padding + rollout.enable_rollout_routing_replay
+      # + the r3 sglang import patch below. Config path confirmed against v0.9.0 (actor.megatron.*,
+      # not the top-level actor.router_replay).
       router_replay:
         mode: R3
       override_transformer_config:
@@ -214,42 +152,13 @@ actor_rollout_ref:
         moe_grouped_gemm: True
         moe_permute_fusion: True
     optim:
-      # CPU-streaming (HybridDevice) optimizer -- the step-1 fused_adam OOM fix, 2026-09-01.
-      # Runs 3241496-3250425 (6x) all die in the first optimizer.step(): [MEMDUMP] (3246683,
-      # 3247517, 3250425) proved it is a genuine hairline miss -- ~40 GiB free on GPU 0 right
-      # before the step, and optimizer.step() then allocates a ~40 GiB transient (exp_avg +
-      # exp_avg_sq creation, grad->fp32-main copy, distributed-optimizer all-gather buffer,
-      # grad-norm + .float() upcast scratch) and misses by ~19 MiB, every run. DP scaling stalled
-      # (3247517 DP=4 / 3250425 DP=5 moved "free" only ~2 GiB -- the all-gather buffer and bf16
-      # params are a fixed floor that DP does not shrink).
-      #
-      # override_optimizer_config is forwarded verbatim to Megatron-core's OptimizerConfig
-      # (verl/utils/megatron/optimizer.py:210). This block is verl's OWN canonical large-MoE
-      # Megatron-async recipe -- see verl/experimental/fully_async_policy/shell/
-      # grpo_30b_a3b_base_math_megatron_96_32_mis.sh (Qwen 30B-A3B MoE, 96+32 nodes) and the
-      # other 30B/35B MoE megatron-async scripts, which all set exactly these four keys.
-      # optimizer_cpu_offload builds Megatron's HybridDeviceOptimizer: the optimizer state lives
-      # on CPU and is streamed bucket-by-bucket during the step, so the GPU never materializes
-      # the full moments. overlap_cpu_optimizer_d2h_h2d hides the transfer. use_precision_aware_
-      # optimizer is required by that path. verl's own megatron.optimizer_offload:True stays on
-      # alongside (its offload code already handles the HybridDeviceOptimizer via
-      # _move_new_state_to_right_device).
-      #
-      # main_grads_dtype: bf16 (2026-09-01, added after run 3251006): the CPU-offload optimizer
-      # above cleared the step-1 optimizer.step() OOM (6 runs died there), and step 1 then died
-      # EARLIER in the backward-pass DP grad reduce-scatter -- the fp32 DDP grad buffer holds
-      # grads for all 9.24B local params (~37 GiB) resident before the reduce-scatter shards it.
-      # bf16 halves it to ~18.5 GiB (this key also drives the DDP grad-bucket dtype). Safe here:
-      # token budget 4096 + ~2 rows/DP-rank = 1 micro-batch, so NO grad accumulation (bf16 error
-      # only compounds over many micro-batches); the fp32 master-param update is unchanged.
-      # Adam moments left fp32 (on CPU now anyway).
+      # Megatron HybridDeviceOptimizer (CPU-streamed optimizer state) -- verl's own large-MoE
+      # megatron-async recipes set exactly these keys. Removes the ~40 GB optimizer-state transient
+      # that OOMed GPU 0 at DP<=5 (6 runs; CLAUDE.md). main_grads_dtype bf16 halves the DDP grad
+      # buffer (~37 -> ~18 GB); safe here because the 4096-token budget means no grad accumulation.
       override_optimizer_config:
         optimizer_cpu_offload: True
-        # 1.0 -> 0.7 (2026-09-02, after run 3257320): the CPU-offload optimizer + verl param/grad
-        # offload + the delta engine's pinned CPU snapshot tipped trainer node RAM to 446/450 GB
-        # (Ray OOM-killed a WorkerDict, hung the post-step delta sync). Keeping ~30% of the ~22 GB
-        # optimizer state on GPU (which has 22-45 GB free per [MEMDUMP]) frees ~7 GB host/rank.
-        optimizer_offload_fraction: 0.7
+        optimizer_offload_fraction: 0.7  # 30% of the optimizer state stays on GPU; frees ~7 GB host/rank
         overlap_cpu_optimizer_d2h_h2d: True
         use_precision_aware_optimizer: True
         main_grads_dtype: bf16
@@ -264,36 +173,27 @@ actor_rollout_ref:
     n_gpus_per_node: 4
     temperature: 1.0
     n: ${ROLLOUT_N} # responses per prompt — GRPO group size for the relative-advantage baseline
-    # 8 rollout nodes × 4 GPUs = 32 GPUs; TP=32 (one replica) — 700B needs all 32 GPUs to fit
+    # One TP=32 replica on 32 GPUs: ~744B in bf16 needs all of them.
     tensor_model_parallel_size: 32
     gpu_memory_utilization: 0.75
     free_cache_engine: false  # keep KV cache alive across weight syncs — avoids engine rebuild + CUDA graph re-capture across TP=32 (8-node deadlock)
     calculate_log_probs: True   # required: bypass_mode reads rollout_log_probs as old_log_probs
     log_prob_use_dynamic_bsz: True
-    # R3 companion flag (see actor.megatron.router_replay above). Re-enabled 2026-08-28 alongside
-    # the megatron-core upgrade — r3-sglang-routed-experts-import-fix.patch (still applied below)
-    # was never actually exercised in run 3201189, since the job died in Megatron model init
-    # before rollout ever started; this is the first attempt where it should actually run.
-    enable_rollout_routing_replay: True
-    # delta_sharded (was: nccl) — 2026-08-29. The nccl backend streams the FULL 700B model every
-    # sync via megatron-bridge per-tensor gather_from_ep_ranks (~6000 back-to-back collectives),
-    # and ~1 run in 2 hangs when one rank silently drops a collective (runs 3141801 / 3207923 /
-    # 3219811). delta_sharded exports each rank's LOCAL mcore shard (no cross-rank gather in the
-    # export; bridge param-mapping run comm-stubbed) and ships only the changed (position,value)
-    # pairs with count-lockstepped sparse gathers — designed by verl specifically to keep the
-    # gather sequence identical across ranks. Only the one-time seed sync still uses the fragile
-    # full path; every steady sync is on the robust delta path (and far smaller / faster). verl
-    # auto-wires the SGLang delta_loader when backend==delta_sharded (async_sglang_server.py:263).
-    # See CLAUDE.md's Run log / this script's Configuration audit for the full investigation.
+    enable_rollout_routing_replay: True  # R3 companion flag (see actor.megatron.router_replay)
+    # delta_sharded: each rank byte-diffs its local shard and ships only changed (position, value)
+    # pairs; the nccl backend re-streamed the full model via megatron-bridge every sync and hung
+    # ~1 run in 2. Its two scale bugs (rank-0 padded gather OOM / 480-peer gather hang) are fixed
+    # by verl PRs #7778 / #7777, applied below.
     checkpoint_engine:
       backend: delta_sharded  # separate-async rejects "naive"; delta_sharded extends the nccl engine
-      # 2048 -> 512 (2026-09-02, after run 3257320): the per-bucket megatron-bridge HF-conversion
-      # buffer during the weight sync -- 4x smaller cuts host RAM on the trainer nodes (446/450 GB
-      # OOM in the post-step delta sync).
-      update_weights_bucket_megabytes: 512
+      update_weights_bucket_megabytes: 512  # flush bucket to the rollout (2048 cost host RAM on the trainer)
       engine_kwargs:
         delta_sharded:
           rebuild_group: false
+          # Per-rank byte budget of one steady-sync gather round (verl PR #7778). Under PP>1 every
+          # param merges over the 480-rank WORLD group, so this bounds what rank 0 receives per round;
+          # with PR #7777 (targeted P2P) that is real data from <= 32 ranks, i.e. a few GB at most.
+          gather_round_megabytes: 64
     engine_kwargs:
       sglang:
         watchdog_timeout: 300
@@ -308,7 +208,7 @@ actor_rollout_ref:
       tensor_model_parallel_size: 4
       pipeline_model_parallel_size: 3
       expert_model_parallel_size: 8
-      vanilla_mbridge: False  # GLM-5.1 model_type=glm_moe_dsa requires Megatron-Bridge
+      vanilla_mbridge: False  # GLM-5.1 (glm_moe_dsa) needs megatron-bridge
 
 algorithm:
   adv_estimator: grpo
@@ -341,20 +241,16 @@ trainer:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
   total_epochs: 3
-  # Overrides the epoch-based step count (verl/trainer/ppo/v1/trainer_base.py:712-716) so the
-  # run stops after a fixed number of steps regardless of dataset size/epochs, and the LR
-  # scheduler (fed total_training_steps * parameter_sync_step) decays over the right horizon
-  # instead of the full 231-step schedule. Sized against the confirmed ~350-360s/step (run
-  # 3149736): 40 * 360s = 4h worst case + ~20min setup overhead, comfortably inside the 5h
-  # limit. Enough to see whether training is moving at all (KL-from-reference nonzero, reward
-  # mean not degenerate) but not enough for a trustworthy reward trend, which needs closer to
-  # 50-100 steps on GSM8K's noisy per-step reward signal.
+  # Fixed step count (overrides epochs; also sizes the LR schedule). 40 steps ~ 1 h wall here.
   total_training_steps: 40
   project_name: ${PROJECT_NAME}
   experiment_name: ${RUN_NAME}
   nnodes: ${TRAINING_NNODES}
   n_gpus_per_node: 4
-  save_freq: 20
+  # Checkpoint saving OFF (2026-09-07): with the default use_dist_checkpointing: False the model save
+  # is an HF export gathered through rank-0 HOST RAM (302 GB -> node OOM on DeepSeek-V3, run 3279810;
+  # this model is larger). For checkpoints, try actor.megatron.use_dist_checkpointing: True (untested).
+  save_freq: -1
   test_freq: -1   # disable validation — greedy decode over 1319 samples hangs at 24min (cuEventSynchronize deadlock)
   val_before_train: false
   default_local_dir: ${CHECKPOINT_HOME}
@@ -394,6 +290,22 @@ def extract_model_answer(response: str) -> Optional[str]:
         return raw
 
 
+_DUMP_LEFT = [6]  # print a few raw rollouts per reward process (verl does not log generations)
+
+
+def _maybe_dump(solution_str: str, ground_truth, model_ans) -> None:
+    # Cheap visibility into what the rollout actually generates ([REWARD-DUMP] lines in the log):
+    # the fastest way to tell a broken rollout from a wrong answer format.
+    if _DUMP_LEFT[0] <= 0:
+        return
+    _DUMP_LEFT[0] -= 1
+    text = solution_str.replace("\n", "\\n")
+    if len(text) > 900:
+        text = text[:900] + "...[truncated " + str(len(solution_str)) + " chars]"
+    print("[REWARD-DUMP] gt=" + repr(str(ground_truth)) + " parsed=" + repr(model_ans)
+          + " words=" + str(len(solution_str.split())) + " text=" + text, flush=True)
+
+
 def compute_reward(
     data_source, solution_str, ground_truth, extra_info=None, **kwargs
 ) -> float:
@@ -403,12 +315,12 @@ def compute_reward(
         return 0.0
 
     model_ans = extract_model_answer(solution_str)
+    _maybe_dump(solution_str, ground_truth, model_ans)
     has_answer = "<answer>" in solution_str and "</answer>" in solution_str
     format_reward  = 0.1 if has_answer else 0.0
     outcome_reward = 1.0 if (model_ans is not None and model_ans == str(ground_truth)) else 0.0
 
-    # Smooth length penalty starting at 1000 words, max -0.2 at 2000 words.
-    # Kimi-K2.6 produces long thinking traces; penalise only runaway verbosity.
+    # Smooth length penalty starting at 1000 words, max -0.2 at 2000 words (runaway verbosity only).
     words = len(solution_str.split())
     length_penalty = -0.2 * min(1.0, max(0.0, (words - 1000) / 1000))
 
@@ -477,16 +389,19 @@ EOF
 sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
 
-# Content of example/patches/v1-separate-async-fixes.patch, embedded here
-# rather than read via a script-relative path: under sbatch, BASH_SOURCE[0]
-# resolves to the spool-staged copy of this script, not its checkout location,
-# so a script-relative read silently fails on every node (this is the exact
-# failure mode that lost the old sitecustomize.py-based fallback patch in run
-# 3129805 -- see Known hazards in CLAUDE.md). Applied via git apply after the
-# verl v0.9.0 checkout below, alongside the upstream PR patches -- three real,
-# stable fixes converted from runtime sitecustomize.py monkeypatches (used
-# while still iterating) once run 3149736 confirmed the whole recipe works
-# end-to-end with them as a plain source patch instead.
+# Local verl source patches (example/patches/*.patch), embedded as heredocs: under sbatch the
+# script runs from Slurm's spool copy, so script-relative paths do not resolve on the nodes. Each
+# heredoc must stay byte-identical to its checked-in file. Staged on the batch host, sbcast to
+# every node, applied in the srun (apply-or-fail, so no node can silently run unpatched code).
+#   v1-separate-async-fixes.patch ....... no-op the hybrid rollout replicas + the stale hybrid
+#                                          weight-sync call; nested-tensor fix in TensorDict assembly
+#   r3-sglang-routed-experts-import-fix .. R3 rollout capture vs sglang 0.5.16 (moved module,
+#                                          base64 routed_experts)
+#   wsync-debug-progress-log.patch ....... per-tensor weight-sync progress log + the seed-sync
+#                                          WORLD barrier (megatron-bridge collective desync)
+#   delta-sharded-localserializedtensor-import-fix .. sglang 0.5.16 import path for the delta path
+#   step1-oom-memdump.patch .............. unconditional empty_cache() before optimizer.step()
+#                                          (+ a one-shot [MEMDUMP] memory report per rank)
 cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
 # Local fixes for verl v0.9.0's V1 separate-async trainer, discovered debugging
 # train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh (see Known hazards and the
@@ -636,14 +551,6 @@ index d9beede7..4e2d767e 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/v1-separate-async-fixes.patch ${TRAINING_CONFIG}/v1-separate-async-fixes.patch
 
-# example/patches/r3-sglang-routed-experts-import-fix.patch, embedded here for the same
-# reason as v1-separate-async-fixes.patch above (BASH_SOURCE[0] resolves to the sbatch
-# spool copy under srun, not this file's real checkout location, so a script-relative
-# read silently fails on every node). Applied via git apply after the verl v0.9.0
-# checkout below, alongside the other verl-source patches. See CLAUDE.md's Configuration
-# audit entry and the Run log entries for run 3199623 / probe job 3199799 for the full
-# story: verl v0.9.0 imports R3's rollout-side capture helper from a path this image's
-# sglang (0.5.16) no longer has it at -- relocated, not missing.
 cat > "${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch" <<- 'EOF'
 # Fixes R3 (Rollout Router Replay)'s rollout-side routed-experts capture for this image's
 # actual SGLang version (0.5.16). Discovered debugging
@@ -724,11 +631,6 @@ index b3329a8..fe20e55 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch
 
-# example/patches/wsync-debug-progress-log.patch, embedded (same BASH_SOURCE-under-sbatch
-# reason as the patches above). Per-tensor progress logging for the trainer->rollout weight
-# sync (diagnostic) PLUS the seed-sync lockstep barrier that fixes the megatron-bridge
-# collective desync hit in runs 3141801/3207923/3219811/3240762 (see the patch header and
-# CLAUDE.md). Applied after the verl checkout, alongside the other verl-source patches.
 cat > "${TRAINING_CONFIG}/wsync-debug-progress-log.patch" <<- 'EOF'
 # [CSCS, 2026-09-02] Weight-sync per-tensor progress logging + seed AND steady-sync lockstep
 # barrier.
@@ -846,10 +748,6 @@ index e8a6c56..259cdd7 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/wsync-debug-progress-log.patch ${TRAINING_CONFIG}/wsync-debug-progress-log.patch
 
-# example/patches/delta-sharded-localserializedtensor-import-fix.patch, embedded (same reason).
-# verl v0.9.0's delta_sharded rollout path imports LocalSerializedTensor from a sglang path that
-# moved in sglang 0.5.16; run 3223205 hit this on the first delta flush. Applied after the verl
-# checkout alongside the other verl-source patches.
 cat > "${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch" <<- 'EOF'
 # [CSCS, 2026-08-30] verl v0.9.0's delta_sharded weight-sync path
 # (_update_weights_delta_flush in sglang_rollout.py) hardcodes
@@ -893,10 +791,6 @@ index 07e30d0..bf05f07 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch ${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch
 
-# example/patches/step1-oom-memdump.patch, embedded (same reason). DIAGNOSTIC ONLY: dumps GPU
-# memory accounting + full nvidia-smi right before the first optimizer.step() to identify the
-# ~19 GiB of non-trainer memory on trainer GPU-0 that OOMs fused_adam at step 1 (runs 3241496 /
-# 3243323 / 3244653). Remove once identified.
 cat > "${TRAINING_CONFIG}/step1-oom-memdump.patch" <<- 'EOF'
 # [CSCS diagnostic, 2026-09-01/02] step-1 GPU memory instrumentation + the empty_cache() fix.
 #
@@ -999,19 +893,10 @@ index 259cdd7..fa9d585 100644
 EOF
 sbcast -f ${TRAINING_CONFIG}/step1-oom-memdump.patch ${TRAINING_CONFIG}/step1-oom-memdump.patch
 
-# CSCS SGLang scheduler-watchdog diagnostic (2026-09-02, after run 3264247). The TP=32 standalone
-# rollout's own 300s scheduler watchdog has now hung at 3 distinct call sites across this recipe's
-# history (a torch.distributed broadcast, run 3152802; flashinfer MLA plan(), run 3209484, fixed
-# by the flashinfer 0.6.14 pin; R3's routed-experts get_topk D2H copy, run 3264247) -- a real,
-# recurring TP=32 SGLang fragility, not (so far) a single flake. The stock watchdog only py-spy
-# dumps Python stacks on timeout -- shows WHERE a rank is stuck, not the underlying CUDA state,
-# which is what actually found + fixed the flashinfer-MLA occurrence. This file defines an extra
-# diagnostic hook (nvidia-smi + local CUDA memory/stream state) wired into SGLang's own watchdog
-# dump_info callback -- see the srun-side patcher below. Deliberately does NOT attempt an NCCL
-# flight-recorder dump: that API's behavior when called ad hoc (outside torch's own watchdog
-# handler) is not confirmed safe/fast, and this code runs INSIDE the watchdog thread that is
-# about to SIGQUIT the stuck process -- anything slow or blocking here would delay recovery
-# instead of just diagnosing it. Kept to fast, synchronous, local reads only.
+
+# SGLang scheduler-watchdog diagnostic hook: on a TP=32 rollout watchdog timeout (3 distinct call
+# sites so far, see the "TP=32 SGLang" hazard in CLAUDE.md) also print nvidia-smi + local CUDA
+# state next to the stock py-spy dump. Wired into sglang's WatchdogRaw dump_info in the srun.
 cat > "${TRAINING_CONFIG}/cscs_watchdog_diag.py" <<- 'PYEOF'
 def _cscs_watchdog_dump_info():
     """[CSCS diagnostic] Extra state captured on any SGLang scheduler watchdog timeout, beyond
@@ -1053,14 +938,11 @@ def _cscs_watchdog_dump_info():
 PYEOF
 sbcast -f ${TRAINING_CONFIG}/cscs_watchdog_diag.py ${TRAINING_CONFIG}/cscs_watchdog_diag.py
 
-# Fetch the upstream PR patches once here and sbcast them to every node, instead of
-# curl-ing them from inside the srun. In run 3124273 each of the 80 nodes downloaded
-# them independently and only ~45/80 succeeded, so the cluster ran mixed verl code:
-# the nodes that missed PR #7422 flipped the standalone rollout back to
-# load_format=auto and their TP ranks started loading the real 700B weights while
-# the patched ranks dummy-initialised, blowing up SGLang's post-load barrier.
-# -f makes an HTTP error page a hard failure instead of a "patch" that applies as a no-op.
-for pr in 7421 7422 7423; do
+
+# Upstream verl PRs applied at runtime (v0.9.0 does not have them). Fetched ONCE here and sbcast:
+# per-node downloads inside the srun left half the cluster unpatched (run 3124273). -f turns an
+# HTTP error page into a hard failure. What each one is: see the apply loop in the srun.
+for pr in 7421 7422 7423 7777 7778; do
     curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
         || { echo "FATAL: could not download PR #${pr}"; exit 1; }
     [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
@@ -1068,12 +950,17 @@ for pr in 7421 7422 7423; do
     sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
 done
 
-# NOTE (2026-08-30): the runtime pip upgrades that used to be here — TransferQueue 0.1.7,
-# megatron-core 0.19.0, megatron-bridge 0.6.1, flashinfer 0.6.14 (matched python+cubin) — are now
-# all baked into the image (tag alps7-dev-a9f9e56471c0574e, built from
-# Alps-Images/apps/verl/Containerfile). Removed. The srun still verifies the versions non-fatally
-# and applies the verl *source* patches (PR #7421/#7422/#7423 + the local .patch files), which
-# are NOT in the image.
+# sglang PR #38298 (found on the DeepSeek-V3 recipe, 2026-09-07): the sglang DeepSeek-family loader
+# fused q_a_proj / kv_a_proj_with_mqa only when both halves arrived in the same load_weights call;
+# the chunked delta weight sync split pairs across calls and left layers with dummy-init attention.
+# A no-op for models without q_lora_rank; applied here for parity with the DeepSeek-V3 recipe
+# (patch -p2 against the installed sglang 0.5.16 in the srun).
+export SGLANG_FIX_QKV_A_CACHE="38298"
+curl -sfL "https://github.com/sgl-project/sglang/pull/${SGLANG_FIX_QKV_A_CACHE}.patch" -o "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" \
+    || { echo "FATAL: could not download sglang PR #${SGLANG_FIX_QKV_A_CACHE}"; exit 1; }
+grep -q "^diff --git a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py" "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" \
+    || { echo "FATAL: sglang qkv_a cache patch has no loader diff (bad SHA or GitHub error page)"; exit 1; }
+sbcast -f "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch"
 
 
 # Download model (skip if already present)
@@ -1114,15 +1001,12 @@ export WANDB_SILENT=true # Suppress WandB logs
 export RAY_memory_usage_threshold=0.99
 
 
-
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
     --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
 
-# verl is baked into the image at v0.9.0 (Containerfile VERL_REF=v0.9.0), editable-installed from
-# /workspace/verl — no runtime checkout needed. The source patches below (PR #7421/#7422/#7423 +
-# the local .patch files) are still applied on top.
+# verl is baked into the image at v0.9.0 (editable install at /workspace/verl); the patches below go on top.
 git -C /workspace/verl --no-pager log --oneline -1 || true
 
 
@@ -1132,10 +1016,7 @@ export PIP_CACHE_DIR=/tmp/pip_cache_${SLURM_JOB_ID}
 export TMPDIR=/tmp
 mkdir -p $PIP_CACHE_DIR
 
-# Image-version + import smoke test (diagnostic only, non-fatal). Every dependency below is baked
-# into the image now; this block just makes a wrong image tag obvious in the first ~30 s of the
-# log instead of via a downstream crash. A failure here does NOT stop the job — the real step
-# will fail loudly with a clear error if the image is actually wrong.
+# Image-version + import smoke test (non-fatal): makes a wrong image tag obvious in the first 30 s.
 python3 -c "
 import importlib.metadata as _m
 for _p in (\"verl\", \"TransferQueue\", \"megatron-core\", \"megatron-bridge\", \"flashinfer-python\", \"flashinfer-cubin\", \"sglang\", \"transformers\", \"transformer-engine\", \"transformer-engine-torch\", \"nvidia-cutlass-dsl\"):
@@ -1162,14 +1043,8 @@ except ImportError as _e:
 "
 
 
-# Patch megatron-bridge safe_config_loader to skip filelock.
-# /dev/shm and /tmp on CSCS Alps do not support fcntl.flock in the container
-# (ENOLCK / ESTALE on every attempt). The lock is unnecessary because the config
-# files are written by localid=0 before any reader starts (purely read-only after that).
-#
-# We match line-by-line on the "with filelock." prefix rather than using a regex
-# that tries to parse the argument, because FileLock() arguments often contain
-# nested parens (e.g. os.path.join(...)) which break [^)]* patterns.
+# megatron-bridge safe_config_loader: drop its filelock (fcntl.flock is unsupported in-container on
+# CSCS Lustre/tmpfs). Safe: the config files are written by local rank 0 before any reader starts.
 python3 -c "
 import importlib.util
 spec = importlib.util.find_spec(\"megatron.bridge.models.hf_pretrained.safe_config_loader\")
@@ -1199,11 +1074,8 @@ else:
         print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
 "
 
-# CSCS SGLang scheduler-watchdog diagnostic: wire _cscs_watchdog_dump_info (staged above, see the
-# batch-host heredoc for the full reasoning) into the sglang WatchdogRaw dump_info hook, which
-# is None by default (sglang/srt/utils/watchdog.py never passes it). Best-effort: WARN and
-# continue on any mismatch (sglang version drift) rather than aborting the run -- this is
-# diagnostic-only, not load-bearing.
+# Wire the watchdog diagnostic (cscs_watchdog_diag.py) into the sglang WatchdogRaw dump_info hook.
+# Best-effort: WARN and continue on sglang drift (diagnostic only, not load-bearing).
 python3 -c "
 import importlib.util
 spec = importlib.util.find_spec(\"sglang.srt.utils.watchdog\")
@@ -1217,13 +1089,8 @@ else:
         print(\"CSCS watchdog diagnostic already patched in \" + p)
     else:
         anchor = \"class Watchdog:\"
-        # soft=soft, appears twice in this file: once in the Watchdog.create() call to
-        # _WatchdogReal(...) (which has no dump_info parameter -- injecting there would break
-        # sglang startup with a TypeError), and once in the _WatchdogReal.__init__ call to
-        # WatchdogRaw(...) (the real target, which does accept dump_info). Disambiguate by also
-        # matching the closing paren: only the WatchdogRaw(...) call has soft=soft, immediately
-        # followed by the closing paren; the _WatchdogReal(...) call has test_stuck_time=... in
-        # between. Verified against the real sglang v0.5.16 source before wiring this in.
+        # soft=soft, appears twice: the WatchdogRaw(...) call (the target) is the one immediately
+        # followed by the closing paren.
         call_line = \"            soft=soft,\n        )\"
         if anchor not in src or call_line not in src:
             print(\"WARNING: sglang watchdog.py anchor or call-site not found in \" + p + \" -- skipping (sglang version drift?)\")
@@ -1241,27 +1108,30 @@ else:
             print(\"Patched CSCS watchdog diagnostic hook into \" + p)
 "
 
-# Apply the upstream PR patches sbcast to ${TRAINING_CONFIG} before the srun. They are
-# NOT in v0.9.0 (all three still apply cleanly to the tag) and must be applied *after*
-# the checkout above — git checkout -f would discard them.
-#
-# A patch that neither applies nor is already present is fatal: a cluster where only
-# some ranks carry a patch is worse than one that carries none (run 3124273).
-#
-# PR #7421: DSA (experimental_attention_variant=dsa) compatibility with mcore >= 0.16.2.
-#   Upstream _run_core_attention no longer forwards the x/qr kwargs DSA requires; route
-#   DSA instances through the verl patch_forward. Also injects a pure-PyTorch
-#   Walsh-Hadamard fallback when fast_hadamard_transform is not installed.
-# PR #7422: Preserve load_format=dummy in disaggregated SGLang rollout.
-#   At v0.9.0 async_sglang_server.py still overrides dummy -> auto for every non-hybrid
-#   replica, which is exactly the standalone rollout of separate-async, so the rollout
-#   nodes load the 700B weights from Lustre instead of receiving them over NCCL.
-# PR #7423: Fix NCCL deadlock in async disaggregated weight sync.
-#   update_actor (thread-pool) and update_weights (event loop) both submit ops to the
-#   same PP/EP NCCL communicators. A threading.Lock serialises them; entry and exit
-#   barriers ensure all actors complete the weight-sync collective before any resumes
-#   training, preventing seq-number mismatches across EP ranks.
-for pr in 7421 7422 7423; do
+# sglang PR #38298 (see the batch-host block): LOAD-BEARING for the delta weight sync. patch -p2
+# against the installed sglang (diff paths are python/sglang/...); presence of the new attribute
+# is both the idempotency test and the post-check. Must run before ray start.
+SGL_LOADER=$(python3 -c "import sglang.srt.models.deepseek_common.deepseek_weight_loader as m; print(m.__file__)")
+[ -n "$SGL_LOADER" ] || { echo "FATAL: sglang deepseek_weight_loader not found on $(hostname)"; exit 1; }
+SGL_PKG_ROOT=${SGL_LOADER%/sglang/srt/models/deepseek_common/deepseek_weight_loader.py}
+if grep -q "_pending_fused_a_proj" "$SGL_LOADER"; then
+    echo "sglang qkv_a cache fix already present on $(hostname), skipping"
+elif patch -p2 -d "$SGL_PKG_ROOT" -s < "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" && grep -q "_pending_fused_a_proj" "$SGL_LOADER"; then
+    echo "Applied sglang PR #${SGLANG_FIX_QKV_A_CACHE} (qkv_a cache fix) on $(hostname)"
+else
+    echo "FATAL: sglang qkv_a cache fix did not apply on $(hostname)"
+    exit 1
+fi
+
+# Upstream verl PRs (fetched on the batch host). apply-or-already-present-or-FATAL: a cluster where
+# only some ranks carry a patch is worse than one that carries none (run 3124273).
+#   #7421 DSA attention compat with mcore >= 0.16.2 (load-bearing: GLM-5.1 uses DSA)
+#   #7422 keep load_format=dummy for the standalone rollout (else it loads the full model from Lustre)
+#   #7423 lock + barriers around the async weight sync (NCCL deadlock)
+#   #7777 delta_sharded steady sync: targeted P2P instead of the padded 480-way gather-to-rank-0
+#         (found on the DeepSeek-V3 recipe; run 3263683 here hung on the same collective).
+#   #7778 gather_round_megabytes kwarg (same origin) -- applied separately below with fuzz.
+for pr in 7421 7422 7423 7777; do
     p="${TRAINING_CONFIG}/${pr}.patch"
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied PR #${pr} on $(hostname)"
@@ -1273,76 +1143,34 @@ for pr in 7421 7422 7423; do
     fi
 done
 
-# example/patches/v1-separate-async-fixes.patch: three local fixes for this recipe
-# specifically (hybrid-rollout OOM, stale hybrid weight-sync call, a shape-equality
-# bug in TensorDict construction) — see the header of the patch file, and Known
-# hazards / Run log in CLAUDE.md, for the full story. Same apply-or-fail discipline
-# as the PR patches above.
-p="${TRAINING_CONFIG}/v1-separate-async-fixes.patch"
-if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
-    git -C /workspace/verl apply "$p" && echo "Applied v1-separate-async-fixes.patch on $(hostname)"
-elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
-    echo "v1-separate-async-fixes.patch already present on $(hostname), skipping"
+# PR #7778: delta_checkpoint_engine.py moved between v0.9.0 and main, so its hunk needs patch
+# --fuzz=3. Idempotency = a presence test on the installed file (NOT patch --dry-run -R, which with
+# fuzz reports "already applied" on an unpatched tree), re-asserted after applying.
+p="${TRAINING_CONFIG}/7778.patch"
+_has_round() { grep -q "gather_round_megabytes" /workspace/verl/verl/checkpoint_engine/delta_checkpoint_engine.py; }
+if _has_round; then
+    echo "PR #7778 already present on $(hostname), skipping"
+elif patch -p1 -d /workspace/verl --fuzz=3 -s < "$p" && _has_round; then
+    echo "Applied PR #7778 (patch --fuzz=3) on $(hostname)"
 else
-    echo "FATAL: v1-separate-async-fixes.patch neither applies nor is already present on $(hostname)"
+    echo "FATAL: PR #7778 did not apply on $(hostname)"
     exit 1
 fi
 
-# example/patches/r3-sglang-routed-experts-import-fix.patch: fixes R3 rollout-side
-# capture to import from the path this image sglang 0.5.16 actually has
-# (sglang.srt.state_capturer.routed_experts), not the sglang.srt.layers.moe.
-# routed_experts_capturer path verl v0.9.0 ships by default. See Known hazards / the
-# Configuration audit entry / Run log for run 3199623 and probe job 3199799 in CLAUDE.md.
-# Same apply-or-fail discipline as the PR patches and v1-separate-async-fixes.patch above.
-p="${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch"
-if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
-    git -C /workspace/verl apply "$p" && echo "Applied r3-sglang-routed-experts-import-fix.patch on $(hostname)"
-elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
-    echo "r3-sglang-routed-experts-import-fix.patch already present on $(hostname), skipping"
-else
-    echo "FATAL: r3-sglang-routed-experts-import-fix.patch neither applies nor is already present on $(hostname)"
-    exit 1
-fi
-
-# example/patches/wsync-debug-progress-log.patch: per-tensor progress logging for the trainer to
-# rollout weight sync (diagnostic) + the seed-sync WORLD-barrier that bounds rank drift in
-# stream_weights_megatron_to_hf to zero, fixing the ~1-in-2 megatron-bridge collective desync
-# (runs 3141801/3207923/3219811/3240762; see its header and CLAUDE.md). Same apply-or-fail
-# discipline as the patches above.
-p="${TRAINING_CONFIG}/wsync-debug-progress-log.patch"
-if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
-    git -C /workspace/verl apply "$p" && echo "Applied wsync-debug-progress-log.patch on $(hostname)"
-elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
-    echo "wsync-debug-progress-log.patch already present on $(hostname), skipping"
-else
-    echo "FATAL: wsync-debug-progress-log.patch neither applies nor is already present on $(hostname)"
-    exit 1
-fi
-
-# example/patches/delta-sharded-localserializedtensor-import-fix.patch: re-points the
-# delta_sharded rollout weight-loader import at the sglang 0.5.16 path (moved). Required by the
-# checkpoint_engine.backend: delta_sharded switch. Same apply-or-fail discipline.
-p="${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch"
-if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
-    git -C /workspace/verl apply "$p" && echo "Applied delta-sharded-localserializedtensor-import-fix.patch on $(hostname)"
-elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
-    echo "delta-sharded-localserializedtensor-import-fix.patch already present on $(hostname), skipping"
-else
-    echo "FATAL: delta-sharded-localserializedtensor-import-fix.patch neither applies nor is already present on $(hostname)"
-    exit 1
-fi
-
-# example/patches/step1-oom-memdump.patch: DIAGNOSTIC ONLY -- see its header and CLAUDE.md
-# runs 3241496 / 3243323 / 3244653. Same apply-or-fail discipline.
-p="${TRAINING_CONFIG}/step1-oom-memdump.patch"
-if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
-    git -C /workspace/verl apply "$p" && echo "Applied step1-oom-memdump.patch on $(hostname)"
-elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
-    echo "step1-oom-memdump.patch already present on $(hostname), skipping"
-else
-    echo "FATAL: step1-oom-memdump.patch neither applies nor is already present on $(hostname)"
-    exit 1
-fi
+# Local patches (staged on the batch host, see there for what each does). Same apply-or-fail
+# discipline. Order matters: step1-oom-memdump.patch is diffed on top of wsync-debug-progress-log.patch.
+for lp in v1-separate-async-fixes r3-sglang-routed-experts-import-fix wsync-debug-progress-log \
+          delta-sharded-localserializedtensor-import-fix step1-oom-memdump; do
+    p="${TRAINING_CONFIG}/${lp}.patch"
+    if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
+        git -C /workspace/verl apply "$p" && echo "Applied ${lp}.patch on $(hostname)"
+    elif git -C /workspace/verl apply --reverse --check "$p" 2>/dev/null; then
+        echo "${lp}.patch already present on $(hostname), skipping"
+    else
+        echo "FATAL: ${lp}.patch neither applies nor is already present on $(hostname)"
+        exit 1
+    fi
+done
 
 
 # Mirror model config files to local tmpfs to avoid Lustre metadata contention.
@@ -1389,37 +1217,19 @@ export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
 
-# NCCL flight recorder — so the NEXT weight-sync hang (or any collective timeout) dumps a
-# per-rank collective trace instead of the useless "last enqueued NCCL work: -1" seen in run
-# 3219811 (that -1 means the ring buffer was OFF). TRACE_BUFFER_SIZE enables it; DUMP_ON_TIMEOUT
-# writes it on watchdog fire; TEMP_FILE lands one file per rank under /tmp so it can be pulled
-# from the failed nodes. Pinpoints which rank stalled on which collective seq (i.e. which tensor).
+# NCCL flight recorder: on a collective timeout, dump per-rank collective traces (one file per rank
+# under /tmp) instead of the useless "last enqueued NCCL work: -1".
 export TORCH_NCCL_TRACE_BUFFER_SIZE=20000
 export TORCH_NCCL_DUMP_ON_TIMEOUT=1
 export TORCH_NCCL_DEBUG_INFO_TEMP_FILE=/tmp/nccl_flightrecorder_${SLURM_JOB_ID}_rank
 
-# NCCL_NVLS_ENABLE=0 (2026-08-31): disable NVLink-multicast (NVLS / NVLink SHARP). On GH200,
-# with the many communicators here -- TP=4, PP=3, EP=8, DP=5, world, CE -- each NVLS-enabled
-# group reserves multicast buffers on device 0, part of the ~12.3 GiB non-PyTorch memory on
-# trainer local-GPU-0 that leaves the step-1 fused_adam optimizer-state alloc 12-24 MiB short
-# (runs 3241496 / 3243323). Pure perf knob -- falls back to ring/tree all-reduce -- no
-# correctness or collective-stability impact. Paired with the precision-aware optimizer above.
+# No NVLink multicast: with this many communicators each NVLS group reserves buffers on device 0
+# (~1.4 GB back on the tight trainer GPU 0). Pure perf knob, no correctness impact.
 export NCCL_NVLS_ENABLE=0
 
-# NOTE: do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here. Tried in run 3219305 as
-# an OOM mitigation, but this srun body is shared by the SGLang standalone-rollout processes too,
-# and SGLang torch_memory_saver -- called unconditionally by load_model_with_memory_saver even
-# with free_cache_engine set to false -- hard-raises "TorchMemorySaver is disabled ...
-# expandable_segments is not supported yet", killing every rollout TP rank before the first
-# training step. The step-21 OOM mitigation is the ppo_max_token_len_per_gpu 16384 to 12288 cut
-# in grpo_gsm8k.yaml instead.
+# Do NOT set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True here: this srun body is shared by the
+# SGLang rollout processes, whose torch_memory_saver hard-raises on it (run 3219305).
 
-# The hybrid-rollout OOM fallback, stale weight-sync skip, and
-# list_of_dict_to_tensordict fix all now live in
-# example/patches/v1-separate-async-fixes.patch (applied via git apply above,
-# alongside the upstream PR patches) rather than a sitecustomize.py runtime
-# monkeypatch — see the header of that patch file and Known hazards / Run log in
-# CLAUDE.md for why. Confirmed working end-to-end in run 3149736.
 
 # Required for Megatron communication/computation overlapping
 export CUDA_DEVICE_MAX_CONNECTIONS=1

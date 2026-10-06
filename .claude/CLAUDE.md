@@ -3056,6 +3056,67 @@ differ. ShellCheck not installed locally.
 
 ## Run log
 
+### Probe `3542043` → run `3551338` — 2026-09-29/30 — DAPO-Math memory probe clean; 16-step run with AIME validation submitted
+
+- **Probe `3542043`** (`preemptable`, 128 nodes, `BENCHMARK=dapo-math`, 5 steps): COMPLETED exit 0,
+  50 min. Peak GPU 45.5 → 51.0 GB allocated / 56.7 → 58.9 GB reserved as mean response length grew
+  1060 → 2459 tokens (max hit 12288 at step 5, `clip_ratio` ≤1.3%); host RAM flat ~500 GB;
+  `update_actor` ~40 s, `update_weights` ~26–30 s, gen ~260–390 s, step ~330–570 s. `ppo_kl`
+  ~3e-4, `critic/score/mean` 0.54–0.74. Memory at full-length responses is still unmeasured.
+- **Recipe changes for validation (2026-09-30)**: `TEST_FREQ` / `VAL_BEFORE_TRAIN` env-overridable
+  (defaults unchanged: off); per-benchmark `rollout.val_kwargs` (dapo-math = AIME avg@32, n=32
+  T=0.6 top_p=0.95; gsm8k = greedy). `v1-separate-async-fixes.patch` (heredoc +
+  `example/patches/`) gained the `switch_to_rollout` hunk ported from the Apertus recipe (run
+  `3261338` KeyError) — without it the first mid-run validation calls the naive hybrid
+  `update_weights`. Full chain (PRs 7421/7422/7423/7777/7778 + 5 local patches) rehearsed on a
+  fresh v0.9.0: applies, compiles. The GLM script's embedded copy of this patch is now the older
+  3-hunk version (GLM runs with validation off, so harmless).
+- **Run `3551338`**: `preemptable` (normal partition not available), 6 h, 128 nodes, dapo-math,
+  16 steps, `val_before_train` + `test_freq: 4` (validations at 0/4/8/12/16), checkpoint saving
+  off. **FAILED (exit 15) after 22 min, in the step-0 AIME validation — 0 training steps.**
+  Init/seed sync clean (rollout HTTP up 13:28 CEST, `FULL-SEED v=0 done in 154.2s`), validation
+  submitted 30 prompts × 32, `finished: 0` for 8 min, then the SGLang TP=32 scheduler watchdog
+  (300 s) fired: one rank stuck in `flashinfer/mla/_core.py:1648 plan` (a `.to()` copy) via
+  `flashinfer_mla_backend.py:381 init_forward_metadata` → `_execute_decode`, the other ranks idle in
+  `_broadcast_reqs_across_ranks`. The same signature as GLM run `3209484`, **now on flashinfer
+  0.6.14**, so the "fixed by 0.6.14" verdict above is not the whole story. The earlier
+  `test_freq: -1` comment ("greedy gsm8k val hangs at 24 min, cuEventSynchronize") is very likely
+  the same hang. The CSCS watchdog `dump_info` hook printed nothing.
+  **Why flashinfer at all**: verl v0.9.0 `async_sglang_server.py:266-274` forces
+  `attention_backend="flashinfer"` for sglang ≥ 0.5.12 (FA3 CUDA-graph capture bug #22800),
+  overriding SGLang's own default for MLA on Hopper (`fa3`, `server_args._get_default_attn_backend`).
+  This recipe runs `disable_cuda_graph: true`, so that workaround does not apply. **Fix (unverified)**:
+  `engine_kwargs.sglang.attention_backend: ${ROLLOUT_ATTENTION_BACKEND}` (default `fa3`;
+  `flashinfer` reproduces the 3309430 config). verl pops `attention_backend` from
+  `engine_kwargs` before its default, so the override takes effect.
+- **Run `3552393`** (2026-09-30): resubmit of `3551338` with `attention_backend: fa3`, otherwise
+  identical. **FAILED after 12 min, rollout startup**: `ImportError: Can not import FA3 in sgl_kernel`
+  (`cannot import name 'flash_ops'`) on every SGLang rank -- this image's sgl_kernel (aarch64) ships
+  no FA3 ops, which may be why verl/the image never used fa3. Default switched to
+  `ROLLOUT_ATTENTION_BACKEND=triton` (SGLang's own MLA fallback off Hopper, pure Triton, no
+  sgl_kernel dependency; `TRITON_CACHE_DIR` already on /tmp). Expect slower decode than flashinfer.
+- **Run `3554110`** (2026-09-30): resubmit with `attention_backend: triton`, otherwise identical.
+  **PREEMPTED after 99 min, 0 training steps.** Triton backend confirmed active, no flashinfer in
+  the stack. Step-0 AIME eval started 19:13 CEST and was slow but progressing: 6 of 30 prompt groups
+  (x32 samples) finished in 40 min at a full 128-request batch. At 19:56 the SGLang watchdog fired on
+  **all 32 TP ranks at once**, now stuck in MoE routing (`moe/topk.py:1476 biased_grouped_topk_gpu`
+  -> `F.pad`) during `_execute_decode`. The job then looped on `ActorDiedError` (no rollout restart)
+  until preemption at 20:39 CEST. **Conclusion: the hang is not the attention kernel.** Three
+  different stuck frames (flashinfer MLA `plan()`, MoE `topk`, and GLM's
+  `_broadcast_reqs_across_ranks`) are all places where the CPU waits on the GPU, so the likelier
+  cause is a device or cross-node collective (TP=32 over 8 nodes, NCCL) that stops completing under
+  sustained full-batch decoding. Seen so far only in long validation passes (960 samples); the
+  probe's training generations (~160 samples, ~6 min each) and gsm8k run 3309430 never hit it.
+  Triton is also far slower than flashinfer, so keeping it buys nothing.
+- **Run `3558872`** (2026-10-01): "light eval" variant. Back to flashinfer (now the recipe
+  default again), AIME avg@8 (`VAL_N` is now env-overridable; default stays 32), eval at step 0
+  and step 16 only (`TEST_FREQ=16`), 16 steps, preemptable, 6 h. **PREEMPTED after 56 min, 2 min
+  into step 1.** First clean AIME validation on this recipe: **no hang** with flashinfer at avg@8,
+  30/30 prompts finished in ~38 min (10:13 -> 10:51 CEST). **Baseline DeepSeek-V3 AIME-2024
+  `acc/mean@8` = 29.6 %, `best@8` = 53.1 %** (best@4 46.0 %, best@2 38.0 %). The preemption is
+  infra, not the recipe. Budget estimate for a full run: ~15 min setup + ~40 min per eval + 16
+  steps x ~7-10 min = ~4 h, inside 6 h.
+
 ### Run `3309430` — 2026-09-07 — **VALIDATED: 40/40 steps, COMPLETED exit 0, 58 min.** The P2P gather fix works; DeepSeek-V3 trains cleanly on the delta_sharded path.
 
 - **Log**: `~/Downloads/slurm-3309430.out` (5.9 MB, 44,292 lines; > the FirecREST `ops/download`

@@ -61,8 +61,10 @@
 # should end up in. A plain source patch is one less moving part (no
 # sys.meta_path machinery, no PYTHONPATH staging, no import-timing dependency)
 # and the actual behavior is just readable in the file.
+# (2026-09-30) Also drops the same naive update_weights call from switch_to_rollout,
+# ported from apertus-benchmarks/patches/v1-separate-async-fixes.patch (run 3261338),
+# so test_freq validation can run mid-training.
 diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
-index 18a06ee2..4c1815a5 100644
 --- a/verl/trainer/ppo/v1/trainer_separate_async.py
 +++ b/verl/trainer/ppo/v1/trainer_separate_async.py
 @@ -133,7 +133,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
@@ -80,6 +82,25 @@ index 18a06ee2..4c1815a5 100644
 
      def on_train_begin(self):
          if self.config.skip.rollout_tq.enable:
+@@ -179,7 +185,16 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+
+     def switch_to_rollout(self):
+         # TODO: disable auto offload in config and offload according to the switch strategy
+-        self.checkpoint_manager.update_weights(self.global_steps)
++        # self.checkpoint_manager.update_weights(...) is skipped for the same reason
++        # as on_init_end above: backend="naive" bypasses the (empty) hybrid replica
++        # list and pushes mode="naive" onto every actor rank, which unconditionally
++        # calls rollout.resume(tags=["weights"]) -- resuming a tag never released,
++        # since this recipe's real weight sync (standalone_checkpoint_manager, nccl
++        # backend, on_step_end) never touches memory-occupation tags at all. Left
++        # unpatched, this crashes SGLang's resume_memory_occupation with
++        # KeyError: 'weights' the first time switch_to_rollout runs -- which, since
++        # should_switch_to_rollout() is a hardcoded False stub, is only ever at
++        # validation (run 3261338: 45/46 steps clean, crashed here at the final val).
+         self.checkpoint_manager.resume_generation_replicas()
+         self.add_replicas_to_balancer()
+         self.current_mode = HybridEngineMode.ROLLOUT
+
 diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
 index 91d82b15..810ccbee 100644
 --- a/verl/utils/tensordict_utils.py
