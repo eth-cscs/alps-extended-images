@@ -39,7 +39,8 @@
 # Differences from the author's recipe that follow from that: no expert
 # offloading (model_overrides block dropped -> more trainer GPU memory),
 # TEMPORARILY Adam instead of the md_decoupling optimizer Chonk was pretrained
-# with (TODO: change back, see the optimizer block of the recipe), and
+# with (TODO: change back, see the optimizer block of the recipe), TEMPORARILY no
+# KL penalty against the starting policy (TODO, see loss_fn in the recipe), and
 # generation by Megatron-Core's dynamic engine, eager (no CUDA graphs), with the
 # native Megatron-to-Megatron refit.
 #
@@ -78,6 +79,9 @@ export TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-4}"
 export INFERENCE_REQUESTS="${INFERENCE_REQUESTS:-32}"
 export MAX_NUM_STEPS="${MAX_NUM_STEPS:-2}"
 export NUM_PROMPTS="${NUM_PROMPTS:-32}"
+# KL penalty against the starting policy; > 0 needs a reference model on the
+# trainer GPUs (see the loss_fn block of the recipe). Author's value: 0.01.
+export REFERENCE_KL_PENALTY="${REFERENCE_KL_PENALTY:-0.0}"
 export TRAIN_GLOBAL_BATCH=$(( TRAIN_NODES * 4 * TRAIN_MICRO_BATCH ))
 if [ "${INFERENCE_NODES}" -le 0 ] || [ $(( INFERENCE_NODES * 4 % 8 )) -ne 0 ]; then
     echo "FATAL: ${INFERENCE_NODES} generation nodes x 4 GPUs is not a positive multiple of EP8"
@@ -550,7 +554,11 @@ data:
     env_name: math
 
 loss_fn:
-  reference_policy_kl_penalty: 0.01
+  # TEMPORARY: 0 (REFERENCE_KL_PENALTY). Any value > 0 makes NeMo-RL build a
+  # second, reference copy of the model on the trainer GPUs, which does not fit
+  # without expert offloading (run 3622931). The author's recipe uses 0.01.
+  # TODO: restore once the trainer has the memory for it.
+  reference_policy_kl_penalty: ${oc.decode:${oc.env:REFERENCE_KL_PENALTY}}
   reference_policy_kl_type: k3
   kl_input_clamp_value: 20.0
   kl_output_clamp_value: 10.0
@@ -755,6 +763,7 @@ print(
     "gen_backend", gen["backend"],
     "refit", gen["refit_transport"],
     "optimizer", cfg["policy"]["megatron_cfg"]["optimizer"]["optimizer"],
+    "kl_penalty", cfg["loss_fn"]["reference_policy_kl_penalty"],
 )
 PYEOF
 fi

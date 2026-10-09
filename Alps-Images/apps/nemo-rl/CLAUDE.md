@@ -371,3 +371,29 @@ tokenizer rework and `max_requests` key of PR #1.
 - **Fix**: override removed, default `persist` (no request is in flight across a refit in sync
   GRPO). Unverified.
 - **Not reached**: Ray actors, model construction, HF import, memory, generation, refit.
+
+### Run `3622931` — 2026-10-09 — trainer model builds and imports the HF checkpoint without offloading; OOM when the reference model is added
+
+- **Log**: `~/Downloads/slurm-3622931.tail.out` (last 6000 lines) + first 2.6 MB in
+  `~/Downloads/slurm-3622931.out`. 24 nodes, FAILED after 967 s. Reused the `src-v2` checkout.
+- **Worked**: past the setup validation; Ray 24/24; all 32 `MegatronPolicyWorker`s built the
+  Apertus2 model with Adam and imported the HF checkpoint through the vanilla bridge + `apertus2`
+  package (`[GPU_DIAG] after_hf_import` and `after_model_setup` on every rank).
+  **Trainer memory without expert offloading, per GPU at `after_model_setup`: NVML used ~68.5 GB
+  of 97.9 GB, PyTorch allocated ~49 GB / reserved ~64 GB** (EP16, DP2, Adam distributed optimizer).
+- **Symptom**: `torch.OutOfMemoryError: Tried to allocate 12.00 GiB ... 79.63 GiB allocated by
+  PyTorch` in `megatron_policy_worker.py:759 self.move_model(self.model, "cuda")` ->
+  `param_and_grad_buffer.py reload_from_cpu` (`grad_data` resize), on 3 ranks; the rest died with
+  `ActorDiedError`.
+- **Root cause**: with `loss_fn.reference_policy_kl_penalty > 0` the worker moves the policy's
+  param/grad buffers to CPU, builds a full second (reference) model on the GPU to load the
+  checkpoint, copies its state dict to CPU and then moves the policy back
+  (`megatron_policy_worker.py` step 5 / `setup_reference_model_state`). The reference model's GPU
+  memory is not explicitly released before the policy comes back, and the optimizer state never
+  left the GPU, so the two overlap: ~80 GB allocated when the policy's 12 GiB grad buffer is
+  re-created. The author's recipe avoids this by keeping the experts off the GPU (offloading).
+- **Fix (user to confirm)**: `REFERENCE_KL_PENALTY` knob, default `0.0` -> no reference model.
+  TEMPORARY, changes the objective (author: 0.01). Alternatives not taken: a small NeMo-RL patch
+  freeing the reference model (`del` + `gc.collect()` + `empty_cache()`) before the policy is moved
+  back -- plausible but unverified that nothing else holds it; or the expert-offloading patch group.
+- **Not reached**: generation workers' model build, KDA inference, refit, any step.
