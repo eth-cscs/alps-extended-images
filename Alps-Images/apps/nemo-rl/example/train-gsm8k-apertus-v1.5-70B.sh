@@ -48,8 +48,8 @@
 #   * no CUDA xIELU kernel (not in the image): the Megatron side uses the
 #     bridge's jit-fused Python xIELU -- same math, slower activation.
 #
-# Status: a 1-step shakedown completed (run 3622451); the full 92-step run has
-# not been done yet (see ../CLAUDE.md).
+# Status: validated -- 92/92 steps in 2 h 04 min (run 3622703, before the switch
+# to the unmodified bridge checkout; see ../CLAUDE.md).
 # ─────────────────────────────────────────────────────────────────────────────
 
 export NEMORL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-7eab7fc435699b52c9668a663afde4b3"

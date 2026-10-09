@@ -468,3 +468,39 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   `inference_cuda_graph_scope: block`, 4 graphs); `moe_pad_experts_for_cuda_graph_inference: true`
   added (required for EP > 1 with inference CUDA graphs unless `inference_optimized`).
   Open: whether graph capture works with the KDA + latent-MoE layers at all.
+
+## Apertus 1.5 run log (continued)
+
+### Run `3622703` — 2026-10-09 — **FULL RUN VALIDATED: 92/92 steps, COMPLETED exit 0, 2 h 04 min** (`train-gsm8k-apertus-v1.5-70B.sh`, vLLM rollout)
+
+- **Log**: `~/Downloads/slurm-3622703.tail.out` (last 4000 lines); full log on the cluster at
+  `/users/palmee/slurm-3622703.out`, run dir
+  `.../RL/Apertus-v1.5-70B/nemo-rl-runs/Apertus-v1.5-70B-gsm8k-nemorl-vllm-megatron-async-16n-run-3622703`
+  (`run.log`, `tb/`). 16 nodes, image `alps7-dev-7eab7fc4...`, script as committed at `1eacbe4`
+  (old checkout with the bridge filelock edit; the `-clean` checkout + `MEGATRON_CONFIG_LOCK_DIR`
+  variant is still untested). ~5 min queued, 7447 s elapsed.
+- **Result**: `SC run complete: {'train_steps': 92, 'trainer_version': 92}`. No OOM, no NCCL
+  timeout, no refit failure across 92 refits.
+- **Sampled metrics** (poller, every ~10 steps):
+
+  | step | step time | loss | grad_norm | gen_kl_error | reward mean |
+  |---|---|---|---|---|---|
+  | 1 | 126 s | 0.075 | 0.185 | 0.00068 | 0.975 |
+  | 11 | 76 s | 0.012 | 0.097 | 0.00068 | 1.051 |
+  | 20 | 78 s | 0.047 | 0.118 | 0.00074 | 1.001 |
+  | 31 | 71 s | 0.064 | 0.132 | 0.00074 | 0.993 |
+  | 40 | 69 s | 0.034 | 0.096 | 0.00072 | 1.025 |
+  | 50 | 66 s | 0.020 | 0.092 | 0.00073 | 1.073 |
+  | 60 | 67 s | 0.032 | 0.109 | 0.00068 | 1.049 |
+  | 71 | 67 s | 0.014 | 0.104 | 0.00072 | 1.067 |
+  | 81 | 69 s | 0.012 | 0.072 | 0.00072 | 1.066 |
+  | 90 | 66 s | 0.014 | 0.100 | 0.00075 | 1.044 |
+  | 92 | 72 s | 0.031 | 0.100 | 0.00080 | 1.067 |
+
+  Reward is the composite one (1.0 correct + 0.1 format, max 1.1); GSM8K is near-saturated for
+  this checkpoint from step 1, so the curve says "stable", not "learning". `gen_kl_error` stays
+  ~0.0007 throughout (fork's healthy bar < 0.002): trainer and vLLM agree after every refit.
+- **Timing** (last step): generation 24.6 s, policy training 39.0 s, weight sync 3.4 s. About
+  67-70 s/step in steady state, i.e. ~2 h for 92 steps of 48x16 on 12 trainer + 4 rollout nodes.
+- **Not captured**: per-step metrics for all 92 steps (only the samples above; the rest are in
+  `run.log` / TensorBoard on the cluster); a held-out evaluation (the recipe has `val_period: 0`).

@@ -14,7 +14,7 @@ README for pinned sources, batch sizes and the unvalidated memory/refit limits.
 [`example/train-gsm8k-apertus-v1.5-70B.sh`](example/train-gsm8k-apertus-v1.5-70B.sh) is a
 self-contained launcher for Apertus 1.5 70B GRPO on GSM8K (16 nodes: Megatron TP2/PP4
 training, vLLM TP4 generation) using the `Alvorecer721/Nemo-RL` fork and its recipe. It
-has completed a 1-step shakedown but not a full run; status and run log are in
+has completed a full 92-step run (about 2 hours); status and run log are in
 [`CLAUDE.md`](CLAUDE.md).
 `example/train-gsm8k-chonk-megatron-gen.sh` runs the Chonk recipe with Megatron generation instead of
 vLLM on vanilla NeMo-RL and Megatron-Bridge plus two small patches (`example/patches/`); it has not
