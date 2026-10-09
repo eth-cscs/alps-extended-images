@@ -18,12 +18,12 @@
 #
 # Sources (cloned once to Lustre, all pinned):
 #   NeMo-RL          NVIDIA-NeMo/RL@f196ef0a            vanilla + 2-file patch
-#   Megatron-Bridge  NVIDIA-NeMo/Megatron-Bridge@07722453  vanilla + 5-file patch
+#   Megatron-Bridge  NVIDIA-NeMo/Megatron-Bridge@07722453  vanilla + 4-file patch
 #                    + models/apertus2/ copied verbatim from
 #                      swiss-ai/Megatron-Bridge@f3bc8e7e (6 new files)
 #   Megatron-LM      swiss-ai/Megatron-LM-MoE@a9e0c497  the fork, untouched (KDA
-#                    layers, latent MoE, quantile-balancing router, md_decoupling
-#                    optimizer are not in stock Megatron-LM)
+#                    layers, latent MoE, quantile-balancing router are not in
+#                    stock Megatron-LM)
 #   nemo-lens        NVIDIA-NeMo/Lens@b85578fc          the rev NeMo-RL pins
 # The two patches are embedded below and checked in under patches/ (keep them
 # byte-identical); each hunk and why it is needed is listed in the patch header.
@@ -37,7 +37,9 @@
 #   * NeMo-RL: upstream PR #2517 (vLLM data-parallel), swiss-ai PR #5 (load
 #     checkpoints under no_grad), the rest of swiss-ai PR #1.
 # Differences from the author's recipe that follow from that: no expert
-# offloading (model_overrides block dropped -> more trainer GPU memory), and
+# offloading (model_overrides block dropped -> more trainer GPU memory),
+# TEMPORARILY Adam instead of the md_decoupling optimizer Chonk was pretrained
+# with (TODO: change back, see the optimizer block of the recipe), and
 # generation by Megatron-Core's dynamic engine, eager (no CUDA graphs), with the
 # native Megatron-to-Megatron refit.
 #
@@ -65,7 +67,7 @@ export MLM_REF="a9e0c497bbab7e01ea80f363925f3b41a43aee0b"
 export LENS_REPO="https://github.com/NVIDIA-NeMo/Lens.git"
 export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
-export SRC_VERSION="v1"
+export SRC_VERSION="v2"
 
 # Topology and batch sizes of the author's recipe: 8 training nodes (32 GPUs,
 # EP16 -> DP2) + 16 generation nodes (64 GPUs, EP8 -> 8 replicas).
@@ -126,7 +128,6 @@ cat > "${RUN_DIR}/patches/bridge-apertus2-shared-minimal.patch" << 'CHONK_PATCH_
 #                             import guards: the Megatron-LM fork lacks mla_qk_norm_config and the
 #                             dynamic-resolution context-parallel helpers these packages import
 #   models/model_provider.py  keep the quantile-balancing router buffer (qb_beta) in fp32
-#   training/optim.py         dispatch optimizer=md_decoupling (drop this hunk if training with Adam)
 diff --git a/src/megatron/bridge/models/__init__.py b/src/megatron/bridge/models/__init__.py
 index 5ccb3939..65a3dd53 100644
 --- a/src/megatron/bridge/models/__init__.py
@@ -330,32 +331,6 @@ index c2cf239a..86624859 100644
          from megatron.bridge.models.nemotron_omni.nemotron_omni_sound import BridgeSoundEncoder
  
          return BridgeSoundEncoder
-diff --git a/src/megatron/bridge/training/optim.py b/src/megatron/bridge/training/optim.py
-index 32a77160..32ef9423 100644
---- a/src/megatron/bridge/training/optim.py
-+++ b/src/megatron/bridge/training/optim.py
-@@ -85,7 +85,20 @@ def setup_optimizer(
-                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
-             )
- 
--    if hasattr(optimizer_config, "provide"):
-+    if optimizer_config.optimizer == "md_decoupling":
-+        # MDDecoupling has its own parameter partitioning and cannot use the
-+        # generic optimizer factory (which would flatten matrix parameters).
-+        from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
-+
-+        optimizer = get_megatron_mddecoupling_optimizer(
-+            config=optimizer_config,
-+            model_chunks=model_chunks,
-+            config_overrides=config_overrides,
-+            use_gloo_process_groups=use_gloo_process_groups,
-+            layer_wise_distributed_optimizer=optimizer_config.use_layer_wise_distributed_optimizer,
-+            pg_collection=pg_collection,
-+        )
-+    elif hasattr(optimizer_config, "provide"):
-         optimizer = optimizer_config.provide(
-             model_chunks=model,
-             config_overrides=config_overrides,
 CHONK_PATCH_EOF
 cat > "${RUN_DIR}/patches/nemo-rl-chonk-megatron-gen-minimal.patch" << 'CHONK_PATCH_EOF'
 # Minimal edits to NeMo-RL for Apertus 2 (Chonk) with Megatron generation on the nemo-rl-cuda image.
@@ -500,41 +475,22 @@ policy:
     checkpoint:
       async_save: false
       save: ${oc.env:RUN_DIR}/megatron-save
+    # TEMPORARY: Adam. Chonk was pretrained with the fork's md_decoupling optimizer
+    # (Muon-style orthogonal updates, hypersphere-constrained weights with learned
+    # gains); Adam does not maintain those constraints. TODO: switch back to
+    # md_decoupling -- restore the optimizer block of the author's
+    # grpo-chonk-vllm.yaml and apply patches/bridge-md-decoupling-optimizer.patch.
+    # Learning rates and betas below are the author's; everything not set here is
+    # NeMo-RL's stock Adam config (distributed, precision-aware optimizer).
     optimizer:
-      optimizer: md_decoupling
+      optimizer: adam
       lr: 2.0e-6
       min_lr: 2.0e-7
-      min_lr_mode: absolute
-      matrix_lr: 5.0e-5
-      gains_lr: 2.0e-6
       weight_decay: 0.0
-      bf16: true
-      fp16: false
-      params_dtype: float32
       adam_beta1: 0.9
       adam_beta2: 0.95
       adam_eps: 1.0e-8
-      use_distributed_optimizer: false
-      use_layer_wise_distributed_optimizer: true
-      use_precision_aware_optimizer: false
-      hypersphere_preserve_init: true
-      hypersphere_mode: row
-      hypersphere_embedding_mode: row
-      hypersphere_router_mode: row
-      hypersphere_radius_mode: fan_in
-      hypersphere_gains_mode: rowcol
-      hypersphere_gains_mode_router: rowcol
-      hypersphere_gains_mode_embedding: none
-      gain_parametrization: softplus
-      use_orthogonal_updates: true
-      muon_coefficient_type: polar_express
-      muon_scale_mode: shape_up
-      muon_router_scale_mode: none
-      muon_momentum: 0.95
-      muon_use_nesterov: true
       clip_grad: ${policy.max_grad_norm}
-      optimizer_cpu_offload: false
-      optimizer_offload_fraction: 0.0
     scheduler:
       lr_decay_style: cosine
       lr_decay_iters: 1200
@@ -743,7 +699,6 @@ for mod in (
     "nemo.lens",
     "megatron.core",
     "megatron.core.ssm.kimi_delta_attention",
-    "megatron.core.optimizer.md_decoupling",
     "megatron.core.inference.engines.dynamic_engine",
     "megatron.core.resharding.refit",
     "megatron.bridge",

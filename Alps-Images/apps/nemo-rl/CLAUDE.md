@@ -332,3 +332,20 @@ tokenizer rework and `max_requests` key of PR #1.
 4. KDA + latent MoE under the dynamic inference engine, eager.
 5. Native `mcore` refit EP16 -> EP8 for the fork's custom modules.
 6. If swiss-ai PR #5 (`no_grad` checkpoint load) turns out to be load-bearing.
+
+## Optimizer switched to Adam — 2026-10-09 (user decision, TEMPORARY)
+
+- **TODO: change back to `md_decoupling`.** Chonk was pretrained with the Megatron-LM fork's
+  `md_decoupling` optimizer (Muon-style orthogonal updates, hypersphere-constrained weights with
+  learned gains); Adam does not maintain those constraints, so this is for bringing the RL loop up,
+  not the intended training setup.
+- Recipe: `optimizer: adam` with the author's `lr` 2e-6 / `min_lr` 2e-7 / betas 0.9, 0.95 /
+  `weight_decay` 0 and the author's scheduler; everything else is NeMo-RL's stock Adam config
+  (`use_distributed_optimizer: true`, `use_precision_aware_optimizer: true`).
+- Consequence for the library delta: the `training/optim.py` hunk is no longer applied. The bridge
+  patch is now **4 files, +77/-45**; the hunk lives on as
+  `example/patches/bridge-md-decoupling-optimizer.patch` (not applied by any launcher, verified to
+  apply on top of the minimal patch). `SRC_VERSION` bumped to `v2` so the shared checkout is rebuilt.
+- To switch back: restore the optimizer block from `grpo-chonk-vllm.yaml`, embed/apply the
+  optimizer patch after the minimal one, bump `SRC_VERSION`. Everything above this entry that says
+  "5 files" or lists `md_decoupling` as kept describes the state before this change.

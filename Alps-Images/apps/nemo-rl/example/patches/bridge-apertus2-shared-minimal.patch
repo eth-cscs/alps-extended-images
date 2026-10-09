@@ -7,7 +7,6 @@
 #                             import guards: the Megatron-LM fork lacks mla_qk_norm_config and the
 #                             dynamic-resolution context-parallel helpers these packages import
 #   models/model_provider.py  keep the quantile-balancing router buffer (qb_beta) in fp32
-#   training/optim.py         dispatch optimizer=md_decoupling (drop this hunk if training with Adam)
 diff --git a/src/megatron/bridge/models/__init__.py b/src/megatron/bridge/models/__init__.py
 index 5ccb3939..65a3dd53 100644
 --- a/src/megatron/bridge/models/__init__.py
@@ -211,29 +210,3 @@ index c2cf239a..86624859 100644
          from megatron.bridge.models.nemotron_omni.nemotron_omni_sound import BridgeSoundEncoder
  
          return BridgeSoundEncoder
-diff --git a/src/megatron/bridge/training/optim.py b/src/megatron/bridge/training/optim.py
-index 32a77160..32ef9423 100644
---- a/src/megatron/bridge/training/optim.py
-+++ b/src/megatron/bridge/training/optim.py
-@@ -85,7 +85,20 @@ def setup_optimizer(
-                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
-             )
- 
--    if hasattr(optimizer_config, "provide"):
-+    if optimizer_config.optimizer == "md_decoupling":
-+        # MDDecoupling has its own parameter partitioning and cannot use the
-+        # generic optimizer factory (which would flatten matrix parameters).
-+        from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
-+
-+        optimizer = get_megatron_mddecoupling_optimizer(
-+            config=optimizer_config,
-+            model_chunks=model_chunks,
-+            config_overrides=config_overrides,
-+            use_gloo_process_groups=use_gloo_process_groups,
-+            layer_wise_distributed_optimizer=optimizer_config.use_layer_wise_distributed_optimizer,
-+            pg_collection=pg_collection,
-+        )
-+    elif hasattr(optimizer_config, "provide"):
-         optimizer = optimizer_config.provide(
-             model_chunks=model,
-             config_overrides=config_overrides,
