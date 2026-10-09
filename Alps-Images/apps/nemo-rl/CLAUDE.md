@@ -397,3 +397,14 @@ tokenizer rework and `max_requests` key of PR #1.
   freeing the reference model (`del` + `gc.collect()` + `empty_cache()`) before the policy is moved
   back -- plausible but unverified that nothing else holds it; or the expert-offloading patch group.
 - **Not reached**: generation workers' model build, KDA inference, refit, any step.
+
+## Chonk: what must be restored before the final run (user decisions, 2026-10-09)
+
+Both are disabled only to bring the RL loop up; neither is the intended training setup.
+
+1. **KL penalty against the starting policy** -- `REFERENCE_KL_PENALTY` is `0.0`; the final run
+   needs the author's `0.01`. Blocked on trainer GPU memory for the reference model (run `3622931`):
+   needs either expert offloading (bridge PR #4 patch group) or a NeMo-RL change that frees the
+   reference model before the policy returns to the GPU.
+2. **`md_decoupling` optimizer** -- currently Adam; restore the author's optimizer block and apply
+   `example/patches/bridge-md-decoupling-optimizer.patch`.

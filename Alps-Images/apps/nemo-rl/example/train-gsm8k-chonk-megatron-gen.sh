@@ -44,6 +44,10 @@
 # generation by Megatron-Core's dynamic engine, eager (no CUDA graphs), with the
 # native Megatron-to-Megatron refit.
 #
+# BEFORE THE FINAL RUN, restore: the md_decoupling optimizer and the KL penalty
+# against the starting policy (REFERENCE_KL_PENALTY=0.01). Both are disabled only
+# to bring the loop up.
+#
 # UNTESTED. No run yet. First things that can go wrong, in order: imports of the
 # patched vanilla bridge against the Megatron-LM fork (preflight), trainer OOM
 # without expert offloading, KDA under the inference engine, the native refit
@@ -557,7 +561,8 @@ loss_fn:
   # TEMPORARY: 0 (REFERENCE_KL_PENALTY). Any value > 0 makes NeMo-RL build a
   # second, reference copy of the model on the trainer GPUs, which does not fit
   # without expert offloading (run 3622931). The author's recipe uses 0.01.
-  # TODO: restore once the trainer has the memory for it.
+  # TODO: REQUIRED FOR THE FINAL RUN -- restore the KL penalty (0.01) once the
+  # trainer has the memory for the reference model.
   reference_policy_kl_penalty: ${oc.decode:${oc.env:REFERENCE_KL_PENALTY}}
   reference_policy_kl_type: k3
   kl_input_clamp_value: 20.0
