@@ -225,3 +225,18 @@ preflight module list.
   rules out `refit_transport: nccl_reshard` for this backend (it requires `inference_optimized`).
   Generation CUDA graphs with the xIELU module, native refit TP2/PP4 -> TP4/PP1, and rollout
   throughput vs vLLM (KV buffer is only 10 GB by default) are all unexercised.
+
+## No source edits to Megatron-Bridge / Megatron-LM — 2026-10-09 (unverified)
+
+- Both launchers used to rewrite the bridge's `safe_config_loader.py` (`filelock` ->
+  `nullcontext`) at clone time. Replaced by the bridge's own knob:
+  `MEGATRON_CONFIG_LOCK_DIR=/tmp/mbridge_locks_<jobid>` (its default lock dir is
+  `~/.cache/huggingface`, i.e. Lustre home, where flock fails in-container; `/tmp` is node-local).
+- The checkout dir is now `nemo-rl-src/<sha12>-clean`, so the next job makes a fresh clone with the
+  bridge and Megatron-LM untouched. The old `nemo-rl-src/<sha12>` (with the filelock edit) is what
+  runs `3621638`-`3622703` used; it can be deleted once nothing is running from it.
+- Still edited at runtime, in the NeMo-RL checkout only: the `transformers < 5.13` assert in
+  `nemo_rl/models/policy/__init__.py`.
+- What cannot be avoided is using a *fork* of the bridge: Apertus support (provider, bridge, xIELU)
+  exists only in `Alvorecer721/Megatron-Bridge`; upstream `NVIDIA-NeMo/Megatron-Bridge` `main` has no
+  `models/apertus*` (checked 2026-10-09). That ends only when the Apertus bridge is upstreamed.

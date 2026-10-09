@@ -84,7 +84,9 @@ export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
 export TRAINING_CONFIG=/tmp
 export RUN_DIR=${TRAINING_HOME}/nemo-rl-runs/${RUN_NAME}
-export NEMORL_DIR=${TRAINING_HOME}/nemo-rl-src/${NEMORL_REF:0:12}
+# "-clean": no source edits to Megatron-Bridge / Megatron-LM in this checkout (the
+# first checkout, without the suffix, carries a filelock edit to the bridge).
+export NEMORL_DIR=${TRAINING_HOME}/nemo-rl-src/${NEMORL_REF:0:12}-clean
 export LENS_DIR=${TRAINING_HOME}/nemo-rl-src/lens-${LENS_REF:0:12}
 # Optional: Python packages nemo_rl imports that the image lacks, installed once
 # with --no-deps into a shared --target dir (bump the suffix when the list
@@ -171,7 +173,7 @@ EOF
 # Cloned on a single node into a temp dir and renamed into place, so every node
 # of every job sees one complete tree at the pinned commit. Only the two
 # submodules the Megatron/vLLM path imports are initialised (Gym, Automodel and
-# the xIELU kernels are not).
+# the xIELU kernels are not). Megatron-Bridge and Megatron-LM are used unmodified.
 if [ ! -f "${NEMORL_DIR}/.alps-checkout-ready" ] || [ ! -f "${LENS_DIR}/.alps-checkout-ready" ] \
         || [ "${EXTRA_SITE_READY}" -ne 1 ]; then
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
@@ -217,26 +219,6 @@ if [ ! -f "${NEMORL_DIR}/.alps-checkout-ready" ] || [ ! -f "${LENS_DIR}/.alps-ch
     [ -f "${tmp}/${NEMORL_RECIPE}" ] || { echo "FATAL: recipe ${NEMORL_RECIPE} not in ${NEMORL_REF}"; exit 1; }
     [ -d "${tmp}/${BRIDGE_SUBDIR}/src/megatron/bridge" ] || { echo "FATAL: Megatron-Bridge submodule is empty"; exit 1; }
     [ -d "${tmp}/${BRIDGE_SUBDIR}/3rdparty/Megatron-LM/megatron/core" ] || { echo "FATAL: Megatron-LM submodule is empty"; exit 1; }
-
-    # fcntl.flock is unsupported in-container on Lustre (ENOLCK / stale file
-    # handle): drop the lock around the
-    # read-only config load in megatron-bridge. Best effort.
-    python3 - "${tmp}/${BRIDGE_SUBDIR}/src/megatron/bridge/models/hf_pretrained/safe_config_loader.py" <<"PYEOF"
-import sys
-path = sys.argv[1]
-lines = open(path).read().split("\n")
-n = 0
-for i, line in enumerate(lines):
-    if line.lstrip().startswith("with filelock."):
-        lines[i] = line[: len(line) - len(line.lstrip())] + "with contextlib.nullcontext():"
-        n += 1
-if n:
-    lines.insert(0, "import contextlib")
-    open(path, "w").write("\n".join(lines))
-    print("Patched", n, "filelock site(s) in", path)
-else:
-    print("WARNING: no filelock site found in", path)
-PYEOF
 
     git -C "${tmp}" rev-parse HEAD > "${tmp}/.alps-checkout-ready"
     if mv -T "${tmp}" "${NEMORL_DIR}" 2>/dev/null; then
@@ -306,6 +288,9 @@ export NRL_XFERDTENSOR_PYTHON=1
 
 # Compile / JIT / dataset caches off Lustre (no flock there) onto node-local /tmp.
 export HF_HOME=/tmp/hf_${JOB_ID}
+# megatron-bridge takes a file lock around the HF config load; its default lock
+# dir is under the home directory (Lustre, no flock in-container).
+export MEGATRON_CONFIG_LOCK_DIR=/tmp/mbridge_locks_${JOB_ID}
 export TRITON_CACHE_DIR=/tmp/triton_${JOB_ID}
 export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_${JOB_ID}
 export VLLM_CACHE_ROOT=/tmp/vllm_cache_${JOB_ID}
