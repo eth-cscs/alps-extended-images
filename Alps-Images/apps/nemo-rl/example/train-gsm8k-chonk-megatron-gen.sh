@@ -530,7 +530,9 @@ policy:
       inference_cuda_graph_scope: none
       num_cuda_graphs: null
       use_cuda_graphs_for_non_decode_steps: false
-      kv_cache_management_mode: recompute
+      # kv_cache_management_mode stays at the default (persist): NeMo-RL requires
+      # it to agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates
+      # (false), and synchronous GRPO has no request in flight across a refit.
       logprobs_mode: raw_logprobs
 
 data:

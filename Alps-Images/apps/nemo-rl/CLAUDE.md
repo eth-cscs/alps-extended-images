@@ -349,3 +349,25 @@ tokenizer rework and `max_requests` key of PR #1.
 - To switch back: restore the optimizer block from `grpo-chonk-vllm.yaml`, embed/apply the
   optimizer patch after the minimal one, bump `SRC_VERSION`. Everything above this entry that says
   "5 files" or lists `md_decoupling` as kept describes the state before this change.
+
+## Chonk run log
+
+### Run `3622848` — 2026-10-09 — first Chonk attempt: checkouts, patches and preflight all pass; stops on a recipe validation error
+
+- **Log**: `/users/palmee/slurm-3622848.out` on clariden (tail fetched via `ops/tail`). 24 nodes,
+  image `alps7-dev-7eab7fc4...`, Adam, Megatron generation. ~15 min queued, failed ~4 min in.
+- **Worked**: the one-node checkout step on the cluster (`Source checkouts ready at
+  .../src-v2-f196ef0a-07722453-a9e0c497`, both patches applied); the preflight -- every import of
+  the patched vanilla bridge + vanilla NeMo-RL against the Megatron-LM fork, and
+  `architectures: ['Apertus2KDAForCausalLM'] -> provider Apertus2ModelProvider`; `config OK`.
+  So the 4-file bridge patch + the `apertus2` package + the 2-file NeMo-RL patch are sufficient at
+  import / registration level.
+- **Symptom**: `ValueError: grpo.async_grpo.recompute_kv_cache_after_weight_updates=False conflicts
+  with policy.generation.mcore_generation_config.kv_cache_management_mode='recompute'`
+  (`nemo_rl/algorithms/grpo.py`, Megatron-generation consistency check at setup).
+- **Root cause**: my recipe set `kv_cache_management_mode: recompute` (copied from the fork's
+  single-controller Qwen recipe, where the matching loop flag is on); this recipe runs synchronous
+  GRPO with the flag at its default `false`.
+- **Fix**: override removed, default `persist` (no request is in flight across a refit in sync
+  GRPO). Unverified.
+- **Not reached**: Ray actors, model construction, HF import, memory, generation, refit.
