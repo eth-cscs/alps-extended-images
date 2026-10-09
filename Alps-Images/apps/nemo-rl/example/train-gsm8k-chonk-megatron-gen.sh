@@ -41,8 +41,8 @@
 # TEMPORARILY Adam instead of the md_decoupling optimizer Chonk was pretrained
 # with (TODO: change back, see the optimizer block of the recipe), TEMPORARILY no
 # KL penalty against the starting policy (TODO, see loss_fn in the recipe), and
-# generation by Megatron-Core's dynamic engine, eager (no CUDA graphs), refit by
-# NeMo-RL's default collective through the bridge mapping.
+# generation by Megatron-Core's dynamic engine (CUDA graphs on, NeMo-RL
+# defaults), refit by NeMo-RL's default collective through the bridge mapping.
 #
 # BEFORE THE FINAL RUN, restore: the md_decoupling optimizer and the KL penalty
 # against the starting policy (REFERENCE_KL_PENALTY=0.01). Both are disabled only
@@ -543,11 +543,13 @@ policy:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 8
-      # Eager generation: CUDA graphs with KDA + latent-MoE layers are untested.
-      cuda_graph_impl: none
-      inference_cuda_graph_scope: none
-      num_cuda_graphs: null
-      use_cuda_graphs_for_non_decode_steps: false
+      # Generation CUDA graphs stay at NeMo-RL's defaults (cuda_graph_impl: local,
+      # inference_cuda_graph_scope: block). Eager generation is NOT usable: idle
+      # expert-parallel ranks then run a one-token dummy forward outside any
+      # graph, and the KDA layer's TransformerEngine LayerNormLinear fails on it
+      # (run 3623722). Padding experts is required for EP > 1 with CUDA graphs
+      # when the layers are not Megatron-Core's inference_optimized ones.
+      moe_pad_experts_for_cuda_graph_inference: true
       # kv_cache_management_mode stays at the default (persist): NeMo-RL requires
       # it to agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates
       # (false), and synchronous GRPO has no request in flight across a refit.

@@ -442,3 +442,29 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   a further NeMo-RL patch with unknown further drift behind it.
 - **Consequence**: the per-step Megatron -> HF-schema -> Megatron conversion is back in the refit
   (the thing the native transport would have avoided); vLLM is still gone.
+
+### Run `3623722` — 2026-10-09 — default refit works, first step entered; eager generation crashes idle expert-parallel engines
+
+- **Log**: `~/Downloads/slurm-3623722.tail.out`. 24 nodes. Reached `Step 1/2` ~13 min in, then
+  hung (log idle; engines dying) -- state RUNNING when this was written.
+- **Worked, all for the first time on Chonk**: weight-synchronizer init with
+  `refit_transport: null`; the initial trainer -> generator refit (`refit: watchdog NOT armed`,
+  then every generation rank `prepare_for_generation: engine already serving`); the 64 Megatron
+  inference engines registered with the data-parallel coordinator; `Step 1/2` banner.
+- **Symptom**: on 10 generation ranks,
+  `megatron/core/inference/engines/dynamic_engine.py run_engine_with_coordinator ->
+  _run_ep_dummy_step -> controller.dummy_forward -> ... -> kimi_delta_attention.py
+  _dynamic_inference -> self.in_proj(hidden_states)` (TE `LayerNormLinear`) ->
+  `RuntimeError: transformer_engine.cpp:255 CheckOutputTensor: Assertion failed: t.has_data() ||
+  t.has_columnwise_data(). Output (rsigma) is not allocated!`; the coordinator logs
+  `removed engine ... (now 54 engines)` and generation stalls.
+- **Root cause**: my recipe forced eager generation (`cuda_graph_impl: none`). An expert-parallel
+  rank with no request of its own runs a dummy step to stay in the EP collectives; without a
+  matching CUDA graph `DynamicInferenceContext.initialize_attention_state` returns early ("the
+  controller will directly call the model forward pass with a single token") and the fork's KDA
+  dynamic-inference path does not survive that batch (TE 2.17 layernorm output unallocated). With
+  CUDA graphs the dummy step is padded to a captured graph's dimensions instead.
+- **Fix (unverified)**: eager overrides removed -> NeMo-RL defaults (`cuda_graph_impl: local`,
+  `inference_cuda_graph_scope: block`, 4 graphs); `moe_pad_experts_for_cuda_graph_inference: true`
+  added (required for EP > 1 with inference CUDA graphs unless `inference_optimized`).
+  Open: whether graph capture works with the KDA + latent-MoE layers at all.
