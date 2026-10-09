@@ -504,3 +504,34 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   67-70 s/step in steady state, i.e. ~2 h for 92 steps of 48x16 on 12 trainer + 4 rollout nodes.
 - **Not captured**: per-step metrics for all 92 steps (only the samples above; the rest are in
   `run.log` / TensorBoard on the cluster); a held-out evaluation (the recipe has `val_period: 0`).
+
+### Run `3624750` — 2026-10-09 — CUDA graphs on: graph capture works, same KDA crash in the idle-rank dummy step during prefill
+
+- **Log**: `~/Downloads/slurm-3624750.tail.out` (last 14000 lines). 24 nodes. Reached `Step 1/2`
+  ~11 min in, `Generating responses for batch of size 256...`, then 13 engines crashed and the job
+  hung (log idle; state RUNNING when written). Job `3623722` before it was cancelled by the user's
+  OK after hanging the same way.
+- **Worked**: inference CUDA-graph warmup on the generation ranks with the KDA + latent-MoE layers
+  (`cuda graph warmup - [152]: 0 P + 152 D ... 4/4`); `Initialized persistent inference engine`.
+- **Symptom**: identical to `3623722` -- `_run_ep_dummy_step -> dummy_forward -> ... ->
+  kimi_delta_attention.py:1422 _dynamic_inference: projected, _ = self.in_proj(hidden_states)` ->
+  TE `CheckOutputTensor ... Output (rsigma) is not allocated`; 13 of 64 engines removed.
+- **Root cause (refined)**: only DECODE graphs are captured -- the four warmup shapes are
+  `0 P + {1, 2, 76, 152} D`, none with prefill requests. Generation starts with prefill, and
+  `generation_batch_size: 32` hands requests to at most 32 of the 64 engines at a time, so idle
+  expert-parallel ranks run the dummy step while a peer is in prefill. No captured graph matches,
+  `initialize_attention_state` returns early with `token_count=0`, the dummy forward gets an empty
+  batch, and the Megatron-LM fork's KDA layer feeds it to a TE `LayerNormLinear`, which asserts on
+  the empty output. KDA's dummy-state handling (`kda_dummy_state_idx`) only covers dummy slots
+  inside a captured decode graph. Enabling CUDA graphs therefore did not help; this is a gap in
+  the fork's KDA inference path, independent of NeMo-RL and the bridge.
+- **Options (none applied yet)**:
+  1. config only -- `INFERENCE_REQUESTS=256` so all 64 engines get requests at once and none is
+     idle during prefill; racy by construction (an engine can start a step before its peers have
+     received theirs) and idle ranks will still appear whenever a prefill overlaps an empty engine;
+  2. a small patch to the Megatron-LM fork: make `KimiDeltaAttention._dynamic_inference` return an
+     empty output for an empty batch instead of calling `in_proj` (the MoE layers after it still
+     run their collectives, which is the point of the dummy step) -- unverified, and belongs
+     upstream in `swiss-ai/Megatron-LM-MoE`;
+  3. get prefill graphs captured (`cuda_graph_max_tokens`, `num_cuda_graphs`) -- unknown whether
+     KDA prefill is graph-capturable.
