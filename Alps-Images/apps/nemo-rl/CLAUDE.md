@@ -558,3 +558,34 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   `is_spec_decode` argument, which NeMo-RL only forwards when a caller sets it
   (`distributed/model_utils.py`) and no caller does.
 - Note: the vLLM example `train-gsm8k-chonk.sh` (author's) still pins `a9e0c497`.
+
+### Run `3628358` — 2026-10-09 — **Megatron generation of Chonk WORKS** (256 rollouts, no engine crash); trainer OOM in the first training forward
+
+- **Log**: `~/Downloads/slurm-3628358.tail.out` (last 6000 lines). 24 nodes, fork pin `b0844260`,
+  fresh `src-v3` checkout. ~50 min queued, FAILED after 827 s.
+- **Worked, first time**: the whole generation side. `Generating responses for batch of size 256`
+  -> every rank `finishing generation` (`mcore async scheduling steps (cumul): 93`), zero
+  `CheckOutputTensor`, zero `removed engine`: the fork commit `b0844260` (non-empty EP dummy
+  forwards) fixes runs `3623722` / `3624750`, and KDA + latent-MoE generation under Megatron-Core's
+  dynamic engine with CUDA graphs works. Generation rank memory after the rollout: ~46.3 GB
+  allocated / 56.2 GB device. Then rewards, advantages and the trainer's logprob pass
+  (`logprob_batch_size: 1`) all completed.
+- **Symptom**: `torch.OutOfMemoryError: Tried to allocate 2.52 GiB ... 86.28 GiB allocated by
+  PyTorch` on trainer rank 17 in `MegatronPolicyWorker.train()` ->
+  `megatron/core/pipeline_parallel/schedules.py forward_step_calc_loss` ->
+  `nemo_rl/algorithms/loss/loss_input.py prepare_loss_input` ->
+  `distributed/model_utils.py from_parallel_logits_to_logprobs` -> `all_to_all_vp2sq`
+  (`torch.empty_like` of the logits).
+- **Root cause**: training micro-batch 4 x 1280 tokens x vocabulary 200064 logits (several GiB per
+  copy, more than one copy in the loss) plus the forward activations of 42 layers without activation
+  checkpointing, on top of the ~49 GB the trainer holds at rest without expert offloading. The
+  author's recipe uses micro-batch 4 only together with offloading (and notes the historical run
+  used 1).
+- **Fix (unverified)**: `TRAIN_MICRO_BATCH` default 4 -> 1, `TRAIN_GLOBAL_BATCH` decoupled and kept
+  at 128 (4 accumulated micro-batches per rank; both env-overridable, divisibility checked).
+  Further levers if needed: `activation_checkpointing: true`, expert offloading.
+- **Side observation (relevant to the R3 question)**: during the trainer's logprob pass every rank
+  logs `N/M valid tokens have -inf in prev_logprobs (policy top-k/top-p mismatch). Masking out`
+  with N = 1-2 of 35-241 tokens -- i.e. about 1-2 % of sampled tokens fall outside the trainer's
+  top-p 0.9 nucleus. Generator and trainer are therefore close but not identical at the nucleus
+  boundary. No generation-KL number was printed (the run died before the step metrics).

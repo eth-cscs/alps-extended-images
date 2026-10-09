@@ -83,20 +83,25 @@ export SRC_VERSION="v3"
 export TRAIN_NODES=8
 export INFERENCE_NODES=$(( SLURM_JOB_NUM_NODES - TRAIN_NODES ))
 export TOTAL_NODES=${SLURM_JOB_NUM_NODES}
-export TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-4}"
+# Micro-batch 1 with the global batch kept at 128 (4 accumulated micro-batches
+# per trainer rank): at micro-batch 4 the trainer runs out of GPU memory in the
+# loss (vocabulary-wide logits for 4 x 1280 tokens on top of ~49 GB of model and
+# optimizer state without expert offloading, run 3628358).
+export TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-1}"
 export INFERENCE_REQUESTS="${INFERENCE_REQUESTS:-32}"
 export MAX_NUM_STEPS="${MAX_NUM_STEPS:-2}"
 export NUM_PROMPTS="${NUM_PROMPTS:-32}"
 # KL penalty against the starting policy; > 0 needs a reference model on the
 # trainer GPUs (see the loss_fn block of the recipe). Author's value: 0.01.
 export REFERENCE_KL_PENALTY="${REFERENCE_KL_PENALTY:-0.0}"
-export TRAIN_GLOBAL_BATCH=$(( TRAIN_NODES * 4 * TRAIN_MICRO_BATCH ))
+export TRAIN_GLOBAL_BATCH="${TRAIN_GLOBAL_BATCH:-$(( TRAIN_NODES * 4 * 4 ))}"
 if [ "${INFERENCE_NODES}" -le 0 ] || [ $(( INFERENCE_NODES * 4 % 8 )) -ne 0 ]; then
     echo "FATAL: ${INFERENCE_NODES} generation nodes x 4 GPUs is not a positive multiple of EP8"
     exit 1
 fi
-if [ $(( NUM_PROMPTS * 8 % TRAIN_GLOBAL_BATCH )) -ne 0 ]; then
-    echo "FATAL: rollout batch ${NUM_PROMPTS} x 8 does not divide into training batches of ${TRAIN_GLOBAL_BATCH}"
+if [ $(( NUM_PROMPTS * 8 % TRAIN_GLOBAL_BATCH )) -ne 0 ] \
+        || [ $(( TRAIN_GLOBAL_BATCH % (TRAIN_NODES * 4 * TRAIN_MICRO_BATCH) )) -ne 0 ]; then
+    echo "FATAL: rollout batch ${NUM_PROMPTS} x 8 / global batch ${TRAIN_GLOBAL_BATCH} / micro-batch ${TRAIN_MICRO_BATCH} x $(( TRAIN_NODES * 4 )) ranks do not divide"
     exit 1
 fi
 
