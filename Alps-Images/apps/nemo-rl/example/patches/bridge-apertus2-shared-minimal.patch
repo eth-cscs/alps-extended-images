@@ -1,0 +1,239 @@
+# Minimal edits to shared Megatron-Bridge files for Apertus 2 (Chonk) on the swiss-ai Megatron-LM-MoE fork.
+# Base: NVIDIA-NeMo/Megatron-Bridge@077224531ad4d6d0caef767a84e619b256aa5cb6. Source of every hunk: swiss-ai/Megatron-Bridge@f3bc8e7e6a722adde1176b2ba8980109e09493ef
+# (Apache-2.0). The models/apertus2/ package itself is NOT in this patch: the launcher checks it out
+# verbatim from the fork. Hunks:
+#   models/__init__.py        register the Apertus2 bridge; make DeepSeek / Nemotron-Omni imports optional
+#   models/deepseek/__init__.py, models/nemotron_omni/__init__.py
+#                             import guards: the Megatron-LM fork lacks mla_qk_norm_config and the
+#                             dynamic-resolution context-parallel helpers these packages import
+#   models/model_provider.py  keep the quantile-balancing router buffer (qb_beta) in fp32
+#   training/optim.py         dispatch optimizer=md_decoupling (drop this hunk if training with Adam)
+diff --git a/src/megatron/bridge/models/__init__.py b/src/megatron/bridge/models/__init__.py
+index 5ccb3939..65a3dd53 100644
+--- a/src/megatron/bridge/models/__init__.py
++++ b/src/megatron/bridge/models/__init__.py
+@@ -13,6 +13,12 @@
+ # limitations under the License.
+ 
+ # Import model providers for easy access
++from megatron.bridge.models.apertus2 import (
++    Apertus2Bridge,
++    Apertus2ModelBuilder,
++    Apertus2ModelConfig,
++    Apertus2ModelProvider,
++)
+ from megatron.bridge.models.bailing import (
+     BailingMoeV2Bridge,
+ )
+@@ -28,10 +34,11 @@ from megatron.bridge.models.conversion.param_mapping import (
+     ReplicatedMapping,
+     RowParallelMapping,
+ )
+-from megatron.bridge.models.deepseek import (
+-    DeepSeekV2Bridge,
+-    DeepSeekV3Bridge,
+-)
++from megatron.bridge.models.deepseek import DEEPSEEK_AVAILABLE
++
++
++if DEEPSEEK_AVAILABLE:
++    from megatron.bridge.models.deepseek import DeepSeekV2Bridge, DeepSeekV3Bridge
+ from megatron.bridge.models.ernie import (
+     Ernie45Bridge,
+ )
+@@ -140,10 +147,11 @@ from megatron.bridge.models.muse_glimmer import (
+ from megatron.bridge.models.nemotron import (
+     NemotronBridge,
+ )
+-from megatron.bridge.models.nemotron_omni import (
+-    NemotronOmniBridge,
+-    NemotronOmniModel,
+-)
++from megatron.bridge.models.nemotron_omni import NEMOTRON_OMNI_AVAILABLE
++
++
++if NEMOTRON_OMNI_AVAILABLE:
++    from megatron.bridge.models.nemotron_omni import NemotronOmniBridge, NemotronOmniModel
+ from megatron.bridge.models.nemotron_vl import (
+     NemotronVLBridge,
+     NemotronVLModel,
+@@ -218,9 +226,12 @@ __all__ = [
+     "RowParallelMapping",
+     "AutoMapping",
+     "BailingMoeV2Bridge",
+-    # DeepSeek Models
+-    "DeepSeekV2Bridge",
+-    "DeepSeekV3Bridge",
++    # Apertus Models
++    "Apertus2Bridge",
++    "Apertus2ModelBuilder",
++    "Apertus2ModelConfig",
++    "Apertus2ModelProvider",
++    # DeepSeek Models are appended when the MCore MLA resolver is available.
+     # ERNIE Text-Only Models
+     "Ernie45Bridge",
+     # ERNIE VL Models
+@@ -307,8 +318,7 @@ __all__ = [
+     "NemotronVLModel",
+     "NemotronVLBridge",
+     "NemotronVLModelProvider",
+-    "NemotronOmniBridge",
+-    "NemotronOmniModel",
++    # Nemotron Omni models are appended when MCore dynamic-resolution CP is available.
+     # ASR Models
+     "Qwen3ASRBridge",
+     "Qwen3ASRModel",
+@@ -334,3 +344,8 @@ __all__ = [
+     "ExaoneMoeBridge",
+     "ExaoneMoeModelProvider",
+ ]
++
++if DEEPSEEK_AVAILABLE:
++    __all__.extend(("DeepSeekV2Bridge", "DeepSeekV3Bridge"))
++if NEMOTRON_OMNI_AVAILABLE:
++    __all__.extend(("NemotronOmniBridge", "NemotronOmniModel"))
+diff --git a/src/megatron/bridge/models/deepseek/__init__.py b/src/megatron/bridge/models/deepseek/__init__.py
+index 968868c2..3c8151c2 100644
+--- a/src/megatron/bridge/models/deepseek/__init__.py
++++ b/src/megatron/bridge/models/deepseek/__init__.py
+@@ -12,13 +12,18 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge  # noqa: F401
+-from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge  # noqa: F401
+-from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge  # noqa: F401
++from importlib.util import find_spec
+ 
+ 
+-__all__ = [
+-    "DeepSeekV2Bridge",
+-    "DeepSeekV3Bridge",
+-    "DeepSeekV4Bridge",
+-]
++# TODO: Remove this guard when the Apertus2 MCore fork provides the MLA QK-norm resolver.
++# Other model families import deepseek.common without requiring DeepSeek model classes.
++DEEPSEEK_AVAILABLE = find_spec("megatron.core.transformer.mla_qk_norm_config") is not None
++
++if DEEPSEEK_AVAILABLE:
++    from megatron.bridge.models.deepseek.deepseek_v2_bridge import DeepSeekV2Bridge
++    from megatron.bridge.models.deepseek.deepseek_v3_bridge import DeepSeekV3Bridge
++    from megatron.bridge.models.deepseek.deepseek_v4_bridge import DeepSeekV4Bridge
++
++    __all__ = ["DeepSeekV2Bridge", "DeepSeekV3Bridge", "DeepSeekV4Bridge"]
++else:
++    __all__ = []
+diff --git a/src/megatron/bridge/models/model_provider.py b/src/megatron/bridge/models/model_provider.py
+index 4717974e..ea7fdeff 100644
+--- a/src/megatron/bridge/models/model_provider.py
++++ b/src/megatron/bridge/models/model_provider.py
+@@ -71,9 +71,10 @@ def _apply_mixed_precision_wrapper(
+         for submodule in model_module.modules():
+             # Preserve the existing MCore expert-bias contract.
+             if hasattr(submodule, "_maintain_float32_expert_bias"):
+-                expert_bias = getattr(submodule, "expert_bias", None)
+-                if expert_bias is not None:
+-                    keep_in_fp32.append((submodule, "expert_bias", expert_bias.data.clone()))
++                for buffer_name in ("expert_bias", "qb_beta"):
++                    buffer = getattr(submodule, buffer_name, None)
++                    if buffer is not None:
++                        keep_in_fp32.append((submodule, buffer_name, buffer.data.float().clone()))
+ 
+             # Model-specific modules can mark direct parameters that must not be
+             # truncated by Float16Module's recursive half()/bfloat16() cast.
+diff --git a/src/megatron/bridge/models/nemotron_omni/__init__.py b/src/megatron/bridge/models/nemotron_omni/__init__.py
+index c2cf239a..86624859 100644
+--- a/src/megatron/bridge/models/nemotron_omni/__init__.py
++++ b/src/megatron/bridge/models/nemotron_omni/__init__.py
+@@ -14,33 +14,44 @@
+ 
+ """Nemotron Omni model family (Vision-Language + Audio) for Megatron Bridge."""
+ 
+-from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import NemotronOmniModel
+-from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni_llava import NemotronOmniLlavaModel
+-from megatron.bridge.models.nemotron_omni.nemotron_omni_bridge import (
+-    NemotronOmniBridge,
+-    NemotronOmniLlavaBridge,
+-)
+-from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
+-    NemotronOmniLlavaModelProvider,
+-    NemotronOmniModelProvider,
+-    NemotronVLModelProvider,
++from megatron.core.models.multimodal import context_parallel as _context_parallel
++
++
++# TODO: Remove this guard when the Apertus2 MCore fork provides dynamic-resolution CP.
++NEMOTRON_OMNI_AVAILABLE = all(
++    hasattr(_context_parallel, name)
++    for name in ("gather_from_context_parallel_ranks_dynamic_res", "split_to_context_parallel_ranks_dynamic_res")
+ )
+ 
++if NEMOTRON_OMNI_AVAILABLE:
++    from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni import NemotronOmniModel
++    from megatron.bridge.models.nemotron_omni.modeling_nemotron_omni_llava import NemotronOmniLlavaModel
++    from megatron.bridge.models.nemotron_omni.nemotron_omni_bridge import (
++        NemotronOmniBridge,
++        NemotronOmniLlavaBridge,
++    )
++    from megatron.bridge.models.nemotron_omni.nemotron_omni_provider import (
++        NemotronOmniLlavaModelProvider,
++        NemotronOmniModelProvider,
++        NemotronVLModelProvider,
++    )
+ 
+-__all__ = [
+-    "NemotronOmniModel",
+-    "NemotronOmniBridge",
+-    "NemotronOmniModelProvider",
+-    "NemotronOmniLlavaModel",
+-    "NemotronOmniLlavaBridge",
+-    "NemotronOmniLlavaModelProvider",
+-    "NemotronVLModelProvider",
+-    "BridgeSoundEncoder",
+-]
++    __all__ = [
++        "NemotronOmniModel",
++        "NemotronOmniBridge",
++        "NemotronOmniModelProvider",
++        "NemotronOmniLlavaModel",
++        "NemotronOmniLlavaBridge",
++        "NemotronOmniLlavaModelProvider",
++        "NemotronVLModelProvider",
++        "BridgeSoundEncoder",
++    ]
++else:
++    __all__ = []
+ 
+ 
+ def __getattr__(name: str):
+-    if name == "BridgeSoundEncoder":
++    if name == "BridgeSoundEncoder" and NEMOTRON_OMNI_AVAILABLE:
+         from megatron.bridge.models.nemotron_omni.nemotron_omni_sound import BridgeSoundEncoder
+ 
+         return BridgeSoundEncoder
+diff --git a/src/megatron/bridge/training/optim.py b/src/megatron/bridge/training/optim.py
+index 32a77160..32ef9423 100644
+--- a/src/megatron/bridge/training/optim.py
++++ b/src/megatron/bridge/training/optim.py
+@@ -85,7 +85,20 @@ def setup_optimizer(
+                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
+             )
+ 
+-    if hasattr(optimizer_config, "provide"):
++    if optimizer_config.optimizer == "md_decoupling":
++        # MDDecoupling has its own parameter partitioning and cannot use the
++        # generic optimizer factory (which would flatten matrix parameters).
++        from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
++
++        optimizer = get_megatron_mddecoupling_optimizer(
++            config=optimizer_config,
++            model_chunks=model_chunks,
++            config_overrides=config_overrides,
++            use_gloo_process_groups=use_gloo_process_groups,
++            layer_wise_distributed_optimizer=optimizer_config.use_layer_wise_distributed_optimizer,
++            pg_collection=pg_collection,
++        )
++    elif hasattr(optimizer_config, "provide"):
+         optimizer = optimizer_config.provide(
+             model_chunks=model,
+             config_overrides=config_overrides,

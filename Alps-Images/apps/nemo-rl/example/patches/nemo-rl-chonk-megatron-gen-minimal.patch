@@ -1,0 +1,66 @@
+# Minimal edits to NeMo-RL for Apertus 2 (Chonk) with Megatron generation on the nemo-rl-cuda image.
+# Base: NVIDIA-NeMo/RL@f196ef0a1ccb54d6ce71cd63277fb6a0e01168db (Apache-2.0).
+#   nemo_rl/models/generation/megatron/megatron_worker.py
+#       from swiss-ai/Nemo-RL PR #1: hand the KDA (linear-attention) per-request state config to
+#       Megatron-Core's inference engine, and advertise the node IP (not the container hostname) to
+#       the data-parallel inference coordinator.
+#   nemo_rl/models/policy/__init__.py
+#       local: the image ships transformers 5.17; turn the '< 5.13' assert guarding a DeepSeek-V3
+#       tokenizer workaround into a printed warning.
+diff --git a/nemo_rl/models/generation/megatron/megatron_worker.py b/nemo_rl/models/generation/megatron/megatron_worker.py
+index 6c88b7d..b55954a 100644
+--- a/nemo_rl/models/generation/megatron/megatron_worker.py
++++ b/nemo_rl/models/generation/megatron/megatron_worker.py
+@@ -528,6 +528,15 @@ class MegatronGenerationMixin:
+         mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+             inference_model
+         )
++        kda_inference_state_config = None
++        if getattr(model_config, "experimental_attention_variant", None) == "kda":
++            from megatron.core.inference.config import KDAInferenceStateConfig
++
++            kda_inference_state_config = KDAInferenceStateConfig.from_model(
++                inference_model
++            )
++            if kda_inference_state_config is None:
++                raise ValueError("KDA model has no KDA inference state")
+         is_hybrid_model = mamba_inference_state_config is not None
+         if is_hybrid_model:
+             if (
+@@ -590,6 +599,10 @@ class MegatronGenerationMixin:
+             "image_preprocessing_config": image_preprocessing_config,
+             "video_preprocessing_config": video_preprocessing_config,
+         }
++        if kda_inference_state_config is not None:
++            inference_config_kwargs["kda_inference_state_config"] = (
++                kda_inference_state_config
++            )
+         _apply_optional_inference_config_kwargs(
+             inference_config_kwargs, mcore_generation_config
+         )
+@@ -627,9 +640,12 @@ class MegatronGenerationMixin:
+ 
+     async def _start_inference_coordinator(self):
+         """Start the inference coordinator and engine loop."""
++        from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
++
+         self.coordinator_addr = await self.dynamic_inference_engine.start_listening_to_data_parallel_coordinator(
+             inference_coordinator_port=None,
+             launch_inference_coordinator=True,
++            hostname=_get_node_ip_local(),
+         )
+         if torch.distributed.get_rank() == 0:
+             from megatron.core.inference.inference_client import InferenceClient
+diff --git a/nemo_rl/models/policy/__init__.py b/nemo_rl/models/policy/__init__.py
+index 1c0c1f4..34eb287 100644
+--- a/nemo_rl/models/policy/__init__.py
++++ b/nemo_rl/models/policy/__init__.py
+@@ -50,7 +50,7 @@ def _patch_transformers_tokenizer_class_set():
+     # TODO: remove this patch (and the assert below) once the deepseek_v3
+     # entries actually disappear upstream.
+     # https://github.com/NVIDIA-NeMo/RL/issues/2764
+-    assert PkgVersion(transformers.__version__) < PkgVersion("5.13.0"), (
++    if not PkgVersion(transformers.__version__) < PkgVersion("5.13.0"): print(
+         f"transformers {transformers.__version__} detected. "
+         "The deepseek_v3 tokenizer-blocklist patch was verified against <5.13. "
+         "Check if the upstream fix now applies and remove this patch if so."

@@ -240,3 +240,95 @@ preflight module list.
 - What cannot be avoided is using a *fork* of the bridge: Apertus support (provider, bridge, xIELU)
   exists only in `Alvorecer721/Megatron-Bridge`; upstream `NVIDIA-NeMo/Megatron-Bridge` `main` has no
   `models/apertus*` (checked 2026-10-09). That ends only when the Apertus bridge is upstreamed.
+
+# Chonk (Apertus 2) with Megatron generation on near-vanilla libraries (`example/train-gsm8k-chonk-megatron-gen.sh`)
+
+Created 2026-10-09. **UNTESTED on cluster.** Goal (user): train Chonk without vLLM and with as few
+library changes as possible -- vanilla NeMo-RL and Megatron-Bridge plus only what is strictly
+needed; the Megatron-LM fork is accepted as unavoidable.
+
+## What Chonk is (from the checkpoint `config.json`, read 2026-10-09)
+
+`architectures: [Apertus2KDAForCausalLM]`, `model_type: apertus2`, config class shipped as remote
+code (`configuration_apertus2.py`). 42 layers mixing `linear_attention` (KDA, Kimi Delta Attention)
+and `full_attention`; MoE from layer 3 on, 256 routed + 1 shared experts, 8 active, latent MoE
+(`moe_latent_size` 1792), quantile-balancing router; `hidden_act: sssglu`, sandwich norm, QK norm,
+embedding/residual multipliers; hidden 3584, vocab 200064. Roughly 70B parameters, ~69B of them
+experts (my arithmetic from the config, not measured).
+
+## Sources and the delta from vanilla
+
+| Library | Base (vanilla) | Added |
+|---|---|---|
+| NeMo-RL | `NVIDIA-NeMo/RL@f196ef0a` (the commit the author's example pins; `swiss-ai/Nemo-RL` is 0 commits ahead of upstream) | `patches/nemo-rl-chonk-megatron-gen-minimal.patch`: 2 files, +17/-1 |
+| Megatron-Bridge | `NVIDIA-NeMo/Megatron-Bridge@07722453` (merge-base of the swiss-ai fork with upstream) | `models/apertus2/` (6 new files) copied verbatim from `swiss-ai/Megatron-Bridge@f3bc8e7e`; `patches/bridge-apertus2-shared-minimal.patch`: 5 files, +91/-46 |
+| Megatron-LM | -- | `swiss-ai/Megatron-LM-MoE@a9e0c497` (head of its PR #88), untouched |
+| nemo-lens | `NVIDIA-NeMo/Lens@b85578fc` (NeMo-RL's pin) | -- |
+
+Both patches were generated from the forks' own commits with git (not hand-written), carry a
+header listing each hunk and its reason, apply cleanly to the vanilla bases, and are embedded in
+the launcher byte-identically (verified). The launcher's checkout step was run locally end to end.
+
+**Bridge hunks kept, and why** (each checked against the source):
+- `models/__init__.py`: import/registration of the Apertus2 bridge (the `register_bridge`
+  decorator only fires on import).
+- `models/deepseek/__init__.py`, `models/nemotron_omni/__init__.py` (+ their guards in
+  `models/__init__.py`): the vanilla bridge imports `megatron.core.transformer.mla_qk_norm_config`
+  and the dynamic-resolution context-parallel helpers at package import; the Megatron-LM fork has
+  neither (verified absent at `a9e0c497`), so `import megatron.bridge.models` would fail.
+- `models/model_provider.py`: keep the quantile-balancing buffer `qb_beta` in fp32 under the
+  mixed-precision wrapper.
+- `training/optim.py` (first hunk only): dispatch `optimizer: md_decoupling` to the fork's
+  optimizer factory. Needed only because the recipe keeps the author's optimizer; drop it if
+  training with Adam.
+
+**Bridge changes of the fork deliberately left out**:
+- `conversion/auto_bridge.py`, `training/model_load_save.py`, `training/mlm_compat/arguments.py`,
+  `training/checkpointing.py`: loading native / legacy Megatron checkpoints (no `run_config.yaml`,
+  legacy offloading schema). Not needed when starting from the HF checkpoint.
+- `conversion/utils.py`, `conversion/model_bridge.py` (incl. swiss-ai bridge PR #4): per-expert
+  weight views for `OffloadingExpertsMLP`, and moving CPU master weights to CUDA before NCCL
+  collectives in the Megatron->HF export. Needed only with expert offloading and/or the vLLM
+  refit; this recipe has neither.
+- formatting-only hunks in `optim.py`, docs, scripts, tests.
+
+**NeMo-RL hunks kept**: `megatron_worker.py` from swiss-ai PR #1 -- pass
+`KDAInferenceStateConfig.from_model(...)` to Megatron-Core's `InferenceConfig` (vanilla only wires
+the Mamba state config, so KDA layers would have no per-request state), and give the data-parallel
+inference coordinator the node IP instead of the container hostname; plus the local one-line
+`transformers < 5.13` assert relaxation (image has 5.17).
+**Left out**: upstream PR #2517 (vLLM DP), swiss-ai PR #5 (checkpoint load under `no_grad`), the
+tokenizer rework and `max_requests` key of PR #1.
+
+## Why Megatron generation is feasible here (checked, not assumed)
+
+- Every `megatron.core` symbol NeMo-RL's `models/generation/megatron/*` imports resolves in the
+  fork (40/40, static check).
+- The fork's `megatron/core/ssm/kimi_delta_attention.py` implements `_dynamic_inference` /
+  `_dynamic_inference_decode` (needs `fla.ops.kda.fused_recurrent_kda_fwd`; the image ships
+  flash-linear-attention) and raises `NotImplementedError` for anything but the dynamic engine;
+  `InferenceConfig.kda_inference_state_config` and `DynamicInferenceContext.has_kda` exist.
+- The image was described by its author as "Megatron policy + Megatron generation backend".
+
+## Recipe = the author's `grpo-chonk-vllm.yaml` with these differences
+
+- `policy.generation`: `backend: megatron`, `refit_transport: mcore`,
+  `mcore_generation_config: {expert_model_parallel_size: 8, tensor/pipeline 1, refit_backend: nccl,
+  cuda_graph_impl: none, inference_cuda_graph_scope: none, num_cuda_graphs: null,
+  use_cuda_graphs_for_non_decode_steps: false, kv_cache_management_mode: recompute,
+  logprobs_mode: raw_logprobs}`; `vllm_cfg` / `vllm_kwargs` removed.
+- `megatron_cfg.model_overrides` (coarse-grained expert offloading, in-place FP8 params) removed.
+- Everything else (24 nodes = 8 train EP16 + 16 generation EP8, 32x8 rollouts, 2 steps,
+  md_decoupling optimizer, sync GRPO via `examples/run_grpo.py`) unchanged.
+
+## Open risks, in the order a first run would meet them
+
+1. Preflight: the patched vanilla bridge importing against the Megatron-LM fork, and
+   `AutoBridge.from_hf_config` resolving the checkpoint to the Apertus2 provider.
+2. Trainer memory without expert offloading (the author enabled it; if this OOMs, the next step is
+   the offloading patch group: bridge PR #4 + the two `conversion/` files).
+3. Whether `md_decoupling` needs anything else from the fork bridge (the author's job 5003401
+   reached generation with the full fork, not with this subset).
+4. KDA + latent MoE under the dynamic inference engine, eager.
+5. Native `mcore` refit EP16 -> EP8 for the fork's custom modules.
+6. If swiss-ai PR #5 (`no_grad` checkpoint load) turns out to be load-bearing.
