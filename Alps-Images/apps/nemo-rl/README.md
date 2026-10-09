@@ -11,6 +11,11 @@ It uses Megatron training and vLLM generation with an HF model input. One shell
 launcher uses separate YAML and prompt files. See the example
 README for pinned sources, batch sizes and the unvalidated memory/refit limits.
 
+[`example/train-gsm8k-apertus-v1.5-70B.sh`](example/train-gsm8k-apertus-v1.5-70B.sh) is a
+self-contained launcher for Apertus 1.5 70B GRPO on GSM8K (16 nodes: Megatron TP2/PP4
+training, vLLM TP4 generation) using the `Alvorecer721/Nemo-RL` fork and its recipe. It
+has not completed a run yet; status and run log are in [`CLAUDE.md`](CLAUDE.md).
+
 ## Build
 
 Use the repository's [manual-build workflow](../../../manual-build/README.md)
