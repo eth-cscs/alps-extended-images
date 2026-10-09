@@ -535,3 +535,26 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
      upstream in `swiss-ai/Megatron-LM-MoE`;
   3. get prefill graphs captured (`cuda_graph_max_tokens`, `num_cuda_graphs`) -- unknown whether
      KDA prefill is graph-capturable.
+
+## Megatron-LM fork pin moved to `b0844260` — 2026-10-09 (fix for the KDA dummy-step crash, unverified)
+
+- Job `3624750` cancelled with the user's OK (hung, 24 nodes). User chose "option 2, and if the fix
+  already exists apply it".
+- **The fix already exists in the fork**: `andresnowak/Megatron-LM-MoE` branch
+  `feat/nemo-rl-integration-v2` (= `swiss-ai/Megatron-LM-MoE` PR #88) gained one commit on
+  2026-10-09 16:05 CEST, directly on top of the previously pinned `a9e0c497`:
+  `b0844260b2a0888c711dca230b88ec13b20f3229` "Complete nonempty EP dummy forwards for PR #4258"
+  (adapted from NVIDIA/Megatron-LM PR #4258). It prepares a non-empty dummy batch (one decode
+  request) for an idle expert-parallel rank *before* CUDA-graph matching, so both graph execution
+  and the eager fallback get valid input, and removes the old empty/single-token dummy path --
+  exactly the failure of runs `3623722` / `3624750`. Files: `inference/contexts/dynamic_context.py`,
+  `inference/model_inference_wrappers/abstract_model_inference_wrapper.py`, `models/gpt/gpt_model.py`,
+  `models/hybrid/hybrid_model.py` (+ tests). The KDA layer itself is unchanged.
+- **Applied by moving the pin** (`MLM_REF` -> `b0844260`, `SRC_VERSION` -> `v3`, new shared
+  checkout) rather than as an embedded patch on `a9e0c497`: the result is byte-identical, and the
+  Megatron-LM fork stays "used as-is at a commit of its own PR".
+- **Compatibility checked statically**: all 126 module-level `megatron.core` imports of vanilla
+  NeMo-RL `f196ef0a` still resolve at `b0844260`; the commit removes `GPTModel.forward`'s
+  `is_spec_decode` argument, which NeMo-RL only forwards when a caller sets it
+  (`distributed/model_utils.py`) and no caller does.
+- Note: the vLLM example `train-gsm8k-chonk.sh` (author's) still pins `a9e0c497`.

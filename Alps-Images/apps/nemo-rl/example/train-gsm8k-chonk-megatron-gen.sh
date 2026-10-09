@@ -21,7 +21,7 @@
 #   Megatron-Bridge  NVIDIA-NeMo/Megatron-Bridge@07722453  vanilla + 4-file patch
 #                    + models/apertus2/ copied verbatim from
 #                      swiss-ai/Megatron-Bridge@f3bc8e7e (6 new files)
-#   Megatron-LM      swiss-ai/Megatron-LM-MoE@a9e0c497  the fork, untouched (KDA
+#   Megatron-LM      swiss-ai/Megatron-LM-MoE PR #88 @b0844260  the fork, untouched (KDA
 #                    layers, latent MoE, quantile-balancing router are not in
 #                    stock Megatron-LM)
 #   nemo-lens        NVIDIA-NeMo/Lens@b85578fc          the rev NeMo-RL pins
@@ -68,11 +68,15 @@ export BRIDGE_REF="077224531ad4d6d0caef767a84e619b256aa5cb6"
 export BRIDGE_APERTUS2_REPO="https://github.com/swiss-ai/Megatron-Bridge.git"
 export BRIDGE_APERTUS2_REF="f3bc8e7e6a722adde1176b2ba8980109e09493ef"
 export MLM_REPO="https://github.com/swiss-ai/Megatron-LM-MoE.git"
-export MLM_REF="a9e0c497bbab7e01ea80f363925f3b41a43aee0b"
+# b0844260 = a9e0c497 (the commit the vLLM example pins) + one commit on the same
+# PR (#88), "Complete nonempty EP dummy forwards": idle expert-parallel ranks get
+# a non-empty dummy batch. Without it generation crashes in the KDA layer during
+# prefill (runs 3623722, 3624750).
+export MLM_REF="b0844260b2a0888c711dca230b88ec13b20f3229"
 export LENS_REPO="https://github.com/NVIDIA-NeMo/Lens.git"
 export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
-export SRC_VERSION="v2"
+export SRC_VERSION="v3"
 
 # Topology and batch sizes of the author's recipe: 8 training nodes (32 GPUs,
 # EP16 -> DP2) + 16 generation nodes (64 GPUs, EP8 -> 8 replicas).
@@ -544,11 +548,9 @@ policy:
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 8
       # Generation CUDA graphs stay at NeMo-RL's defaults (cuda_graph_impl: local,
-      # inference_cuda_graph_scope: block). Eager generation is NOT usable: idle
-      # expert-parallel ranks then run a one-token dummy forward outside any
-      # graph, and the KDA layer's TransformerEngine LayerNormLinear fails on it
-      # (run 3623722). Padding experts is required for EP > 1 with CUDA graphs
-      # when the layers are not Megatron-Core's inference_optimized ones.
+      # inference_cuda_graph_scope: block); capture works with the KDA + MoE
+      # layers (run 3624750). Padding experts is required for EP > 1 with CUDA
+      # graphs when the layers are not Megatron-Core's inference_optimized ones.
       moe_pad_experts_for_cuda_graph_inference: true
       # kv_cache_management_mode stays at the default (persist): NeMo-RL requires
       # it to agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates
