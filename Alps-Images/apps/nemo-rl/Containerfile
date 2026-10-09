@@ -1,0 +1,768 @@
+# syntax=docker/dockerfile:1
+
+# NeMo-RL on Alps: Megatron policy + Megatron generation backend (no weight
+# refit), with vLLM plus the MoE/FP8 kernel stack Apertus2 KDA checkpoints need.
+#
+# Kernel stack starts from pytorch2512_alps6_te217_groupgemm0518_emrgopt04_deepgemm_fla52_cconv17_uccl
+# ("megachonk"); UCCL and vLLM align with app/vllm-apertus2. No PYTHONPATH overlays
+# are required at run time. The NeMo-RL checkout itself is NOT vendored: bind-mount
+# it and put it on PYTHONPATH, so the fork stays editable without an image rebuild.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS uv-base
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+
+# System deps. libibverbs-dev is the UCCL build dependency; python3-dev is needed
+# by the native extensions built further down.
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      pkg-config \
+      python3-dev \
+      libibverbs-dev \
+      libnl-3-dev \
+      libnl-route-3-dev \
+      libnuma-dev \
+      build-essential \
+      cmake \
+      libelf-dev \
+      libgflags-dev \
+      libgtest-dev \
+      libhwloc-dev \
+      ninja-build \
+      zlib1g-dev \
+    ; \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    arch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    libdir="/usr/lib/${arch}"; \
+    if [[ ! -e "${libdir}/libibverbs.so" && -e "${libdir}/libibverbs.so.1" ]]; then \
+        ln -sf "${libdir}/libibverbs.so.1" "${libdir}/libibverbs.so"; \
+        ldconfig; \
+    fi
+
+# ---- uv ---------------------------------------------------------------------
+# uv is the installer for everything below: it resolves the whole dependency set
+# at once instead of package by package. It is also what NeMo Gym shells out to
+# at run time to build its per-server venvs.
+#
+# Deliberately no --exclude-newer: it would be the obvious way to freeze the
+# unpinned entries, but uv drops any distribution whose index metadata carries no
+# upload date, and nanobind (needed by the UCCL build) is one of those — the whole
+# package disappears from the resolution. Pin versions inline instead.
+# Bootstrapped with pip because nothing else is available yet.
+ARG UV_VERSION=0.11.23
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python3 --no-cache-dir "uv==${UV_VERSION}"; \
+    uv --version
+
+# Same JFrog mirror pip_install defaults to. Set as ENV so the NeMo Gym venvs
+# built at run time resolve through it too.
+ENV UV_DEFAULT_INDEX=https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple
+
+# Both are ARGs, not ENVs: uv reads them from the build environment, and they do
+# not leak into the runtime image, so the Gym venvs built at run time are
+# unaffected.
+#   UV_BREAK_SYSTEM_PACKAGES
+#                       the NGC base marks its interpreter PEP 668
+#                       EXTERNALLY-MANAGED, so uv refuses to touch it otherwise.
+#                       Upstream hits the same wall with pip: see
+#                       apps/verl/Containerfile's `--break-system-packages`.
+#   UV_PYTHON_DOWNLOADS never lets uv fetch its own managed CPython. Every install
+#                       must land in the NGC interpreter that `--system` selects,
+#                       not one uv quietly downloaded alongside it.
+ARG UV_BREAK_SYSTEM_PACKAGES=1
+ARG UV_PYTHON_DOWNLOADS=never
+
+# ---- dependency pins --------------------------------------------------------
+# Everything installed below is resolved against the base image's own torch stack.
+# Recorded here as a constraints file so a transitive dependency can never
+# silently drag in a PyPI torch wheel and shadow the NGC build (the failure mode
+# the PYTHONPATH-overlay workaround existed to avoid).
+RUN set -eux; \
+    : > /opt/alps/base-pins.txt; \
+    for p in torch torchvision triton numpy; do \
+      v="$(python3 -c "import importlib.metadata as m; print(m.version('${p}'))" 2>/dev/null || true)"; \
+      if [[ -n "${v}" ]]; then echo "${p}==${v}" >> /opt/alps/base-pins.txt; fi; \
+    done; \
+    cat /opt/alps/base-pins.txt; \
+    grep '^torch==' /opt/alps/base-pins.txt > /opt/alps/torch-override.txt
+
+# Build vLLM in an isolated stage so its build environment cannot alter NeMo.
+FROM uv-base AS vllm-builder
+
+# Redeclare build-only uv settings: the CI Podman builder does not propagate
+# these ARGs from uv-base into derived stages.
+ARG UV_BREAK_SYSTEM_PACKAGES=1
+ARG UV_PYTHON_DOWNLOADS=never
+
+ARG VLLM_REPO=https://github.com/swiss-ai/vllm.git
+ARG VLLM_REF=d4d41485a1cc1aee0d906d19f41523d2fdc67463
+ARG VLLM_MAX_JOBS=32
+ARG VLLM_NVCC_THREADS=4
+ARG VLLM_CUDA_ARCH_LIST=9.0
+ARG VLLM_VERSION_OVERRIDE=0.28.0+apertus2
+# Ubuntu's Cargo cannot parse vLLM's resolver=3 workspace. Require the Rust
+# frontend instead of silently producing a wheel without its native components.
+ARG VLLM_RUST_VERSION=1.93.0
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+      build-essential ca-certificates cmake curl git ninja-build \
+      pkg-config python3-dev xz-utils; \
+    rm -rf /var/lib/apt/lists/*; \
+    curl -fsSL "https://static.rust-lang.org/dist/rust-${VLLM_RUST_VERSION}-aarch64-unknown-linux-gnu.tar.xz" \
+      -o /tmp/rust.tar.xz; \
+    mkdir -p /tmp/rust-install; \
+    tar -xf /tmp/rust.tar.xz --strip-components=1 -C /tmp/rust-install; \
+    /tmp/rust-install/install.sh --prefix=/opt/rust \
+      --components=rustc,cargo,rust-std-aarch64-unknown-linux-gnu --disable-ldconfig; \
+    rm -rf /tmp/rust-install /tmp/rust.tar.xz; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
+      build jinja2 'packaging<=25.0' 'setuptools>=77.0.3,<81.0.0' \
+      setuptools-rust setuptools-scm wheel; \
+    uv pip uninstall --system grpcio-tools
+
+RUN set -eux; \
+    export PATH="/opt/rust/bin:${PATH}" CARGO_HOME=/tmp/cargo \
+      VLLM_TARGET_DEVICE=cuda VLLM_REQUIRE_RUST_FRONTEND=1 \
+      CUDA_ARCH_LIST="${VLLM_CUDA_ARCH_LIST}" \
+      TORCH_CUDA_ARCH_LIST="${VLLM_CUDA_ARCH_LIST}" \
+      VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE}" \
+      MAX_JOBS="${VLLM_MAX_JOBS}" \
+      NVCC_THREADS="${VLLM_NVCC_THREADS}" \
+      CMAKE_BUILD_PARALLEL_LEVEL="${VLLM_MAX_JOBS}"; \
+    git clone --recursive "${VLLM_REPO}" /tmp/vllm; \
+    cd /tmp/vllm; \
+    git checkout -q "${VLLM_REF}"; \
+    git submodule update --init --recursive; \
+    cargo --version; \
+    cargo metadata --no-deps --manifest-path rust/Cargo.toml --format-version 1 >/dev/null; \
+    python use_existing_torch.py --prefix || python use_existing_torch.py; \
+    build_requirements=requirements/build/cuda.txt; \
+    if [[ ! -f "${build_requirements}" ]]; then build_requirements=requirements/build.txt; fi; \
+    awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/) { print }' \
+      "${build_requirements}" > /tmp/vllm-build-requirements.txt; \
+    printf 'protobuf>=5.29.6,<7\n' > /tmp/vllm-build-constraints.txt; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/vllm-build-constraints.txt \
+      -r /tmp/vllm-build-requirements.txt; \
+    awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/ || $0 ~ /^cuda-toolkit/ || $0 ~ /^nvidia-cuda-/ || $0 ~ /^nvidia-nvjitlink/ || $0 ~ /^nvidia-nvvm/) { print }' \
+      requirements/cuda.txt > requirements/cuda-alps.txt; \
+    # NGC prereleases can sort below stable-version floors in dependency metadata.
+    # Override only torch with the captured base version, never a PyPI wheel.
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/vllm-build-constraints.txt \
+      --overrides /opt/alps/torch-override.txt -r requirements/cuda-alps.txt; \
+    mkdir -p /opt/artifacts/vllm; \
+    uv build --wheel --no-build-isolation --no-cache --python python3 --out-dir /opt/artifacts/vllm .; \
+    cp -a requirements /opt/artifacts/vllm/
+
+RUN test "$(find /opt/artifacts/vllm -maxdepth 1 -name 'vllm-*.whl' | wc -l)" -eq 1
+
+# fast-hadamard-transform's PyPI sdist omits a required C++ source file. Build
+# the complete, unmodified upstream v1.1.0 release source against the selected
+# NGC Torch/CUDA stack, then install its wheel into the runtime stage.
+FROM uv-base AS hadamard-builder
+ARG HADAMARD_REPO=https://github.com/Dao-AILab/fast-hadamard-transform.git
+ARG HADAMARD_REF=1cc807efbd6cc001df359822d60bf6052dd66859
+ARG HADAMARD_CUDA_ARCH=9.0
+ARG HADAMARD_MAX_JOBS=8
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    git clone --filter=blob:none "${HADAMARD_REPO}" /tmp/fast-hadamard-transform; \
+    git -C /tmp/fast-hadamard-transform checkout -q "${HADAMARD_REF}"; \
+    test "$(git -C /tmp/fast-hadamard-transform rev-parse HEAD)" = "${HADAMARD_REF}"; \
+    mkdir -p /opt/wheels/hadamard; \
+    TORCH_CUDA_ARCH_LIST="${HADAMARD_CUDA_ARCH}" MAX_JOBS="${HADAMARD_MAX_JOBS}" \
+      python3 -m pip wheel --no-cache-dir \
+        --no-deps --no-build-isolation --wheel-dir /opt/wheels/hadamard \
+        /tmp/fast-hadamard-transform; \
+    test "$(find /opt/wheels/hadamard -maxdepth 1 -name 'fast_hadamard_transform-*.whl' | wc -l)" -eq 1; \
+    rm -rf /tmp/fast-hadamard-transform
+
+# Build only the GH200 SM90a FlashInfer cache assets. The architecture is explicit
+# because source builds must not probe for a CUDA device on the builder.
+FROM uv-base AS flashinfer-cache-builder
+ARG UV_BREAK_SYSTEM_PACKAGES=1
+ARG UV_PYTHON_DOWNLOADS=never
+ARG FLASHINFER_CACHE_REPO=https://github.com/flashinfer-ai/flashinfer.git
+ARG FLASHINFER_CACHE_REF=9dc1b2495b40314dec8a8cde8cd7faf5c5206702
+ARG FLASHINFER_CACHE_ARCH=9.0a
+ARG FLASHINFER_CACHE_MAX_JOBS=4
+ARG FLASHINFER_CACHE_NVCC_THREADS=1
+ARG FLASHINFER_CACHE_TVM_FFI_VERSION=0.1.11
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      'setuptools>=77' 'packaging>=24' wheel tqdm ninja requests nvidia-ml-py \
+      "apache-tvm-ffi==${FLASHINFER_CACHE_TVM_FFI_VERSION}"; \
+    git clone --recursive --branch v0.6.16.post3 "${FLASHINFER_CACHE_REPO}" /tmp/flashinfer; \
+    git -C /tmp/flashinfer checkout -q "${FLASHINFER_CACHE_REF}"; \
+    git -C /tmp/flashinfer submodule update --init --recursive; \
+    test "$(git -C /tmp/flashinfer rev-parse HEAD)" = "${FLASHINFER_CACHE_REF}"; \
+    mkdir -p /opt/wheels/flashinfer-cache; \
+    cd /tmp/flashinfer/flashinfer-jit-cache; \
+    FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CACHE_ARCH}" CUDA_HOME=/usr/local/cuda \
+      MAX_JOBS="${FLASHINFER_CACHE_MAX_JOBS}" FLASHINFER_NVCC_THREADS="${FLASHINFER_CACHE_NVCC_THREADS}" \
+      python3 -m pip wheel --no-cache-dir \
+        --no-deps --no-build-isolation --wheel-dir /opt/wheels/flashinfer-cache .; \
+    test "$(find /opt/wheels/flashinfer-cache -maxdepth 1 -name 'flashinfer_jit_cache-0.6.16.post3-*.whl' | wc -l)" -eq 1; \
+    rm -rf /tmp/flashinfer
+
+FROM uv-base AS runtime
+ARG UV_BREAK_SYSTEM_PACKAGES=1
+ARG UV_PYTHON_DOWNLOADS=never
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+COPY --from=vllm-builder /opt/artifacts/vllm/ /opt/wheels/vllm/
+COPY Alps-Images/apps/nemo-rl/sources/package-additions.in /opt/alps/package-additions.in
+
+# ---- Complete UCCL (EP, P2P and DeepEP wrapper) -----------------------------
+# Match app/vllm-apertus2's full CUDA 13 wheel and public P2P library/headers,
+# including the DeepEP wrapper used by Megatron's flex dispatcher.
+ARG UCCL_REPO=https://github.com/uccl-project/uccl.git
+ARG UCCL_REF=540cc775ba8ab231122f9a98a6d832699f239f70
+ARG NANOBIND_VERSION=3.0.1
+ARG UCCL_NVL_PEERS=4     # NVLink peers per node (GH200: 4 GPUs/node)
+ARG UCCL_CUDA_ARCH=9.0   # GH200 = Hopper (sm_90)
+# Match the Apertus2 vLLM image's ninja parallelism. Each nvcc job is
+# memory-hungry; the default (one per core, 288 here) can OOM the build.
+ARG UCCL_MAX_JOBS=8
+# NB: UCCL_NVL_PEERS / UCCL_CUDA_ARCH / UCCL_MAX_JOBS are deliberately NOT named
+# NUM_MAX_NVL_PEERS / TORCH_CUDA_ARCH_LIST / MAX_JOBS. An ENV in the base image
+# beats an ARG of the same name. The original 25.12 base shipped
+# TORCH_CUDA_ARCH_LIST="8.0 8.6 9.0 10.0 11.0 12.0+PTX", which won and
+# exhausted the container fd limit mid-build.
+#
+# Keep the full build's /io checkout layout and Python GPU stub identical to
+# app/vllm-apertus2. build_inner.sh assumes that absolute packaging path.
+#
+# ep/setup.py picks -DUSE_GRACE_HOPPER from `nvidia-smi --query-gpu=name` (GH200 +
+# aarch64) and offers no env override, but the build host has no GPU — without a
+# stand-in the image would silently get a non-GH200 build. The stub answers the two
+# queries setup.py makes and is removed inside the same layer, so it can never
+# shadow the real nvidia-smi at run time.
+RUN set -eux; \
+    hard="$(ulimit -Hn)"; \
+    if [[ "${hard}" == unlimited ]]; then hard=65536; fi; \
+    ulimit -n "${hard}"; \
+    source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends libgfortran5 libgomp1 rdma-core; \
+    rm -rf /var/lib/apt/lists/*; \
+    uv pip uninstall --system deep_ep uccl; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      auditwheel build intervaltree "nanobind==${NANOBIND_VERSION}" \
+      patchelf pybind11 wheel; \
+    # build_inner.sh uses /io for its wheel output and packaging steps.
+    git clone --recursive "${UCCL_REPO}" /io; \
+    git -C /io checkout -q "${UCCL_REF}"; \
+    git -C /io submodule update --init --recursive; \
+    mkdir -p /tmp/gpustub /opt/wheels/uccl; \
+    # Use Python as in app/vllm-apertus2: NGC's ENV/BASH_ENV initialization
+    # itself invokes nvidia-smi, so a shell stub recursively starts more shells.
+    printf '#!/usr/bin/python3\nimport sys\na = " ".join(sys.argv[1:])\nif "query-gpu=name" in a:\n    print("NVIDIA GH200 120GB")\nelif "query-gpu=compute_cap" in a:\n    print("9.0")\nelse:\n    sys.exit(1)\n' > /tmp/gpustub/nvidia-smi; \
+    chmod +x /tmp/gpustub/nvidia-smi; \
+    libfabric_prefix="$(pkg-config --variable=prefix libfabric)"; \
+    libfabric_libdir="$(pkg-config --variable=libdir libfabric)"; \
+    test -n "${libfabric_prefix}"; \
+    test -f "${libfabric_libdir}/libfabric.so"; \
+    printf '%s\n' "${libfabric_libdir}" > /etc/ld.so.conf.d/98-alps-libfabric.conf; \
+    ldconfig; \
+    pushd /io; \
+    sed -i 's|-Wl,-rpath=/usr/lib/x86_64-linux-gnu||g' p2p/Makefile; \
+    export PATH="/tmp/gpustub:${PATH}" \
+      CUDA_HOME=/usr/local/cuda \
+      LIBFABRIC_HOME="${libfabric_prefix}" \
+      LIBRARY_PATH="${libfabric_libdir}:/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}" \
+      LDFLAGS="-L${libfabric_libdir} -Wl,-rpath,${libfabric_libdir} ${LDFLAGS:-}" \
+      TORCH_CUDA_ARCH_LIST="${UCCL_CUDA_ARCH}" \
+      NUM_MAX_NVL_PEERS="${UCCL_NVL_PEERS}" \
+      MAX_JOBS="${UCCL_MAX_JOBS}" \
+      USE_LIBFABRIC_CXI=1 PER_EXPERT_BATCHING=1 \
+      TARGET=cu13 PY_VER=3.12 ARCH=aarch64 BUILD_TYPE=all IS_EFA="" \
+      WHEEL_DIR=wheelhouse-cu13 \
+      HOST_GLIBC_VER="$(python3 -c 'import platform; print(platform.libc_ver()[1])')" \
+      UCCL_RETAG_TO_HOST_GLIBC=0 UCCL_LOCAL_VERSION=cu13; \
+    bash ./build_inner.sh; \
+    cp wheelhouse-cu13/uccl*.whl /opt/wheels/uccl/; \
+    test "$(find /opt/wheels/uccl -maxdepth 1 -name 'uccl-*.whl' | wc -l)" -eq 1; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/uccl/uccl-*.whl; \
+    make -C p2p -j"${UCCL_MAX_JOBS}" install \
+      PYTHON=python3 LIBFABRIC_HOME="${libfabric_prefix}"; \
+    site_dir="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
+    printf '%s\n%s\n' /usr/local/lib "${site_dir}/uccl/lib" > /etc/ld.so.conf.d/98-uccl.conf; \
+    ldconfig; \
+    cd ep/deep_ep_wrapper; \
+    uv build --wheel --no-build-isolation --no-cache --python python3 --out-dir /opt/wheels/uccl .; \
+    test "$(find /opt/wheels/uccl -maxdepth 1 -name 'deep_ep-*.whl' | wc -l)" -eq 1; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/uccl/deep_ep-*.whl; \
+    popd; \
+    rm -rf /tmp/gpustub /io /opt/wheels/uccl
+
+# Selects UCCL's RDMA transport (ep/src/proxy.cpp: use_cxi_transport_ is true only
+# for the exact string "cxi"). Anything else takes the ibverbs path, which on
+# Slingshot finds no verbs device and aborts every rank with
+# "[FATAL] Selected RDMA NIC '' not found in verbs device list".
+ENV UCCL_EP_TRANSPORT=cxi \
+    UCCL_P2P_TRANSPORT=cxi \
+    UCCL_CXI_THREADING=safe
+
+# ---- TransformerEngine 2.17 (CUDA graph support) ----------------------------
+ARG TE_TAG=v2.17
+# Deliberately not named MAX_JOBS: an ENV in the base image beats an ARG of the same
+# name, the same trap documented for the UCCL build args above. Left well below the
+# 288 cores an exclusive GH200 node has, since each nvcc job is memory-hungry.
+ARG TE_MAX_JOBS=8
+# Keep TE's NCCL expert-parallel extension disabled: this image uses UCCL-EP.
+# This also preserves the original 25.12 build configuration, where Torch lacked
+# the nccl_dev_cap.hpp header required by TE 2.17's NCCL EP extension.
+RUN set -eux; \
+    uv pip uninstall --system transformer_engine transformer_engine_cu13; \
+    MAX_JOBS="${TE_MAX_JOBS}" \
+    NVTE_CUDA_ARCHS=90 \
+    NVTE_WITH_NCCL_EP=0 \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt \
+      "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_TAG}"
+
+# ---- DeepGEMM (FP8 grouped GEMM) --------------------------------------------
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_COMMIT=559d79fb6994a58b8a15b4b93bf13ccc16edf247
+RUN set -eux; \
+    uv pip uninstall --system deep_gemm; \
+    mkdir -p /tmp/DeepGEMM; \
+    git -C /tmp/DeepGEMM init -q .; \
+    git -C /tmp/DeepGEMM remote add origin "${DEEPGEMM_REPO}"; \
+    git -C /tmp/DeepGEMM fetch -q --depth 1 origin "${DEEPGEMM_COMMIT}"; \
+    git -C /tmp/DeepGEMM checkout -q FETCH_HEAD; \
+    git -C /tmp/DeepGEMM submodule update --init --recursive --depth 1; \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt /tmp/DeepGEMM; \
+    rm -rf /tmp/DeepGEMM
+
+# ---- grouped_gemm (MoE, gradient-accumulation fusion) -----------------------
+ARG GROUPED_GEMM_REPO=https://github.com/FFGGSSJJ/grouped_gemm.git
+ARG GROUPED_GEMM_COMMIT=45118e547923803ed52f80f240cf974620c9bdc5
+RUN set -eux; \
+    uv pip uninstall --system grouped_gemm nv-grouped-gemm; \
+    mkdir -p /tmp/grouped_gemm; \
+    git -C /tmp/grouped_gemm init -q .; \
+    git -C /tmp/grouped_gemm remote add origin "${GROUPED_GEMM_REPO}"; \
+    git -C /tmp/grouped_gemm fetch -q --depth 1 origin "${GROUPED_GEMM_COMMIT}"; \
+    git -C /tmp/grouped_gemm checkout -q FETCH_HEAD; \
+    # setup.py includes third_party/cutlass/include directly, so the submodule
+    # must be present or every .cu fails on "cutlass/bfloat16.h: No such file".
+    git -C /tmp/grouped_gemm submodule update --init --recursive --depth 1; \
+    TORCH_CUDA_ARCH_LIST="9.0" \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt /tmp/grouped_gemm; \
+    rm -rf /tmp/grouped_gemm
+
+# ---- nvidia-resiliency-ext --------------------------------------------------
+# Megatron-LM pins 0.6.0 (pyproject.toml). Older releases export only the private
+# _get_write_results_queue from filesystem_async, so Megatron's nvrx import fails
+# and is masked as "package is not installed"
+# (dist_checkpointing/strategies/torch.py). Needed by any recipe with async_save.
+#
+# NOT named NVRX_VERSION: the base image exports ENV NVRX_VERSION=0.5.0, an ENV
+# beats an ARG of the same name, and the layer then installs 0.5.0 while its own
+# assert -- reading the same shadowed variable -- agrees with it. Same trap as the
+# MAX_JOBS args above. The assert spells the version out for that reason.
+ARG NVRESILIENCY_VERSION=0.6.0
+RUN set -eux; \
+    uv pip uninstall --system nvidia-resiliency-ext; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "nvidia-resiliency-ext==${NVRESILIENCY_VERSION}"; \
+    python3 -c "import nvidia_resiliency_ext as n; assert n.__version__ == '0.6.0', n.__version__"
+
+# ---- Emerging-Optimizers (community fork: Muon / md_decoupling) -------------
+# Provides the decoupled-Muon optimizer the Apertus2 KDA runs train with.
+ARG EMERGING_OPTIMIZERS_REPO=https://github.com/FFGGSSJJ/Emerging-Optimizers.git
+ARG EMERGING_OPTIMIZERS_COMMIT=cc1385eec1966aea2aebfb6dd6fc66a898312a55
+RUN set -eux; \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt \
+      "git+${EMERGING_OPTIMIZERS_REPO}@${EMERGING_OPTIMIZERS_COMMIT}"
+
+# ---- flash-linear-attention (KDA kernels) -----------------------------------
+# Swiss-AI v0.5.2 baseline plus per-channel A_log support for Megachonk.
+# NOTE: this is only needed because we have problems with cache in Megatron LM MoE when training Megachonk
+# (I believe cache creation takes to much time just because of number of nodes and maybe it is taking a variable path, variable meaning number of tokens changing in some parts, but it shouldn't not sure).
+# This should be changed to upstream basically
+ARG FLA_REPO=https://github.com/swiss-ai/flash-linear-attention.git
+ARG FLA_COMMIT=1820dba7e15fb927294779f23ac5097eb3927b25
+RUN set -eux; \
+    uv pip uninstall --system flash-linear-attention; \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt \
+      "git+${FLA_REPO}@${FLA_COMMIT}"
+
+# ---- NeMo-RL runtime stack --------------------------------------------------
+# The base image ships neither ray nor flashinfer. NeMo-RL hardcodes
+# sampling_backend="flashinfer" in its Megatron worker, so InferenceConfig raises
+# ImportError without it — it is required, not optional.
+#
+# openai is pinned to 2.7.2 on purpose: nemo-gym requires openai<=2.7.2 and pins
+# each child server venv to the PARENT openai version, so a newer parent makes
+# every Gym child venv unresolvable. NeMo-RL core never imports openai.
+ARG RAY_VERSION=2.56.1
+ARG FLASHINFER_VERSION=0.6.16.post3
+ARG FLASHINFER_CACHE_VERSION=0.6.16.post3
+ARG TVM_FFI_VERSION=0.1.11
+# TODO: Restore parallel uv installs once the datasets/packaged_modules EEXIST
+# failure on fuse-overlayfs is resolved; serialization slows this runtime install.
+RUN set -eux; \
+    UV_CONCURRENT_INSTALLS=1 uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "ray[default]==${RAY_VERSION}" \
+      "hydra-core==1.3.2" \
+      "transformers==5.17.0" \
+      "megatron-energon==7.4.0" \
+      "math-verify==0.9.0" \
+      "mlflow==3.14.0" \
+      "tensordict==0.13.0" \
+      "swanlab==0.6.4" \
+      "zstandard==0.25.0" \
+      "openai==2.7.2" \
+      "colored==2.2.3" \
+      "pybase64==1.5.0" \
+      "msgspec==0.21.1" \
+      "pyzmq==27.1.0" \
+      "pyyaml==6.0.3" \
+      "wandb==0.30.0" \
+      "datasets==4.4.1" \
+      "accelerate==1.15.0" \
+      "tensorboard==2.20.0" \
+      "torchdata==0.11.0" \
+      "nvidia-ml-py==13.590.44" \
+      "tiktoken==0.14.0" \
+      "sentencepiece==0.2.2" \
+      "blobfile==3.3.0" \
+      "debugpy==1.8.19" \
+      "nvtx==0.2.15" \
+      "matplotlib==3.10.8" \
+      "plotly==7.0.0" \
+      "sympy==1.14.0" \
+      "num2words==0.5.14" \
+      "rich==14.2.0"
+
+# flashinfer is installed --no-deps so its dependency metadata (which names torch
+# and the cu12 nvidia-* wheels) cannot touch the NGC stack; tvm_ffi is its only
+# import-time requirement and is added explicitly.
+RUN set -eux; \
+    uv pip install --system --no-cache --no-deps \
+      "flashinfer-python==${FLASHINFER_VERSION}"; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "apache-tvm-ffi==${TVM_FFI_VERSION}"
+
+# ---- refit / data-plane transports -------------------------------------------
+# Not reachable on the Megatron-generation path (it does no weight refit, and
+# data_plane defaults to the in-process "simple" backend), but declared in
+# NeMo-RL's base dependencies, so a worker venv or a config flip finds them here
+# rather than failing at run time. Specs match NeMo-RL's pyproject.
+# Build the same CUDA 13 NIXL/UCCL plugin as app/vllm-apertus2, not a generic
+# PyPI NIXL wheel without the UCCL backend.
+ARG NIXL_REPO=https://github.com/ai-dynamo/nixl.git
+ARG NIXL_REF=de8115ca97d3f8fb63a4988e9b4d4a038b2e0f72
+ARG NIXL_LIBDIR=lib/aarch64-linux-gnu
+ARG NIXL_MAX_JOBS=16
+ENV NIXL_PLUGIN_DIR=/usr/local/${NIXL_LIBDIR}/plugins
+RUN set -eux; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      build meson meson-python patchelf pybind11 pyyaml pytest \
+      'setuptools>=80.9.0,<81.0.0' tomlkit types-PyYAML; \
+    export LIBRARY_PATH="/usr/local/lib:${LIBRARY_PATH:-}" \
+      LDFLAGS="-L/usr/local/lib -Wl,-rpath,/usr/local/lib ${LDFLAGS:-}"; \
+    git clone "${NIXL_REPO}" /tmp/nixl; \
+    pushd /tmp/nixl; \
+    git checkout -q "${NIXL_REF}"; \
+    python3 contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml; \
+    mkdir -p /opt/wheels/nixl; \
+    uv build --wheel --no-build-isolation --no-cache --python python3 \
+      --out-dir /opt/wheels/nixl \
+      -Cbuild-dir=/tmp/nixl-build \
+      -Ccompile-args="-j${NIXL_MAX_JOBS}" \
+      -Csetup-args="-Dlibdir=${NIXL_LIBDIR}" \
+      -Csetup-args=-Denable_plugins=UCCL \
+      -Csetup-args=-Dbuild_tests=false \
+      -Csetup-args=-Dbuild_examples=false \
+      -Csetup-args=-Dinstall_headers=false \
+      -Csetup-args=-Dnixl_cuda_arch_list=90 \
+      -Csetup-args=-Dwheel_variant=cu13; \
+    cp /tmp/nixl-build/src/bindings/python/nixl-meta/nixl-*.whl /opt/wheels/nixl/; \
+    test "$(find /opt/wheels/nixl -maxdepth 1 -name 'nixl_cu13-*.whl' | wc -l)" -eq 1; \
+    test "$(find /opt/wheels/nixl -maxdepth 1 -name 'nixl-*.whl' | wc -l)" -eq 1; \
+    uv pip uninstall --system nixl nixl-cu12 nixl-cu13; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/nixl/nixl_cu13-*.whl; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/nixl/nixl-*.whl; \
+    site_dir="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
+    torch_lib_dir="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"; \
+    nixl_plugin="$(find "${site_dir}" /usr/local -type f -name libplugin_UCCL.so -print -quit 2>/dev/null)"; \
+    nixl_lib="$(find "${site_dir}" /usr/local -type f -name 'libnixl.so*' -print -quit 2>/dev/null)"; \
+    test -n "${nixl_plugin}"; \
+    test -n "${nixl_lib}"; \
+    mkdir -p "${NIXL_PLUGIN_DIR}"; \
+    if [[ "${nixl_plugin}" != "${NIXL_PLUGIN_DIR}/libplugin_UCCL.so" ]]; then \
+      ln -sfn "${nixl_plugin}" "${NIXL_PLUGIN_DIR}/libplugin_UCCL.so"; \
+    fi; \
+    printf '%s\n%s\n%s\n%s\n%s\n' "${torch_lib_dir}" /usr/local/lib "${site_dir}/uccl/lib" \
+      "$(dirname "${nixl_lib}")" "$(dirname "${nixl_plugin}")" > /etc/ld.so.conf.d/99-nemo-rl-uccl-nixl.conf; \
+    ldconfig; \
+    popd; \
+    rm -rf /tmp/nixl /tmp/nixl-build /opt/wheels/nixl
+
+ARG AWSCRT_VERSION=0.36.3
+ARG NCCL4PY_VERSION=0.5.0
+# Both nccl.ep and nccl.m2n, including packaged CUDA 13 native libraries.
+# The cu13 extra pins NCCL 2.30.7, matching the base's 2.30.7-1 build.
+ARG NCCL_EXTENSIONS_VERSION=0.1.0
+ARG TRANSFER_QUEUE_COMMIT=c51614308b68c8d7a87c9b3ef62d59e14c69bde2
+RUN set -eux; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "awscrt==${AWSCRT_VERSION}" \
+      --only-binary nccl-extensions \
+      "nccl4py==${NCCL4PY_VERSION}" \
+      "nccl-extensions[cu13]==${NCCL_EXTENSIONS_VERSION}" \
+      "TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@${TRANSFER_QUEUE_COMMIT}"
+
+# ---- causal-conv1d / mamba-ssm ----------------------------------------------
+# megachonk carries causal-conv1d 1.7 (the "cconv17" in its image name); the
+# NeMo-RL side of that work ran mamba_ssm 2.3.2.post1 against it. Both ship sdist
+# only, so they compile here. Arch is pinned inline rather than through an ARG
+# named TORCH_CUDA_ARCH_LIST for the reason documented on the UCCL layer.
+ARG CAUSAL_CONV1D_VERSION=1.7.0
+ARG MAMBA_SSM_VERSION=2.3.2.post1
+ARG KERNEL_MAX_JOBS=64
+RUN set -eux; \
+    TORCH_CUDA_ARCH_LIST="9.0" \
+    MAX_JOBS="${KERNEL_MAX_JOBS}" \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt \
+      "causal-conv1d==${CAUSAL_CONV1D_VERSION}"; \
+    TORCH_CUDA_ARCH_LIST="9.0" \
+    MAX_JOBS="${KERNEL_MAX_JOBS}" \
+    MAMBA_FORCE_BUILD=TRUE \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt \
+      "mamba-ssm==${MAMBA_SSM_VERSION}"
+
+# ---- FlashKDA ----------------------------------------------------------------
+# Moonshot's Kimi Delta Attention kernels (SM90+, CUDA 12.9+). Vendors CUTLASS as a
+# git submodule, and setup.py's default FLASH_KDA_CUDA_ARCHS=auto probes a visible
+# CUDA device -- neither is available on a GPU-less build host, so init submodules
+# and name the arch explicitly (90 = GH200) rather than paying for "all".
+ARG FLASH_KDA_REPO=https://github.com/MoonshotAI/FlashKDA.git
+ARG FLASH_KDA_COMMIT=7afb9f454f160a6c4bbc0999beca0a8c40a38934
+RUN set -eux; \
+    mkdir -p /tmp/flash-kda; \
+    git -C /tmp/flash-kda init -q .; \
+    git -C /tmp/flash-kda remote add origin "${FLASH_KDA_REPO}"; \
+    git -C /tmp/flash-kda fetch -q --depth 1 origin "${FLASH_KDA_COMMIT}"; \
+    git -C /tmp/flash-kda checkout -q FETCH_HEAD; \
+    git -C /tmp/flash-kda submodule update --init --recursive --depth 1; \
+    FLASH_KDA_CUDA_ARCHS=90 \
+    MAX_JOBS="${KERNEL_MAX_JOBS}" \
+    uv pip install --system --no-cache --no-build-isolation \
+      -c /opt/alps/base-pins.txt /tmp/flash-kda; \
+    rm -rf /tmp/flash-kda
+
+# ---- CUTLASS DSL -------------------------------------------------------------
+# Pure-python wheel (py3-none-any). flashinfer imports without it on TE 2.17, but
+# the te212 pin overlay carried it and some CUTLASS-backed kernels expect it.
+#
+# The [cu13] extra is not optional on this base. nvidia-cutlass-dsl requires
+# nvidia-cutlass-dsl-libs-cu12 unconditionally and gates the cu13 libs behind that
+# extra, so the plain spec installs CUDA 12 binaries against a CUDA 13.1 toolkit.
+ARG CUTLASS_DSL_VERSION=4.6.2
+RUN set -eux; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "nvidia-cutlass-dsl[cu13]==${CUTLASS_DSL_VERSION}"
+
+# The Megatron generation backend's OpenAI-compatible HTTP server (the endpoint
+# NeMo Gym drives when mcore_generation_config.expose_http_server is true) is
+# served by Quart under hypercorn; without them Megatron raises
+# "Web backend framework (Quart) not available" and no rollout can reach the policy.
+ARG QUART_VERSION=0.22.0
+ARG HYPERCORN_VERSION=0.18.0
+RUN set -eux; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "quart==${QUART_VERSION}" \
+      "hypercorn==${HYPERCORN_VERSION}"
+
+# Install vLLM runtime requirements with the NeMo API/runtime pins protected.
+# Install its source-built wheel without dependencies to preserve NGC torch.
+RUN set -eux; \
+    printf 'openai==2.7.2\nray==2.56.1\ntransformers==5.17.0\nflashinfer-python==0.6.16.post3\napache-tvm-ffi==0.1.11\nnvidia-cutlass-dsl==4.6.2\nnvtx==0.2.15\nopentelemetry-api==1.45.1\nopentelemetry-sdk==1.45.1\nopentelemetry-exporter-otlp-proto-grpc==1.45.1\nopentelemetry-exporter-otlp-proto-http==1.45.1\nprotobuf==6.33.6\n' \
+      > /tmp/vllm-runtime-constraints.txt; \
+    uv pip install --system --no-cache \
+      -c /opt/alps/base-pins.txt -c /tmp/vllm-runtime-constraints.txt \
+      --overrides /opt/alps/torch-override.txt \
+      -r /opt/wheels/vllm/requirements/cuda-alps.txt "runai-model-streamer==0.15.7"; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      --no-deps /opt/wheels/vllm/vllm-*.whl; \
+    torch_lib_dir="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"; \
+    printf '%s\n' "${torch_lib_dir}" > /etc/ld.so.conf.d/99-alps-vllm-torch.conf; \
+    ldconfig; \
+    rm -rf /opt/wheels
+
+# Install the source-built SM90a cache after every broad wheel cleanup.
+COPY --from=flashinfer-cache-builder /opt/wheels/flashinfer-cache/ /opt/wheels/flashinfer-cache/
+RUN set -eux; \
+    uv pip install --system --no-cache --no-deps \
+      /opt/wheels/flashinfer-cache/flashinfer_jit_cache-*.whl; \
+    test "$(python3 -c 'import importlib.metadata as m; print(m.version("flashinfer-jit-cache"))')" = "${FLASHINFER_CACHE_VERSION}"; \
+    rm -rf /opt/wheels/flashinfer-cache
+
+# NemoLens 0.1.0 declares Python >=3.13 although its API works on this Python 3.12
+# image. Override metadata validation for this wheel only; dependencies are already
+# supplied by the base image and must not be resolved/downgraded here.
+ARG NEMO_LENS_VERSION=0.1.0
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python3 --break-system-packages --no-cache-dir \
+      --ignore-requires-python --no-deps --only-binary :all: \
+      "nemo-lens[sdk]==${NEMO_LENS_VERSION}"; \
+    python3 - <<'VERIFY'
+import importlib.metadata as md
+import opentelemetry.exporter.otlp.proto.grpc.trace_exporter
+import opentelemetry.exporter.otlp.proto.http.trace_exporter
+import opentelemetry.sdk
+assert md.version("nemo-lens") == "0.1.0"
+assert md.metadata("nemo-lens")["Requires-Python"] == ">=3.13"
+assert md.version("opentelemetry-sdk") == "1.45.1"
+assert md.version("protobuf") == "6.33.6"
+VERIFY
+
+# ---- validated package additions --------------------------------------------
+# These exact direct pins were exercised together in an isolated overlay on the
+# CUDA 13.3 / Python 3.12 NGC image. Keep the NemoRun compatibility constraints
+# scoped to this addition set: its TorchX dependency requires the older urllib3.
+# If a future base's urllib3 constraints conflict, fail resolution instead of
+# silently overriding the base's dependency graph.
+COPY Alps-Images/apps/nemo-rl/sources/nemo-run-constraints.txt /opt/alps/nemo-run-constraints.txt
+COPY --from=hadamard-builder /opt/wheels/hadamard/ /opt/wheels/hadamard/
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    awk '!/^flashinfer-jit-cache==/ && !/^nemo-lens==/' \
+      /opt/alps/package-additions.in > /tmp/package-additions-normal.in; \
+    pip_install python3 --break-system-packages --no-cache-dir \
+      -c /opt/alps/base-pins.txt -c /tmp/vllm-runtime-constraints.txt \
+      -c /opt/alps/nemo-run-constraints.txt \
+      -r /tmp/package-additions-normal.in; \
+    pip_install python3 --break-system-packages --no-cache-dir \
+      --no-deps /opt/wheels/hadamard/fast_hadamard_transform-*.whl; \
+    rm -rf /opt/wheels/hadamard /tmp/vllm-runtime-constraints.txt /tmp/package-additions-normal.in
+
+# ---- runtime defaults -------------------------------------------------------
+# The point of this image is that every NeMo-RL dependency is already importable,
+# so Ray workers must use the container interpreter rather than building per-worker
+# uv venvs (NeMo-RL's own `uv sync` also fails against a bind-mounted checkout
+# whose vendored Megatron-Bridge submodule is empty).
+ENV NEMO_RL_PY_EXECUTABLES_SYSTEM=1 \
+    RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 \
+    NRL_CONTAINER=1 \
+    PYTHONNOUSERSITE=1 \
+    UV_LINK_MODE=copy
+
+# ---- verification -----------------------------------------------------------
+# Fails the build if any install above moved the NGC torch stack, or if a layer
+# resolved to a version other than the one it asked for -- a later `uv pip install`
+# is free to upgrade an earlier package, and only a check after the last layer
+# catches that. Imports are not checked here: the build host has no GPU, so
+# tests/import-smoke.sh asserts them on a compute node instead.
+RUN set -eux; \
+    python3 - <<'VERIFY'
+import importlib.metadata as md
+
+pins = dict(line.split("==", 1) for line in open("/opt/alps/base-pins.txt").read().split())
+for pkg, want in pins.items():
+    got = md.version(pkg)
+    assert got == want, f"{pkg} moved: {want} -> {got}"
+
+PREFIXES = {
+    "transformer_engine": "2.17.",
+    "ray": "2.56.",
+    "openai": "2.7.2",
+    "flashinfer-python": "0.6.16.post3",
+    "apache-tvm-ffi": "0.1.11",
+    "tilelang": "0.1.12",
+    "nvtx": "0.2.15",
+    "runai-model-streamer": "0.15.7",
+    "nvidia-resiliency-ext": "0.6.0",
+    "causal-conv1d": "1.7.0",
+    "mamba-ssm": "2.3.2",
+    "uccl": "0.1.1",
+    "deep-ep": "0.1.0",
+    "nixl": "1.3.2",
+    "nixl-cu13": "1.3.2",
+    "nccl-extensions": "0.1.0",
+    "nvidia-nccl-cu13": "2.30.7",
+    "nvidia-cutlass-dsl": "4.6.2",
+    "transformers": "5.17.0",
+    "megatron-energon": "7.4.0",
+    "hydra-core": "1.3.2",
+}
+for pkg, prefix in PREFIXES.items():
+    got = md.version(pkg)
+    assert got.startswith(prefix), f"{pkg}: expected {prefix}*, got {got}"
+
+assert md.version("vllm") == "0.28.0+apertus2", md.version("vllm")
+assert md.version("flashinfer-jit-cache") == "0.6.16.post3"
+assert md.version("nemo-lens") == "0.1.0"
+assert md.version("opentelemetry-sdk") == "1.45.1"
+assert md.version("protobuf") == "6.33.6"
+print("torch stack unchanged:", pins)
+VERIFY
+
+# Check shared-library linkage without importing vLLM (which needs build GPUs).
+# libcuda.so.1 is supplied by the host driver at runtime.
+RUN set -eux; \
+    site_dir="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
+    test -x "${site_dir}/vllm/vllm-rs"; \
+    test -n "$(find "${site_dir}/vllm" -maxdepth 1 -name '_rust_tool_parser*.so' -print -quit)"; \
+    test -f "${NIXL_PLUGIN_DIR}/libplugin_UCCL.so"; \
+    test -f /usr/local/include/uccl_engine.h; \
+    test -f /usr/local/lib/libuccl_p2p.so; \
+    test -f "${site_dir}/nccl/ep/lib/cu13/libnccl_ep.so"; \
+    test -f "${site_dir}/nccl/m2n/lib/cu13/libnccl_m2n.so"; \
+    nixl_lib_dir="$(dirname "$(find "${site_dir}" -type f -name 'libnixl.so*' -print -quit)")"; \
+    test -d "${nixl_lib_dir}"; \
+    missing="$(find "${site_dir}/vllm" "${site_dir}/uccl" "${nixl_lib_dir}" "${NIXL_PLUGIN_DIR}" \
+      "${site_dir}/nccl/ep/lib/cu13" "${site_dir}/nccl/m2n/lib/cu13" \
+      -name '*.so' -exec ldd {} + 2>/dev/null \
+      | awk '/not found/ && $1 != "libcuda.so.1" { print }' || true)"; \
+    if [[ -n "${missing}" ]]; then printf '%s\n' "${missing}" >&2; exit 1; fi
+
+# Tests shipped with the image. `a+rX` alone is not enough: capital X only adds the
+# bit where one already exists, so a 0644 checkout stays unrunnable.
+COPY Alps-Images/apps/nemo-rl/tests/ /opt/tests/nemo-rl/
+COPY Alps-Images/apps/nemo-rl/sources/mathdx-cufftdx-smoke.cu /opt/tests/nemo-rl/
+RUN set -eux; \
+    chmod -R a+rX /opt/tests/nemo-rl; \
+    find /opt/tests/nemo-rl -name '*.sh' -exec chmod a+rx {} +
+
+ENV LD_PRELOAD="/usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so:${LD_PRELOAD}"

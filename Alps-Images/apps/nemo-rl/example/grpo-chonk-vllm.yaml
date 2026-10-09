@@ -1,0 +1,185 @@
+# Self-contained overlay; the pinned NeMo source supplies the complete schema.
+defaults:
+  - ${oc.env:NEMO_RL_PATH}/examples/configs/grpo_math_1B_megatron.yaml
+
+cluster:
+  num_nodes: ${oc.decode:${oc.env:TOTAL_NODES}}
+  gpus_per_node: 4
+
+# Synchronous GRPO with Megatron training and vLLM generation.
+grpo:
+  async_grpo:
+    enabled: false
+  max_num_steps: ${oc.decode:${oc.env:MAX_NUM_STEPS}}
+  max_num_epochs: 6
+  num_prompts_per_step: ${oc.decode:${oc.env:NUM_PROMPTS}}
+  num_generations_per_prompt: 8
+  normalize_rewards: true
+  use_leave_one_out_baseline: true
+  advantage_clip_low: -5.0
+  advantage_clip_high: 5.0
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: ${oc.env:RUN_DIR}/checkpoints
+  save_period: 50
+  metric_name: null
+
+policy:
+  model_name: ${oc.env:HF_MODEL}
+  tokenizer:
+    name: ${oc.env:HF_MODEL}
+    chat_template: "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"
+  precision: bfloat16
+  train_global_batch_size: ${oc.decode:${oc.env:TRAIN_GLOBAL_BATCH}}
+  train_micro_batch_size: ${oc.decode:${oc.env:TRAIN_MICRO_BATCH}}
+  generation_batch_size: ${oc.decode:${oc.env:INFERENCE_REQUESTS}}
+  logprob_batch_size: 1
+  offload_optimizer_for_logprob: true
+  max_total_sequence_length: 1280
+  make_sequence_length_divisible_by: 2
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 16
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: false
+    gradient_accumulation_fusion: true
+    cuda_graph_impl: none
+    freeze_moe_router: true
+    moe_router_load_balancing_type: quantile_balancing
+    moe_router_quantile_balancing_freeze: true
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.0
+    moe_token_dispatcher_type: alltoall
+    moe_permute_fusion: true
+    apply_rope_fusion: false
+    # Match the vLLM recipe's training experts; export logical BF16 for refit.
+    env_vars:
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+      NRL_REFIT_NUM_BUFFERS: "1"
+    model_overrides:
+      moe_use_offloading_experts: true
+      moe_offloading_mode: coarse-grained
+      moe_offloading_num_chunks: 8
+      moe_offloading_num_stages: 2
+      moe_use_inplace_fp8_param: true
+      moe_use_extra_fp8_param_storage: true
+      moe_offloading_experts_debug_mode: false
+    checkpoint:
+      async_save: false
+      save: ${oc.env:RUN_DIR}/megatron-save
+    optimizer:
+      optimizer: md_decoupling
+      lr: 2.0e-6
+      min_lr: 2.0e-7
+      min_lr_mode: absolute
+      matrix_lr: 5.0e-5
+      gains_lr: 2.0e-6
+      weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
+      adam_beta1: 0.9
+      adam_beta2: 0.95
+      adam_eps: 1.0e-8
+      use_distributed_optimizer: false
+      use_layer_wise_distributed_optimizer: true
+      use_precision_aware_optimizer: false
+      hypersphere_preserve_init: true
+      hypersphere_mode: row
+      hypersphere_embedding_mode: row
+      hypersphere_router_mode: row
+      hypersphere_radius_mode: fan_in
+      hypersphere_gains_mode: rowcol
+      hypersphere_gains_mode_router: rowcol
+      hypersphere_gains_mode_embedding: none
+      gain_parametrization: softplus
+      use_orthogonal_updates: true
+      muon_coefficient_type: polar_express
+      muon_scale_mode: shape_up
+      muon_router_scale_mode: none
+      muon_momentum: 0.95
+      muon_use_nesterov: true
+      clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
+    scheduler:
+      lr_decay_style: cosine
+      lr_decay_iters: 1200
+      lr_warmup_iters: 60
+      lr_warmup_init: 1.0e-7
+      start_weight_decay: 0.0
+      end_weight_decay: 0.0
+      weight_decay_incr_style: constant
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: true
+      overlap_param_gather: false
+      use_custom_fsdp: false
+      data_parallel_sharding_strategy: optim_grads_params
+  generation:
+    backend: vllm
+    temperature: 1.0
+    top_p: 0.9
+    top_k: -1
+    max_new_tokens: 256
+    stop_strings: ["Question:", "</s>", "<|im_end|>"]
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: ${oc.decode:${oc.env:INFERENCE_NODES}}
+        gpus_per_node: 4
+    refit_transport: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 8
+      gpu_memory_utilization: 0.8
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: false
+      load_format: dummy
+    vllm_kwargs:
+      all2all_backend: allgather_reducescatter
+
+data:
+  max_input_seq_length: 900
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: gsm8k
+    split_validation_size: 0.0
+  validation: null
+  default:
+    prompt_file: ${oc.env:EXAMPLE_DIR}/gsm8k-five-shot.txt
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: k3
+  kl_input_clamp_value: 20.0
+  kl_output_clamp_value: 10.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_on_policy_kl_approximation: false
+
+logger:
+  log_dir: ${oc.env:RUN_DIR}/nemo-rl-logs
+  wandb_enabled: false
+  tensorboard_enabled: false
+  num_val_samples_to_print: 8

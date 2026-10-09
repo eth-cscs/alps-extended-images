@@ -1,0 +1,26 @@
+# [2026-10-07T11:30] User-selected new PR64 image; registry verified linux/arm64.
+# Manifest digest sha256:6dc3748ee1e86d4eefe2265083a4a69d33b0e6da6a2f776743962c94421ab386.
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-cfcfede4262bfb99f4659aad30992344"
+mounts = ["/capstor/", "/iopsstor/", "/ritom/", "${HOME}:${HOME}"]
+workdir = "/tmp"
+writable = true
+
+[env]
+# Derived from the built image, not the submitting shell's user-local Python.
+PATH = "/usr/local/lib/python3.12/dist-packages/torch_tensorrt/bin:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/mpi/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/ucx/bin:/opt/amazon/efa/bin:/opt/tensorrt/bin"
+PMIX_MCA_psec = "native"
+NCCL_PXN_DISABLE = "1"
+NCCL_CROSS_NIC = "0"
+UCCL_EP_TRANSPORT = "cxi"
+XDG_CACHE_HOME = "/ritom/scratch/cscs/${USER}/cache"
+HF_HOME = "/ritom/scratch/cscs/${USER}/cache/huggingface"
+HF_HUB_CACHE = "/ritom/scratch/cscs/${USER}/cache/huggingface/hub"
+TORCH_HOME = "/ritom/scratch/cscs/${USER}/cache/torch"
+VLLM_CACHE_ROOT = "/ritom/scratch/cscs/${USER}/cache/vllm"
+FLASHINFER_WORKSPACE_BASE = "/ritom/scratch/cscs/${USER}/cache/flashinfer"
+PIP_CACHE_DIR = "/ritom/scratch/cscs/${USER}/cache/pip"
+UV_CACHE_DIR = "/ritom/scratch/cscs/${USER}/cache/uv"
+
+[annotations]
+com.hooks.cxi.enabled = "false"
+com.hooks.netstack.source = "host"

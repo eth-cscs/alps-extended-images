@@ -1,0 +1,17 @@
+Question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?
+Answer: Natalia sold 48/2 = 24 clips in May. Natalia sold 48+24 = 72 clips altogether in April and May. #### 72
+
+Question: Weng earns $12 an hour for babysitting. Yesterday, she just did 50 minutes of babysitting. How much did she earn?
+Answer: Weng earns 12/60 = $0.2 per minute. Working 50 minutes, she earned 0.2 x 50 = $10. #### 10
+
+Question: Betty is saving money for a new wallet which costs $100. Betty has only half of the money she needs. Her parents decided to give her $15 for that purpose, and her grandparents twice as much as her parents. How much more money does Betty need to buy the wallet?
+Answer: Betty has only 100/2 = $50. Betty's grandparents gave her 15*2 = $30. This means she needs 100-50-30-15 = $5 more. #### 5
+
+Question: Julie is reading a 120-page book. Yesterday, she read 12 pages and today, she read twice as many pages as yesterday. If she wants to read half of the remaining pages tomorrow, how many pages should she read?
+Answer: Julie read 12 x 2 = 24 pages today. So she has read a total of 12 + 24 = 36 pages. There are 120 - 36 = 84 pages left. She should read 84/2 = 42 pages. #### 42
+
+Question: James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?
+Answer: He writes 3*2 = 6 pages every time. So he writes 6*2 = 12 pages per week. That means he writes 12*52 = 624 pages a year. #### 624
+
+Question: {}
+Answer:
