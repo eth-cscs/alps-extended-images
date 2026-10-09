@@ -138,3 +138,35 @@ validated -- three shakedowns so far, all stopped in the rank-0 preflight (Run l
   checkout stays: the fork needs >= 0.2.0 and the checkout is first on `PYTHONPATH`.
 - Everything in "Recipe"/"Open risks" above that names versions was read from the old tag;
   re-read them from the next run's preflight.
+
+### Run `3622335` — 2026-10-09 — new image: preflight, Ray, model load and vLLM all clean; first weight refit fails with NCCL `InvalidUsage (5)`
+
+- **Log**: `~/Downloads/slurm-3622335.out` (first 3.6 MB only -- `ops/download` returned 504 once the
+  log passed that size) and `~/Downloads/slurm-3622335.tail.out` (last 3000 lines, has the error).
+  Image `alps7-dev-7eab7fc4...`. ~15 min queued, FAILED after 1165 s (~19.5 min).
+- **Worked, all for the first time**: preflight (`third-party modules not importable: none`,
+  12/12 imports, `config OK`), 16/16 nodes in Ray (the head-ready marker fix), 48/48
+  `MegatronPolicyWorker`s initialised, 4 vLLM engines up on `v0.28.0+apertus2`
+  (`Resolved architecture: ApertusForCausalLM`), checkpoint load from the HF snapshot through the
+  bridge. No OOM, no Lustre lock errors.
+- **Symptom**: at the first trainer->vLLM refit (`refit: watchdog armed, deadline 300.0s`), every
+  vLLM TP worker raises in
+  `nemo_rl/weight_sync/xferdtensor.py:116 _communicator_supports_device_api` ->
+  `getattr(communicator, "device_api_support", False)` -> NCCL `InvalidUsage (5): invalid usage`;
+  the trainer side then fails `MegatronPolicyWorker.nccl_reshard_refit()` with
+  `RayTaskError(NCCLError)` and the driver exits 1. Every rank also logs
+  `NCCL WARN NCCL library is too old. This application was compiled with NCCL version 2.31.2, but
+  is running with NCCL library version 2.30.7`.
+- **Root cause**: the image ships `nccl-extensions` 0.1.0, so `nccl.m2n.reshard` imports and the
+  fork probes the refit communicator for device-API support; the nccl4py binding (built against
+  NCCL 2.31.2) errors on the image's runtime NCCL 2.30.7 instead of returning "unsupported".
+  `getattr(..., False)` only absorbs `AttributeError`, so the `NCCLError` propagates. On the older
+  tag this would not have triggered (no `nccl.m2n`, the fork falls back by itself).
+- **Fix (unverified)**: `export NRL_XFERDTENSOR_PYTHON=1` -- the fork's own switch for the Python
+  exact-transfer reshard, the path it takes anyway when the native op is absent or the fabric has
+  no GPU-initiated networking (Slingshot: `NET/OFI GIN only supports RDMA`).
+- **Image-side note for PR #64**: nccl4py / nccl-extensions are built against a newer NCCL than the
+  image runs; worth aligning, independent of this recipe.
+- **Log volume**: `NCCL_DEBUG=WARN` (fork launcher default) makes every rank repeat the OFI/GIN
+  warnings -- several MB in 15 min. Monitor with `ops/tail`, not `ops/download`.
+- **Commit**: see `git log` (fix committed with this entry).

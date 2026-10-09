@@ -48,8 +48,7 @@
 #   * no CUDA xIELU kernel (not in the image): the Megatron side uses the
 #     bridge's jit-fused Python xIELU -- same math, slower activation.
 #
-# NOT YET VALIDATED: runs 3621638 / 3621707 / 3621888 failed in the preflight
-# (see ../CLAUDE.md).
+# NOT YET VALIDATED: no run has completed a training step yet (see ../CLAUDE.md).
 # ─────────────────────────────────────────────────────────────────────────────
 
 export NEMORL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-7eab7fc435699b52c9668a663afde4b3"
@@ -296,6 +295,13 @@ export NRL_REFIT_NUM_STREAMS=2
 export RAY_DEDUP_LOGS=0
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
 export VLLM_DISABLE_PYNCCL=1
+
+# Weight refit: use the Python exact-transfer reshard. The image ships
+# nccl.m2n.reshard (nccl-extensions) built against NCCL 2.31.2 while the runtime
+# NCCL is 2.30.7, and probing the communicator for device-API support then
+# raises InvalidUsage (5) instead of answering no (run 3622335). Slingshot has
+# no GPU-initiated networking, so the native op could not be used here anyway.
+export NRL_XFERDTENSOR_PYTHON=1
 
 # Compile / JIT / dataset caches off Lustre (no flock there) onto node-local /tmp.
 export HF_HOME=/tmp/hf_${JOB_ID}
