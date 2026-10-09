@@ -32,8 +32,8 @@
 #   * bridge: native / legacy Megatron-checkpoint loading (auto_bridge,
 #     model_load_save, mlm_compat, checkpointing) -- this starts from the HF
 #     checkpoint; offloading-expert weight views (swiss-ai bridge PR #4) and the
-#     CPU->CUDA step in the Megatron->HF export -- expert offloading is off here
-#     and there is no HF-schema refit without vLLM.
+#     CPU->CUDA step in the Megatron->HF export -- only needed with expert
+#     offloading, which is off here.
 #   * NeMo-RL: upstream PR #2517 (vLLM data-parallel), swiss-ai PR #5 (load
 #     checkpoints under no_grad), the rest of swiss-ai PR #1.
 # Differences from the author's recipe that follow from that: no expert
@@ -41,8 +41,8 @@
 # TEMPORARILY Adam instead of the md_decoupling optimizer Chonk was pretrained
 # with (TODO: change back, see the optimizer block of the recipe), TEMPORARILY no
 # KL penalty against the starting policy (TODO, see loss_fn in the recipe), and
-# generation by Megatron-Core's dynamic engine, eager (no CUDA graphs), with the
-# native Megatron-to-Megatron refit.
+# generation by Megatron-Core's dynamic engine, eager (no CUDA graphs), refit by
+# NeMo-RL's default collective through the bridge mapping.
 #
 # BEFORE THE FINAL RUN, restore: the md_decoupling optimizer and the KL penalty
 # against the starting policy (REFERENCE_KL_PENALTY=0.01). Both are disabled only
@@ -50,8 +50,7 @@
 #
 # UNTESTED. No run yet. First things that can go wrong, in order: imports of the
 # patched vanilla bridge against the Megatron-LM fork (preflight), trainer OOM
-# without expert offloading, KDA under the inference engine, the native refit
-# EP16 -> EP8.
+# without expert offloading, KDA under the inference engine, the refit EP16 -> EP8.
 # ─────────────────────────────────────────────────────────────────────────────
 
 export NEMORL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-7eab7fc435699b52c9668a663afde4b3"
@@ -477,6 +476,9 @@ policy:
     moe_token_dispatcher_type: alltoall
     moe_permute_fusion: true
     apply_rope_fusion: false
+    env_vars:
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+      NRL_REFIT_NUM_BUFFERS: "1"
     # No model_overrides: the author's recipe turns on coarse-grained expert
     # offloading with in-place FP8 parameters there, which needs the bridge's
     # offloading-expert conversion (swiss-ai Megatron-Bridge PR #4).
@@ -526,13 +528,17 @@ policy:
       resources:
         num_nodes: ${oc.decode:${oc.env:INFERENCE_NODES}}
         gpus_per_node: 4
-    # Native Megatron-to-Megatron refit (megatron.core.resharding), EP16 -> EP8.
-    refit_transport: mcore
+    # NeMo-RL's own refit (the default): the trainer streams weights through the
+    # bridge mapping over an NCCL collective and the generator maps them back.
+    # Same trainer-side path as the author's vLLM recipe. The native Megatron
+    # refit (refit_transport: mcore) is not usable: vanilla NeMo-RL passes
+    # execution_batch_bytes to megatron.core.resharding.refit, which the
+    # Megatron-LM fork's version does not accept (run 3623177).
+    refit_transport: null
     mcore_generation_config:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 8
-      refit_backend: nccl
       # Eager generation: CUDA graphs with KDA + latent-MoE layers are untested.
       cuda_graph_impl: none
       inference_cuda_graph_scope: none
@@ -679,6 +685,9 @@ export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
+# Refit staging limits from the vLLM recipe of the image author.
+export NRL_REFIT_BUFFER_MEMORY_RATIO=0.005
+export NRL_REFIT_NUM_BUFFERS=1
 export NCCL_DEBUG=WARN
 export RAY_DEDUP_LOGS=0
 

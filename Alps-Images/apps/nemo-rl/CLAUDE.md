@@ -408,3 +408,27 @@ Both are disabled only to bring the RL loop up; neither is the intended training
    reference model before the policy returns to the GPU.
 2. **`md_decoupling` optimizer** -- currently Adam; restore the author's optimizer block and apply
    `example/patches/bridge-md-decoupling-optimizer.patch`.
+
+### Run `3623177` — 2026-10-09 — KL penalty 0: trainer and generator both built; native `mcore` refit API mismatch at synchronizer init
+
+- **Log**: `~/Downloads/slurm-3623177.tail.out` (last 8000 lines). 24 nodes, FAILED after 513 s
+  (faster than `3622931`: the converted Megatron checkpoint was already cached).
+- **Worked**: with `REFERENCE_KL_PENALTY=0.0` no reference model is built and the trainer OOM is
+  gone. `grpo.setup` got past creating both the policy and the generation worker groups (the
+  failure is in `init_megatron_weight_synchronizer`, which runs after them), i.e. the dedicated
+  Megatron generation model was constructed on the 16 generation nodes.
+- **Symptom**: `TypeError: prepare_swap_model_weights() got an unexpected keyword argument
+  'execution_batch_bytes'` in `megatron_worker.py:1410 init_collective_mcore_generation`.
+- **Root cause**: version drift between vanilla NeMo-RL and the Megatron-LM fork on the native
+  refit API. NeMo-RL `f196ef0a` passes `execution_batch_bytes` to
+  `megatron.core.resharding.refit.prepare_swap_model_weights` / `swap_model_weights` (3 call
+  sites); the fork's functions do not take it. The author's recipe never exercises this path
+  (`refit_transport: null`).
+- **Fix (unverified)**: `refit_transport: null` (NeMo-RL's default collective through the bridge
+  mapping -- same trainer-side path as the author's vLLM recipe), `refit_backend` override removed
+  (only valid with `mcore`), and the author's `NRL_REFIT_BUFFER_MEMORY_RATIO=0.005` /
+  `NRL_REFIT_NUM_BUFFERS=1` restored (env + `megatron_cfg.env_vars`). Zero library change.
+  Alternative not taken: drop the kwarg at NeMo-RL's three call sites to keep the native refit --
+  a further NeMo-RL patch with unknown further drift behind it.
+- **Consequence**: the per-step Megatron -> HF-schema -> Megatron conversion is back in the refit
+  (the thing the native transport would have avoided); vLLM is still gone.
