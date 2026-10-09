@@ -170,3 +170,24 @@ validated -- three shakedowns so far, all stopped in the rank-0 preflight (Run l
 - **Log volume**: `NCCL_DEBUG=WARN` (fork launcher default) makes every rank repeat the OFI/GIN
   warnings -- several MB in 15 min. Monitor with `ops/tail`, not `ops/download`.
 - **Commit**: see `git log` (fix committed with this entry).
+
+### Run `3622451` — 2026-10-09 — **FIRST COMPLETE STEP: `train step 1/1`, `SC run complete`** (1-step shakedown)
+
+- **Log**: `~/Downloads/slurm-3622451.tail.out` (last 3000 lines; the full log is > 5 MB, on the
+  cluster at `/users/palmee/slurm-3622451.out` and `<RUN_DIR>/run.log`). Image `alps7-dev-7eab7fc4...`,
+  16 nodes, `TOTAL_TRAINING_STEPS=1`. ~5 min queued. Slurm state at time of writing: `COMPLETED 0 889`
+  (state exitCode elapsed_s).
+- **Result**: the `NRL_XFERDTENSOR_PYTHON=1` fix cleared the refit; rollout, training, weight sync
+  and the step-1 data-plane checkpoint all completed.
+- **Step-1 metrics**: `loss` 0.0813, `grad_norm` 0.157, **`gen_kl_error` 0.00066** (fork's healthy
+  bar is < 0.002: generator and trainer agree after the refit), `policy_kl_error` 0.00067,
+  `sampling_importance_ratio` 0.9999, `reward` mean 1.021 (max 1.1, min 0, median 1.077 -- composite
+  reward, 1.0 correct + 0.1 format), 768 valid samples, 582k valid tokens, `lr` 1e-6.
+- **Step-1 timing**: total 137.0 s = generation 67.0 s + policy training 60.6 s + checkpointing
+  4.4 s + weight sync 3.6 s. (First step; includes warm-up.)
+- **Teardown noise, not failures**: `Error in GPU monitoring collection loop ...` and a wandb
+  `atexit` `ConnectionResetError: Connection lost` after `SC run complete`.
+- **Still unvalidated**: more than one step (windowed async sampler across weight versions,
+  repeated refits, memory over time), the full 92-step run, and throughput vs. the fork's own
+  image (no CUDA xIELU kernel here).
+- **Commit**: recorded with this entry.
