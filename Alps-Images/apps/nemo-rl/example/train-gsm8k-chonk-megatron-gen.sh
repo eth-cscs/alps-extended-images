@@ -46,7 +46,8 @@
 #
 # BEFORE THE FINAL RUN, restore: the md_decoupling optimizer and the KL penalty
 # against the starting policy (REFERENCE_KL_PENALTY=0.01). Both are disabled only
-# to bring the loop up.
+# to bring the loop up. ALSO WANTED BACK: the native Megatron-to-Megatron refit
+# (refit_transport: mcore), see the generation block of the recipe.
 #
 # UNTESTED. No run yet. First things that can go wrong, in order: imports of the
 # patched vanilla bridge against the Megatron-LM fork (preflight), trainer OOM
@@ -534,6 +535,9 @@ policy:
     # refit (refit_transport: mcore) is not usable: vanilla NeMo-RL passes
     # execution_batch_bytes to megatron.core.resharding.refit, which the
     # Megatron-LM fork's version does not accept (run 3623177).
+    # TODO: RE-ENABLE THE NATIVE PATH (refit_transport: mcore + refit_backend: nccl
+    # under mcore_generation_config) once NeMo-RL and the Megatron-LM fork agree on
+    # that API; it avoids the conversion through the HF layout on every refit.
     refit_transport: null
     mcore_generation_config:
       tensor_model_parallel_size: 1

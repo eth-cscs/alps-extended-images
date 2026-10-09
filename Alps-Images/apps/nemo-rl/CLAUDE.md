@@ -409,6 +409,16 @@ Both are disabled only to bring the RL loop up; neither is the intended training
 2. **`md_decoupling` optimizer** -- currently Adam; restore the author's optimizer block and apply
    `example/patches/bridge-md-decoupling-optimizer.patch`.
 
+Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
+
+3. **Native Megatron-to-Megatron refit** -- `refit_transport: mcore` with
+   `mcore_generation_config.refit_backend: nccl`. Currently `null` (NeMo-RL's default collective
+   through the bridge mapping) because vanilla NeMo-RL `f196ef0a` passes `execution_batch_bytes` to
+   `megatron.core.resharding.refit.{prepare_swap_model_weights,swap_model_weights}` and the
+   Megatron-LM fork `a9e0c497` does not accept it (run `3623177`). Re-enable when the fork catches
+   up with upstream Megatron-Core's refit API, or with a NeMo-RL patch dropping that keyword at its
+   three call sites in `models/generation/megatron/megatron_worker.py`.
+
 ### Run `3623177` — 2026-10-09 — KL penalty 0: trainer and generator both built; native `mcore` refit API mismatch at synchronizer init
 
 - **Log**: `~/Downloads/slurm-3623177.tail.out` (last 8000 lines). 24 nodes, FAILED after 513 s
