@@ -191,3 +191,37 @@ validated -- three shakedowns so far, all stopped in the rank-0 preflight (Run l
   repeated refits, memory over time), the full 92-step run, and throughput vs. the fork's own
   image (no CUDA xIELU kernel here).
 - **Commit**: recorded with this entry.
+
+# Megatron-generation variant (`example/train-gsm8k-apertus-v1.5-70B-megatron-gen.sh`)
+
+Created 2026-10-09 as a copy of `train-gsm8k-apertus-v1.5-70B.sh` with Megatron-Core's inference
+engine as the rollout backend instead of vLLM. **UNTESTED -- no run yet.** Keep the two scripts in
+sync by hand: `diff` them from `export NEMORL_IMAGE` down; the only intended differences are the
+experiment name, `GEN_TP`, the generation block of the YAML, the two `VLLM_*` exports and the
+preflight module list.
+
+- **Config delta** (child YAML): `policy.generation.backend: megatron`,
+  `refit_transport: mcore`, `mcore_generation_config.{tensor_model_parallel_size: 4,
+  pipeline_model_parallel_size: 1, refit_backend: nccl, kv_cache_management_mode: recompute}`,
+  `async_rl.generation_fleet_health.refit_timeout_s: null` -- the same four generation keys as the
+  fork's `grpo-qwen2.5-math-1.5b-instruct-1n4g-megatron_generation-noncolocated-single-controller-async-lag4.yaml`,
+  plus the generator layout. Everything else (CUDA graphs `local`/`block`, `buffer_size_gb: 10`,
+  `max_tokens: 16384`, `logprobs_mode: processed_logprobs`) is the fork default from
+  `grpo_math_1B.yaml`. The generator's `megatron_cfg` is the trainer's merged with
+  `mcore_generation_config` (`merged_inference_megatron_cfg`), activation checkpointing forced off.
+- **What it does and does not remove** (checked in the fork source, not assumed):
+  - removed: vLLM, NeMo-RL's runtime source patches to vLLM, the Megatron->HF-schema conversion
+    on every refit (`mcore` transport = `megatron.core.resharding`, Megatron-to-Megatron).
+  - NOT removed: **Megatron-Bridge** -- `megatron_worker.py` builds the generation model from a
+    bridge provider (`megatron.bridge.models.gpt_provider`), and the HF checkpoint import on both
+    sides is the bridge; **transformers** -- `megatron_generation.py` imports it at module level
+    (tokenizer, processor), and tokenizer / chat template / HF config come from it everywhere.
+    Dropping them would need a pre-converted Megatron checkpoint plus a non-HF tokenizer path,
+    which this fork does not offer.
+- **Open risks**: no Apertus Megatron-generation recipe exists in the fork (Qwen, Llama,
+  Nemotron only). `ApertusModelProvider` sets its own `transformer_layer_spec`
+  (`apertus_layer_spec`, xIELU as a module activation), so `_configure_inference_optimized_layer_spec`
+  leaves it alone and the generator runs regular TE layers, not `inference_optimized` -- which also
+  rules out `refit_transport: nccl_reshard` for this backend (it requires `inference_optimized`).
+  Generation CUDA graphs with the xIELU module, native refit TP2/PP4 -> TP4/PP1, and rollout
+  throughput vs vLLM (KV buffer is only 10 GB by default) are all unexercised.
