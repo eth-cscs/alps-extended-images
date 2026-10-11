@@ -713,6 +713,10 @@ export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_${JOB_ID}
 export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions_${JOB_ID}
 export CUDA_CACHE_PATH=/tmp/cuda_cache_${JOB_ID}
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${JOB_ID}
+# The KDA backward kernels are JIT-compiled by TileLang on the first training
+# step; its binary cache defaults to ~/.tilelang/cache (Lustre) and 32 trainer
+# ranks racing on it end in a stale file handle (run 3639449).
+export TILELANG_CACHE_DIR=/tmp/tilelang_${JOB_ID}
 
 if [ "${RANK}" -eq 0 ]; then
     # Preflight: versions, that the patched vanilla checkouts import against the

@@ -589,3 +589,25 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   with N = 1-2 of 35-241 tokens -- i.e. about 1-2 % of sampled tokens fall outside the trainer's
   top-p 0.9 nucleus. Generator and trainer are therefore close but not identical at the nucleus
   boundary. No generation-KL number was printed (the run died before the step metrics).
+
+### Run `3639449` — 2026-10-11 — micro-batch 1 clears the trainer OOM; first backward pass dies on TileLang's kernel cache on Lustre
+
+- **Log**: `~/Downloads/slurm-3639449.tail.out`. 24 nodes, no queue wait, FAILED after 1188 s
+  (checkpoint load was ~5 min slower than `3628358`; no error there).
+- **Worked**: generation (again), rewards, the logprob pass, and the training FORWARD at
+  `TRAIN_MICRO_BATCH=1` -- no `OutOfMemoryError` anywhere. Training reached the backward pass.
+- **Symptom**: `MegatronPolicyWorker.train()` on rank 0:
+  `fla/ops/kda/backends/tilelang/chunk_bwd_dqkg.py:455 chunk_kda_bwd_wy_dqkg_fused_tilelang ->
+  tilelang/jit ... -> tilelang/cache/cuda_binary_cache.py:132 load -> f.read()` ->
+  `RuntimeError: [Errno 116] Stale file handle` (surfaced through TVM FFI, hence the extra
+  `ffi.Error ... ToJSONGraph` noise and Ray's "original cause isn't serializable").
+- **Root cause**: the KDA backward kernels (flash-linear-attention's TileLang backend) are
+  JIT-compiled on the first training step. TileLang 0.1.12 caches the compiled CUDA binaries under
+  `TILELANG_CACHE_DIR`, default `~/.tilelang/cache` -- Lustre home, shared by all 32 trainer ranks
+  compiling the same kernels at once. Same class as the Triton / FlashInfer / bridge-lock cache
+  hazards. Generation did not hit it (its KDA path uses the fused recurrent kernel).
+- **Fix (unverified)**: `export TILELANG_CACHE_DIR=/tmp/tilelang_<jobid>` (node-local) with the
+  other cache redirects. Cost: every job recompiles these kernels (~30 s per kernel per the log).
+- **New cache-redirect rule for this image**: anything KDA / TileLang needs `TILELANG_CACHE_DIR`
+  off Lustre. `~/.tilelang/cache` may now hold partial files from this run; harmless once the
+  variable is set.
