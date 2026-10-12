@@ -51,7 +51,7 @@
 #
 # UNTESTED. No run yet. First things that can go wrong, in order: imports of the
 # patched vanilla bridge against the Megatron-LM fork (preflight), trainer OOM
-# without expert offloading, KDA under the inference engine, the refit EP16 -> EP8.
+# without expert offloading, KDA under the inference engine, the refit EP32 -> EP8.
 # ─────────────────────────────────────────────────────────────────────────────
 
 export NEMORL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-7eab7fc435699b52c9668a663afde4b3"
@@ -78,8 +78,9 @@ export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
 export SRC_VERSION="v3"
 
-# Topology and batch sizes of the author's recipe: 8 training nodes (32 GPUs,
-# EP16 -> DP2) + 16 generation nodes (64 GPUs, EP8 -> 8 replicas).
+# Topology and batch sizes of the author's recipe, except trainer EP32 instead
+# of EP16 (memory, see the recipe below): 8 training nodes (32 GPUs,
+# EP32, 8 experts per GPU) + 16 generation nodes (64 GPUs, EP8 -> 8 replicas).
 export TRAIN_NODES=8
 export INFERENCE_NODES=$(( SLURM_JOB_NUM_NODES - TRAIN_NODES ))
 export TOTAL_NODES=${SLURM_JOB_NUM_NODES}
@@ -471,11 +472,16 @@ policy:
     enabled: true
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
-    expert_model_parallel_size: 16
+    # EP32 (8 of the 256 experts per trainer GPU) plus activation checkpointing:
+    # without expert offloading EP16 does not fit a 95 GB GPU. Run 3640152 ran out
+    # of memory in the forward of a later micro-batch with ~49 GB of weights and
+    # gradients, ~31 GB of activations and ~12 GB outside PyTorch, before any Adam
+    # state had been allocated.
+    expert_model_parallel_size: 32
     expert_tensor_parallel_size: 1
     context_parallel_size: 1
     sequence_parallel: true
-    activation_checkpointing: false
+    activation_checkpointing: true
     gradient_accumulation_fusion: true
     cuda_graph_impl: none
     freeze_moe_router: true
@@ -510,6 +516,11 @@ policy:
       adam_beta1: 0.9
       adam_beta2: 0.95
       adam_eps: 1.0e-8
+      # Adam moments in bf16 instead of the fp32 default, to halve the optimizer
+      # state that is allocated at the first optimizer step (same memory budget
+      # as above). Goes away with the Adam block when md_decoupling is restored.
+      exp_avg_dtype: bf16
+      exp_avg_sq_dtype: bf16
       clip_grad: ${policy.max_grad_norm}
     scheduler:
       lr_decay_style: cosine

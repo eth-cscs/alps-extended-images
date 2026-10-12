@@ -318,7 +318,7 @@ tokenizer rework and `max_requests` key of PR #1.
   use_cuda_graphs_for_non_decode_steps: false, kv_cache_management_mode: recompute,
   logprobs_mode: raw_logprobs}`; `vllm_cfg` / `vllm_kwargs` removed.
 - `megatron_cfg.model_overrides` (coarse-grained expert offloading, in-place FP8 params) removed.
-- Everything else (24 nodes = 8 train EP16 + 16 generation EP8, 32x8 rollouts, 2 steps,
+- Everything else (24 nodes = 8 train EP16 (EP32 since run `3640152`) + 16 generation EP8, 32x8 rollouts, 2 steps,
   md_decoupling optimizer, sync GRPO via `examples/run_grpo.py`) unchanged.
 
 ## Open risks, in the order a first run would meet them
@@ -611,3 +611,32 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **New cache-redirect rule for this image**: anything KDA / TileLang needs `TILELANG_CACHE_DIR`
   off Lustre. `~/.tilelang/cache` may now hold partial files from this run; harmless once the
   variable is set.
+
+### Run `3640152` — 2026-10-11 — TileLang fix confirmed, first backward pass completes; trainer OOM in a later micro-batch forward
+
+- **Log**: `~/Downloads/slurm-3640152.out` (15 MB; fetched with `ops/view` in 1 MB chunks, since
+  `ops/download` fails above ~5 MB and the S3 transfer job sat PENDING). ~65 min queue wait
+  (`QOSGrpNodeLimit`), FAILED after 884 s.
+- **Worked**: everything up to and including the first backward pass. TileLang compiled its
+  kernels from node-local /tmp in ~30 s (`TileLang completes to compile kernel`) and
+  `run_backward` ran -- the `TILELANG_CACHE_DIR` fix of run `3639449` is verified.
+- **Symptom**: `MegatronPolicyWorker.train()` rank 23, `forward_backward_no_pipelining ->
+  forward_step -> experts.py:653 -> TE grouped_linear` -> `torch.OutOfMemoryError`: 93.66 GiB in
+  use by the process, 80.56 GiB allocated by PyTorch, 1.34 GiB reserved-unallocated (so ~12 GiB
+  outside PyTorch: CUDA context, NCCL, TE workspaces, TileLang kernels).
+- **Budget at EP16** (11.66 B parameters per trainer rank; generator at EP8 has 18.1 B, so
+  ~5.2 B non-expert + ~103 B expert parameters in total): bf16 weights 23 GB + gradient buffer
+  23 GB = the ~49 GB seen at build, ~31 GB of activations at micro-batch 1 without activation
+  checkpointing, ~12 GB outside PyTorch. The Adam state (TE FusedAdam, precision-aware: fp32
+  moments and master weights for the rank's shard) is allocated lazily at the first optimizer
+  step and had not been allocated yet -- it would not have fitted either.
+- **Fix (unverified, config only)**: trainer `expert_model_parallel_size: 32` (8 experts per
+  GPU, ~8.4 B parameters per rank), `activation_checkpointing: true`, Adam moments in bf16
+  (`exp_avg_dtype` / `exp_avg_sq_dtype`). Estimate: ~34 GB weights + gradients, ~20 GB optimizer
+  state, ~12 GB outside PyTorch, leaving ~29 GB for (now checkpointed) activations. The
+  optimizer-state estimate assumes the shard reasoning above and has not been measured.
+- **Untested side effects**: default refit now gathers EP32 -> EP8; expert data-parallel size
+  is 1; activation checkpointing recomputes the KDA forward during backward (slower steps).
+- **Underlying trade-off**: the author's recipe fits because of coarse-grained expert offloading
+  with in-place FP8 parameters, which needs swiss-ai Megatron-Bridge PR #4. Staying on the
+  vanilla bridge is what makes the trainer memory this tight.
