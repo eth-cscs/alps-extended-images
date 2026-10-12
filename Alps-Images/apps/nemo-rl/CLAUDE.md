@@ -640,3 +640,30 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Underlying trade-off**: the author's recipe fits because of coarse-grained expert offloading
   with in-place FP8 parameters, which needs swiss-ai Megatron-Bridge PR #4. Staying on the
   vanilla bridge is what makes the trainer memory this tight.
+
+### Run `3642870` — 2026-10-12 — FIRST COMPLETE RUN (2/2 steps, COMPLETED exit 0, 967 s); generator degrades after the first refit
+
+- **Log**: `~/Downloads/slurm-3642870.tail.out` (last 6 MB of a 16.5 MB log). No queue wait.
+- **Memory fix verified**: trainer EP32 + activation checkpointing + bf16 Adam moments ran both
+  steps with no `OutOfMemoryError`. Config validated, EP32 -> EP8 default refit ran (7.1 s).
+- **Metrics**:
+
+  | | Step 1 | Step 2 |
+  |---|---|---|
+  | Avg reward | 0.6016 | 0.2070 |
+  | Generation KL error | 0.0555 | 0.5533 |
+  | Loss | 0.0930 | 0.1869 |
+  | Step time | 345 s (TileLang compile included) | 71 s |
+
+  Step 2 breakdown: generation 30 s, policy_training 18 s, refit 7 s, logprobs 6 s.
+- **Open correctness problem (not diagnosed)**: after one optimizer step at warm-up learning
+  rate (~1e-7) the reward drops by two thirds and gen-KL rises tenfold. Step 1 has no refit
+  (both models load the same checkpoint); the first trainer -> generator refit is just before
+  step 2, so the refit is the prime suspect (EP32 -> EP8 through the vanilla bridge mapping:
+  expert ordering, fork-only parameters / buffers such as `qb_beta`, KDA state). Second
+  candidate: the Adam step itself on hypersphere-constrained weights. No refit warnings in the log.
+- **Also off**: gen-KL 0.0555 at step 1, before any update (Apertus 1.5 run: ~0.0007) --
+  generator (inference engine, KDA inference state, EP8) and trainer (EP32) already disagree.
+- **Next**: separate refit from optimizer (learning rate 0 for one step, or compare generator
+  and trainer weights after the refit).
+
