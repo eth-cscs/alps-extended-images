@@ -746,9 +746,24 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   2. The rest is a logprob-mode mismatch: the generator reported `raw_logprobs`, the trainer
      renormalises over the nucleus. 62% of trainer values are exactly 0 (single-token
      nucleus) and trainer - generator is in [0, -ln 0.9] for 95% of tokens. Fixed in the
-     script: `logprobs_mode: processed_logprobs` (unverified). The Apertus 1.5 Megatron-gen
+     script: `logprobs_mode: processed_logprobs` (verified in `3654364`). The Apertus 1.5 Megatron-gen
      script never set `top_p`, which is why it showed ~0.0007.
 - **Lesson**: judge gen-KL from the per-token dump, not the printed mean; with `top_p < 1` a
   handful of out-of-nucleus tokens dominates it. `top_p: 1.0` removes both effects but
   departs from the author's recipe.
+
+### Run `3654364` — 2026-10-13 — `processed_logprobs`: generator and trainer agree; the printed gen-KL is only the out-of-nucleus artifact
+
+- **Log**: `~/Downloads/slurm-3654364.out`. Repo script at `353667d` (`top_p: 0.9` kept, as in
+  the author's recipe), `preemptable` in the submitted copy only. COMPLETED, exit 0, 996 s.
+- **Printed**: step 1 reward 0.5117 / gen-KL 0.0741 / loss -0.0277; step 2 reward 0.5703 /
+  gen-KL 0.0495 / loss 0.0115.
+- **Per-token recomputation** (`train_data_step{1,2}.jsonl`): excluding the out-of-nucleus
+  tokens (16 of 20149 and 19 of 22154, 0.08-0.09%, >99% of the printed KL) the gen-KL is
+  0.00033 on both steps, below the Apertus 1.5 figure (~0.0007). Mean trainer - generator
+  log-probability -0.0001 to -0.0003 (was +0.042 with `raw_logprobs`), median |diff| 0.
+- **Open**: step-1 reward 0.51 is below the 0.57-0.61 of the four earlier runs (256 samples,
+  standard error ~0.03). `logprobs_mode` should not change sampling; watch it on the next run.
+- **Not fixable by config**: the printed gen-KL stays at 0.05-0.07 while `top_p < 1`, because
+  NeMo-RL writes 0 for a `-inf` trainer log-probability and the metric keeps the position.
 
