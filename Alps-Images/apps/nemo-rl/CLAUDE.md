@@ -667,3 +667,30 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Next**: separate refit from optimizer (learning rate 0 for one step, or compare generator
   and trainer weights after the refit).
 
+### Run `3648142` — 2026-10-12 — learning-rate-0 diagnostic: generator still degrades after the refit, so the optimizer is not the cause
+
+- **Log**: `~/Downloads/slurm-3648142.tail.out`. Submitted copy only: `lr`, `min_lr`,
+  `lr_warmup_init` = 0 and `#SBATCH --partition=preemptable` (repo script unchanged).
+  COMPLETED exit 0, 1037 s.
+- **Queue**: the same job on `normal` (`3647237`) sat ~3 h on `QOSGrpNodeLimit` and was
+  cancelled; on `preemptable` the pending reason became `Resources` and it started within
+  ~10 min. `preemptable` bypasses the `csstaff` group node limit.
+- **Metrics**:
+
+  | | Step 1 | Step 2 |
+  |---|---|---|
+  | Avg reward | 0.5703 | 0.2461 |
+  | Generation KL error | 0.0455 | 0.3678 |
+  | Loss | 0.0729 | 0.0469 |
+
+- **Conclusion**: with a zero update the trainer weights cannot have moved, yet the generator
+  degrades exactly as in `3642870`. The fault is in the trainer -> generator refit (default
+  path: bridge `export_hf_weights` on EP32, `stream_weights_hf_to_megatron` per task on EP8,
+  then `finalize_hf_import`), or in a training-mode side effect on non-gradient state.
+- **Checked by reading code, not the cause as far as it goes**: the bridge keeps `A_log`,
+  `dt_bias` and `qb_beta` in fp32 on export; the recipe sets
+  `moe_router_quantile_balancing_freeze: true` (not confirmed to reach the trainer config).
+- **Not yet checked**: expert ordering of the TE grouped-MLP `weight*` mappings across
+  EP32 -> EP8, the KDA custom mappings' round trip, `finalize_hf_import` for Apertus 2.
+- **Separate, still open**: gen-KL ~0.05 at step 1 before any refit.
+
