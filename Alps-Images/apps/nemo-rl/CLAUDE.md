@@ -713,11 +713,25 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   not forward it (unknown `megatron_cfg` keys are dropped silently), so the fork router's
   default (`freeze=False`, EMA 0.0) replaced `qb_beta` with a quantile estimate from each
   128-sequence GSM8K batch. Every other recipe key in that block is forwarded (checked).
-- **Fix (unverified)**: `megatron_cfg.model_overrides: {moe_router_quantile_balancing_freeze:
+- **Fix (verified in `3653929`)**: `megatron_cfg.model_overrides: {moe_router_quantile_balancing_freeze:
   true}` -- vanilla NeMo-RL's route to model-config fields (`_merge_model_overrides`); the field
   comes from the fork's `TransformerConfig`. No library change.
 - **Lesson**: a recipe key that vanilla NeMo-RL does not know is not an error. When porting a
   key from the author's fork recipe, grep `nemo_rl/models/megatron/setup.py` for it.
 - **Still open**: gen-KL 0.036-0.055 at step 1 with identical weights on both sides (Apertus
   1.5: ~0.0007).
+
+### Run `3653929` — 2026-10-13 — `qb_beta` freeze via `model_overrides`: generator no longer degrades after the refit
+
+- **Log**: `~/Downloads/slurm-3653929.out`. Repo script at `f782e78` (normal learning rate,
+  Adam, KL penalty 0, default refit, shared `src-v3` checkout), `preemptable` set in the
+  submitted copy only. COMPLETED, exit 0, 967 s; started ~25 min after submission.
+- **Result**: step 1 reward 0.6055 / gen-KL 0.0679 / loss -0.0300 / mean length 77.2;
+  step 2 reward 0.6133 / gen-KL 0.0803 / loss -0.0467 / mean length 83.8. Before the fix,
+  step 2 was reward 0.21-0.25 / gen-KL 0.31-0.55.
+- **Confirmed**: `model_overrides` accepts `moe_router_quantile_balancing_freeze` for
+  `Apertus2ModelProvider` (it appears in the resolved `MasterConfig`); no library change.
+- **Still open**: gen-KL 0.04-0.08 on both steps (Apertus 1.5: ~0.0007). Two steps say
+  nothing about learning; a longer run is the next check. Adam, KL penalty 0 and the default
+  refit are still the temporary settings noted in the script.
 
