@@ -486,7 +486,6 @@ policy:
     cuda_graph_impl: none
     freeze_moe_router: true
     moe_router_load_balancing_type: quantile_balancing
-    moe_router_quantile_balancing_freeze: true
     moe_router_dtype: fp32
     moe_router_bias_update_rate: 0.0
     moe_token_dispatcher_type: alltoall
@@ -495,9 +494,16 @@ policy:
     env_vars:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
       NRL_REFIT_NUM_BUFFERS: "1"
-    # No model_overrides: the author's recipe turns on coarse-grained expert
-    # offloading with in-place FP8 parameters there, which needs the bridge's
-    # offloading-expert conversion (swiss-ai Megatron-Bridge PR #4).
+    # Keep the checkpoint's quantile-balancing thresholds (qb_beta) fixed. Vanilla
+    # NeMo-RL silently drops moe_router_quantile_balancing_freeze as a top-level
+    # megatron_cfg key (the author's fork forwards it), so the trainer re-estimated
+    # qb_beta from every GSM8K batch and the refit shipped it to the generator:
+    # reward 0.57 -> 0.25 after one step even at learning rate 0 (runs 3642870,
+    # 3648142, 3652972). model_overrides is the vanilla route to model-config fields.
+    # Not carried over from the author's model_overrides: coarse-grained expert
+    # offloading with in-place FP8 parameters (needs swiss-ai Megatron-Bridge PR #4).
+    model_overrides:
+      moe_router_quantile_balancing_freeze: true
     checkpoint:
       async_save: false
       save: ${oc.env:RUN_DIR}/megatron-save

@@ -694,3 +694,30 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   EP32 -> EP8, the KDA custom mappings' round trip, `finalize_hf_import` for Apertus 2.
 - **Separate, still open**: gen-KL ~0.05 at step 1 before any refit.
 
+### Run `3652972` — 2026-10-13 — refit probe: the refit is faithful; the trainer rewrites `qb_beta` because the freeze flag never reached the model
+
+- **Log**: `~/Downloads/slurm-3652972.out`. Learning rate 0, `preemptable`, separate checkout
+  `src-v3diag-...` with a probe in `megatron_worker.py::_write_generation_refit_weight` that
+  compares each destination tensor with the value about to be written (probe script:
+  scratchpad `refit_diag.py`; not in the repo). Step 1 reward 0.59 / gen-KL 0.036, step 2
+  reward 0.21 / gen-KL 0.31.
+- **Finding 1**: there IS an initial refit before step 1 -- all 3230 tasks change, with large
+  differences. The generator is built without loading the checkpoint and receives its weights
+  from the trainer, so the bridge export/import round trip (EP32 -> EP8, KDA mappings, expert
+  gather) is what produces the step-1 generator, and that generator scores ~0.6.
+- **Finding 2**: at the refit before step 2, on all 64 generator ranks, only
+  `decoder.layers.N.mlp.router.qb_beta` changes: 39/39 MoE layers, every one of the 256
+  entries, max abs diff ~1.0 (plus denormal-level noise, ~1e-38, on 2 latent projections).
+- **Root cause**: `moe_router_quantile_balancing_freeze: true` was a top-level `megatron_cfg`
+  key, as in the author's `grpo-chonk-vllm.yaml`. Vanilla NeMo-RL's `_apply_moe_config` does
+  not forward it (unknown `megatron_cfg` keys are dropped silently), so the fork router's
+  default (`freeze=False`, EMA 0.0) replaced `qb_beta` with a quantile estimate from each
+  128-sequence GSM8K batch. Every other recipe key in that block is forwarded (checked).
+- **Fix (unverified)**: `megatron_cfg.model_overrides: {moe_router_quantile_balancing_freeze:
+  true}` -- vanilla NeMo-RL's route to model-config fields (`_merge_model_overrides`); the field
+  comes from the fork's `TransformerConfig`. No library change.
+- **Lesson**: a recipe key that vanilla NeMo-RL does not know is not an error. When porting a
+  key from the author's fork recipe, grep `nemo_rl/models/megatron/setup.py` for it.
+- **Still open**: gen-KL 0.036-0.055 at step 1 with identical weights on both sides (Apertus
+  1.5: ~0.0007).
+
