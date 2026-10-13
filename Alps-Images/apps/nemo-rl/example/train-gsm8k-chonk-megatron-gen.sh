@@ -577,7 +577,12 @@ policy:
       # kv_cache_management_mode stays at the default (persist): NeMo-RL requires
       # it to agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates
       # (false), and synchronous GRPO has no request in flight across a refit.
-      logprobs_mode: raw_logprobs
+      # The trainer recomputes log-probabilities over the top-p nucleus
+      # (generation.top_p: 0.9 is forwarded to it as sampling params), so the
+      # generator has to report them after its sampling processors as well.
+      # raw_logprobs only gives parity when top_p is 1.0 and top_k is off
+      # (run 3653929: raw vs renormalised, a constant offset up to -ln(0.9)).
+      logprobs_mode: processed_logprobs
 
 data:
   max_input_seq_length: 900

@@ -734,4 +734,21 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Still open**: gen-KL 0.04-0.08 on both steps (Apertus 1.5: ~0.0007). Two steps say
   nothing about learning; a longer run is the next check. Adam, KL penalty 0 and the default
   refit are still the temporary settings noted in the script.
+- **Gen-KL analysis** (offline, from `nemo-rl-logs/exp_001/train_data_step1.jsonl`, 19775
+  generated tokens): the 0.068 is not a Chonk model mismatch. Two effects, both from
+  `top_p: 0.9`:
+  1. 25 tokens (0.13%) carry 97% of the KL. The generator sampled them inside its nucleus,
+     the trainer places them just outside its own (flat tails, bf16 noise moves the cutoff).
+     Their trainer log-probability is `-inf`, `mask_out_neg_inf_logprobs`
+     (`nemo_rl/models/megatron/train.py`) writes 0 instead, and the gen-KL metric still counts
+     the position (trainer 0 vs generator down to -6.2). The loss masks these positions, so
+     this inflates the metric, not the gradient. Without them the KL is 0.0018.
+  2. The rest is a logprob-mode mismatch: the generator reported `raw_logprobs`, the trainer
+     renormalises over the nucleus. 62% of trainer values are exactly 0 (single-token
+     nucleus) and trainer - generator is in [0, -ln 0.9] for 95% of tokens. Fixed in the
+     script: `logprobs_mode: processed_logprobs` (unverified). The Apertus 1.5 Megatron-gen
+     script never set `top_p`, which is why it showed ~0.0007.
+- **Lesson**: judge gen-KL from the per-token dump, not the printed mean; with `top_p < 1` a
+  handful of out-of-nucleus tokens dominates it. `top_p: 1.0` removes both effects but
+  departs from the author's recipe.
 
