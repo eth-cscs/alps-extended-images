@@ -767,3 +767,19 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Not fixable by config**: the printed gen-KL stays at 0.05-0.07 while `top_p < 1`, because
   NeMo-RL writes 0 for a `-inf` trainer log-probability and the metric keeps the position.
 
+### Run `3654710` — 2026-10-13 — first 20-step run: reward drifts up from ~0.62 to ~0.72, loop stable
+
+- **Log**: `~/Downloads/slurm-3654710.out`. Repo script at `353667d`, `MAX_NUM_STEPS` default
+  set to 20 and `preemptable` in the submitted copy only. COMPLETED, exit 0, 2040 s
+  (step 1 352 s, later steps 50-74 s including the refit).
+- **Reward per step**: 0.57 0.56 0.61 0.69 0.69 0.63 0.64 0.66 0.59 0.75 0.70 0.66 0.66 0.77
+  0.69 0.76 0.64 0.74 0.77 0.66. Mean of steps 1-5 0.623, 6-15 0.676, 16-20 0.716; first ten
+  0.639, last ten 0.706. Single steps are noisy (256 samples, standard error ~0.03).
+- **Gen-KL**: printed 0.02-0.06 with spikes at step 6 (0.387) and step 7 (0.125). Per-token
+  dumps for steps 1, 6, 7, 20: excluding out-of-nucleus tokens (15-30 per step, >99% of the
+  printed value) it is 0.00033 on every step. The spikes are single tokens with generator
+  log-probability down to -8.9; nothing drifts over 20 refits.
+- **Caveats**: the learning rate was still in warm-up (60 iterations, ~40 done); Adam, KL
+  penalty 0 and the default refit are still the temporary settings; no validation set, so the
+  reward is on training prompts.
+
