@@ -39,15 +39,15 @@
 # Differences from the author's recipe that follow from that: no expert
 # offloading (model_overrides block dropped -> more trainer GPU memory),
 # TEMPORARILY Adam instead of the md_decoupling optimizer Chonk was pretrained
-# with (TODO: change back, see the optimizer block of the recipe), TEMPORARILY no
-# KL penalty against the starting policy (TODO, see loss_fn in the recipe), and
+# with (TODO: change back, see the optimizer block of the recipe), and
 # generation by Megatron-Core's dynamic engine (CUDA graphs on, NeMo-RL
 # defaults), refit by NeMo-RL's default collective through the bridge mapping.
 #
-# BEFORE THE FINAL RUN, restore: the md_decoupling optimizer and the KL penalty
-# against the starting policy (REFERENCE_KL_PENALTY=0.01). Both are disabled only
-# to bring the loop up. ALSO WANTED BACK: the native Megatron-to-Megatron refit
-# (refit_transport: mcore), see the generation block of the recipe.
+# BEFORE THE FINAL RUN, restore: the md_decoupling optimizer. It is disabled only
+# to bring the loop up. The KL penalty against the starting policy is back at
+# the author's 0.01 (REFERENCE_KL_PENALTY). ALSO WANTED BACK: the native
+# Megatron-to-Megatron refit (refit_transport: mcore), see the generation block
+# of the recipe.
 #
 # UNTESTED. No run yet. First things that can go wrong, in order: imports of the
 # patched vanilla bridge against the Megatron-LM fork (preflight), trainer OOM
@@ -92,9 +92,10 @@ export TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-1}"
 export INFERENCE_REQUESTS="${INFERENCE_REQUESTS:-32}"
 export MAX_NUM_STEPS="${MAX_NUM_STEPS:-2}"
 export NUM_PROMPTS="${NUM_PROMPTS:-32}"
-# KL penalty against the starting policy; > 0 needs a reference model on the
-# trainer GPUs (see the loss_fn block of the recipe). Author's value: 0.01.
-export REFERENCE_KL_PENALTY="${REFERENCE_KL_PENALTY:-0.0}"
+# KL penalty against the starting policy (author's value). > 0 makes NeMo-RL
+# build a reference model on the trainer GPUs at setup (see the loss_fn block
+# of the recipe); 0.0 skips it.
+export REFERENCE_KL_PENALTY="${REFERENCE_KL_PENALTY:-0.01}"
 export TRAIN_GLOBAL_BATCH="${TRAIN_GLOBAL_BATCH:-$(( TRAIN_NODES * 4 * 4 ))}"
 if [ "${INFERENCE_NODES}" -le 0 ] || [ $(( INFERENCE_NODES * 4 % 8 )) -ne 0 ]; then
     echo "FATAL: ${INFERENCE_NODES} generation nodes x 4 GPUs is not a positive multiple of EP8"
@@ -599,11 +600,11 @@ data:
     env_name: math
 
 loss_fn:
-  # TEMPORARY: 0 (REFERENCE_KL_PENALTY). Any value > 0 makes NeMo-RL build a
-  # second, reference copy of the model on the trainer GPUs, which does not fit
-  # without expert offloading (run 3622931). The author's recipe uses 0.01.
-  # TODO: REQUIRED FOR THE FINAL RUN -- restore the KL penalty (0.01) once the
-  # trainer has the memory for the reference model.
+  # 0.01 as in the author's recipe (REFERENCE_KL_PENALTY). Any value > 0 makes
+  # NeMo-RL build a second, reference copy of the model on the trainer GPUs at
+  # setup and keep its weights on the host; each step swaps them in to compute
+  # the reference log-probabilities. At EP16 that copy did not fit (run
+  # 3622931); EP32 halves the per-GPU model (32 GB allocated at init).
   reference_policy_kl_penalty: ${oc.decode:${oc.env:REFERENCE_KL_PENALTY}}
   reference_policy_kl_type: k3
   kl_input_clamp_value: 20.0
