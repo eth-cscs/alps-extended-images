@@ -21,11 +21,11 @@
 #   Megatron-Bridge  NVIDIA-NeMo/Megatron-Bridge@07722453  vanilla + 4-file patch
 #                    + models/apertus2/ copied verbatim from
 #                      swiss-ai/Megatron-Bridge@f3bc8e7e (6 new files)
-#   Megatron-LM      swiss-ai/Megatron-LM-MoE PR #88 @b0844260  the fork, untouched (KDA
-#                    layers, latent MoE, quantile-balancing router are not in
-#                    stock Megatron-LM)
+#   Megatron-LM      swiss-ai/Megatron-LM-MoE PR #88 @b0844260  the fork (KDA layers,
+#                    latent MoE, quantile-balancing router are not in stock
+#                    Megatron-LM) + 1-file patch: upstream's native refit API
 #   nemo-lens        NVIDIA-NeMo/Lens@b85578fc          the rev NeMo-RL pins
-# The two patches are embedded below and checked in under patches/ (keep them
+# The three patches are embedded below and checked in under patches/ (keep them
 # byte-identical); each hunk and why it is needed is listed in the patch header.
 #
 # Deliberately NOT taken from the forks (see ../CLAUDE.md for the reasoning):
@@ -76,7 +76,7 @@ export MLM_REF="b0844260b2a0888c711dca230b88ec13b20f3229"
 export LENS_REPO="https://github.com/NVIDIA-NeMo/Lens.git"
 export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
-export SRC_VERSION="v3"
+export SRC_VERSION="v4"
 
 # Topology and batch sizes of the author's recipe, except trainer EP32 instead
 # of EP16 (memory, see the recipe below): 8 training nodes (32 GPUs,
@@ -351,6 +351,101 @@ index c2cf239a..86624859 100644
  
          return BridgeSoundEncoder
 CHONK_PATCH_EOF
+cat > "${RUN_DIR}/patches/mlm-refit-execution-batch-bytes.patch" << 'CHONK_PATCH_EOF'
+# Upstream-compatible native refit API for the swiss-ai Megatron-LM-MoE fork.
+# Base: swiss-ai/Megatron-LM-MoE@b0844260b2a0888c711dca230b88ec13b20f3229 (Apache-2.0).
+#   megatron/core/resharding/refit.py
+#       local: accept execution_batch_bytes in prepare_swap_model_weights / swap_model_weights /
+#       get_or_create_service with upstream Megatron-Core's signature (NVIDIA/Megatron-LM #6878,
+#       5eb0744c7). Vanilla NeMo-RL f196ef0a always passes it (resolved from
+#       refit_execution_batch_bytes, default: its packed-tensor size). With a string nccl_m2n backend
+#       the value sets M2N's grouped-submission limit, as upstream does; other backends keep the
+#       fork's model-wide submission, upstream's bounded batching is NOT ported. A faithful port
+#       needs #5872, #5187, #6826, #6133 and #6878 with conflicts in execution.py / refit.py.
+diff --git a/megatron/core/resharding/refit.py b/megatron/core/resharding/refit.py
+index 77e25de9c..092667554 100644
+--- a/megatron/core/resharding/refit.py
++++ b/megatron/core/resharding/refit.py
+@@ -118,7 +118,9 @@ _service_cache: dict[tuple[str, int | None], CopyService] = {}
+ _plan_cache: dict[_PlanCacheKey, Any] = {}
+ 
+ 
+-def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
++def get_or_create_service(
++    backend: RefitBackendName, group=None, execution_batch_bytes: int | None = None
++) -> CopyService:
+     """Get or create a cached CopyService instance for the given backend.
+ 
+     This avoids expensive repeated allocations (especially for NVSHMEM buffers)
+@@ -127,15 +129,19 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
+     Args:
+         backend: Backend name ("nccl", "nccl_m2n", "gloo", or "nvshmem").
+         group: Optional process group for the backend.
++        execution_batch_bytes: Optional soft byte limit for execution staging.
++            For NCCL M2N, this overrides its grouped-submission limit. None
++            preserves M2N's existing environment setting or 256 MiB default.
+     """
+-    cache_key = (backend, id(group) if group is not None else None)
++    service_batch_bytes = execution_batch_bytes if backend == "nccl_m2n" else None
++    cache_key = (backend, id(group) if group is not None else None, service_batch_bytes)
+     if cache_key in _service_cache:
+         return _service_cache[cache_key]
+ 
+     if backend == "nccl":
+         service = NCCLCopyService(group=group)
+     elif backend == "nccl_m2n":
+-        service = NCCLM2NCopyService(group=group)
++        service = NCCLM2NCopyService(group=group, max_group_bytes=execution_batch_bytes)
+     elif backend == "gloo":
+         service = GlooCopyService(group=group)
+     elif backend == "nvshmem":
+@@ -327,6 +333,7 @@ def prepare_swap_model_weights(
+     group=None,
+     src_rank_offset: int = 0,
+     dst_rank_offset: int = 0,
++    execution_batch_bytes: int | None = None,
+ ):
+     """Pre-build and cache the reshard plan and any format-conversion transforms.
+ 
+@@ -356,7 +363,11 @@ def prepare_swap_model_weights(
+         group: Optional process group for collective communication.
+         src_rank_offset: Rank offset for source (training) workers.
+         dst_rank_offset: Rank offset for destination (inference) workers.
++        execution_batch_bytes: Accepted for API compatibility with upstream
++            Megatron-Core (NVIDIA/Megatron-LM #6878). This fork builds one
++            model-wide plan, so the value does not change the plan.
+     """
++    del execution_batch_bytes  # API compatibility only, see the docstring.
+     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+     plan = _build_or_get_plan(
+         src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+@@ -378,6 +389,7 @@ def swap_model_weights(
+     transform: Optional[ReshardTransform] = None,
+     num_dst_pools: int = 1,
+     dst_pool_index: int = 0,
++    execution_batch_bytes: int | None = None,
+ ):
+     """
+     Orchestrate weight swap/refit.
+@@ -397,9 +409,16 @@ def swap_model_weights(
+         transform: Optional ReshardTransform for custom format conversion.
+             If None, the cached transform (from prepare_swap_model_weights)
+             is used automatically when the receiver needs MXFP8 conversion.
++        execution_batch_bytes: Accepted for API compatibility with upstream
++            Megatron-Core (NVIDIA/Megatron-LM #6878). With a string
++            ``nccl_m2n`` backend it sets M2N's grouped-submission limit, as
++            upstream does. Other backends keep this fork's model-wide
++            submission; upstream's bounded batching is not ported.
+     """
+     if isinstance(refit_method, str):
+-        service = get_or_create_service(refit_method, group=group)
++        service = get_or_create_service(
++            refit_method, group=group, execution_batch_bytes=execution_batch_bytes
++        )
+     elif isinstance(refit_method, CopyService):
+         service = refit_method
+     else:
+CHONK_PATCH_EOF
 cat > "${RUN_DIR}/patches/nemo-rl-chonk-megatron-gen-minimal.patch" << 'CHONK_PATCH_EOF'
 # Minimal edits to NeMo-RL for Apertus 2 (Chonk) with Megatron generation on the nemo-rl-cuda image.
 # Base: NVIDIA-NeMo/RL@f196ef0a1ccb54d6ce71cd63277fb6a0e01168db (Apache-2.0).
@@ -556,16 +651,13 @@ policy:
       resources:
         num_nodes: ${oc.decode:${oc.env:INFERENCE_NODES}}
         gpus_per_node: 4
-    # NeMo-RL's own refit (the default): the trainer streams weights through the
-    # bridge mapping over an NCCL collective and the generator maps them back.
-    # Same trainer-side path as the author's vLLM recipe. The native Megatron
-    # refit (refit_transport: mcore) is not usable: vanilla NeMo-RL passes
-    # execution_batch_bytes to megatron.core.resharding.refit, which the
-    # Megatron-LM fork's version does not accept (run 3623177).
-    # TODO: RE-ENABLE THE NATIVE PATH (refit_transport: mcore + refit_backend: nccl
-    # under mcore_generation_config) once NeMo-RL and the Megatron-LM fork agree on
-    # that API; it avoids the conversion through the HF layout on every refit.
-    refit_transport: null
+    # Native Megatron-to-Megatron refit: Megatron-Core's resharding plan copies
+    # trainer shards (EP32) straight into the generator's (EP8) over NCCL, with
+    # no conversion through the HF layout. Needs the Megatron-LM patch above
+    # (NeMo-RL passes execution_batch_bytes, which the fork did not accept, run
+    # 3623177). Fallback: refit_transport: null, NeMo-RL's collective through
+    # the bridge mapping (runs 3653929-3655036).
+    refit_transport: mcore
     mcore_generation_config:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
@@ -575,6 +667,9 @@ policy:
       # layers (run 3624750). Padding experts is required for EP > 1 with CUDA
       # graphs when the layers are not Megatron-Core's inference_optimized ones.
       moe_pad_experts_for_cuda_graph_inference: true
+      # Copy service for refit_transport: mcore. NeMo-RL warns that nvshmem is
+      # broken; nccl is the plain point-to-point backend.
+      refit_backend: nccl
       # kv_cache_management_mode stays at the default (persist): NeMo-RL requires
       # it to agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates
       # (false), and synchronous GRPO has no request in flight across a refit.
@@ -673,16 +768,19 @@ if [ ! -f "${SRC_DIR}/.alps-ready" ]; then
         || { echo "FATAL: bridge patch does not apply to ${BRIDGE_REF}"; exit 1; }
     git -C "${tmp}/nemo-rl" apply "${RUN_DIR}/patches/nemo-rl-chonk-megatron-gen-minimal.patch" \
         || { echo "FATAL: NeMo-RL patch does not apply to ${NEMO_REF}"; exit 1; }
+    git -C "${tmp}/megatron-lm" apply "${RUN_DIR}/patches/mlm-refit-execution-batch-bytes.patch" \
+        || { echo "FATAL: Megatron-LM patch does not apply to ${MLM_REF}"; exit 1; }
 
     [ -d "${tmp}/megatron-lm/megatron/core" ] || { echo "FATAL: Megatron-LM checkout is empty"; exit 1; }
     [ -d "${tmp}/lens/src/nemo/lens" ] || { echo "FATAL: nemo-lens checkout is empty"; exit 1; }
     {
         echo "nemo-rl ${NEMO_REF} + nemo-rl-chonk-megatron-gen-minimal.patch"
         echo "bridge ${BRIDGE_REF} + models/apertus2 from ${BRIDGE_APERTUS2_REF} + bridge-apertus2-shared-minimal.patch"
-        echo "megatron-lm ${MLM_REF}"
+        echo "megatron-lm ${MLM_REF} + mlm-refit-execution-batch-bytes.patch"
         echo "lens ${LENS_REF}"
         git -C "${tmp}/nemo-rl" status --short
         git -C "${tmp}/bridge" status --short
+        git -C "${tmp}/megatron-lm" status --short
     } > "${tmp}/.alps-ready"
     if mv -T "${tmp}" "${SRC_DIR}" 2>/dev/null; then
         echo "Source checkouts ready at ${SRC_DIR}"

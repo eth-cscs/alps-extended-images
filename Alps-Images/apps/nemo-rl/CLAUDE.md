@@ -413,9 +413,9 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
    `mcore_generation_config.refit_backend: nccl`. Currently `null` (NeMo-RL's default collective
    through the bridge mapping) because vanilla NeMo-RL `f196ef0a` passes `execution_batch_bytes` to
    `megatron.core.resharding.refit.{prepare_swap_model_weights,swap_model_weights}` and the
-   Megatron-LM fork `a9e0c497` does not accept it (run `3623177`). Re-enable when the fork catches
-   up with upstream Megatron-Core's refit API, or with a NeMo-RL patch dropping that keyword at its
-   three call sites in `models/generation/megatron/megatron_worker.py`.
+   Megatron-LM fork `a9e0c497` does not accept it (run `3623177`). Enabled again with
+   `example/patches/mlm-refit-execution-batch-bytes.patch` on the fork (decision 2026-10-14, see
+   below); untested.
 
 ### Run `3623177` — 2026-10-09 — KL penalty 0: trainer and generator both built; native `mcore` refit API mismatch at synchronizer init
 
@@ -797,4 +797,21 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Gen-KL** excluding out-of-nucleus tokens: 0.00031 (step 1), 0.00030 (step 20).
 - **Not measured**: KL to the reference policy. Neither the console metrics nor
   `train_data_step*.jsonl` include reference log-probabilities in this NeMo-RL version.
+
+### Native refit: Megatron-LM API shim instead of an upstream port (2026-10-14)
+
+- Upstream NVIDIA/Megatron-LM `main` added `execution_batch_bytes` to
+  `prepare_swap_model_weights` / `swap_model_weights` in `5eb0744c7` (#6878, 2026-08-28); `dev`
+  and the fork (`b0844260`) do not have it. It is the only keyword NeMo-RL `f196ef0a` passes that
+  the fork lacks.
+- NeMo-RL always passes a value: `resolve_refit_execution_batch_bytes` turns `null` into its
+  packed-tensor size. (An earlier note here said `null` reaches Megatron-LM; it does not.)
+- A faithful port (rebasing is not realistic: 475 fork commits on a 2026-03-31 merge base,
+  upstream 1610 ahead) means cherry-picking #5872, #5187, #6826, #6133, #6878; trial picks on
+  `b0844260` conflict in 6, 2, 0, 3 and 11 files, mostly `execution.py` / `refit.py`, where the
+  fork has its own reconciled refit port (`7dbf53902`). Left to the fork's maintainers.
+- Chosen instead (user): `mlm-refit-execution-batch-bytes.patch`, upstream's signature only. With
+  `nccl_m2n` it sets the M2N grouped-submission limit as upstream does; other backends (we use
+  `nccl`) keep the fork's model-wide submission. Recipe: `refit_transport: mcore`,
+  `mcore_generation_config.refit_backend: nccl`, `SRC_VERSION` v4.
 

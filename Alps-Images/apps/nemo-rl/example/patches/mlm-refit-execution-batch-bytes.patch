@@ -1,0 +1,93 @@
+# Upstream-compatible native refit API for the swiss-ai Megatron-LM-MoE fork.
+# Base: swiss-ai/Megatron-LM-MoE@b0844260b2a0888c711dca230b88ec13b20f3229 (Apache-2.0).
+#   megatron/core/resharding/refit.py
+#       local: accept execution_batch_bytes in prepare_swap_model_weights / swap_model_weights /
+#       get_or_create_service with upstream Megatron-Core's signature (NVIDIA/Megatron-LM #6878,
+#       5eb0744c7). Vanilla NeMo-RL f196ef0a always passes it (resolved from
+#       refit_execution_batch_bytes, default: its packed-tensor size). With a string nccl_m2n backend
+#       the value sets M2N's grouped-submission limit, as upstream does; other backends keep the
+#       fork's model-wide submission, upstream's bounded batching is NOT ported. A faithful port
+#       needs #5872, #5187, #6826, #6133 and #6878 with conflicts in execution.py / refit.py.
+diff --git a/megatron/core/resharding/refit.py b/megatron/core/resharding/refit.py
+index 77e25de9c..092667554 100644
+--- a/megatron/core/resharding/refit.py
++++ b/megatron/core/resharding/refit.py
+@@ -118,7 +118,9 @@ _service_cache: dict[tuple[str, int | None], CopyService] = {}
+ _plan_cache: dict[_PlanCacheKey, Any] = {}
+ 
+ 
+-def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
++def get_or_create_service(
++    backend: RefitBackendName, group=None, execution_batch_bytes: int | None = None
++) -> CopyService:
+     """Get or create a cached CopyService instance for the given backend.
+ 
+     This avoids expensive repeated allocations (especially for NVSHMEM buffers)
+@@ -127,15 +129,19 @@ def get_or_create_service(backend: RefitBackendName, group=None) -> CopyService:
+     Args:
+         backend: Backend name ("nccl", "nccl_m2n", "gloo", or "nvshmem").
+         group: Optional process group for the backend.
++        execution_batch_bytes: Optional soft byte limit for execution staging.
++            For NCCL M2N, this overrides its grouped-submission limit. None
++            preserves M2N's existing environment setting or 256 MiB default.
+     """
+-    cache_key = (backend, id(group) if group is not None else None)
++    service_batch_bytes = execution_batch_bytes if backend == "nccl_m2n" else None
++    cache_key = (backend, id(group) if group is not None else None, service_batch_bytes)
+     if cache_key in _service_cache:
+         return _service_cache[cache_key]
+ 
+     if backend == "nccl":
+         service = NCCLCopyService(group=group)
+     elif backend == "nccl_m2n":
+-        service = NCCLM2NCopyService(group=group)
++        service = NCCLM2NCopyService(group=group, max_group_bytes=execution_batch_bytes)
+     elif backend == "gloo":
+         service = GlooCopyService(group=group)
+     elif backend == "nvshmem":
+@@ -327,6 +333,7 @@ def prepare_swap_model_weights(
+     group=None,
+     src_rank_offset: int = 0,
+     dst_rank_offset: int = 0,
++    execution_batch_bytes: int | None = None,
+ ):
+     """Pre-build and cache the reshard plan and any format-conversion transforms.
+ 
+@@ -356,7 +363,11 @@ def prepare_swap_model_weights(
+         group: Optional process group for collective communication.
+         src_rank_offset: Rank offset for source (training) workers.
+         dst_rank_offset: Rank offset for destination (inference) workers.
++        execution_batch_bytes: Accepted for API compatibility with upstream
++            Megatron-Core (NVIDIA/Megatron-LM #6878). This fork builds one
++            model-wide plan, so the value does not change the plan.
+     """
++    del execution_batch_bytes  # API compatibility only, see the docstring.
+     src_core, tgt_core, num_experts = _unwrap_model_cores(src_model, target_model)
+     plan = _build_or_get_plan(
+         src_core, tgt_core, num_experts, group, src_rank_offset, dst_rank_offset
+@@ -378,6 +389,7 @@ def swap_model_weights(
+     transform: Optional[ReshardTransform] = None,
+     num_dst_pools: int = 1,
+     dst_pool_index: int = 0,
++    execution_batch_bytes: int | None = None,
+ ):
+     """
+     Orchestrate weight swap/refit.
+@@ -397,9 +409,16 @@ def swap_model_weights(
+         transform: Optional ReshardTransform for custom format conversion.
+             If None, the cached transform (from prepare_swap_model_weights)
+             is used automatically when the receiver needs MXFP8 conversion.
++        execution_batch_bytes: Accepted for API compatibility with upstream
++            Megatron-Core (NVIDIA/Megatron-LM #6878). With a string
++            ``nccl_m2n`` backend it sets M2N's grouped-submission limit, as
++            upstream does. Other backends keep this fork's model-wide
++            submission; upstream's bounded batching is not ported.
+     """
+     if isinstance(refit_method, str):
+-        service = get_or_create_service(refit_method, group=group)
++        service = get_or_create_service(
++            refit_method, group=group, execution_batch_bytes=execution_batch_bytes
++        )
+     elif isinstance(refit_method, CopyService):
+         service = refit_method
+     else:
