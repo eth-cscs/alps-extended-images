@@ -404,6 +404,9 @@ Both are disabled only to bring the RL loop up; neither is the intended training
 
 1. **KL penalty against the starting policy** -- `REFERENCE_KL_PENALTY` is `0.0`; the final run
    needs the author's `0.01`. DONE in `3cd896f`, verified in run `3655036` (fits at EP32).
+   **Back to `0.0` (user, 2026-10-14)** to free the reference model's ~32 GB GPU copy for the
+   native refit (trainer OOM in `3659594`); the native refit is kept because the larger models
+   to come need it. Restoring 0.01 needs the reference copy freed (NeMo-RL patch) or more room.
 2. **`md_decoupling` optimizer** -- currently Adam; restore the author's optimizer block and apply
    `example/patches/bridge-md-decoupling-optimizer.patch`.
 
@@ -869,4 +872,7 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   for the refit's point-to-point connections (each trainer rank exchanges with many generator
   ranks); the default refit path uses broadcasts and ran 20 steps with the same trainer config
   (`3655036`). The trainer also still holds the reference model's GPU copy (~32 GB).
-
+- **Fix (user decision, unverified)**: keep the native refit, `REFERENCE_KL_PENALTY` default back
+  to `0.0` (no reference model, ~32 GB less allocated per trainer GPU). Does not explain the
+  ~26 GiB outside the process's accounting; if that grows across refits, the OOM will return
+  later in the run.
