@@ -107,6 +107,8 @@ if [ $(( NUM_PROMPTS * 8 % TRAIN_GLOBAL_BATCH )) -ne 0 ] \
     exit 1
 fi
 
+export PROJECT_NAME="${PROJECT_NAME:-apertus-benchmarks}"   # same W&B project as the Apertus 1.5 recipes
+export WANDB_ENTITY="${WANDB_ENTITY:-ml-team-cscs}"
 export EXPERIMENT_NAME="${MODEL_NAME}-gsm8k-nemorl-megatron-gen-${SLURM_JOB_NUM_NODES}n"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}
@@ -121,6 +123,16 @@ mkdir -p "${TRAINING_HOME}" "${RUN_DIR}/patches" "${NRL_MEGATRON_CHECKPOINT_DIR}
 cd "${TRAINING_HOME}"
 
 [ -r "${HF_MODEL}/config.json" ] || { echo "FATAL: no HF checkpoint at ${HF_MODEL}"; exit 1; }
+
+# W&B logging, as in the Apertus 1.5 recipes: on when the key file exists.
+if [ -f "/users/${USER}/.wandb_api_key" ]; then
+    export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
+    export WANDB_ENABLED=true
+else
+    echo "WARNING: /users/${USER}/.wandb_api_key not found, W&B logging disabled"
+    export WANDB_ENABLED=false
+fi
+export WANDB_SILENT=true
 
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${NEMORL_IMAGE}"
@@ -711,7 +723,11 @@ loss_fn:
 
 logger:
   log_dir: ${oc.env:RUN_DIR}/nemo-rl-logs
-  wandb_enabled: false
+  wandb_enabled: ${oc.decode:${oc.env:WANDB_ENABLED}}
+  wandb:
+    project: ${oc.env:PROJECT_NAME}
+    entity: ${oc.env:WANDB_ENTITY}
+    name: ${oc.env:RUN_NAME}
   tensorboard_enabled: false
   num_val_samples_to_print: 8
 CHONK_YAML_EOF
@@ -916,6 +932,7 @@ print(
     "refit", gen["refit_transport"],
     "optimizer", cfg["policy"]["megatron_cfg"]["optimizer"]["optimizer"],
     "kl_penalty", cfg["loss_fn"]["reference_policy_kl_penalty"],
+    "wandb", cfg["logger"]["wandb_enabled"],
 )
 PYEOF
 fi
