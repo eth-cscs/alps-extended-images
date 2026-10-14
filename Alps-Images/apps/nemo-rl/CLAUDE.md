@@ -850,3 +850,23 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   line is at Megatron INFO level and did not reach the console.
 - **First preemption** on `preemptable` in this series: with checkpointing off the run is lost.
 
+### Run `3659594` — 2026-10-14 — native refit works for both refits; trainer OOM on one rank in step-2 training
+
+- **Log**: `~/Downloads/slurm-3659594.out`. Same as `3659387` (`c17e381`, `src-v5`, W&B on),
+  `preemptable` in the submitted copy only. FAILED, exit 15, 1206 s.
+- **Worked**: initial native refit, step 1 (reward 0.6133, printed gen-KL 0.0373, mean length
+  81.2; step time 369 s = generation 164 s + logprobs incl. reference 90 s + training 113 s),
+  then the native refit with updated weights before step 2 and step-2 generation. Both native
+  refits completed; no NCCL timeout.
+- **Symptom**: step-2 training, trainer rank 14 only:
+  `torch.OutOfMemoryError: ... Tried to allocate 588.00 MiB. GPU 2 has a total capacity of
+  95.00 GiB of which 592.31 MiB is free. Including non-PyTorch memory, this process has 68.69 GiB
+  memory in use. Of the allocated memory 57.71 GiB is allocated by PyTorch` in the top-p filter
+  of the loss (`logits_sampling_utils.py:171 _apply_top_k_top_p_fn` <- `DistributedLogprobWithSampling`).
+- **Reading**: the GPU is full (94.4 GiB used) while this process accounts for 68.7 GiB, so about
+  26 GiB on that GPU sit outside the process's own accounting. At `init_complete` the process
+  accounted for all used memory (79.2 of 79.8 GB). Most likely holder (unverified): NCCL buffers
+  for the refit's point-to-point connections (each trainer rank exchanges with many generator
+  ranks); the default refit path uses broadcasts and ran 20 steps with the same trainer config
+  (`3655036`). The trainer also still holds the reference model's GPU copy (~32 GB).
+
