@@ -839,3 +839,14 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   whenever every op has a task id (always, for planner-built plans), the same decision on every
   rank. #7189's planner-side batching is not ported. `SRC_VERSION` v5.
 
+### Run `3659387` — 2026-10-14 — NCCL windowing fix gets the native refit through setup; preempted in step 1
+
+- **Log**: `~/Downloads/slurm-3659387.out`. Repo script at `c17e381` (`src-v5`), `preemptable` in
+  the submitted copy only. PREEMPTED after 928 s, during step-1 generation.
+- **Worked**: the initial native refit (EP32 -> EP8 over the 96-rank refit group) completed with
+  no NCCL timeout: `SETUP COMPLETE`, total setup 497.7 s, then `Step 1/2` and all 64 generation
+  ranks serving. The windowing fix removes the `3659197` deadlock.
+- **Not yet known**: refit-before-step-2 time, step-2 reward, gen-KL. The `task-id windows` log
+  line is at Megatron INFO level and did not reach the console.
+- **First preemption** on `preemptable` in this series: with checkpointing off the run is lost.
+
