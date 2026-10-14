@@ -403,9 +403,7 @@ tokenizer rework and `max_requests` key of PR #1.
 Both are disabled only to bring the RL loop up; neither is the intended training setup.
 
 1. **KL penalty against the starting policy** -- `REFERENCE_KL_PENALTY` is `0.0`; the final run
-   needs the author's `0.01`. Blocked on trainer GPU memory for the reference model (run `3622931`):
-   needs either expert offloading (bridge PR #4 patch group) or a NeMo-RL change that frees the
-   reference model before the policy returns to the GPU.
+   needs the author's `0.01`. DONE in `3cd896f`, verified in run `3655036` (fits at EP32).
 2. **`md_decoupling` optimizer** -- currently Adam; restore the author's optimizer block and apply
    `example/patches/bridge-md-decoupling-optimizer.patch`.
 
@@ -782,4 +780,21 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Caveats**: the learning rate was still in warm-up (60 iterations, ~40 done); Adam, KL
   penalty 0 and the default refit are still the temporary settings; no validation set, so the
   reward is on training prompts.
+
+### Run `3655036` — 2026-10-13 — KL penalty 0.01 restored: reference model fits at EP32, same reward trend
+
+- **Log**: `~/Downloads/slurm-3655036.out`. Repo script at `3cd896f` (`REFERENCE_KL_PENALTY`
+  default 0.01), 20 steps and `preemptable` in the submitted copy only. COMPLETED, exit 0,
+  2377 s (step 1 430 s, later steps 60-78 s; `reference_logprobs` ~10 s per step, 88 s on
+  step 1).
+- **Memory**: `[GPU_DIAG] after_ref_model` on the trainer: PyTorch allocated 64.4 GB, reserved
+  76.6 GB, NVML used up to 80.9 GB of 97.9 GB. The reference model's GPU copy is not freed by
+  `setup_reference_model_state` (allocated doubles from 32.2 GB), as suspected in `3622931`;
+  it fits at EP32 with ~17 GB headroom. All 20 training steps ran without OOM.
+- **Reward per step**: 0.59 0.61 0.57 0.70 0.68 0.65 0.67 0.65 0.57 0.74 0.71 0.71 0.73 0.75
+  0.68 0.75 0.60 0.77 0.78 0.68. Mean of steps 1-5 0.631, 6-15 0.685, 16-20 0.715 (run
+  `3654710` without the penalty: 0.623 / 0.676 / 0.716).
+- **Gen-KL** excluding out-of-nucleus tokens: 0.00031 (step 1), 0.00030 (step 20).
+- **Not measured**: KL to the reference policy. Neither the console metrics nor
+  `train_data_step*.jsonl` include reference log-probabilities in this NeMo-RL version.
 
