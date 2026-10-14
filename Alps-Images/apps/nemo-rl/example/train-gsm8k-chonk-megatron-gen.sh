@@ -23,7 +23,8 @@
 #                      swiss-ai/Megatron-Bridge@f3bc8e7e (6 new files)
 #   Megatron-LM      swiss-ai/Megatron-LM-MoE PR #88 @b0844260  the fork (KDA layers,
 #                    latent MoE, quantile-balancing router are not in stock
-#                    Megatron-LM) + 1-file patch: upstream's native refit API
+#                    Megatron-LM) + 2-file patch: upstream's native refit API
+#                    and its NCCL refit deadlock fix
 #   nemo-lens        NVIDIA-NeMo/Lens@b85578fc          the rev NeMo-RL pins
 # The three patches are embedded below and checked in under patches/ (keep them
 # byte-identical); each hunk and why it is needed is listed in the patch header.
@@ -76,7 +77,7 @@ export MLM_REF="b0844260b2a0888c711dca230b88ec13b20f3229"
 export LENS_REPO="https://github.com/NVIDIA-NeMo/Lens.git"
 export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
-export SRC_VERSION="v4"
+export SRC_VERSION="v5"
 
 # Topology and batch sizes of the author's recipe, except trainer EP32 instead
 # of EP16 (memory, see the recipe below): 8 training nodes (32 GPUs,
@@ -364,7 +365,7 @@ index c2cf239a..86624859 100644
          return BridgeSoundEncoder
 CHONK_PATCH_EOF
 cat > "${RUN_DIR}/patches/mlm-refit-execution-batch-bytes.patch" << 'CHONK_PATCH_EOF'
-# Upstream-compatible native refit API for the swiss-ai Megatron-LM-MoE fork.
+# Native refit on the swiss-ai Megatron-LM-MoE fork: upstream-compatible API + NCCL deadlock fix.
 # Base: swiss-ai/Megatron-LM-MoE@b0844260b2a0888c711dca230b88ec13b20f3229 (Apache-2.0).
 #   megatron/core/resharding/refit.py
 #       local: accept execution_batch_bytes in prepare_swap_model_weights / swap_model_weights /
@@ -374,6 +375,112 @@ cat > "${RUN_DIR}/patches/mlm-refit-execution-batch-bytes.patch" << 'CHONK_PATCH
 #       the value sets M2N's grouped-submission limit, as upstream does; other backends keep the
 #       fork's model-wide submission, upstream's bounded batching is NOT ported. A faithful port
 #       needs #5872, #5187, #6826, #6133 and #6878 with conflicts in execution.py / refit.py.
+#   megatron/core/resharding/copy_services/nccl_copy_service.py
+#       from upstream NVIDIA/Megatron-LM #7189 (325c9936b), its run()-side layer only: issue the
+#       plan's P2P ops in windows of 256 global task ids instead of one batch_isend_irecv. One
+#       ncclGroup with the whole model is split by NCCL into rank-dependent kernel plans and
+#       deadlocks (pytorch/pytorch#174288); seen here as a 600 s NCCL timeout on all 96 ranks in
+#       the first refit (run 3659197). The planner-side batching of #7189 is not ported.
+diff --git a/megatron/core/resharding/copy_services/nccl_copy_service.py b/megatron/core/resharding/copy_services/nccl_copy_service.py
+index 95f5ad5da..37c78289d 100644
+--- a/megatron/core/resharding/copy_services/nccl_copy_service.py
++++ b/megatron/core/resharding/copy_services/nccl_copy_service.py
+@@ -2,6 +2,7 @@
+ from __future__ import annotations
+ 
+ import logging
++import os
+ from typing import List, Optional
+ 
+ import torch
+@@ -18,6 +19,19 @@ class NCCLCopyService(CopyService):
+     a batch of point-to-point sends and recvs.
+     """
+ 
++    # From upstream NVIDIA/Megatron-LM #7189 (325c9936b), windowing layer only: a
++    # single ncclGroup holding a whole model's P2P ops is split by NCCL into
++    # several kernel plans at rank-dependent points, and matching sends/recvs
++    # that end up in different plans deadlock
++    # (https://github.com/pytorch/pytorch/issues/174288). run() therefore issues
++    # the remote ops as consecutive batch_isend_irecv calls over windows of
++    # TASK_WINDOW global task ids. Sender and receiver of a transfer share its
++    # task id, so both place it in the same window. Upstream windows only plans
++    # with more than TASK_WINDOW tasks; this fork's plans carry no global task
++    # count, so it windows whenever every op has a task id, which is the same
++    # decision on every rank. Set to 0 to disable.
++    TASK_WINDOW = int(os.environ.get("MEGATRON_NCCL_COPY_TASK_WINDOW", "256"))
++
+     def __init__(self, group=None):
+         super().__init__(group=group)
+         self.send_ops: List[SendOp] = []
+@@ -43,6 +57,37 @@ class NCCLCopyService(CopyService):
+         """Fork execution adapter retained for task-ID-aware reshard calls."""
+         self.submit_recv(dest_tensor, src_rank, task_id=task_id)
+ 
++    def _should_window(self, remote_sends: List[SendOp], remote_recvs: List[RecvOp]) -> bool:
++        if self.TASK_WINDOW <= 0:
++            return False
++        return all(op.task_id is not None for op in remote_sends) and all(
++            op.task_id is not None for op in remote_recvs
++        )
++
++    def _run_in_task_windows(self, remote_sends: List[SendOp], remote_recvs: List[RecvOp]) -> None:
++        """Issue the pending remote ops as one batch_isend_irecv per global task-id window."""
++        width = self.TASK_WINDOW
++        windows: dict[int, list] = {}
++        for op in remote_sends:
++            windows.setdefault(op.task_id // width, []).append(
++                dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group)
++            )
++        for op in remote_recvs:
++            windows.setdefault(op.task_id // width, []).append(
++                dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group)
++            )
++        if self.rank == 0:
++            logger.info(
++                "Executing batched communication in %d task-id windows of %d (max %d ops/window)",
++                len(windows),
++                width,
++                max((len(w) for w in windows.values()), default=0),
++            )
++        for key in sorted(windows):
++            reqs = dist.batch_isend_irecv(windows[key])
++            for req in reqs:
++                req.wait()
++
+     def run(self):
+         total_ops = len(self.send_ops) + len(self.recv_ops)
+         if self.rank == 0:
+@@ -66,16 +111,19 @@ class NCCLCopyService(CopyService):
+                 for send_op, recv_op in pairs:
+                     recv_op.tensor.copy_(send_op.tensor)
+ 
+-        p2p_ops = []
+-        for op in remote_sends:
+-            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
+-        for op in remote_recvs:
+-            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
+-
+-        if p2p_ops:
+-            reqs = dist.batch_isend_irecv(p2p_ops)
+-            for req in reqs:
+-                req.wait()
++        if self._should_window(remote_sends, remote_recvs):
++            self._run_in_task_windows(remote_sends, remote_recvs)
++        else:
++            p2p_ops = []
++            for op in remote_sends:
++                p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
++            for op in remote_recvs:
++                p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
++
++            if p2p_ops:
++                reqs = dist.batch_isend_irecv(p2p_ops)
++                for req in reqs:
++                    req.wait()
+ 
+         # Make sure the copy stream is finished
+         torch.cuda.current_stream().wait_stream(self._copy_stream)
 diff --git a/megatron/core/resharding/refit.py b/megatron/core/resharding/refit.py
 index 77e25de9c..092667554 100644
 --- a/megatron/core/resharding/refit.py

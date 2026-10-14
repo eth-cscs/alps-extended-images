@@ -815,3 +815,27 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   `nccl`) keep the fork's model-wide submission. Recipe: `refit_transport: mcore`,
   `mcore_generation_config.refit_backend: nccl`, `SRC_VERSION` v4.
 
+### Run `3659197` — 2026-10-14 — native refit: plan builds, first transfer deadlocks in NCCL (600 s timeout on all 96 ranks)
+
+- **Log**: `~/Downloads/slurm-3659197.out`. Repo script at `4e4a661` (`refit_transport: mcore`,
+  `refit_backend: nccl`, `src-v4`, W&B on), `preemptable` in the submitted copy only. FAILED, exit
+  15, 1225 s. `3659128` (same, no W&B) was cancelled while pending.
+- **Worked**: `src-v4` checkout with the Megatron-LM patch; config check (`refit mcore`,
+  `wandb True`); trainer with the reference model (64.4 GB allocated); generator; the refit
+  process group (96 ranks = 32 trainer + 64 generator) and the reshard plan, so the plan builder
+  handles KDA, latent MoE and `qb_beta`.
+- **Symptom**: no output for 10 min after the refit started, then on every rank
+  `Watchdog caught collective operation timeout: WorkNCCL(SeqNum=1, OpType=COALESCED, ...
+  Timeout(ms)=600000)` in `batch_isend_irecv` <- `nccl_copy_service.py:76 run` <-
+  `execution.py:218 execute_reshard_plan` <- `refit.py swap_model_weights`.
+- **Root cause**: the fork's `NCCLCopyService.run` sends every P2P op of the plan in one
+  `batch_isend_irecv` (one ncclGroup with the whole model). NCCL splits a group that large into
+  kernel plans at rank-dependent points, and a send and its matching receive can end up in
+  different plans on the two ranks: a device-side deadlock (pytorch/pytorch#174288). Upstream
+  fixed exactly this in NVIDIA/Megatron-LM #7189 (`325c9936b`).
+- **Fix (unverified)**: the Megatron-LM patch now also ports #7189's `run()`-side layer: P2P ops
+  go out in windows of 256 global task ids, which sender and receiver share. Upstream decides to
+  window from the plan's global task count; the fork's plans carry none, so the port windows
+  whenever every op has a task id (always, for planner-built plans), the same decision on every
+  rank. #7189's planner-side batching is not ported. `SRC_VERSION` v5.
+
