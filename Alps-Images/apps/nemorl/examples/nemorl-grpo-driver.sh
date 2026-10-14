@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# Shared NeMo-RL GRPO driver for Alps.
+#
+# This script is sourced by the train-*.sh entry points after they have
+# exported all required variables and generated the training configuration
+# (env.toml + YAML config).
+#
+# Required environment (set by the caller):
+#   TRAINING_HOME, TRAINING_CONFIG, CHECKPOINT_HOME, LOCAL_MODEL_DIR
+#   MODEL_NAME, MODEL_REPO, HF_TOKEN_PATH
+#   NEMORL_DIR, NEMORL_IMAGE
+#   MASTER_NODE_IP, PORT, RAY_ADDRESS
+#   YAML_NAME
+
+set -euo pipefail
+
+mkdir -p "${TRAINING_HOME}"
+mkdir -p "${TRAINING_CONFIG}"
+cd "${TRAINING_HOME}"
+
+# -----------------------------------------------------------------------------
+# Download the model once to shared storage.
+#
+# We check not only that the directory exists but also that a real (non-LFS-
+# pointer) config.json is present inside it. A previous run may have created
+# the directory but failed mid-download (network error, LFS not fetched,
+# etc.), leaving an incomplete model that `AutoTokenizer.from_pretrained`
+# later chokes on with a misleading "You need to have sentencepiece or
+# tiktoken installed" error.
+# -----------------------------------------------------------------------------
+_model_complete=false
+if [ -d "${LOCAL_MODEL_DIR}" ] && [ -f "${LOCAL_MODEL_DIR}/config.json" ]; then
+    # An LFS pointer file starts with "version https://git-lfs.github.com/spec/v1".
+    # A real config.json starts with "{" (JSON).
+    if head -c 1 "${LOCAL_MODEL_DIR}/config.json" | grep -q '{'; then
+        _model_complete=true
+    fi
+fi
+
+if [ "${_model_complete}" = false ]; then
+    if [ -d "${LOCAL_MODEL_DIR}" ]; then
+        echo "WARNING: ${LOCAL_MODEL_DIR} exists but appears incomplete (missing or LFS-pointer config.json). Re-downloading." >&2
+        rm -rf "${LOCAL_MODEL_DIR}"
+    else
+        echo "Downloading ${MODEL_REPO}/${MODEL_NAME} to ${LOCAL_MODEL_DIR}..."
+    fi
+
+    # Stripe the model directory across all OSTs BEFORE downloading: Lustre
+    # bakes the layout in at file creation, so the setstripe must precede
+    # hf download (which inherits the directory default for every new file).
+    # 384 training ranks + 32 vLLM ranks all read the same safetensors at
+    # startup; with the default stripe count of 1 each file is served by a
+    # single OST.  Existing complete downloads are deliberately NOT migrated
+    # (load is ~4.5 min either way, not worth the rewrite).
+    mkdir -p "${LOCAL_MODEL_DIR}"
+    if command -v lfs >/dev/null 2>&1; then
+        lfs setstripe -c -1 -S 4M "${LOCAL_MODEL_DIR}" \
+            || echo "WARNING: lfs setstripe on ${LOCAL_MODEL_DIR} failed; downloading unstriped." >&2
+    fi
+    HF_DOWNLOAD_DIR="${HOME}/tmp/hf_download_${SLURM_JOB_ID}"
+    mkdir -p "${HF_DOWNLOAD_DIR}"
+    pushd "${HF_DOWNLOAD_DIR}" >/dev/null || exit 1
+
+    uvx hf download "${MODEL_REPO}/${MODEL_NAME}" --local-dir "${LOCAL_MODEL_DIR}"
+
+    popd >/dev/null || true
+    rm -rf "${HF_DOWNLOAD_DIR}"
+else
+    echo "Model already present at ${LOCAL_MODEL_DIR}, skipping download."
+fi
+
+# -----------------------------------------------------------------------------
+# Start the Ray cluster manually (verl-style).
+#
+# NeMo-RL's run_grpo.py only starts a single-node local cluster automatically;
+# for multi-node it expects an existing Ray cluster. This explicit head + worker
+# setup is therefore required here, just as it is for verl.
+#
+# Note: NeMo-RL's canonical launcher is ray.sub, which also injects topology-
+# aware Ray resources (nvlink_domain_*, topo_rank, worker_units). This manual
+# start works, but without those extras NeMo-RL falls back to generic instead of
+# topology-aware scheduling. For a first comparison run this is acceptable.
+# -----------------------------------------------------------------------------
+srun --mpi=pmix --network=disable_rdzv_get -N "${SLURM_JOB_NUM_NODES}" --ntasks-per-node=1 -u \
+    --kill-on-bad-exit=1 \
+    --environment="${TRAINING_CONFIG}/env.toml" \
+    --container-writable bash -c '
+
+unset PYTHONOPTIMIZE
+
+# -----------------------------------------------------------------------------
+# Salvage Ray error logs before the node-local tmpfs vanishes with the job.
+#
+# Workers that die silently mid-import (slurm-3046402 ReplayBuffer SIGSEGV,
+# slurm-3079454 MegatronPolicyWorker) leave their only trace in
+# /tmp/ray/session_*/logs/worker-*.err on the node — gone at teardown.  Copy
+# non-empty error files to Lustre on exit (also on SIGTERM from
+# --kill-on-bad-exit; slurm allows a grace period before SIGKILL).
+# -----------------------------------------------------------------------------
+# Resolve Ray worker pids by the START of /proc/<pid>/cmdline (the ray::
+# proctitle).  NEVER pgrep -f: this whole script is the cmdline of our own
+# shells, so any substring of it (ray::, MegatronPolicyWorker, ...) matches
+# ourselves — exactly the trap train_monitor.sh warns about, and exactly what
+# emptied the memfd census and polluted live_procs in slurm-3116103.
+_pids_by_prefix() {
+    for _c in /proc/[0-9]*/cmdline; do
+        case "$(tr "\0" " " < "${_c}" 2>/dev/null)" in
+            "$1"*) _pp="${_c%/cmdline}"; echo "${_pp##*/}";;
+        esac
+    done
+}
+
+salvage_ray_logs() {
+    _dst="${TRAINING_HOME}/ray_err_logs/${SLURM_JOB_ID}"
+    mkdir -p "${_dst}" 2>/dev/null || return 0
+    find /tmp/ray/session_latest/logs /tmp/ray/session_*/logs -maxdepth 1 \
+        \( -name "worker-*.err" -o -name "raylet.err" -o -name "gcs_server.err" \
+           -o -name "runtime_env*.log" \) \
+        -size +0c 2>/dev/null | sort -u | head -60 | while read -r _f; do
+        cp "${_f}" "${_dst}/$(hostname)_$(basename "${_f}")" 2>/dev/null || true
+    done
+    # Fingerprint any still-alive Ray workers: an init-hang (3046402, 3079454,
+    # 3113822) leaves EMPTY logs — the only evidence is where the live process
+    # is stuck at teardown time.  wchan/syscall distinguish a FUSE/overlay read
+    # stall (dlopen through fuse-overlayfs) from a futex/collective wait.
+    for _p in $(_pids_by_prefix "ray::" | head -30); do
+        {
+            echo "== pid ${_p}"
+            tr "\0" " " < "/proc/${_p}/cmdline" 2>/dev/null; echo
+            grep -E "^State|^Threads" "/proc/${_p}/status" 2>/dev/null
+            printf "wchan: "; cat "/proc/${_p}/wchan" 2>/dev/null; echo
+            printf "syscall: "; cat "/proc/${_p}/syscall" 2>/dev/null
+            echo "kstack:"; cat "/proc/${_p}/stack" 2>/dev/null
+            echo
+        } >> "${_dst}/$(hostname)_live_procs.txt" 2>/dev/null
+    done
+}
+
+# -----------------------------------------------------------------------------
+# Host-memory tracer (slurm-3100132 / slurm-3101957 post-mortems).
+#
+# Both runs died of a fleet-wide host-memory CLIMB (~400 GiB of anonymous
+# process memory by step 2, sacct MaxRSS ~= Ray monitor reading) whose per-
+# step growth source is unknown.  Every 30 s, append one line per node to
+# Lustre: step-cgroup usage, MemAvailable, Shmem, and the top-5 RSS
+# processes.  The curve SHAPE localizes the leak: refit-synchronized jumps
+# vs. smooth growth during generation/training, and which process carries it.
+# Overhead: one tiny append per node per 30 s.
+# -----------------------------------------------------------------------------
+MEM_TRACE_DIR="${TRAINING_HOME}/mem_trace/${SLURM_JOB_ID}"
+mkdir -p "${MEM_TRACE_DIR}" 2>/dev/null || true
+(
+    _cg_path="/sys/fs/cgroup$(awk -F: "{print \$3}" /proc/self/cgroup)"
+    _trace_file="${MEM_TRACE_DIR}/$(hostname).log"
+    while true; do
+        {
+            printf "%s" "$(date +%s)"
+            printf " cg_bytes=%s" "$(cat "${_cg_path}/memory.current" 2>/dev/null || echo -1)"
+            printf " avail_kb=%s" "$(awk "/MemAvailable/{print \$2}" /proc/meminfo)"
+            printf " shmem_kb=%s" "$(awk "/^Shmem:/{print \$2}" /proc/meminfo)"
+            printf " top5_rss_kb=%s" "$(ps -eo rss=,comm= --sort=-rss | head -5 | tr -s " " | tr "\n" ";")"
+            printf " shm_top20_mb=%s" "$(du -m /dev/shm/* 2>/dev/null | sort -rn | head -20 | tr -s "\t" ":" | tr "\n" ";")"
+            printf " tmp_top10_mb=%s" "$(du -m /tmp/* 2>/dev/null | sort -rn | head -10 | tr -s "\t" ":" | tr "\n" ";")"
+            printf " top5_rssshmem=%s" "$(ps -eo pid=,comm= --sort=-rss | head -5 | while read -r _pp _cc; do _rs=$(grep RssShmem "/proc/${_pp}/status" 2>/dev/null | tr -s " " | cut -d" " -f2); printf "%s:%s:%skB;" "${_cc}" "${_pp}" "${_rs:-0}"; done)"
+            printf " sysv_shm_mb=%s" "$(awk "NR>1{s+=\$4} END{printf \"%d\", s/1048576}" /proc/sysvipc/shm 2>/dev/null)"
+            _p="$(_pids_by_prefix "ray::MegatronPolicyWorker" | head -1)"
+            if [ -n "${_p}" ]; then
+                printf " shmfd_top5=%s" "$(for _fd in /proc/${_p}/fd/*; do _t=$(readlink "${_fd}" 2>/dev/null); case "${_t}" in /memfd:*|/dev/shm/*|*"(deleted)"*) printf "%s %s\n" "$(stat -Lc %s "${_fd}" 2>/dev/null)" "${_t}";; esac; done | sort -rn | head -5 | tr "\n" ";")"
+                _del_mb=0
+                while read -r _range _perm _off _dev _ino _path; do
+                    case "${_path}" in *"(deleted)"*|*deleted*)
+                        _s16="${_range%-*}"; _e16="${_range#*-}"
+                        _del_mb=$(( _del_mb + ( 16#${_e16} - 16#${_s16} ) / 1048576 ));;
+                    esac
+                done < "/proc/${_p}/maps" 2>/dev/null
+                printf " del_map_mb=%s" "${_del_mb}"
+                printf " del_map_names=%s" "$(grep -oE "/[^ ]+ \(deleted\)" /proc/${_p}/maps 2>/dev/null | sort | uniq -c | sort -rn | head -4 | tr -s " " | tr "\n" ";")"
+            fi
+            printf "\n"
+        } >> "${_trace_file}" 2>/dev/null
+        sleep 30
+    done
+) &
+MEM_TRACE_PID=$!
+
+trap "salvage_ray_logs; kill ${MEM_TRACE_PID} 2>/dev/null || true" EXIT TERM
+
+# -----------------------------------------------------------------------------
+# Bind host memory to the CPU (LPDDR) NUMA nodes.
+#
+# On GH200 each GPU exposes its HBM as a memory-only NUMA node.  Under LPDDR
+# pressure the kernel places host pages there — including cudaHostAlloc
+# PINNED pages, which are unevictable — invisibly consuming GPU memory that
+# NVML attributes to no process (the "phantom", HANDOFF.md §8,
+# slurm-3044145).  Binding to the CPU-bearing nodes prevents this; CUDA
+# device allocations go through the GPU driver and are unaffected by the
+# host mempolicy.  The node list is detected, not hardcoded: LPDDR nodes
+# are the ones with a non-empty cpulist.
+# -----------------------------------------------------------------------------
+NUMACTL=""
+MEMBIND_NODES=""
+for _node_dir in /sys/devices/system/node/node[0-9]*; do
+    if [ -f "${_node_dir}/cpulist" ] && [ -n "$(tr -d "[:space:]" < "${_node_dir}/cpulist")" ]; then
+        _node_id="${_node_dir##*/node}"
+        MEMBIND_NODES="${MEMBIND_NODES:+${MEMBIND_NODES},}${_node_id}"
+    fi
+done
+# Fallback if sysfs is not available in the container: parse `numactl -H`
+# ("node <N> cpus: <list>" — CPU-bearing nodes have a non-empty list).
+if [ -z "${MEMBIND_NODES}" ] && command -v numactl >/dev/null 2>&1; then
+    MEMBIND_NODES="$(numactl -H 2>/dev/null | awk "/^node [0-9]+ cpus:/ { if (NF > 3) printf \"%s%s\", (n++ ? \",\" : \"\"), \$2 }")"
+fi
+if command -v numactl >/dev/null 2>&1 && [ -n "${MEMBIND_NODES}" ]; then
+    NUMACTL="numactl --membind=${MEMBIND_NODES}"
+    echo "Rank ${SLURM_PROCID}: binding host memory to NUMA nodes ${MEMBIND_NODES}"
+    if [ "${SLURM_PROCID}" -eq 0 ]; then
+        numactl -H || true
+    fi
+else
+    echo "WARNING: Rank ${SLURM_PROCID}: numactl unavailable or no CPU NUMA nodes detected (MEMBIND_NODES=\"${MEMBIND_NODES}\"); running WITHOUT membind — the phantom-memory mitigation is inactive." >&2
+fi
+
+# If a token file was passed, read it into the environment as a fallback for
+# libraries that do not natively honour HF_TOKEN_PATH.
+if [[ -n "${HF_TOKEN_PATH}" && -f "${HF_TOKEN_PATH}" && -z "${HF_TOKEN}" ]]; then
+    export HF_TOKEN="$(cat "${HF_TOKEN_PATH}")"
+    export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+fi
+
+cd "${NEMORL_DIR}"
+
+git remote remove fork 2>/dev/null || true
+git remote add fork "${NEMORL_FORK_URL}"
+
+# Fetch the current branch state with retries and GATE on success.  A single
+# transient GitHub 500 (slurm-3103672) otherwise leaves this node silently
+# running the image-baked commit while the rest of the cluster runs the
+# fetched one — a mixed-version cluster that fails in confusing ways (there:
+# TypeError on a method signature that only existed in the newer code).
+# Failing loudly here is strictly better: --kill-on-bad-exit tears the job
+# down within seconds with a clear message.
+_git_ready=false
+for _attempt in 1 2 3 4 5; do
+    if git fetch fork "${NEMORL_BRANCH}" 2>&1; then
+        _git_ready=true
+        break
+    fi
+    echo "Rank ${SLURM_PROCID}: git fetch attempt ${_attempt}/5 failed; retrying in 20s..." >&2
+    sleep 20
+done
+if [ "${_git_ready}" != true ]; then
+    echo "FATAL: Rank ${SLURM_PROCID}: could not fetch ${NEMORL_BRANCH} from the fork after 5 attempts; aborting job (refusing to run a mixed-version cluster)." >&2
+    exit 1
+fi
+git switch -C "${NEMORL_BRANCH}" "fork/${NEMORL_BRANCH}" || {
+    echo "FATAL: Rank ${SLURM_PROCID}: git switch to fork/${NEMORL_BRANCH} failed; aborting job." >&2
+    exit 1
+}
+
+# Prepare the uv environment with retries, and GATE on success.  A single
+# flaky fetch (e.g. the flash-attn wheel from GitHub) otherwise kills
+# ray start on this node silently and the job hangs forever at N-1/N nodes
+# joined (slurm-3045644).  All later uv invocations use --no-sync so the
+# network is never touched again after this point.
+_uv_ready=false
+for _attempt in 1 2 3 4 5; do
+    if uv run ray --version >/dev/null 2>&1; then
+        _uv_ready=true
+        break
+    fi
+    echo "Rank ${SLURM_PROCID}: uv env preparation attempt ${_attempt}/5 failed; retrying in 30s..." >&2
+    sleep 30
+done
+if [ "${_uv_ready}" != true ]; then
+    echo "FATAL: Rank ${SLURM_PROCID}: uv environment could not be prepared after 5 attempts; aborting job." >&2
+    exit 1
+fi
+
+# Signal that this rank has finished its uv setup.  The file CONTENT is the
+# checked-out NeMoRL commit of this rank: rank 0 compares it while collecting the
+# files, so a mixed-version cluster dies at rendezvous instead of at the
+# first cross-version RPC.  (Written via tmp+mv so readers never see a
+# partial file.)
+RANK_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${SLURM_PROCID}_done"
+git rev-parse HEAD > "${RANK_DONE_FILE}.tmp" && mv "${RANK_DONE_FILE}.tmp" "${RANK_DONE_FILE}"
+
+if [ "${SLURM_PROCID}" -eq 0 ]; then
+    # Wait until every rank has finished its uv setup, and verify all ranks
+    # checked out the SAME NeMoRL commit (the rank-done files carry it).
+    _my_commit="$(git rev-parse HEAD)"
+    for other_rank in $(seq 1 $((SLURM_JOB_NUM_NODES - 1))); do
+        OTHER_DONE_FILE="${TRAINING_CONFIG}/rank_${SLURM_JOB_ID}_${other_rank}_done"
+        echo "Rank 0: waiting for rank ${other_rank} uv setup..."
+        while [ ! -f "${OTHER_DONE_FILE}" ]; do
+            sleep 1
+        done
+        _other_commit="$(cat "${OTHER_DONE_FILE}" 2>/dev/null)"
+        if [ -n "${_other_commit}" ] && [ "${_other_commit}" != "${_my_commit}" ]; then
+            echo "FATAL: Rank 0: rank ${other_rank} runs NeMoRL commit ${_other_commit} but rank 0 runs ${_my_commit} — mixed-version cluster (see slurm-3103672); aborting job." >&2
+            exit 1
+        fi
+    done
+
+    # Rank 0 starts the Ray head node (under membind: raylet children — all
+    # Ray actors — inherit the memory policy).
+    ${NUMACTL} uv run --no-sync ray start --head \
+        --node-ip-address="${MASTER_NODE_IP}" \
+        --port="${PORT}" \
+        --num-cpus="${SLURM_CPUS_PER_TASK}" \
+        --num-gpus=4 \
+        --disable-usage-stats || true
+
+    # Signal that the Ray head is ready.
+    touch "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
+
+    # Every rank-done marker has been consumed by the wait loop above; remove
+    # our own here (each worker removes its own once it sees the ray_open
+    # marker) so no sentinel files accumulate in TRAINING_CONFIG.
+    rm -f "${RANK_DONE_FILE}"
+
+    # Wait until all worker nodes have joined — with a timeout, so a single
+    # node that failed to start Ray aborts the job instead of hanging at
+    # N-1/N for the whole allocation (slurm-3045644).
+    _join_waited=0
+    while true; do
+        alive_nodes=$(uv run --no-sync ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep -c "node_" || true)
+        if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
+            alive_nodes=0
+        fi
+        if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
+            break
+        fi
+        if [ "${_join_waited}" -ge 1800 ]; then
+            echo "FATAL: Rank 0: only ${alive_nodes}/${SLURM_JOB_NUM_NODES} nodes joined the Ray cluster after 30 min; aborting job." >&2
+            exit 1
+        fi
+        echo "Rank 0: waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
+        sleep 5
+        _join_waited=$((_join_waited + 5))
+    done
+
+    # Run the NeMo-RL training driver (membind for consistency; its own
+    # allocations are small, the heavy lifting is in the Ray actors).
+    ${NUMACTL} uv run --no-sync python examples/run_grpo.py --config "${TRAINING_CONFIG}/${YAML_NAME}"
+    # Preserve the training exit code across the teardown commands below, and
+    # exit with it so sacct records FAILED instead of COMPLETED on a crash
+    # (slurm-3101957 showed COMPLETED after an OOM-killed training loop).
+    _grpo_rc=$?
+
+    # Gracefully stop the Ray cluster. This lets the worker nodes exit their
+    # ray start --block cleanly instead of being killed by srun teardown,
+    # which otherwise prints "Ray subprocesses exited unexpectedly" messages.
+    echo "Rank 0: stopping Ray cluster..."
+    uv run --no-sync ray stop --grace-period 30 || true
+
+    # The cluster is closed; the head-ready marker has served its purpose.
+    rm -f "${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
+
+    sleep 5s
+    exit "${_grpo_rc}"
+else
+    # Worker ranks wait for the Ray head to be ready, then join.
+    RAY_OPEN_FILE="${TRAINING_CONFIG}/ray_open_${SLURM_JOB_ID}"
+    echo "Rank ${SLURM_PROCID}: waiting for Ray head..."
+    while [ ! -f "${RAY_OPEN_FILE}" ]; do
+        sleep 1
+    done
+
+    # ray_open exists => rank 0 has already consumed every rank-done marker
+    # (it touches ray_open only after its wait loop), so ours can go now.
+    rm -f "${RANK_DONE_FILE}"
+
+    ${NUMACTL} uv run --no-sync ray start \
+        --address="${RAY_ADDRESS}" \
+        --node-ip-address="$(hostname -i)" \
+        --num-cpus="${SLURM_CPUS_PER_TASK}" \
+        --num-gpus=4 \
+        --block || true
+fi
+'
