@@ -924,3 +924,24 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Next**: diagnostic run with `log_gpu_memory_diagnostics` (per-process NVML) before/after each
   native refit and at `train()` start, submitted copy only (`src-v6memdiag`, patch in scratchpad
   `nemo-rl-mem-diag.patch`).
+
+### Run `3669266` — 2026-10-15 — memory diagnostic: COMPLETED 4/4; native refit 16 s; the refit allocates nothing
+
+- **Log**: `~/Downloads/slurm-3669266.out`. Repo script at `1330502` plus, in the submitted copy
+  only, `nemo-rl-mem-diag.patch` (scratchpad; `log_gpu_memory_diagnostics` before/after
+  `swap_weights_via_reshard` and at `train()` start), `src-v6memdiag`, 4 steps, `preemptable`.
+  COMPLETED, exit 0, 1253 s.
+- **Refit**: `transfer_and_update_weights` 16.9 / 15.9 / 16.0 s (was 91-102 s in `3667575`):
+  the round-robin task ids work. Step time 71-80 s (default refit runs: 50-74 s).
+  Rewards 0.57 0.61 0.60 0.70; printed gen-KL 0.02-0.14 (per-token check not done).
+- **Memory, per trainer GPU** (NVML used / this process / PyTorch allocated, MB): before and
+  after every native refit identical to within ~0.5 GB, and no other process on any trainer GPU.
+  Typical rank: step-1 `train_start` 41.9k / 41.3k / 32.5k; from step 2 on ~66k / 65k / 54k
+  (the extra ~22 GB is the Adam state, allocated at the first optimizer step).
+- **The unowned memory, localised**: on 3 of 32 trainer GPUs (ranks 12, 15, 25) NVML "used"
+  rises 8-24 GB above the process's own usage, with no other process listed. It appears
+  between the step-2 refit (`after_native_refit`: used = self + 0.6 GB) and step-2
+  `train_start` (rank 25: 90.2k used vs 65.0k self), i.e. during the step-2 logprob pass, and
+  then stays flat. Not the refit, and not the reference model. Same size as the ~26 GiB in the
+  two OOMs. Cause unknown; candidate (unverified): GH200 memory not attributed to any CUDA
+  context (e.g. system-allocated host memory migrated into HBM).
