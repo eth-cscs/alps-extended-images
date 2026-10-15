@@ -945,3 +945,23 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   then stays flat. Not the refit, and not the reference model. Same size as the ~26 GiB in the
   two OOMs. Cause unknown; candidate (unverified): GH200 memory not attributed to any CUDA
   context (e.g. system-allocated host memory migrated into HBM).
+
+### Run `3669588` — 2026-10-15 — NUMA diagnostic: the "unowned" GPU memory is host pages placed in GPU HBM; OOM in step-2 training
+
+- **Log**: `~/Downloads/slurm-3669588.out`. As `3669266` plus NUMA readings in every
+  `[GPU_DIAG]` line (`numa_balancing`, per-node `MemUsed`, this process's resident pages per node
+  from `/proc/self/numa_maps`) and readings at `get_logprobs` start/end; scratchpad
+  `nemo-rl-mem-diag2.patch`, `src-v6memdiag2`. FAILED, exit 15, 1023 s: trainer rank 6, step-2
+  training, tried 588 MiB with 46 MiB free.
+- **Layout**: CPU NUMA nodes 0-3 (~119 GB each); GPU HBM is NUMA nodes 4, 12, 20, 28 (95 GB each).
+  `numa_balancing=0`.
+- **Finding**: on nid006586 all four trainer processes had ordinary host pages on node 20
+  (GPU 2): rank 6 13.0 GB, ranks 4, 5, 7 ~5.0 GB each, ~28 GB together = the memory NVML counts
+  as used on GPU 2 but no process owns (94.3 GB used, rank 6 itself 65.0 GB). The pages appear
+  during step 2 (rank 6 at step-2 `logprobs_start`: 13.0 GB on node 20; before the refit: 0.04).
+  No other node had more than ~0.1 GB of host pages on a GPU node; generator ranks none. So the
+  OOMs of `3659594` / `3669084` / `3669588` are host memory placement, not the refit and not CUDA.
+- **Fix (unverified)**: the launcher starts `ray start` (head and workers) and the driver under
+  `numactl --membind=<NUMA nodes with CPUs>` (inherited by the raylet and every worker);
+  `NUMA_BIND_HOST_MEMORY=0` disables it. Open question: why the kernel placed the pages on a GPU
+  node with CPU nodes far from full (not answered by these readings).

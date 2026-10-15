@@ -1108,8 +1108,24 @@ while IFS="=" read -r name _; do
     case "${name}" in PMI*|PMIX*|MPI*|OMPI*|SLURM_*) unset "${name}" ;; esac
 done < <(env)
 
+# Host memory on the CPU NUMA nodes only. On GH200 each GPU HBM is a NUMA node
+# too, and without a binding the kernel placed ordinary host pages of the
+# trainer processes there: ~28 GB of them on one GPU, outside any CUDA
+# allocation, and that GPU ran out of memory in training (runs 3659594,
+# 3669084, 3669588). The raylet, and through it every worker, inherits the
+# policy. NUMA_BIND_HOST_MEMORY=0 turns it off.
+NUMA_BIND=""
+if [ "${NUMA_BIND_HOST_MEMORY:-1}" = "1" ]; then
+    command -v numactl > /dev/null || { echo "FATAL: numactl not found"; exit 1; }
+    CPU_MEM_NODES=$(for d in /sys/devices/system/node/node[0-9]*; do
+        [ -n "$(cat "${d}/cpulist")" ] && echo "${d##*/node}"; done | paste -sd, -)
+    [ -n "${CPU_MEM_NODES}" ] || { echo "FATAL: no NUMA node with CPUs found"; exit 1; }
+    NUMA_BIND="numactl --membind=${CPU_MEM_NODES}"
+    echo "host memory bound to NUMA nodes ${CPU_MEM_NODES} on $(hostname)"
+fi
+
 if [ "${RANK}" -eq 0 ]; then
-    ray start --head \
+    ${NUMA_BIND} ray start --head \
         --node-ip-address=${MASTER_NODE_IP} \
         --port=${PORT} \
         --num-cpus=${NUM_CPUS} \
@@ -1136,7 +1152,7 @@ if [ "${RANK}" -eq 0 ]; then
         waited=$((waited + 5))
     done
 
-    python3 examples/run_grpo.py \
+    ${NUMA_BIND} python3 examples/run_grpo.py \
         --config "${RUN_DIR}/grpo-chonk-megatron-gen.yaml" 2>&1 | tee "${RUN_DIR}/run.log"
     rc=${PIPESTATUS[0]}
 
@@ -1148,7 +1164,7 @@ else
         sleep 2
     done
     sleep 5
-    ray start \
+    ${NUMA_BIND} ray start \
         --address="${RAY_ADDRESS}" \
         --node-ip-address=${NODE_IP} \
         --num-cpus=${NUM_CPUS} \
