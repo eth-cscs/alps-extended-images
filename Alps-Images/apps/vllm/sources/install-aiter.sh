@@ -10,6 +10,8 @@
 #   AITER_REPO      git remote (default: upstream GitHub)
 #   AITER_REF       tag or branch to clone (default: v0.1.24).
 #   AITER_JIT_DIR   JIT module cache baked into the image (default: /opt/aiter-jit).
+#   AITER_PATCH_DIR patches applied to the AITER sources in name order (default:
+#                   /opt/alps/aiter-patches).
 #   GPU_ARCHS       gfx targets for the JIT (default: PYTORCH_ROCM_ARCH, else gfx942).
 
 set -euo pipefail
@@ -17,6 +19,7 @@ set -euo pipefail
 AITER_REPO="${AITER_REPO:-https://github.com/ROCm/aiter.git}"
 AITER_REF="${AITER_REF:-v0.1.24}"
 export AITER_JIT_DIR="${AITER_JIT_DIR:-/opt/aiter-jit}"
+AITER_PATCH_DIR="${AITER_PATCH_DIR:-/opt/alps/aiter-patches}"
 export GPU_ARCHS="${GPU_ARCHS:-${PYTORCH_ROCM_ARCH:-gfx942}}"
 
 # shellcheck source=/dev/null
@@ -26,6 +29,17 @@ src_dir=/opt/aiter
 rm -rf "${src_dir}"
 git clone -q --depth 1 --branch "${AITER_REF}" "${AITER_REPO}" "${src_dir}"
 git -C "${src_dir}" submodule update --init --recursive --depth 1
+
+[[ -d "${AITER_PATCH_DIR}" ]] \
+    || { echo "ERROR: missing ${AITER_PATCH_DIR}; the app Containerfile must COPY it" >&2; exit 1; }
+shopt -s nullglob
+aiter_patch_files=("${AITER_PATCH_DIR}"/*.patch)
+shopt -u nullglob
+for patch_file in "${aiter_patch_files[@]}"; do
+    echo "Applying AITER patch: ${patch_file}"
+    git -C "${src_dir}" apply --check "${patch_file}"
+    git -C "${src_dir}" apply --verbose "${patch_file}"
+done
 
 # --no-build-isolation: build against the image's ROCm torch.
 cd "${src_dir}"
@@ -61,4 +75,4 @@ baked_modules=("${AITER_JIT_DIR}"/*.so)
 shopt -u nullglob
 [[ ${#baked_modules[@]} -gt 0 ]] \
     || { echo "ERROR: no AITER modules in ${AITER_JIT_DIR}" >&2; exit 1; }
-echo "OK: AITER ${AITER_REF} installed; baked modules: ${baked_modules[*]##*/}"
+echo "OK: AITER ${AITER_REF} installed with ${#aiter_patch_files[@]} patch(es); baked modules: ${baked_modules[*]##*/}"

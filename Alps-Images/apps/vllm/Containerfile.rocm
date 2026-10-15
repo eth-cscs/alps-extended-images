@@ -125,6 +125,7 @@ RUN set -eux; \
 # AITER kernels (MLA prefill/decode, fused MoE, norms); see sources/install-aiter.sh.
 ENV AITER_JIT_DIR="/opt/aiter-jit"
 COPY Alps-Images/apps/vllm/sources/install-aiter.sh /opt/alps/install-aiter.sh
+COPY Alps-Images/apps/vllm/patches/aiter /opt/alps/aiter-patches
 
 RUN set -eux; \
     chmod u+x /opt/alps/install-aiter.sh; \
