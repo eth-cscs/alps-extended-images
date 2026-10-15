@@ -965,3 +965,17 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   `numactl --membind=<NUMA nodes with CPUs>` (inherited by the raylet and every worker);
   `NUMA_BIND_HOST_MEMORY=0` disables it. Open question: why the kernel placed the pages on a GPU
   node with CPU nodes far from full (not answered by these readings).
+
+### Run `3669709` — 2026-10-15 — NUMA binding verified: 6/6 steps, no host pages in GPU HBM, ~30 GB headroom
+
+- **Log**: `~/Downloads/slurm-3669709.out`. Repo script at `379f4a0` (`numactl --membind=0,1,2,3`
+  on every node, printed by the launcher) plus the `nemo-rl-mem-diag2.patch` diagnostics,
+  `src-v6memdiag2`, 6 steps, `preemptable`, submitted copy only. COMPLETED, exit 0, 1388 s.
+- **Binding is safe for CUDA**: model setup, refits, generation and training all ran.
+- **Memory** (2208 diagnostic lines): host pages of any process on a GPU NUMA node at most
+  0.28 GB (was 13 GB), NVML used minus own usage at most 0.83 GB (was ~28 GB). Peak NVML used per
+  trainer GPU 64.3 GB at `train_start` and 65.3 GB after a refit (was up to 94.3 GB), so ~30 GB
+  of the 95 GB free at those points. Generator GPUs at most 55.8 GB.
+- **Steps**: reward 0.61 0.55 0.61 0.68 0.70 0.63; printed gen-KL 0.03-0.09. Native refit
+  16.0-17.0 s every step; step time 67-78 s after step 1 (412 s).
+- **Next**: KL penalty back to 0.01 (the ~32 GB reference copy should now fit), then md_decoupling.
