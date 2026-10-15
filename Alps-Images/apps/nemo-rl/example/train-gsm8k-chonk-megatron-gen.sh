@@ -861,7 +861,13 @@ policy:
       end_weight_decay: 0.0
       weight_decay_incr_style: constant
     distributed_data_parallel_config:
-      grad_reduce_in_fp32: false
+      # true (author: false, with expert offloading). md_decoupling runs under the
+      # fp16/bf16 optimizer wrapper, which copies every gradient into an fp32
+      # main_grad before the step; with an fp32 grad buffer that copy is a no-op.
+      # At EP32 the expert data-parallel group is 1, so the layer-wise optimizer
+      # cannot shard the expert state and the ~15 GB copy ran the trainer out of
+      # memory in the first optimizer step (run 3670987).
+      grad_reduce_in_fp32: true
       overlap_grad_reduce: true
       overlap_param_gather: false
       use_custom_fsdp: false

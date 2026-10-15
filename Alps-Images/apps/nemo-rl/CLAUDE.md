@@ -992,3 +992,27 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Steps**: reward 0.61 0.55 0.61 0.68 0.70 0.63; printed gen-KL 0.03-0.09. Native refit
   16.0-17.0 s every step; step time 67-78 s after step 1 (412 s).
 - **Next**: md_decoupling (KL penalty kept at 0 by user decision, 2026-10-15).
+
+### Run `3670987` — 2026-10-15 — md_decoupling restored: preflight and setup pass; trainer OOM in the first optimizer step
+
+- **Setup**: 4 steps, `src-v7memdiag2` (repo `d490c75` + memory diagnostics), KL penalty 0, native
+  refit, NUMA binding. Both bridge patches applied; `megatron.core.optimizer.md_decoupling` imports;
+  config OK with `optimizer md_decoupling`.
+- **Failure**: rank 15 only, `torch.OutOfMemoryError` in `md_decoupling.py:631` (`_param_step`,
+  AdamW branch, `exp_avg_sq.sqrt()`), allocating 2.67 GiB with 82.75 GiB allocated by PyTorch
+  (93.45 GiB in use). The other ranks were waiting in the step.
+- **Memory vs Adam (`3669709`), step 1, PyTorch allocated**: `logprobs_end` 31.6 vs 16.1 GB,
+  `train_start` 47.2 vs 31.7 GB. So ~15.5 GB more is resident even while optimizer state is
+  offloaded: the fp32 master copy of the bf16 parameters, which the fp16/bf16 optimizer wrapper keeps
+  outside `optimizer.state` (NeMo-RL's `move_optimizer` does not move it).
+- **Cause**: at EP32 on 32 trainer GPUs the expert data-parallel group has size 1, so
+  `LayerWiseDistributedOptimizer.shard_params` cannot shard expert parameters: every rank keeps
+  fp32 masters, fp32 momentum and (with `grad_reduce_in_fp32: false`) an fp32 copy of every
+  gradient (`_copy_model_grads_to_main_grads`, made for all parameters right before the step).
+  Dense parameters are sharded over DP 32 by numel; the rank that gets the largest one
+  (embedding/output, 2.67 GiB in fp32, AdamW branch with `exp_avg_sq` and full-size temporaries) runs
+  out first. The author fitted this with coarse-grained expert offloading, which is not in this delta.
+- **Fix (unverified)**: `grad_reduce_in_fp32: true`. The grad buffer becomes fp32 (+~7.8 GB
+  resident) and the pre-step copy becomes a no-op (`.to(float32)` on an fp32 tensor), net ~-7.8 GB at
+  the optimizer peak. Fallbacks: 16 trainer nodes (expert DP 2 halves expert masters, momentum and
+  grad copies), or the author's expert offloading.
