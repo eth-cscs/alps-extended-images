@@ -335,6 +335,9 @@ tokenizer rework and `max_requests` key of PR #1.
 
 ## Optimizer switched to Adam — 2026-10-09 (user decision, TEMPORARY)
 
+**Superseded 2026-10-15**: md_decoupling is back (see "what must be restored", item 2). The bridge
+delta is again the minimal patch + `bridge-md-decoupling-optimizer.patch`.
+
 - **TODO: change back to `md_decoupling`.** Chonk was pretrained with the Megatron-LM fork's
   `md_decoupling` optimizer (Muon-style orthogonal updates, hypersphere-constrained weights with
   learned gains); Adam does not maintain those constraints, so this is for bringing the RL loop up,
@@ -407,8 +410,18 @@ Both are disabled only to bring the RL loop up; neither is the intended training
    **Back to `0.0` (user, 2026-10-14)** to free the reference model's ~32 GB GPU copy for the
    native refit (trainer OOM in `3659594`); the native refit is kept because the larger models
    to come need it. Restoring 0.01 needs the reference copy freed (NeMo-RL patch) or more room.
-2. **`md_decoupling` optimizer** -- currently Adam; restore the author's optimizer block and apply
-   `example/patches/bridge-md-decoupling-optimizer.patch`.
+   **Kept at `0.0` (user, 2026-10-15)**: "we might don't need it"; no longer a final-run blocker
+   unless the user brings it back.
+2. **`md_decoupling` optimizer** -- RESTORED in the launcher (2026-10-15, `SRC_VERSION` `v7`): the
+   author's optimizer block verbatim, `example/patches/bridge-md-decoupling-optimizer.patch`
+   embedded and applied after the minimal bridge patch, `emerging_optimizers` and
+   `megatron.core.optimizer.md_decoupling` added to the preflight imports. Checked offline: both
+   bridge patches apply to `07722453`; every key of the merged optimizer block (base config + recipe
+   + NeMo-RL's added fp8/overlap keys) is a field of the fork's `OptimizerConfig`; the Adam-only
+   `exp_avg_dtype: bf16` lines are gone (the fork asserts fp32 moments without the precision-aware
+   optimizer); NeMo-RL's `move_optimizer` handles the `LayerWiseDistributedOptimizer` (a
+   `ChainedOptimizer`); the learned gains live in optimizer state, so the parameters the refit
+   ships are the effective weights. Not yet run.
 
 Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 
@@ -978,4 +991,4 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   of the 95 GB free at those points. Generator GPUs at most 55.8 GB.
 - **Steps**: reward 0.61 0.55 0.61 0.68 0.70 0.63; printed gen-KL 0.03-0.09. Native refit
   16.0-17.0 s every step; step time 67-78 s after step 1 (412 s).
-- **Next**: KL penalty back to 0.01 (the ~32 GB reference copy should now fit), then md_decoupling.
+- **Next**: md_decoupling (KL penalty kept at 0 by user decision, 2026-10-15).

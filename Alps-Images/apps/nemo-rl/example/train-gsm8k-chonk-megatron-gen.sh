@@ -38,17 +38,14 @@
 #   * NeMo-RL: upstream PR #2517 (vLLM data-parallel), swiss-ai PR #5 (load
 #     checkpoints under no_grad), the rest of swiss-ai PR #1.
 # Differences from the author's recipe that follow from that: no expert
-# offloading (model_overrides block dropped -> more trainer GPU memory),
-# TEMPORARILY Adam instead of the md_decoupling optimizer Chonk was pretrained
-# with (TODO: change back, see the optimizer block of the recipe), and
-# generation by Megatron-Core's dynamic engine (CUDA graphs on, NeMo-RL
-# defaults), refit by NeMo-RL's default collective through the bridge mapping.
+# offloading (model_overrides block dropped -> more trainer GPU memory), and
+# generation by Megatron-Core's dynamic engine (eager), refit by Megatron-Core's
+# native resharding (refit_transport: mcore, see the generation block).
+# The optimizer is the author's md_decoupling block (Chonk's pretraining
+# optimizer), dispatched by patches/bridge-md-decoupling-optimizer.patch.
 #
-# BEFORE THE FINAL RUN, restore: the md_decoupling optimizer, and the KL penalty
-# against the starting policy (author: 0.01, REFERENCE_KL_PENALTY; TEMPORARILY 0
-# so the native refit fits in trainer memory, run 3659594). Both are disabled
-# only to bring the loop up. The native Megatron-to-Megatron refit
-# (refit_transport: mcore) is on, see the generation block of the recipe.
+# KL penalty against the starting policy: 0 (author: 0.01, REFERENCE_KL_PENALTY).
+# Kept off by user decision (2026-10-15): it may not be needed.
 #
 # UNTESTED. No run yet. First things that can go wrong, in order: imports of the
 # patched vanilla bridge against the Megatron-LM fork (preflight), trainer OOM
@@ -77,7 +74,7 @@ export MLM_REF="b0844260b2a0888c711dca230b88ec13b20f3229"
 export LENS_REPO="https://github.com/NVIDIA-NeMo/Lens.git"
 export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
-export SRC_VERSION="v6"
+export SRC_VERSION="v7"
 
 # Topology and batch sizes of the author's recipe, except trainer EP32 instead
 # of EP16 (memory, see the recipe below): 8 training nodes (32 GPUs,
@@ -93,7 +90,7 @@ export TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-1}"
 export INFERENCE_REQUESTS="${INFERENCE_REQUESTS:-32}"
 export MAX_NUM_STEPS="${MAX_NUM_STEPS:-2}"
 export NUM_PROMPTS="${NUM_PROMPTS:-32}"
-# KL penalty against the starting policy. TEMPORARILY 0.0 (author: 0.01): > 0
+# KL penalty against the starting policy. 0.0 (author: 0.01), user decision: > 0
 # makes NeMo-RL build a reference model on the trainer GPUs at setup and keep
 # its ~32 GB GPU copy (see the loss_fn block of the recipe); with the native
 # refit that no longer fits (run 3659594). 0.0 skips the reference model.
@@ -364,6 +361,39 @@ index c2cf239a..86624859 100644
          from megatron.bridge.models.nemotron_omni.nemotron_omni_sound import BridgeSoundEncoder
  
          return BridgeSoundEncoder
+CHONK_PATCH_EOF
+cat > "${RUN_DIR}/patches/bridge-md-decoupling-optimizer.patch" << 'CHONK_PATCH_EOF'
+# Applied by train-gsm8k-chonk-megatron-gen.sh (embedded byte-identically): dispatches
+# optimizer=md_decoupling to the Megatron-LM fork's factory.
+# Base: NVIDIA-NeMo/Megatron-Bridge@077224531ad4d6d0caef767a84e619b256aa5cb6. Source:
+# swiss-ai/Megatron-Bridge@f3bc8e7e6a722adde1176b2ba8980109e09493ef (Apache-2.0), first hunk of
+# training/optim.py only. Apply after bridge-apertus2-shared-minimal.patch.
+diff --git a/src/megatron/bridge/training/optim.py b/src/megatron/bridge/training/optim.py
+index 32a77160..32ef9423 100644
+--- a/src/megatron/bridge/training/optim.py
++++ b/src/megatron/bridge/training/optim.py
+@@ -85,7 +85,20 @@ def setup_optimizer(
+                 f"applied {len(mup_overrides)} optimizer param-group override(s)."
+             )
+ 
+-    if hasattr(optimizer_config, "provide"):
++    if optimizer_config.optimizer == "md_decoupling":
++        # MDDecoupling has its own parameter partitioning and cannot use the
++        # generic optimizer factory (which would flatten matrix parameters).
++        from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
++
++        optimizer = get_megatron_mddecoupling_optimizer(
++            config=optimizer_config,
++            model_chunks=model_chunks,
++            config_overrides=config_overrides,
++            use_gloo_process_groups=use_gloo_process_groups,
++            layer_wise_distributed_optimizer=optimizer_config.use_layer_wise_distributed_optimizer,
++            pg_collection=pg_collection,
++        )
++    elif hasattr(optimizer_config, "provide"):
+         optimizer = optimizer_config.provide(
+             model_chunks=model,
+             config_overrides=config_overrides,
 CHONK_PATCH_EOF
 cat > "${RUN_DIR}/patches/mlm-refit-execution-batch-bytes.patch" << 'CHONK_PATCH_EOF'
 # Native refit on the swiss-ai Megatron-LM-MoE fork: upstream-compatible API + NCCL deadlock fix + parallel windows.
@@ -779,27 +809,49 @@ policy:
     checkpoint:
       async_save: false
       save: ${oc.env:RUN_DIR}/megatron-save
-    # TEMPORARY: Adam. Chonk was pretrained with the fork's md_decoupling optimizer
-    # (Muon-style orthogonal updates, hypersphere-constrained weights with learned
-    # gains); Adam does not maintain those constraints. TODO: switch back to
-    # md_decoupling -- restore the optimizer block of the author's
-    # grpo-chonk-vllm.yaml and apply patches/bridge-md-decoupling-optimizer.patch.
-    # Learning rates and betas below are the author's; everything not set here is
-    # NeMo-RL's stock Adam config (distributed, precision-aware optimizer).
+    # The author's block verbatim: the fork's md_decoupling optimizer Chonk was
+    # pretrained with (Muon-style orthogonal updates on hypersphere-constrained
+    # weights, learned gains kept in optimizer state). Needs
+    # patches/bridge-md-decoupling-optimizer.patch (vanilla Bridge would route it
+    # to the generic factory) and emerging-optimizers (in the image). It cannot
+    # use the standard distributed optimizer (flattens matrices) and shards its
+    # state layer-wise instead; the precision-aware optimizer is off, so the
+    # moments are fp32 (the fork asserts that).
     optimizer:
-      optimizer: adam
+      optimizer: md_decoupling
       lr: 2.0e-6
       min_lr: 2.0e-7
+      min_lr_mode: absolute
+      matrix_lr: 5.0e-5
+      gains_lr: 2.0e-6
       weight_decay: 0.0
+      bf16: true
+      fp16: false
+      params_dtype: float32
       adam_beta1: 0.9
       adam_beta2: 0.95
       adam_eps: 1.0e-8
-      # Adam moments in bf16 instead of the fp32 default, to halve the optimizer
-      # state that is allocated at the first optimizer step (same memory budget
-      # as above). Goes away with the Adam block when md_decoupling is restored.
-      exp_avg_dtype: bf16
-      exp_avg_sq_dtype: bf16
+      use_distributed_optimizer: false
+      use_layer_wise_distributed_optimizer: true
+      use_precision_aware_optimizer: false
+      hypersphere_preserve_init: true
+      hypersphere_mode: row
+      hypersphere_embedding_mode: row
+      hypersphere_router_mode: row
+      hypersphere_radius_mode: fan_in
+      hypersphere_gains_mode: rowcol
+      hypersphere_gains_mode_router: rowcol
+      hypersphere_gains_mode_embedding: none
+      gain_parametrization: softplus
+      use_orthogonal_updates: true
+      muon_coefficient_type: polar_express
+      muon_scale_mode: shape_up
+      muon_router_scale_mode: none
+      muon_momentum: 0.95
+      muon_use_nesterov: true
       clip_grad: ${policy.max_grad_norm}
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0.0
     scheduler:
       lr_decay_style: cosine
       lr_decay_iters: 1200
@@ -947,6 +999,8 @@ if [ ! -f "${SRC_DIR}/.alps-ready" ]; then
 
     git -C "${tmp}/bridge" apply "${RUN_DIR}/patches/bridge-apertus2-shared-minimal.patch" \
         || { echo "FATAL: bridge patch does not apply to ${BRIDGE_REF}"; exit 1; }
+    git -C "${tmp}/bridge" apply "${RUN_DIR}/patches/bridge-md-decoupling-optimizer.patch" \
+        || { echo "FATAL: bridge optimizer patch does not apply to ${BRIDGE_REF}"; exit 1; }
     git -C "${tmp}/nemo-rl" apply "${RUN_DIR}/patches/nemo-rl-chonk-megatron-gen-minimal.patch" \
         || { echo "FATAL: NeMo-RL patch does not apply to ${NEMO_REF}"; exit 1; }
     git -C "${tmp}/megatron-lm" apply "${RUN_DIR}/patches/mlm-refit-execution-batch-bytes.patch" \
@@ -956,7 +1010,7 @@ if [ ! -f "${SRC_DIR}/.alps-ready" ]; then
     [ -d "${tmp}/lens/src/nemo/lens" ] || { echo "FATAL: nemo-lens checkout is empty"; exit 1; }
     {
         echo "nemo-rl ${NEMO_REF} + nemo-rl-chonk-megatron-gen-minimal.patch"
-        echo "bridge ${BRIDGE_REF} + models/apertus2 from ${BRIDGE_APERTUS2_REF} + bridge-apertus2-shared-minimal.patch"
+        echo "bridge ${BRIDGE_REF} + models/apertus2 from ${BRIDGE_APERTUS2_REF} + bridge-apertus2-shared-minimal.patch + bridge-md-decoupling-optimizer.patch"
         echo "megatron-lm ${MLM_REF} + mlm-refit-execution-batch-bytes.patch"
         echo "lens ${LENS_REF}"
         git -C "${tmp}/nemo-rl" status --short
@@ -1044,6 +1098,8 @@ for mod in (
     "megatron.core.ssm.kimi_delta_attention",
     "megatron.core.inference.engines.dynamic_engine",
     "megatron.core.resharding.refit",
+    "emerging_optimizers",
+    "megatron.core.optimizer.md_decoupling",
     "megatron.bridge",
     "megatron.bridge.models",
     "megatron.bridge.models.apertus2",

@@ -1,5 +1,5 @@
-# NOT APPLIED by any launcher. Needed again when the Chonk recipe goes back from Adam to the
-# md_decoupling optimizer: dispatches optimizer=md_decoupling to the Megatron-LM fork's factory.
+# Applied by train-gsm8k-chonk-megatron-gen.sh (embedded byte-identically): dispatches
+# optimizer=md_decoupling to the Megatron-LM fork's factory.
 # Base: NVIDIA-NeMo/Megatron-Bridge@077224531ad4d6d0caef767a84e619b256aa5cb6. Source:
 # swiss-ai/Megatron-Bridge@f3bc8e7e6a722adde1176b2ba8980109e09493ef (Apache-2.0), first hunk of
 # training/optim.py only. Apply after bridge-apertus2-shared-minimal.patch.
