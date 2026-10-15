@@ -894,3 +894,14 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   Likely causes (unverified): the P2P plan sent in serialized windows of 256 tasks
   (`MEGATRON_NCCL_COPY_TASK_WINDOW`), and plain `nccl` P2P instead of upstream's `nccl_m2n`
   grouped submission.
+- **Root cause of the slow refit (found 2026-10-15)**: my port of #7189's task-id windows. The
+  fork's planner numbers task ids destination rank by destination rank, so each window of 256
+  holds one generator rank's transfers and the windows run one after another: the 64 generator
+  ranks are filled one at a time, at about one GPU's network bandwidth (~2.3 TB in ~92 s,
+  ~25 GB/s). Upstream uses those windows only as a fallback; its main path splits the plan into
+  32-parameter batches that span all ranks, which the fork does not have.
+- **Fix (unverified)**: the Megatron-LM patch now numbers task ids round-robin over destination
+  ranks (planner `_iter_global_transfer_ops`): same transfers, same per-pair order, but each
+  window spans all destination ranks. Offline check on a synthetic 64-receiver plan: ids are a
+  permutation, median 64 receivers per window (was 1), at most ~25 ops per rank per window.
+  `SRC_VERSION` v6.

@@ -1,4 +1,4 @@
-# Native refit on the swiss-ai Megatron-LM-MoE fork: upstream-compatible API + NCCL deadlock fix.
+# Native refit on the swiss-ai Megatron-LM-MoE fork: upstream-compatible API + NCCL deadlock fix + parallel windows.
 # Base: swiss-ai/Megatron-LM-MoE@b0844260b2a0888c711dca230b88ec13b20f3229 (Apache-2.0).
 #   megatron/core/resharding/refit.py
 #       local: accept execution_batch_bytes in prepare_swap_model_weights / swap_model_weights /
@@ -14,6 +14,12 @@
 #       ncclGroup with the whole model is split by NCCL into rank-dependent kernel plans and
 #       deadlocks (pytorch/pytorch#174288); seen here as a 600 s NCCL timeout on all 96 ranks in
 #       the first refit (run 3659197). The planner-side batching of #7189 is not ported.
+#   megatron/core/resharding/planner.py
+#       local: number the global task ids round-robin over destination ranks instead of
+#       destination rank by destination rank. With rank-major ids each 256-id window above holds
+#       one generator rank's transfers, so the 64 generator ranks were filled one at a time
+#       (run 3667575: ~92 s per refit, ~25 GB/s for ~2.3 TB). Upstream #7189 instead splits the
+#       plan into parameter batches spanning all ranks; the fork has no plan batching.
 diff --git a/megatron/core/resharding/copy_services/nccl_copy_service.py b/megatron/core/resharding/copy_services/nccl_copy_service.py
 index 95f5ad5da..37c78289d 100644
 --- a/megatron/core/resharding/copy_services/nccl_copy_service.py
@@ -114,6 +120,56 @@ index 95f5ad5da..37c78289d 100644
  
          # Make sure the copy stream is finished
          torch.cuda.current_stream().wait_stream(self._copy_stream)
+diff --git a/megatron/core/resharding/planner.py b/megatron/core/resharding/planner.py
+index f3423a01e..8c99b6db8 100644
+--- a/megatron/core/resharding/planner.py
++++ b/megatron/core/resharding/planner.py
+@@ -348,9 +348,19 @@ def _iter_global_transfer_ops(
+     """
+     # Shared between a send and its recv; NVSHMEM builds a schedule from it and
+     # local copies match on it.
+-    next_task_id = 0
++    #
++    # Task ids are numbered round-robin over the destination ranks (the k-th
++    # transfer of every destination rank, then the (k+1)-th, ...), not
++    # destination rank by destination rank. NCCLCopyService issues its P2P ops
++    # in consecutive windows of task ids; with rank-major ids a window holds one
++    # destination rank's transfers, so the destinations are served one at a time
++    # (run 3667575: ~92 s per refit, about one GPU's network bandwidth for the
++    # whole model). Upstream (NVIDIA/Megatron-LM #7189) avoids this with
++    # planner-side parameter batches, which this fork does not have.
++    per_dst: list[list[tuple]] = []
+     for dst_rank in sorted(dst_param_metadata_by_rank):
+         dst_rank_params = dst_param_metadata_by_rank[dst_rank]
++        transfers = []
+         for resolved_name, dst_metadata in dst_rank_params.items():
+             src_meta_list = _find_source_metadata(src_param_metadata, resolved_name)
+             if not src_meta_list:
+@@ -364,9 +374,22 @@ def _iter_global_transfer_ops(
+                 resolved_name, src_metadata, dst_metadata, dst_rank
+             )
+             for src_rank, src_slice, dst_slice in sources:
+-                task_id = next_task_id
++                transfers.append(
++                    (dst_rank, src_rank, src_slice, dst_slice, src_metadata, dst_metadata)
++                )
++        per_dst.append(transfers)
++
++    task_ids: list[list[int]] = [[0] * len(transfers) for transfers in per_dst]
++    next_task_id = 0
++    for k in range(max((len(transfers) for transfers in per_dst), default=0)):
++        for i, transfers in enumerate(per_dst):
++            if k < len(transfers):
++                task_ids[i][k] = next_task_id
+                 next_task_id += 1
+-                yield task_id, dst_rank, src_rank, src_slice, dst_slice, src_metadata, dst_metadata
++
++    for i, transfers in enumerate(per_dst):
++        for k, transfer in enumerate(transfers):
++            yield (task_ids[i][k], *transfer)
+ 
+ 
+ def _tensor_mesh(metadata: ParameterMetadata) -> tuple[int, ...]:
 diff --git a/megatron/core/resharding/refit.py b/megatron/core/resharding/refit.py
 index 77e25de9c..092667554 100644
 --- a/megatron/core/resharding/refit.py
