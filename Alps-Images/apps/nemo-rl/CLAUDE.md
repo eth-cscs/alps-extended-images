@@ -905,3 +905,22 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   window spans all destination ranks. Offline check on a synthetic 64-receiver plan: ids are a
   permutation, median 64 receivers per window (was 1), at most ~25 ops per rank per window.
   `SRC_VERSION` v6.
+
+### Run `3669084` — 2026-10-15 — round-robin task ids: refit fast; trainer OOM again in step-2 training
+
+- **Log**: `~/Downloads/slurm-3669084.out`. Repo script at `261eef9` (`src-v6`, KL penalty 0), 4
+  steps and `preemptable` in the submitted copy only. FAILED, exit 15, 1005 s.
+- **Refit**: step 1 ended ~15:48:00 and the OOM is logged at 15:49:06, so the step-2 refit,
+  generation (~30 s) and logprobs together took about a minute (the refit alone was 92 s in
+  `3667575`). The exact refit time was not printed (the step did not finish).
+- **Symptom**: trainer rank 15, step-2 training, same place and numbers as `3659594`: tried
+  588 MiB, 652 MiB free of 95 GiB, this process 68.5 GiB, 57.4 GiB allocated by PyTorch.
+- **Reading**: PyTorch allocation is the same with and without the reference model (57.4 vs
+  57.7 GiB), so the reference copy was not what filled the GPU in `3659594`. Again ~26 GiB on
+  the GPU is outside the process's NVML usage; at `init_complete` there was none
+  (`GPU procs: [PID=63255 (self): 46790 MB]`, used 47422 MB). `NCCL_PXN_DISABLE=1` is already
+  set in `env.toml`, so PXN relay buffers are not the explanation. `3667575` (same memory
+  picture, rank-major windows) survived 20 steps, so the margin is small either way.
+- **Next**: diagnostic run with `log_gpu_memory_diagnostics` (per-process NVML) before/after each
+  native refit and at `train()` start, submitted copy only (`src-v6memdiag`, patch in scratchpad
+  `nemo-rl-mem-diag.patch`).
