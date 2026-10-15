@@ -1012,7 +1012,7 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   Dense parameters are sharded over DP 32 by numel; the rank that gets the largest one
   (embedding/output, 2.67 GiB in fp32, AdamW branch with `exp_avg_sq` and full-size temporaries) runs
   out first. The author fitted this with coarse-grained expert offloading, which is not in this delta.
-- **Fix (unverified)**: `grad_reduce_in_fp32: true`. The grad buffer becomes fp32 (+~7.8 GB
-  resident) and the pre-step copy becomes a no-op (`.to(float32)` on an fp32 tensor), net ~-7.8 GB at
-  the optimizer peak. Fallbacks: 16 trainer nodes (expert DP 2 halves expert masters, momentum and
-  grad copies), or the author's expert offloading.
+- **Fix (user decision, unverified)**: 32 nodes, 16 trainer (64 GPUs, EP32, expert data-parallel 2)
+  + 16 generation; global batch pinned to the author's 128 (2 micro-batches per rank).
+  `grad_reduce_in_fp32` stays at the author's `false` (considered: `true` would make the pre-step
+  copy a no-op, net ~-7.8 GB, but with little margin). Fallback: the author's expert offloading.

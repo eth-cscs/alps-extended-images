@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --nodes=24
+#SBATCH --nodes=32
 #SBATCH --account=csstaff
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
@@ -76,14 +76,18 @@ export LENS_REF="b85578fc2b736a1804705e537001b5f45e9c715d"
 # Bump when a ref or an embedded patch changes: it names the shared checkout.
 export SRC_VERSION="v7"
 
-# Topology and batch sizes of the author's recipe, except trainer EP32 instead
-# of EP16 (memory, see the recipe below): 8 training nodes (32 GPUs,
-# EP32, 8 experts per GPU) + 16 generation nodes (64 GPUs, EP8 -> 8 replicas).
-export TRAIN_NODES=8
+# Batch sizes of the author's recipe; topology differs: 16 training nodes
+# (64 GPUs, EP32 -> 8 experts per GPU, expert data-parallel 2) instead of 8
+# nodes at EP16, + 16 generation nodes (64 GPUs, EP8 -> 8 replicas). Without
+# the author's expert offloading, md_decoupling's layer-wise optimizer can
+# only shard expert state over the expert data-parallel group; at 8 nodes
+# (EP32, expert DP 1) every rank kept full fp32 masters, momentum and gradient
+# copies of its experts and ran out of memory in the first step (run 3670987).
+export TRAIN_NODES=16
 export INFERENCE_NODES=$(( SLURM_JOB_NUM_NODES - TRAIN_NODES ))
 export TOTAL_NODES=${SLURM_JOB_NUM_NODES}
-# Micro-batch 1 with the global batch kept at 128 (4 accumulated micro-batches
-# per trainer rank): at micro-batch 4 the trainer runs out of GPU memory in the
+# Micro-batch 1 with the global batch kept at 128 (2 accumulated micro-batches
+# per trainer rank at 64 ranks): at micro-batch 4 the trainer runs out of GPU memory in the
 # loss (vocabulary-wide logits for 4 x 1280 tokens on top of ~49 GB of model and
 # optimizer state without expert offloading, run 3628358).
 export TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-1}"
@@ -95,7 +99,7 @@ export NUM_PROMPTS="${NUM_PROMPTS:-32}"
 # its ~32 GB GPU copy (see the loss_fn block of the recipe); with the native
 # refit that no longer fits (run 3659594). 0.0 skips the reference model.
 export REFERENCE_KL_PENALTY="${REFERENCE_KL_PENALTY:-0.0}"
-export TRAIN_GLOBAL_BATCH="${TRAIN_GLOBAL_BATCH:-$(( TRAIN_NODES * 4 * 4 ))}"
+export TRAIN_GLOBAL_BATCH="${TRAIN_GLOBAL_BATCH:-128}"
 if [ "${INFERENCE_NODES}" -le 0 ] || [ $(( INFERENCE_NODES * 4 % 8 )) -ne 0 ]; then
     echo "FATAL: ${INFERENCE_NODES} generation nodes x 4 GPUs is not a positive multiple of EP8"
     exit 1
@@ -861,13 +865,7 @@ policy:
       end_weight_decay: 0.0
       weight_decay_incr_style: constant
     distributed_data_parallel_config:
-      # true (author: false, with expert offloading). md_decoupling runs under the
-      # fp16/bf16 optimizer wrapper, which copies every gradient into an fp32
-      # main_grad before the step; with an fp32 grad buffer that copy is a no-op.
-      # At EP32 the expert data-parallel group is 1, so the layer-wise optimizer
-      # cannot shard the expert state and the ~15 GB copy ran the trainer out of
-      # memory in the first optimizer step (run 3670987).
-      grad_reduce_in_fp32: true
+      grad_reduce_in_fp32: false
       overlap_grad_reduce: true
       overlap_param_gather: false
       use_custom_fsdp: false
