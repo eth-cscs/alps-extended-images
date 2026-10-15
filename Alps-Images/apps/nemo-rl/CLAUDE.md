@@ -876,3 +876,21 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   to `0.0` (no reference model, ~32 GB less allocated per trainer GPU). Does not explain the
   ~26 GiB outside the process's accounting; if that grows across refits, the OOM will return
   later in the run.
+
+### Run `3667575` — 2026-10-15 — native refit, KL penalty 0: 20/20 steps, no OOM; refit takes ~92 s per step
+
+- **Log**: `~/Downloads/slurm-3667575.out` (20.5 MB, `ops/view` chunks). Repo script at `535f051`
+  (`refit_transport: mcore`, `REFERENCE_KL_PENALTY` 0.0, `src-v5`), 20 steps and `preemptable` in
+  the submitted copy only. COMPLETED, exit 0, 3792 s; ~8 min queued.
+- **Memory**: no `OutOfMemoryError` over 19 native refits with updated weights, so dropping the
+  reference model was enough. Per-step memory is not logged (`[GPU_DIAG]` only at init), so
+  whether the ~26 GiB seen in `3659594` grows per refit is still unknown.
+- **Reward per step**: 0.64 0.58 0.59 0.74 0.65 0.64 0.66 0.68 0.58 0.73 0.69 0.70 0.70 0.78
+  0.71 0.79 0.59 0.74 0.79 0.62. Mean of steps 1-5 0.640, 6-15 0.688, 16-20 0.704 (default
+  refit, `3654710`: 0.623 / 0.676 / 0.716). Printed gen-KL 0.019-0.11, same range as the default
+  refit runs (per-token check not done).
+- **Refit cost**: `prepare_for_generation/transfer_and_update_weights` 91.4-102.4 s on every step
+  (default refit: ~7 s, `3642870`). Step time ~140 s instead of 50-74 s; the refit is ~65% of it.
+  Likely causes (unverified): the P2P plan sent in serialized windows of 256 tasks
+  (`MEGATRON_NCCL_COPY_TASK_WINDOW`), and plain `nccl` P2P instead of upstream's `nccl_m2n`
+  grouped submission.
