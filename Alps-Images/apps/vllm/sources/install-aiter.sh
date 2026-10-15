@@ -1,42 +1,75 @@
 #!/usr/bin/env bash
-# Install AITER (AMD's kernel library for LLM inference on ROCm) into the ROCm vLLM image.
-# vLLM on ROCm needs it (or flash-attn) for MLA prefill.
+# Build and install AITER for the ROCm vLLM image.
 #
-# AITER is installed editable from /opt/aiter: its JIT compiles kernels from those sources
-# with hipcc on first use and caches the resulting modules in AITER_JIT_DIR. This script
-# pre-compiles the core module into AITER_JIT_DIR at image build time.
+# The caller must provide the image's pinned ref/commit and invoke this script
+# while the ROCm compiler environment, build dependencies, and PIP_CONSTRAINT
+# are active. The installed wheel carries AITER's JIT sources; /opt/aiter is
+# removed after installation. Full multi-architecture AOT remains disabled.
 #
-# Environment overrides:
-#   AITER_REPO      git remote (default: upstream GitHub)
-#   AITER_REF       tag or branch to clone (default: v0.1.24).
-#   AITER_JIT_DIR   JIT module cache baked into the image (default: /opt/aiter-jit).
-#   GPU_ARCHS       gfx targets for the JIT (default: PYTORCH_ROCM_ARCH, else gfx942).
+# Inputs:
+#   AITER_REPO          git remote (default: upstream GitHub)
+#   AITER_REF           tag or branch to clone (required)
+#   AITER_COMMIT        exact commit expected for AITER_REF (required)
+#   GPU_ARCHS           semicolon-separated gfx targets (required)
+#   MAX_JOBS            maximum parallel build jobs (default: 32)
+#   AITER_JIT_DIR       writable preseeded runtime cache (default: /opt/aiter-jit)
+#   ALPS_PACKAGE_HELPERS package helper path (default: /opt/alps/package-helpers.sh)
 
 set -euo pipefail
 
 AITER_REPO="${AITER_REPO:-https://github.com/ROCm/aiter.git}"
-AITER_REF="${AITER_REF:-v0.1.24}"
-export AITER_JIT_DIR="${AITER_JIT_DIR:-/opt/aiter-jit}"
-export GPU_ARCHS="${GPU_ARCHS:-${PYTORCH_ROCM_ARCH:-gfx942}}"
+AITER_REF="${AITER_REF:?AITER_REF is required}"
+AITER_COMMIT="${AITER_COMMIT:?AITER_COMMIT is required}"
+GPU_ARCHS="${GPU_ARCHS:?GPU_ARCHS is required}"
+MAX_JOBS="${MAX_JOBS:-32}"
+AITER_JIT_DIR="${AITER_JIT_DIR:-/opt/aiter-jit}"
+ALPS_PACKAGE_HELPERS="${ALPS_PACKAGE_HELPERS:-/opt/alps/package-helpers.sh}"
+PIP_CONSTRAINT="${PIP_CONSTRAINT:?PIP_CONSTRAINT is required}"
+
+[[ -f "${ALPS_PACKAGE_HELPERS}" ]] \
+    || { echo "ERROR: package helpers not found: ${ALPS_PACKAGE_HELPERS}" >&2; exit 1; }
+[[ -f "${PIP_CONSTRAINT}" ]] \
+    || { echo "ERROR: pip constraint not found: ${PIP_CONSTRAINT}" >&2; exit 1; }
+command -v hipcc >/dev/null \
+    || { echo "ERROR: hipcc is not available in PATH" >&2; exit 1; }
 
 # shellcheck source=/dev/null
-source /opt/alps/package-helpers.sh
+source "${ALPS_PACKAGE_HELPERS}"
 
 src_dir=/opt/aiter
-rm -rf "${src_dir}"
-git clone -q --depth 1 --branch "${AITER_REF}" "${AITER_REPO}" "${src_dir}"
-git -C "${src_dir}" submodule update --init --recursive --depth 1
+dist_dir=/tmp/aiter-dist
+rm -rf "${src_dir}" "${dist_dir}" "${AITER_JIT_DIR}"
 
-# --no-build-isolation: build against the image's ROCm torch.
+git clone --depth=1 --branch "${AITER_REF}" --recurse-submodules --shallow-submodules \
+    "${AITER_REPO}" "${src_dir}"
+[[ "$(git -C "${src_dir}" rev-parse HEAD)" == "${AITER_COMMIT}" ]] \
+    || { echo "ERROR: ${AITER_REF} did not resolve to ${AITER_COMMIT}" >&2; exit 1; }
+
 cd "${src_dir}"
-pip_install python --no-cache-dir --no-build-isolation -e .
+pip_install python --no-cache-dir -r requirements.txt
+mkdir -p "${dist_dir}"
+echo "Building AITER wheel without multi-architecture AOT; runtime JIT target: ${GPU_ARCHS}"
+env -u ROCM_PATH -u HIP_PATH \
+    PREBUILD_KERNELS=0 \
+    AITER_USE_SYSTEM_TRITON=1 \
+    GPU_ARCHS="${GPU_ARCHS}" \
+    MAX_JOBS="${MAX_JOBS}" \
+    python setup.py bdist_wheel --dist-dir "${dist_dir}"
+pip_install python --no-cache-dir --no-deps "${dist_dir}"/*.whl
 
-# Build the core module through jit/core.py loaded standalone, as setup.py's PREBUILD_KERNELS
-# does: `import aiter` probes for a GPU at import time and the CI builder has none.
+# Build the core module through jit/core.py loaded standalone. Importing the
+# installed aiter package can probe for a GPU, but image builders have none.
 mkdir -p "${AITER_JIT_DIR}"
-python - <<PY
+env -u ROCM_PATH -u HIP_PATH \
+    AITER_USE_SYSTEM_TRITON=1 \
+    AITER_JIT_DIR="${AITER_JIT_DIR}" \
+    GPU_ARCHS="${GPU_ARCHS}" \
+    MAX_JOBS="${MAX_JOBS}" \
+    python - "${src_dir}" <<'PY'
 import sys
-sys.path.insert(0, "${src_dir}/aiter")
+
+src_dir = sys.argv[1]
+sys.path.insert(0, f"{src_dir}/aiter")
 from jit import core
 
 args = core.get_args_of_build("module_aiter_core")
@@ -56,9 +89,15 @@ core.build_module(
 )
 PY
 
+rm -rf "${AITER_JIT_DIR}/build"
+mkdir -p "${AITER_JIT_DIR}/build"
 shopt -s nullglob
-baked_modules=("${AITER_JIT_DIR}"/*.so)
+baked_modules=("${AITER_JIT_DIR}"/module_aiter_core*.so)
 shopt -u nullglob
 [[ ${#baked_modules[@]} -gt 0 ]] \
-    || { echo "ERROR: no AITER modules in ${AITER_JIT_DIR}" >&2; exit 1; }
-echo "OK: AITER ${AITER_REF} installed; baked modules: ${baked_modules[*]##*/}"
+    || { echo "ERROR: no AITER core module in ${AITER_JIT_DIR}" >&2; exit 1; }
+chmod -R a+rwX "${AITER_JIT_DIR}"
+
+installed_version="$(python -c 'import importlib.metadata as m; print(m.version("amd-aiter"))')"
+echo "OK: AITER ${installed_version} (${AITER_COMMIT}) installed; preseeded cache modules: ${baked_modules[*]##*/}"
+rm -rf "${src_dir}" "${dist_dir}"

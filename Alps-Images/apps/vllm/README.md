@@ -1,18 +1,33 @@
 # vLLM App Image
 
-This image currently builds vLLM `v0.27.1` from source on top of `pytorch-cuda:26.02-py3` (CUDA variant) and `pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11` (ROCm variant).
+This image builds vLLM `v0.31.0` from source on top of `pytorch-cuda:26.07-py3` (CUDA) and `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` (ROCm).
 
-The app-local patches in `patches/` are required for NVIDIA PyTorch `26.02` and `26.03`, whose Torch `2.11.0a0` snapshots do not expose all APIs assumed by vLLM `v0.27.1` after the stable-libtorch migration. In particular, `torch::stable::Tensor::layout()`, the stable `from_blob` deleter overload, and `torch._opaque_base` are missing or incompatible.
+vLLM `v0.31.0` targets Torch `2.13`, which exposes the stable-libtorch APIs (`Tensor::layout()`, the `from_blob` deleter overload, `torch._opaque_base`) that the previous NVIDIA Torch `2.11.0a0` snapshots were missing. Three narrow compatibility patches remain: both images disable CUDA graphs for the DeepEP high-throughput backend before the compilation-mode early return and prefer vLLM's complete bundled `triton_kernels` tree over the incomplete package in the NGC base; the CUDA image requires both CuteDSL and QuACK before enabling the optional `ll_bf16` kernel.
+The ROCm image installs the matching upstream `amd-aiter` `0.1.23` release from its pinned commit and sets both `PYTORCH_ROCM_ARCH` and `GPU_ARCHS` to `gfx942`, the ISA used by MI300A and MI300X. AITER's full build-time precompilation is disabled because its FlyDSL AOT path ignores `GPU_ARCHS` and compiles targets from multi-architecture CSV data. The image instead prebuilds AITER's core module without requiring a visible GPU and stores it in `/opt/aiter-jit`; required `gfx942` kernels remain available through runtime JIT. The image also prebuilds TVM FFI's ROCm Torch DLPack addon into `/opt/alps/tvm-ffi`, avoiding concurrent Ray-worker compilation into a shared home-directory cache.
 
-Revisit these patches when vLLM moves to Torch `2.12` as its baseline. At that point we may be able to move to a newer NVIDIA PyTorch container and drop some or all compatibility patches.
+Both accelerator variants build UCCL's expert-parallel extension from upstream commit `e22a3e8fcd636f7efbbd90900458087a41ff73ce`, install its `uccl.ep` module and DeepEP-compatible `deep_ep` wrapper, and default the transport to Slingshot CXI. CXI domains are selected from each worker's node-wide physical GPU rank rather than its process-local visible-device index, so Ray workers that each see one logical GPU use the corresponding `cxi0` through `cxi3` device. The CUDA image builds the native extension for SM90, explicitly selects its Grace Hopper memory paths even when container builds cannot see a GPU, and uses libfabric's `FI_HMEM_CUDA` interface. The ROCm image applies five app-local compatibility fixes for the ROCm 10/CXI stack: use `FI_HMEM_ROCR` for AMD GPU allocations, select HIP's extended kernel-launch types and API, restore device math overloads removed in ROCm 10, snapshot volatile shared-memory heads before minimum comparisons, and check the runtime top-k rather than the compile-time maximum against MI300's wave64 dispatch capacity. Both variants serialize stale per-node UCCL shared-memory barrier cleanup before proxy construction, preventing ranks from unlinking barriers created by peers. They also serialize CXI provider initialization within each worker process because UCCL creates transports from several proxy threads and concurrent `fi_getinfo` calls can corrupt libfabric allocator state. `libibverbs-dev` and the other development-only packages are removed after the extension is built.
+
+The CUDA image also installs Run:ai Model Streamer `0.16.1`. UCCL-EP remains its expert-parallel implementation; NIXL is not installed. vLLM's exact `nvidia-cutlass-dsl[cu13]` `4.7.1` and `quack-kernels` `0.6.5` pins are retained, enabling the low-latency BF16 router without crossing incompatible CuteDSL APIs.
+
+Both builds constrain Python package installation to the Torch and Triton versions supplied by their canonical base images; the CUDA build also preserves base-provided TorchVision and TorchAudio versions. A final image check rejects dependency resolution that replaces any of those packages. Runtime Python ignores user-site packages (`PYTHONNOUSERSITE=1`). Build-time package installation uses `package-helpers.sh`, which routes pip through the CSCS PyPI proxy without forcing that index on image users. Image labels record the pinned UCCL revision and, where applicable, the AITER revision and Model Streamer version.
+
+Patch inputs are split under `patches/common/`, `patches/cuda/`, and `patches/rocm/`. Each canonical app hash includes the common set and only its accelerator-specific set, so ROCm-only compatibility changes do not invalidate the CUDA image.
+
+The CUDA vLLM source build uses 64 build jobs and four NVCC threads; its UCCL extension build uses 16 jobs. All three remain explicit build-argument overrides for controlled builders.
+
+The two-node CUDA and ROCm CI tests import both UCCL modules, construct a low-latency UCCL-EP buffer across eight GPUs, and verify an identity dispatch/combine round trip. This exercises CXI endpoint setup, GPU-memory registration, and the UCCL data path in addition to the Ray NCCL/RCCL all-reduce.
+
+The ROCm variant keeps a GPU-less-safe build-time smoke check: `import vllm` runs the platform probe and the module-level GCN-arch query, which initializes CUDA and fails on build containers without a visible GPU. The build only imports torch and locates the vLLM package via `importlib.util.find_spec`; the real ROCm `import vllm` coverage lives in the `ray-rccl-uccl-ep` test job.
 
 Older vLLM releases may need fewer changes. Releases `0.22` and older are suspected to work without these compatibility patches, but that still needs to be verified against the Alps CUDA/HPC stack.
 
 ## AITER (ROCm variant only)
 
-The ROCm variant installs [AITER](https://github.com/ROCm/aiter), AMD's AI Tensor Engine for ROCm, installed via `sources/install-aiter.sh`. It provides the MLA prefill kernels vLLM needs for MLA models (DeepSeek, Kimi, GLM) and also supplies the fused MoE, MLA decode, RMS norm and intra-node all-reduce kernels that vLLM enables with `VLLM_ROCM_USE_AITER=1` (vLLM's default is off; set it in the EDF or job environment). GLM-5.x requires AITER: its sparse MLA attention only runs on vLLM's `ROCM_AITER_MLA_SPARSE` backend on ROCm.
+The ROCm variant installs [AITER](https://github.com/ROCm/aiter), AMD's AI Tensor Engine for ROCm, as a non-editable wheel built by `sources/install-aiter.sh` from the exact revision recorded in the image label. The wheel carries the sources required by AITER's runtime JIT; the build checkout is removed. AITER provides MLA prefill/decode, fused MoE, RMS norm, and intra-node all-reduce kernels, including the ROCm sparse-MLA implementations required by models such as GLM-5.x.
 
-Kernels are JIT-compiled with hipcc on first use. The image sets `AITER_JIT_DIR=/opt/aiter-jit`, which holds the modules compiled at build time. To keep other kernels across jobs, point `AITER_JIT_DIR` (and `AITER_ROOT_DIR`) at a persistent, writable path such as scratch, seeded with `cp -r /opt/aiter-jit/. <path>`; otherwise every job recompiles into the container overlay.
+vLLM defaults `VLLM_ROCM_USE_AITER` to false. Set `VLLM_ROCM_USE_AITER=1` in the EDF or job environment to enable its AITER paths. Kernels not already present in the preseeded image cache are JIT-compiled with `hipcc` on first use.
+
+`AITER_JIT_DIR` defaults to the writable `/opt/aiter-jit` cache, which contains AITER's prebuilt core module and accepts additional runtime-compiled kernels. The ROCm Ray/UCCL CI job imports AITER from this cache. The ROCm-only `aiter` CI job verifies that the image cache is writable, copies it to a private test cache, resolves vLLM's AITER MLA backend, JIT-compiles an RMS-norm kernel, and compares its output with Torch without polluting the shared cache.
 
 ## Mooncake (CXI KV transfer)
 
@@ -20,7 +35,7 @@ Both variants additionally install the [Mooncake](https://github.com/kvcache-ai/
 
 Mooncake is compiled against the libfabric installed by the Alps base image (`/usr`), so it always matches the stack's libfabric version and shares a single in-process libfabric instance with the aws-ofi-nccl NCCL plugin. This is deliberate: a second, bundled libfabric would race for the CXI devices and leave one consumer with an empty provider list.
 
-`patches/mooncake/` fixes CXI device discovery in the Mooncake store client, which otherwise comes up without a transport.
+`patches/common/mooncake/` fixes CXI device discovery in the Mooncake store client, which otherwise comes up without a transport.
 
 On Slingshot, select the CXI transport in the extra config instead of the default `rdma` protocol, e.g.:
 

@@ -229,7 +229,7 @@ def test_meta_base_refs_return_expected_fields():
 def test_meta_app_refs_use_canonical_base_ref():
     fields = run_meta("app_refs vllm cuda").stdout.split()
     assert len(fields) == 4
-    assert re.match(r"localhost/alps-images/pytorch-cuda:26\.02-py3-alps7-dev-[0-9a-f]{32}$", fields[0])
+    assert re.match(r"localhost/alps-images/pytorch-cuda:26\.07-py3-alps7-dev-[0-9a-f]{32}$", fields[0])
 
 
 def test_meta_parse_base_image_rejects_unsupported_format():
@@ -346,6 +346,8 @@ def test_manual_build_generates_valid_rocm_base_script(tmp_path):
     script = generate_manual("base", "rocm", "pytorch", "rocm7.14-ubuntu24.04-py3.12-torch2.11", output=tmp_path / "base-rocm.sh")
     assert "podman build" in script
     assert "ROCM_VARIANT_DIR" in script
+    assert re.search(r'--build-arg ROCM_SYSTEMS_COMMIT="[0-9a-f]{40}"', script)
+    assert "ROCM_LIBRARIES_COMMIT" in script
 
 
 def test_manual_build_generates_valid_cuda_app_script(tmp_path):
@@ -358,3 +360,18 @@ def test_manual_build_generates_valid_rocm_app_script(tmp_path):
     script = generate_manual("app", "vllm", "rocm", output=tmp_path / "app-rocm.sh")
     assert "Alps-Images/apps/vllm/Containerfile.rocm" in script
     assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-rocm:.*-[0-9a-f]{32}"', script)
+
+
+def test_rocm_base_hash_inputs_cover_rocm_libraries_pins():
+    meta = (ROOT / "ci-pipelines" / "helpers" / "meta.sh").read_text()
+    m = re.search(r'rocm_base_refs\(\) \{.*?content_hash "(.*?)"', meta, re.DOTALL)
+    assert m, "rocm_base_refs content_hash field list not found"
+    fields = m.group(1)
+    assert "ROCM_LIBRARIES_REPO" in fields
+    assert "ROCM_LIBRARIES_COMMIT" in fields
+
+    templates = (ROOT / "ci-pipelines" / "child-templates.yaml").read_text()
+    rocm_build = re.search(r"\.child-rocm-base-build-template:.*?DOCKER_BUILD_ARGS: ('.*?')", templates, re.DOTALL)
+    assert rocm_build, ".child-rocm-base-build-template DOCKER_BUILD_ARGS not found"
+    assert "ROCM_LIBRARIES_REPO" in rocm_build.group(1)
+    assert "ROCM_LIBRARIES_COMMIT" in rocm_build.group(1)

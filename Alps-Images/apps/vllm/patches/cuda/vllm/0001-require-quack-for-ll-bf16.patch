@@ -1,0 +1,25 @@
+From 8942bc81f2ea55ee98c55bbdd6505c17d6d45e11 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 22 Sep 2026 00:00:00 +0000
+Subject: [PATCH] cute-dsl: require QuACK before enabling ll_bf16
+
+The low-latency BF16 router imports quack when it creates fake tensors. Keep
+its availability probe honest when the image supplies Cutlass but deliberately
+omits quack-kernels.
+---
+ vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py b/vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py
+--- a/vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py
++++ b/vllm/model_executor/kernels/linear/cute_dsl/ll_bf16.py
+@@ -23,6 +23,7 @@ def is_available() -> bool:
+     try:
+         import cutlass  # noqa: F401
+         import cutlass.cute  # noqa: F401
++        import quack  # noqa: F401
+ 
+         _cutedsl_available = True
+     except ImportError:
+-- 
+2.51.0

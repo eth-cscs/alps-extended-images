@@ -1,0 +1,53 @@
+From 04c38edb3a7968728fa9dd2f7d739788d1685147 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 15 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: restore CUDA-compatible device math on ROCm 10
+
+ROCm 10 no longer exposes the global integer min/max overloads expected by the
+CUDA-authored kernels and HIP cooperative-groups headers. Supply equivalent
+host/device overloads for HIP, and use Clang's device-capable float builtins
+where only the host C library overloads are visible.
+---
+ ep/include/ep_configs.cuh | 12 ++++++++++++
+ ep/src/internode_ll.cu    |  3 ++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/ep/include/ep_configs.cuh b/ep/include/ep_configs.cuh
+index 7188822..a144fda 100644
+--- a/ep/include/ep_configs.cuh
++++ b/ep/include/ep_configs.cuh
+@@ -65,6 +65,18 @@
+ typedef uint8_t __hip_fp8_storage_t;
+ typedef uint16_t __hip_fp8x2_storage_t;
+ #endif
++
++// ROCm 10 no longer exposes the CUDA-compatible global integer min/max
++// overloads expected by the kernels and HIP cooperative-groups headers.
++template <typename T, typename U>
++__host__ __device__ __forceinline__ constexpr auto min(T lhs, U rhs) {
++  return rhs < lhs ? rhs : lhs;
++}
++
++template <typename T, typename U>
++__host__ __device__ __forceinline__ constexpr auto max(T lhs, U rhs) {
++  return lhs < rhs ? rhs : lhs;
++}
+ #define nv_bfloat16 hip_bfloat16
+ #define __nv_fp8x2_storage_t __hip_fp8x2_storage_t
+ #define __nv_fp8_storage_t __hip_fp8_storage_t
+diff --git a/ep/src/internode_ll.cu b/ep/src/internode_ll.cu
+index ebd730f..a237bc5 100644
+--- a/ep/src/internode_ll.cu
++++ b/ep/src/internode_ll.cu
+@@ -187,7 +187,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
+ #pragma unroll
+           for (int j = 0; j < kNumElemsPerRead; ++j) {
+             fp32_values[j] = static_cast<float>(bf16_values[j]);
+-            amax = fmaxf(amax, fabsf(fp32_values[j]));
++            amax =
++                __builtin_fmaxf(amax, __builtin_fabsf(fp32_values[j]));
+           }
+ 
+           // Reduce amax and scale
+-- 
+2.51.0
