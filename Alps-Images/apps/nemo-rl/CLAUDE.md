@@ -1063,3 +1063,17 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Next**: `NRL_XFERDTENSOR_PYTHON=1` selects NeMo-RL's pure-Python xferdtensor (exact shard
   overlaps, batched P2P with striped receives, cached split-communicator broadcasts to replicas),
   plain NCCL point-to-point and broadcast only.
+
+### Run `3674045` — 2026-10-16 — `nccl_reshard` with the pure-Python xferdtensor: works, refit 2.6 s (native mcore: 16 s)
+
+- **Setup**: as `3673870` + `NRL_XFERDTENSOR_PYTHON=1` (submitted copy only; repo still `mcore`).
+  32 nodes, 4 steps, md_decoupling, memory diagnostics.
+- **Result**: setup-time sync and all 4 steps pass. `transfer_and_update_weights` 2.59 / 2.77 /
+  2.60 s for steps 2-4 (native mcore refit on the same topology, `3673498`: 16.0-17.3 s); misc
+  broadcast (train side) 0.38-0.69 s of that. Printed gen-KL 0.0175 0.0667 0.0363 0.0443 (native
+  mcore runs: 0.02-0.09 outside spikes), reward 0.59 0.57 0.63 0.70, step time 366 / 56 / 60 / 58 s.
+- **Memory**: trainer at most 77.0 GB NVML used / 63.3 GB allocated at `train_start` (native refit,
+  `3671334`: 75.6 / 63.3 GB). The generator-side diagnostics hook only the native refit path, so no
+  generator numbers.
+- `NET/OFI GIN only supports RDMA transport protocol` warnings at communicator setup are harmless
+  for this path.
