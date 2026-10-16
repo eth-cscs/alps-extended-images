@@ -12,7 +12,7 @@
 #     timing_s/*, training/global_step|epoch) and of validation
 #     (val-core/<NRL_VERL_VAL_DATA_SOURCE, default openai/gsm8k>/reward/mean@k).
 diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
-index e155183..cbc4458 100644
+index e155183..b7d35c4 100644
 --- a/nemo_rl/algorithms/grpo.py
 +++ b/nemo_rl/algorithms/grpo.py
 @@ -596,16 +596,23 @@ def setup(
@@ -170,30 +170,36 @@ index e155183..cbc4458 100644
  def _clip_grpo_advantages(
      advantages: torch.Tensor,
      grpo_config: GRPOConfig,
-@@ -4101,6 +4228,22 @@ def _grpo_train_impl(
+@@ -4027,6 +4154,19 @@ def _grpo_train_impl(
+                     total_steps + 1,
+                     name="train/token_mult_prob_error_plot_sample",
+                 )
++            # CHONK_BENCHMARK: computed before train_data is freed, logged below.
++            verl_step_metrics = _verl_compat_train_metrics(
++                metrics=metrics,
++                timing_metrics=timing_metrics,
++                train_data=train_data,
++                repeated_batch=repeated_batch,
++                input_lengths=input_lengths,
++                master_config=master_config,
++                total_num_gpus=master_config.cluster["num_nodes"]
++                * master_config.cluster["gpus_per_node"],
++                epoch=current_epoch,
++                step=total_steps + 1,
++            )
+             del train_data
+             if (
+                 master_config.policy["generation"]
+@@ -4101,6 +4241,8 @@ def _grpo_train_impl(
  
              if refit_metrics:
                  logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
 +            # CHONK_BENCHMARK: Verl-named copies of this step's metrics.
-+            logger.log_metrics(
-+                _verl_compat_train_metrics(
-+                    metrics=metrics,
-+                    timing_metrics=timing_metrics,
-+                    train_data=train_data,
-+                    repeated_batch=repeated_batch,
-+                    input_lengths=input_lengths,
-+                    master_config=master_config,
-+                    total_num_gpus=total_num_gpus,
-+                    epoch=current_epoch,
-+                    step=total_steps + 1,
-+                ),
-+                total_steps + 1,
-+                prefix="",
-+            )
++            logger.log_metrics(verl_step_metrics, total_steps + 1, prefix="")
              logger.log_metrics(metrics, total_steps + 1, prefix="train")
              logger.log_metrics(
                  performance_metrics, total_steps + 1, prefix="performance"
-@@ -4238,6 +4381,19 @@ def validate(
+@@ -4238,6 +4380,19 @@ def validate(
          bucket_scope(Bucket.OVERHEAD),
      ):
          print(f"▶ Starting validation at step {step}...", flush=True)
@@ -213,7 +219,7 @@ index e155183..cbc4458 100644
          # >= 1 is validated in setup().
          val_num_generations_per_prompt = (
              master_config.grpo.val_num_generations_per_prompt
-@@ -4346,6 +4502,13 @@ def validate(
+@@ -4346,6 +4501,13 @@ def validate(
  
              all_message_logs.extend(to_env)
  
@@ -227,7 +233,7 @@ index e155183..cbc4458 100644
          # Calculate validation metrics. accuracy is the mean reward over all
          # rollouts; grouped validation (val_num_generations_per_prompt > 1)
          # additionally reports pass@k over each prompt's k rollouts as pass_k.
-@@ -4380,6 +4543,12 @@ def validate(
+@@ -4380,6 +4542,12 @@ def validate(
          }
          if pass_k is not None:
              val_metrics["pass_k"] = pass_k

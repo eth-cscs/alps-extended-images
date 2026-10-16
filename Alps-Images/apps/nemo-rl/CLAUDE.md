@@ -1136,3 +1136,13 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - Benchmark runs go on the `preemptable` partition (user, 2026-10-16): `3675474` on the normal
   partition was cancelled before it started; resubmitted as `3675553`. The benchmark script now
   carries `#SBATCH --partition=preemptable`. Checkpointing is off, so a preemption loses the run.
+
+### Run `3675553` — 2026-10-16 — benchmark on preemptable: setup and step-0 validation pass; crash after step 1 in the patch
+
+- Setup passes with the relaxed guard. Step-0 validation (GSM8K test, 1319 prompts, T 0.6 /
+  top-p 0.95): **accuracy 0.7142**. Step 1 (768 samples, T 1.0 / top-p 1.0, up to 2048 tokens):
+  reward 0.4323, printed gen-KL 0.0005 (no nucleus term with top-p 1.0), 368 s; no OOM.
+- Then `UnboundLocalError: train_data` in `_grpo_train_impl`: vanilla frees the batch
+  (`del train_data`) right after the jsonl / token-mult-prob logging, before the metric logging
+  block where the benchmark patch read it. Fix: the Verl-named step metrics are now computed just
+  before `del train_data` and only logged later. `SRC_VERSION` `v7bench3`.
