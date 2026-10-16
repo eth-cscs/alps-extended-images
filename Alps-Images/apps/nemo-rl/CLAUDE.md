@@ -1100,7 +1100,10 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   default; NeMo-RL ticks the scheduler once per GRPO step, so the recipe's 60-iteration warm-up
   would span 60 of the 92 steps); `MATRIX_LR` 5e-5 / `GAINS_LR` 2e-6 (author's md_decoupling
   values; `LR` is only the base rate); `TRAIN_GLOBAL_BATCH` 128 (6 optimizer steps per GRPO
-  step); `MAX_NEW_TOKENS` 256.
+  step). Responses up to 2048 tokens (user, 2026-10-16): `MAX_NEW_TOKENS` 2048,
+  `max_total_sequence_length` 3072 (prompt <= 900; also the engine's `max_model_len`). Untested: the
+  trainer has only run with sequences <= 1280 tokens (micro-batch 1); a 2k-token response is
+  ~2.3x the activations and logits of that.
 - `example/patches/nemo-rl-benchmark-metrics.patch` (5 files, +253, benchmark copy only):
   - validation sampling: vanilla `validate()` honours `val_temperature`/`val_top_p`/`val_top_k`
     only on the NeMo-Gym path; the plain rollout path sampled with the training profile. Adds

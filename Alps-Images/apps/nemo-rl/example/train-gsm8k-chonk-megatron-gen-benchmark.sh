@@ -12,6 +12,7 @@
 #   * 92 GRPO steps, 48 prompts x 16 samples per step, seed 42.
 #   * learning rate 1e-6 (LR), weight decay 0.01, constant schedule without
 #     warm-up (Verl default; NeMo-RL steps the scheduler once per GRPO step).
+#   * responses up to 2048 tokens (sequence limit 3072).
 #   * training sampling temperature 1.0, top-p 1.0; validation temperature 0.6,
 #     top-p 0.95 on the GSM8K test split (1319 prompts), at steps 0, 46 and 92.
 #   * patches/nemo-rl-benchmark-metrics.patch: validation sampling on the
@@ -119,7 +120,10 @@ export GAINS_LR="${GAINS_LR:-2.0e-6}"
 export WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 export LR_DECAY_STYLE="${LR_DECAY_STYLE:-constant}"
 export LR_WARMUP_ITERS="${LR_WARMUP_ITERS:-0}"
-export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
+export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-2048}"
+# Prompt (data.max_input_seq_length 900) + response; also the generation
+# engine length (max_model_len follows it).
+export MAX_TOTAL_SEQUENCE_LENGTH="${MAX_TOTAL_SEQUENCE_LENGTH:-3072}"
 export VAL_PERIOD="${VAL_PERIOD:-$(( MAX_NUM_STEPS / 2 ))}"
 # KL penalty against the starting policy. 0.0 (author: 0.01), user decision: > 0
 # makes NeMo-RL build a reference model on the trainer GPUs at setup and keep
@@ -1178,7 +1182,7 @@ policy:
   generation_batch_size: ${oc.decode:${oc.env:INFERENCE_REQUESTS}}
   logprob_batch_size: 1
   offload_optimizer_for_logprob: true
-  max_total_sequence_length: 1280
+  max_total_sequence_length: ${oc.decode:${oc.env:MAX_TOTAL_SEQUENCE_LENGTH}}
   make_sequence_length_divisible_by: 2
   sequence_packing:
     enabled: false
@@ -1597,7 +1601,8 @@ print(
     "schedule", sched["lr_decay_style"], "warmup", sched["lr_warmup_iters"],
     "train T/top_p", gen["temperature"], gen["top_p"],
     "val T/top_p/top_k", gen["val_temperature"], gen["val_top_p"], gen["val_top_k"],
-    "max_new_tokens", gen["max_new_tokens"],
+    "max_new_tokens", gen["max_new_tokens"], "max_seq", cfg["policy"]["max_total_sequence_length"],
+    "engine_max_len", gen["mcore_generation_config"]["max_model_len"],
     "val", cfg["grpo"]["val_at_start"], cfg["grpo"]["val_period"], cfg["grpo"]["val_at_end"],
     cfg["data"]["validation"],
 )
