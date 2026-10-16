@@ -1,6 +1,7 @@
 # Benchmark-only NeMo-RL patch (train-gsm8k-chonk-megatron-gen-benchmark.sh); apply after
 # nemo-rl-chonk-megatron-gen-minimal.patch. Base: NVIDIA-NeMo/RL@f196ef0a. Marked CHONK_BENCHMARK.
-#   * Validation sampling on the plain (non-NeMo-Gym) rollout path: validate() switches the
+#   * Validation sampling on the plain (non-NeMo-Gym) rollout path: setup() accepts val_* for
+#     Megatron generation, and validate() switches the
 #     Megatron generation workers to generation.val_temperature / val_top_p / val_top_k and back
 #     (vanilla only honours them on the NeMo-Gym path). New set_generation_sampling() on
 #     MegatronGeneration and its worker mixin.
@@ -11,10 +12,38 @@
 #     timing_s/*, training/global_step|epoch) and of validation
 #     (val-core/<NRL_VERL_VAL_DATA_SOURCE, default openai/gsm8k>/reward/mean@k).
 diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
-index e155183..bcc44b7 100644
+index e155183..cbc4458 100644
 --- a/nemo_rl/algorithms/grpo.py
 +++ b/nemo_rl/algorithms/grpo.py
-@@ -2559,6 +2559,126 @@ def _create_advantage_estimator(master_config: MasterConfig):
+@@ -596,16 +596,23 @@ def setup(
+         or generation_config["val_top_k"] != generation_config["top_k"]
+     )
+     if val_sampling_overridden:
+-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
+-            master_config
++        # CHONK_BENCHMARK: also honored on the plain Megatron generation path,
++        # where validate() switches the workers with set_generation_sampling().
++        megatron_val_sampling = generation_config[
++            "backend"
++        ] == "megatron" and not should_use_nemo_gym(master_config)
++        assert megatron_val_sampling or (
++            generation_config["backend"] == "vllm"
++            and should_use_nemo_gym(master_config)
+         ), (
+             "generation.val_temperature/val_top_p/val_top_k differing from the "
+-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
++            "train sampling params is only supported for vLLM NeMo-Gym rollouts "
++            "and (CHONK_BENCHMARK) Megatron generation."
+         )
+         # The NeMo-Gym path only stamps temperature/top_p onto requests and
+         # rejects any top_k at rollout time, so a val_top_k override can never
+         # be honored — fail here instead of at the first validation step.
+-        assert not generation_config["val_top_k"], (
++        assert megatron_val_sampling or not generation_config["val_top_k"], (
+             "generation.val_top_k is not supported: the NeMo-Gym rollout path "
+             "only honors val_temperature/val_top_p. Leave val_top_k null."
+         )
+@@ -2559,6 +2566,126 @@ def _create_advantage_estimator(master_config: MasterConfig):
      return adv_estimator
  
  
@@ -141,7 +170,7 @@ index e155183..bcc44b7 100644
  def _clip_grpo_advantages(
      advantages: torch.Tensor,
      grpo_config: GRPOConfig,
-@@ -4101,6 +4221,22 @@ def _grpo_train_impl(
+@@ -4101,6 +4228,22 @@ def _grpo_train_impl(
  
              if refit_metrics:
                  logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
@@ -164,7 +193,7 @@ index e155183..bcc44b7 100644
              logger.log_metrics(metrics, total_steps + 1, prefix="train")
              logger.log_metrics(
                  performance_metrics, total_steps + 1, prefix="performance"
-@@ -4238,6 +4374,19 @@ def validate(
+@@ -4238,6 +4381,19 @@ def validate(
          bucket_scope(Bucket.OVERHEAD),
      ):
          print(f"▶ Starting validation at step {step}...", flush=True)
@@ -184,7 +213,7 @@ index e155183..bcc44b7 100644
          # >= 1 is validated in setup().
          val_num_generations_per_prompt = (
              master_config.grpo.val_num_generations_per_prompt
-@@ -4346,6 +4495,13 @@ def validate(
+@@ -4346,6 +4502,13 @@ def validate(
  
              all_message_logs.extend(to_env)
  
@@ -198,7 +227,7 @@ index e155183..bcc44b7 100644
          # Calculate validation metrics. accuracy is the mean reward over all
          # rollouts; grouped validation (val_num_generations_per_prompt > 1)
          # additionally reports pass@k over each prompt's k rollouts as pass_k.
-@@ -4380,6 +4536,12 @@ def validate(
+@@ -4380,6 +4543,12 @@ def validate(
          }
          if pass_k is not None:
              val_metrics["pass_k"] = pass_k

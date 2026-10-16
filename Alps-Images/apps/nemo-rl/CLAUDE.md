@@ -1122,3 +1122,14 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   own token count), so NeMo-RL's own `train/*` values are N x the per-batch mean (N = 6 here); the
   Verl-named `actor/*` copies divide by N. `actor/grad_norm` is the last optimizer step's norm
   (Verl averages over mini-batches).
+
+### Run `3675166` — 2026-10-16 — benchmark: fails in setup on NeMo-RL's validation-sampling guard
+
+- Checkout `src-v7bench` built (all five patches applied), preflight and both config lines OK,
+  train (7473) and validation (1319) GSM8K loaded; then `setup()` (`grpo.py:599`) asserts
+  `generation.val_temperature/val_top_p/val_top_k differing from the train sampling params is
+  only supported for vLLM NeMo-Gym rollouts` (`val_top_k: null` vs `top_k: -1` also counts).
+- Fix: the benchmark patch now accepts val_* overrides for Megatron generation outside NeMo-Gym
+  (the path its `validate()` change serves); the NeMo-Gym top-k rule is kept for vLLM.
+  `SRC_VERSION` `v7bench2` (the `v7bench` checkout holds the old patch). Rest of `setup()`
+  checked: no other assertion touches the benchmark settings.
