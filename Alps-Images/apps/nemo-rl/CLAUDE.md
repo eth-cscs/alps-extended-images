@@ -1077,3 +1077,14 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   generator numbers.
 - `NET/OFI GIN only supports RDMA transport protocol` warnings at communicator setup are harmless
   for this path.
+
+## Refit default switched to `nccl_reshard` — 2026-10-16 (user decision)
+
+- Launcher: `refit_transport: nccl_reshard`, `mcore_generation_config.refit_backend` removed
+  (NeMo-RL rejects it for any transport but `mcore`), `NRL_XFERDTENSOR_PYTHON=1` exported in the
+  per-node Ray environment. Basis: run `3674045` (refit 2.6 s vs 16 s native mcore, gen-KL normal).
+- `refit_transport: mcore` stays the documented fallback; the Megatron-LM patch is kept for it
+  (unused by `nccl_reshard`, so `SRC_VERSION` stays `v7`).
+- Native nccl4py m2n reshard (faster in NeMo-RL's numbers) needs NCCL symmetric memory over the
+  network, not available with the Slingshot OFI plugin here (run `3673870`): a CSCS / NVIDIA
+  question, not a launcher change.

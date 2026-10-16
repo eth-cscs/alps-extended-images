@@ -19,14 +19,16 @@
 # Sources (cloned once to Lustre, all pinned):
 #   NeMo-RL          NVIDIA-NeMo/RL@f196ef0a            vanilla + 2-file patch
 #   Megatron-Bridge  NVIDIA-NeMo/Megatron-Bridge@07722453  vanilla + 4-file patch
+#                    + 1-file md_decoupling optimizer dispatch patch
 #                    + models/apertus2/ copied verbatim from
 #                      swiss-ai/Megatron-Bridge@f3bc8e7e (6 new files)
 #   Megatron-LM      swiss-ai/Megatron-LM-MoE PR #88 @b0844260  the fork (KDA layers,
 #                    latent MoE, quantile-balancing router are not in stock
 #                    Megatron-LM) + 3-file patch: upstream's native refit API,
-#                    its NCCL refit deadlock fix and round-robin task ids
+#                    its NCCL refit deadlock fix and round-robin task ids (only
+#                    used by the refit_transport: mcore fallback)
 #   nemo-lens        NVIDIA-NeMo/Lens@b85578fc          the rev NeMo-RL pins
-# The three patches are embedded below and checked in under patches/ (keep them
+# The four patches are embedded below and checked in under patches/ (keep them
 # byte-identical); each hunk and why it is needed is listed in the patch header.
 #
 # Deliberately NOT taken from the forks (see ../CLAUDE.md for the reasoning):
@@ -39,8 +41,9 @@
 #     checkpoints under no_grad), the rest of swiss-ai PR #1.
 # Differences from the author's recipe that follow from that: no expert
 # offloading (model_overrides block dropped -> more trainer GPU memory), and
-# generation by Megatron-Core's dynamic engine (eager), refit by Megatron-Core's
-# native resharding (refit_transport: mcore, see the generation block).
+# generation by Megatron-Core's dynamic engine (eager), refit by NeMo-RL's
+# shard-to-shard NCCL reshard (refit_transport: nccl_reshard, see the
+# generation block).
 # The optimizer is the author's md_decoupling block (Chonk's pretraining
 # optimizer), dispatched by patches/bridge-md-decoupling-optimizer.patch.
 #
@@ -883,13 +886,19 @@ policy:
       resources:
         num_nodes: ${oc.decode:${oc.env:INFERENCE_NODES}}
         gpus_per_node: 4
-    # Native Megatron-to-Megatron refit: Megatron-Core's resharding plan copies
-    # trainer shards (EP32) straight into the generator's (EP8) over NCCL, with
-    # no conversion through the HF layout. Needs the Megatron-LM patch above
-    # (NeMo-RL passes execution_batch_bytes, which the fork did not accept, run
-    # 3623177). Fallback: refit_transport: null, NeMo-RL's collective through
-    # the bridge mapping (runs 3653929-3655036).
-    refit_transport: mcore
+    # NeMo-RL's shard-to-shard reshard: the FFN/expert projections (95.9% of
+    # Chonk's 201.7 GiB) move once per region trainer -> generator and are
+    # broadcast across generator replicas; the rest (KDA, latent projections,
+    # router, embeddings, shared experts) is a packed broadcast. Refit 2.6 s vs
+    # 16 s for the native mcore refit on the same 32 nodes (runs 3674045,
+    # 3673498). Runs on NeMo-RL's pure-Python transport (NRL_XFERDTENSOR_PYTHON
+    # below): nccl4py's native m2n reshard needs NCCL symmetric memory, which
+    # the cross-node communicator over the Slingshot plugin lacks (run 3673870).
+    # Fallbacks: refit_transport: mcore (Megatron-Core's native refit, needs the
+    # Megatron-LM patch above and mcore_generation_config.refit_backend: nccl,
+    # which must be absent otherwise), or null (NeMo-RL's packed collective
+    # through the bridge mapping, runs 3653929-3655036).
+    refit_transport: nccl_reshard
     mcore_generation_config:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
@@ -899,9 +908,6 @@ policy:
       # layers (run 3624750). Padding experts is required for EP > 1 with CUDA
       # graphs when the layers are not Megatron-Core's inference_optimized ones.
       moe_pad_experts_for_cuda_graph_inference: true
-      # Copy service for refit_transport: mcore. NeMo-RL warns that nvshmem is
-      # broken; nccl is the plain point-to-point backend.
-      refit_backend: nccl
       # kv_cache_management_mode stays at the default (persist): NeMo-RL requires
       # it to agree with grpo.async_grpo.recompute_kv_cache_after_weight_updates
       # (false), and synchronous GRPO has no request in flight across a refit.
@@ -1061,6 +1067,9 @@ export TOKENIZERS_PARALLELISM=false
 # Refit staging limits from the vLLM recipe of the image author.
 export NRL_REFIT_BUFFER_MEMORY_RATIO=0.005
 export NRL_REFIT_NUM_BUFFERS=1
+# refit_transport: nccl_reshard on the pure-Python xferdtensor of NeMo-RL (batched
+# P2P + replica broadcasts); see the generation block of the recipe.
+export NRL_XFERDTENSOR_PYTHON=1
 export NCCL_DEBUG=WARN
 export RAY_DEDUP_LOGS=0
 
