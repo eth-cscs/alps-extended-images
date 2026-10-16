@@ -2,6 +2,7 @@
 
 #SBATCH --nodes=32
 #SBATCH --account=csstaff
+#SBATCH --partition=preemptable
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=288
 #SBATCH --time=8:00:00
@@ -18,7 +19,7 @@
 #   * patches/nemo-rl-benchmark-metrics.patch: validation sampling on the
 #     Megatron generation path, exact token entropy, clip fraction, k1 KL, and
 #     Verl-named copies of the step and validation metrics in wandb.
-#   * own source checkout (SRC_VERSION), normal partition, 8 h limit.
+#   * own source checkout (SRC_VERSION), preemptable partition, 8 h limit.
 #
 # Apertus 2 "Chonk" GRPO on GSM8K with NeMo-RL, Megatron for training AND
 # generation (no vLLM), on as-vanilla-as-possible libraries.

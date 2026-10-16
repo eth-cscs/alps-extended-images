@@ -1133,3 +1133,6 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   (the path its `validate()` change serves); the NeMo-Gym top-k rule is kept for vLLM.
   `SRC_VERSION` `v7bench2` (the `v7bench` checkout holds the old patch). Rest of `setup()`
   checked: no other assertion touches the benchmark settings.
+- Benchmark runs go on the `preemptable` partition (user, 2026-10-16): `3675474` on the normal
+  partition was cancelled before it started; resubmitted as `3675553`. The benchmark script now
+  carries `#SBATCH --partition=preemptable`. Checkpointing is off, so a preemption loses the run.
