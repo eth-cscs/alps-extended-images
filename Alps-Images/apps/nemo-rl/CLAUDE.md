@@ -1016,3 +1016,16 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   + 16 generation; global batch pinned to the author's 128 (2 micro-batches per rank).
   `grad_reduce_in_fp32` stays at the author's `false` (considered: `true` would make the pre-step
   copy a no-op, net ~-7.8 GB, but with little margin). Fallback: the author's expert offloading.
+
+### Run `3671334` — 2026-10-15 — md_decoupling on 32 nodes (16 trainer, expert DP 2): 4/4 steps, no OOM
+
+- **Setup**: repo `fe2ae00` + memory diagnostics (`src-v7memdiag2`), 32 nodes (16 trainer EP32 =
+  expert data-parallel 2, 16 generation EP8), global batch 128, md_decoupling (author's block,
+  `grad_reduce_in_fp32: false`), KL penalty 0, native refit, NUMA binding. COMPLETED, exit 0, 1135 s.
+- **Memory, trainer, PyTorch allocated (max over 64 ranks)**: log-prob pass 36.5 GB (Adam at 32
+  GPUs: 16-18 GB; the fp32 masters stay resident), `train_start` 63.3 GB from step 2 on (Adam:
+  52.9 GB), NVML used at most 75.6 GB of 95 at the logged points. The optimizer-step peak itself is
+  not logged; it fit on every rank in 4 steps.
+- **Steps**: reward 0.62 0.58 0.64 0.67 (Adam run `3669709`: 0.61 0.55 0.61 0.68); printed gen-KL
+  0.022-0.095; loss 0.017 -0.090 -0.072 0.041; mean generation length 83-86 tokens. Native refit
+  16.8-17.1 s (same as with 32 trainer GPUs); step time 67-74 s after step 1 (360 s).
