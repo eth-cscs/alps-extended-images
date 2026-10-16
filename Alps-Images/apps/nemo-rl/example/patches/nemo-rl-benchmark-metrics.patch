@@ -1,0 +1,376 @@
+# Benchmark-only NeMo-RL patch (train-gsm8k-chonk-megatron-gen-benchmark.sh); apply after
+# nemo-rl-chonk-megatron-gen-minimal.patch. Base: NVIDIA-NeMo/RL@f196ef0a. Marked CHONK_BENCHMARK.
+#   * Validation sampling on the plain (non-NeMo-Gym) rollout path: validate() switches the
+#     Megatron generation workers to generation.val_temperature / val_top_p / val_top_k and back
+#     (vanilla only honours them on the NeMo-Gym path). New set_generation_sampling() on
+#     MegatronGeneration and its worker mixin.
+#   * Verl-comparable actor metrics in ClippedPGLossFn: entropy (exact, from the full logits,
+#     opt-in with NRL_LOG_TOKEN_ENTROPY=1 in prepare_loss_input), pg_clipfrac, ppo_kl (k1).
+#   * Verl-named copies of the step metrics logged next to NeMo-RL's own (critic/*,
+#     response_length/*, prompt_length/*, actor/*, training/rollout_probs_diff_*, perf/*,
+#     timing_s/*, training/global_step|epoch) and of validation
+#     (val-core/<NRL_VERL_VAL_DATA_SOURCE, default openai/gsm8k>/reward/mean@k).
+diff --git a/nemo_rl/algorithms/grpo.py b/nemo_rl/algorithms/grpo.py
+index e155183..bcc44b7 100644
+--- a/nemo_rl/algorithms/grpo.py
++++ b/nemo_rl/algorithms/grpo.py
+@@ -2559,6 +2559,126 @@ def _create_advantage_estimator(master_config: MasterConfig):
+     return adv_estimator
+ 
+ 
++# CHONK_BENCHMARK: Verl-named copies of the GRPO step metrics, so a NeMo-RL run
++# and a Verl run can be overlaid in wandb. Verl's names: critic/score,
++# critic/rewards, critic/advantages, critic/returns, response_length,
++# prompt_length, actor/*, training/rollout_probs_diff_*, perf/*, timing_s/*.
++_VERL_TIMING_KEYS = {
++    "generation": "timing_s/gen",
++    "reward_calculation": "timing_s/reward",
++    "policy_and_reference_logprobs": "timing_s/old_log_prob",
++    "advantage_calculation": "timing_s/adv",
++    "policy_training": "timing_s/update_actor",
++    "prepare_for_generation/transfer_and_update_weights": "timing_s/update_weights",
++    "total_step_time": "timing_s/step",
++}
++
++
++def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
++    return cfg.get(key, default) if isinstance(cfg, dict) else getattr(cfg, key, default)
++
++
++def _verl_stats(out: dict[str, float], name: str, x: torch.Tensor, clip: Any = None) -> None:
++    x = x.detach().float().flatten()
++    if x.numel() == 0:
++        return
++    out[f"{name}/mean"] = x.mean().item()
++    out[f"{name}/max"] = x.max().item()
++    out[f"{name}/min"] = x.min().item()
++    if clip is not None:
++        out[f"{name}/clip_ratio"] = (x >= clip).float().mean().item()
++
++
++def _verl_compat_train_metrics(
++    *,
++    metrics: dict[str, Any],
++    timing_metrics: dict[str, Any],
++    train_data: Any,
++    repeated_batch: Any,
++    input_lengths: torch.Tensor,
++    master_config: "MasterConfig",
++    total_num_gpus: int,
++    epoch: int,
++    step: int,
++) -> dict[str, float]:
++    """Verl-named step metrics, computed from the step's training batch.
++
++    NeMo-RL sums its token-normalized loss metrics over the optimizer batches
++    of a step (each batch normalized by its own token count); Verl reports the
++    mean over mini-batches, hence the division by the number of batches.
++    """
++    out: dict[str, float] = {}
++    token_mask = train_data["token_mask"].bool() & train_data["sample_mask"].bool().unsqueeze(-1)
++    scores = torch.as_tensor(repeated_batch["total_reward"])
++    _verl_stats(out, "critic/score", scores)
++    _verl_stats(out, "critic/rewards", scores)
++    advantages = train_data["advantages"][token_mask]
++    _verl_stats(out, "critic/advantages", advantages)
++    _verl_stats(out, "critic/returns", advantages)
++    _verl_stats(
++        out,
++        "response_length",
++        train_data["token_mask"].sum(dim=-1),
++        clip=master_config.policy["generation"]["max_new_tokens"],
++    )
++    _verl_stats(
++        out,
++        "prompt_length",
++        torch.as_tensor(repeated_batch["length"]),
++        clip=_cfg_get(master_config.data, "max_input_seq_length"),
++    )
++    probs_diff = (
++        train_data["generation_logprobs"][token_mask].exp()
++        - train_data["prev_logprobs"][token_mask].exp()
++    ).abs()
++    if probs_diff.numel() > 0:
++        out["training/rollout_probs_diff_max"] = probs_diff.max().item()
++        out["training/rollout_probs_diff_mean"] = probs_diff.mean().item()
++        out["training/rollout_probs_diff_std"] = probs_diff.std().item()
++
++    num_batches = max(
++        1, len(train_data["advantages"]) // master_config.policy["train_global_batch_size"]
++    )
++    for verl_name, name in (
++        ("actor/entropy", "entropy"),
++        ("actor/pg_clipfrac", "pg_clipfrac"),
++        ("actor/ppo_kl", "ppo_kl"),
++        ("actor/pg_loss", "loss"),
++        ("actor/kl_loss", "kl_penalty"),
++    ):
++        if name in metrics:
++            out[verl_name] = float(np.mean(metrics[name])) / num_batches
++    if "approx_entropy" in metrics:
++        out["actor/entropy_approx"] = float(np.mean(metrics["approx_entropy"])) / num_batches
++    out["actor/grad_norm"] = float(np.mean(metrics["grad_norm"]))
++    if "lr" in metrics:
++        out["actor/lr"] = float(np.mean(metrics["lr"]))
++    out["actor/kl_coef"] = float(_cfg_get(master_config.loss_fn, "reference_policy_kl_penalty", 0.0))
++
++    total_tokens = float(input_lengths.sum().item())
++    step_time = float(timing_metrics.get("total_step_time", 0.0))
++    out["perf/total_num_tokens"] = total_tokens
++    out["perf/time_per_step"] = step_time
++    if step_time > 0:
++        out["perf/throughput"] = total_tokens / step_time / total_num_gpus
++    for name, verl_name in _VERL_TIMING_KEYS.items():
++        if name in timing_metrics:
++            out[verl_name] = float(timing_metrics[name])
++    out["training/global_step"] = float(step)
++    out["training/epoch"] = float(epoch)
++    return out
++
++
++def _verl_compat_val_metrics(val_metrics: dict[str, Any], k: int) -> dict[str, float]:
++    """Verl's val-core/<data_source>/reward/mean@k naming for the validation metrics."""
++    source = os.environ.get("NRL_VERL_VAL_DATA_SOURCE", "openai/gsm8k")
++    out = {f"val-core/{source}/reward/mean@{k}": float(val_metrics["accuracy"])}
++    if "pass_k" in val_metrics:
++        out[f"val-core/{source}/reward/best@{k}/mean"] = float(val_metrics["pass_k"])
++    out[f"val-aux/{source}/response_length/mean"] = float(val_metrics["avg_length"])
++    return out
++
++
+ def _clip_grpo_advantages(
+     advantages: torch.Tensor,
+     grpo_config: GRPOConfig,
+@@ -4101,6 +4221,22 @@ def _grpo_train_impl(
+ 
+             if refit_metrics:
+                 logger.log_metrics(refit_metrics, total_steps + 1, prefix="refit")
++            # CHONK_BENCHMARK: Verl-named copies of this step's metrics.
++            logger.log_metrics(
++                _verl_compat_train_metrics(
++                    metrics=metrics,
++                    timing_metrics=timing_metrics,
++                    train_data=train_data,
++                    repeated_batch=repeated_batch,
++                    input_lengths=input_lengths,
++                    master_config=master_config,
++                    total_num_gpus=total_num_gpus,
++                    epoch=current_epoch,
++                    step=total_steps + 1,
++                ),
++                total_steps + 1,
++                prefix="",
++            )
+             logger.log_metrics(metrics, total_steps + 1, prefix="train")
+             logger.log_metrics(
+                 performance_metrics, total_steps + 1, prefix="performance"
+@@ -4238,6 +4374,19 @@ def validate(
+         bucket_scope(Bucket.OVERHEAD),
+     ):
+         print(f"▶ Starting validation at step {step}...", flush=True)
++        # CHONK_BENCHMARK: the plain rollout path samples with the generation
++        # workers' config; switch it to the validation profile (NeMo-Gym
++        # passes val_* per request instead) and back after the loop.
++        generation_config = master_config.policy["generation"]
++        switch_val_sampling = not should_use_nemo_gym(master_config) and hasattr(
++            policy_generation, "set_generation_sampling"
++        )
++        if switch_val_sampling:
++            policy_generation.set_generation_sampling(
++                temperature=generation_config["val_temperature"],
++                top_p=generation_config["val_top_p"],
++                top_k=generation_config["val_top_k"],
++            )
+         # >= 1 is validated in setup().
+         val_num_generations_per_prompt = (
+             master_config.grpo.val_num_generations_per_prompt
+@@ -4346,6 +4495,13 @@ def validate(
+ 
+             all_message_logs.extend(to_env)
+ 
++        if switch_val_sampling:
++            policy_generation.set_generation_sampling(
++                temperature=generation_config["temperature"],
++                top_p=generation_config["top_p"],
++                top_k=generation_config["top_k"],
++            )
++
+         # Calculate validation metrics. accuracy is the mean reward over all
+         # rollouts; grouped validation (val_num_generations_per_prompt > 1)
+         # additionally reports pass@k over each prompt's k rollouts as pass_k.
+@@ -4380,6 +4536,12 @@ def validate(
+         }
+         if pass_k is not None:
+             val_metrics["pass_k"] = pass_k
++        if logger is not None:  # CHONK_BENCHMARK
++            logger.log_metrics(
++                _verl_compat_val_metrics(val_metrics, val_num_generations_per_prompt),
++                step,
++                prefix="",
++            )
+ 
+         # Print sample conversations only once at the end of validation
+         try:
+diff --git a/nemo_rl/algorithms/loss/loss_functions.py b/nemo_rl/algorithms/loss/loss_functions.py
+index 1eecd5c..2f6bcfe 100755
+--- a/nemo_rl/algorithms/loss/loss_functions.py
++++ b/nemo_rl/algorithms/loss/loss_functions.py
+@@ -377,6 +377,10 @@ class ClippedPGLossFn(LossFunction):
+             "policy_kl_error": MetricNormalizer.TOKENS,
+             "js_divergence_error": MetricNormalizer.TOKENS,
+             "approx_entropy": MetricNormalizer.TOKENS,
++            # CHONK_BENCHMARK: Verl-comparable actor metrics (see __call__).
++            "entropy": MetricNormalizer.TOKENS,
++            "pg_clipfrac": MetricNormalizer.TOKENS,
++            "ppo_kl": MetricNormalizer.TOKENS,
+             # Keyed on sequence_level_importance_ratios, NOT loss_type.
+             "sampling_importance_ratio": (
+                 MetricNormalizer.SEQUENCES
+@@ -808,6 +812,35 @@ class ClippedPGLossFn(LossFunction):
+                 global_normalization_factor=global_valid_toks,
+             )
+ 
++        # CHONK_BENCHMARK: Verl-comparable actor metrics. entropy: exact token
++        # entropy of the current policy from the full logits (prepare_loss_input
++        # stores it as data["token_entropy"]); pg_clipfrac: fraction of tokens
++        # whose clipped surrogate term is the active one; ppo_kl: k1 KL
++        # E[log pi_old - log pi_curr] over the response tokens.
++        with torch.no_grad():
++            token_entropy = data.get("token_entropy") if hasattr(data, "get") else None
++            entropy_metric = (
++                masked_mean(
++                    token_entropy, mask, global_normalization_factor=global_valid_toks
++                ).item()
++                if token_entropy is not None
++                else 0.0
++            )
++            pg_clipfrac = (
++                masked_mean(
++                    (loss2 > loss1).float(),
++                    mask,
++                    global_normalization_factor=global_valid_toks,
++                ).item()
++                if not self.use_cispo
++                else 0.0
++            )
++            ppo_kl = masked_mean(
++                prev_logprobs - curr_logprobs.detach(),
++                mask,
++                global_normalization_factor=global_valid_toks,
++            ).item()
++
+         # -----------------------------------------------------------------
+         # VAPO: positive-example NLL loss on correct samples (reward > 0)
+         # L = L_PPO + μ · L_NLL(correct)
+@@ -874,6 +907,9 @@ class ClippedPGLossFn(LossFunction):
+                 "sampling_importance_ratio": sample_importance_ratio.item(),
+                 "num_valid_samples": sample_mask.sum().item(),
+                 "approx_entropy": seq_entropy_approx.item(),
++                "entropy": entropy_metric,
++                "pg_clipfrac": pg_clipfrac,
++                "ppo_kl": ppo_kl,
+                 **_is_filter_metrics,
+                 "positive_nll_loss": nll_loss.item(),
+             },
+diff --git a/nemo_rl/algorithms/loss/loss_input.py b/nemo_rl/algorithms/loss/loss_input.py
+index a62da1e..5295102 100644
+--- a/nemo_rl/algorithms/loss/loss_input.py
++++ b/nemo_rl/algorithms/loss/loss_input.py
+@@ -14,6 +14,7 @@
+ 
+ """Builds the loss-function input dict from model logits."""
+ 
++import os
+ from typing import TYPE_CHECKING, Any, Optional
+ 
+ import torch
+@@ -197,6 +198,28 @@ def _prepare_opd_full_loss_input(
+     return loss_input
+ 
+ 
++@torch.no_grad()
++def _token_entropy(
++    logits: torch.Tensor,
++    vocab_parallel_group: Optional[torch.distributed.ProcessGroup],
++    chunk_size: int = 256,
++) -> torch.Tensor:
++    """CHONK_BENCHMARK: [B, S] entropy -sum_v p log p of next-token logits."""
++    if (
++        vocab_parallel_group is not None
++        and torch.distributed.get_world_size(vocab_parallel_group) > 1
++    ):
++        # ChunkedDistributedEntropy returns sum_v p log p (the negative entropy).
++        return -ChunkedDistributedEntropy.apply(  # type: ignore[misc]
++            logits, chunk_size, vocab_parallel_group, True
++        )
++    out = []
++    for s0 in range(0, logits.shape[1], chunk_size):
++        log_p = torch.log_softmax(logits[:, s0 : s0 + chunk_size].float(), dim=-1)
++        out.append(-(log_p.exp() * log_p).sum(dim=-1))
++    return torch.cat(out, dim=1)
++
++
+ def prepare_loss_input(
+     logits: torch.Tensor,
+     data: BatchedDataDict[Any],
+@@ -292,6 +315,13 @@ def prepare_loss_input(
+                     cp_sharder=cp_sharder,
+                 )
+ 
++        # CHONK_BENCHMARK: exact per-token entropy of the current policy for the
++        # Verl-comparable actor/entropy metric (opt-in, metric only, no grad).
++        if os.environ.get("NRL_LOG_TOKEN_ENTROPY") == "1" and logits.dim() == 3:
++            data["token_entropy"] = _token_entropy(
++                logits[:, : data["input_ids"].shape[1] - 1], vocab_parallel_group
++            )
++
+         loss_input = {"next_token_logprobs": logprobs}
+ 
+     elif loss_fn.input_type == LossInputType.OPD_FULL:
+diff --git a/nemo_rl/models/generation/megatron/megatron_generation.py b/nemo_rl/models/generation/megatron/megatron_generation.py
+index 5b4e6fd..5795338 100644
+--- a/nemo_rl/models/generation/megatron/megatron_generation.py
++++ b/nemo_rl/models/generation/megatron/megatron_generation.py
+@@ -600,6 +600,22 @@ class MegatronGeneration(GenerationInterface):
+             result_batch["gen_leader_worker_idx"] = [0]
+             yield index, result_batch
+ 
++    def set_generation_sampling(
++        self, temperature: float, top_p: float, top_k: Optional[int]
++    ) -> None:
++        """CHONK_BENCHMARK: switch every generation worker's sampling profile.
++
++        Requests are built on worker 0 from its config, read per request, so
++        validation can sample with its own temperature / top-p / top-k.
++        """
++        futures = self._policy.worker_group.run_all_workers_single_data(
++            "set_generation_sampling",
++            temperature=temperature,
++            top_p=top_p,
++            top_k=top_k,
++        )
++        ray.get(futures)
++
+     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+         """Initialize / re-enter inference mode on every worker.
+ 
+diff --git a/nemo_rl/models/generation/megatron/megatron_worker.py b/nemo_rl/models/generation/megatron/megatron_worker.py
+index b55954a..f36db40 100644
+--- a/nemo_rl/models/generation/megatron/megatron_worker.py
++++ b/nemo_rl/models/generation/megatron/megatron_worker.py
+@@ -972,6 +972,15 @@ class MegatronGenerationMixin:
+         """Return this worker's OpenAI server base URL (None if not the leader)."""
+         return self.base_url
+ 
++    def set_generation_sampling(
++        self, temperature: float, top_p: float, top_k: Optional[int]
++    ) -> None:
++        """CHONK_BENCHMARK: sampling profile for subsequent requests (validation)."""
++        gen_cfg = self.cfg["generation"]
++        gen_cfg["temperature"] = temperature
++        gen_cfg["top_p"] = top_p
++        gen_cfg["top_k"] = top_k
++
+     def _build_sampling_params(
+         self,
+         greedy: bool,

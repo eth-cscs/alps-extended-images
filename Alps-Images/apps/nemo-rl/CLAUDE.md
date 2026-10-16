@@ -1088,3 +1088,34 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - Native nccl4py m2n reshard (faster in NeMo-RL's numbers) needs NCCL symmetric memory over the
   network, not available with the Slingshot OFI plugin here (run `3673870`): a CSCS / NVIDIA
   question, not a launcher change.
+
+## Benchmark copy for a Verl comparison — 2026-10-16 (user request)
+
+- `example/train-gsm8k-chonk-megatron-gen-benchmark.sh`: the repo script plus the user's
+  benchmark settings: 92 steps, 48 prompts x 16, seed 42, LR 1e-6, weight decay 0.01 (optimizer
+  and scheduler start/end), train T 1.0 / top-p 1.0, validation T 0.6 / top-p 0.95 on the GSM8K
+  test split (1319 prompts, one batch) at steps 0 / 46 / 92. Own checkout `src-v7bench`, normal
+  partition, 8 h limit.
+- Choices not in the request, as env knobs: `LR_DECAY_STYLE=constant`, `LR_WARMUP_ITERS=0` (Verl
+  default; NeMo-RL ticks the scheduler once per GRPO step, so the recipe's 60-iteration warm-up
+  would span 60 of the 92 steps); `MATRIX_LR` 5e-5 / `GAINS_LR` 2e-6 (author's md_decoupling
+  values; `LR` is only the base rate); `TRAIN_GLOBAL_BATCH` 128 (6 optimizer steps per GRPO
+  step); `MAX_NEW_TOKENS` 256.
+- `example/patches/nemo-rl-benchmark-metrics.patch` (5 files, +253, benchmark copy only):
+  - validation sampling: vanilla `validate()` honours `val_temperature`/`val_top_p`/`val_top_k`
+    only on the NeMo-Gym path; the plain rollout path sampled with the training profile. Adds
+    `set_generation_sampling()` on `MegatronGeneration` + worker mixin, switched around the
+    validation loop.
+  - loss metrics: exact token entropy (`NRL_LOG_TOKEN_ENTROPY=1`, from the full logits in
+    `prepare_loss_input`, checked against `torch.distributions.Categorical`), `pg_clipfrac`,
+    `ppo_kl` (k1).
+  - Verl-named copies: `critic/{score,rewards,advantages,returns}/*`,
+    `{response,prompt}_length/{mean,max,min,clip_ratio}`, `actor/{entropy,pg_loss,pg_clipfrac,
+    ppo_kl,kl_loss,kl_coef,grad_norm,lr}`, `training/rollout_probs_diff_{max,mean,std}`,
+    `perf/{total_num_tokens,time_per_step,throughput}`, `timing_s/*`,
+    `training/{global_step,epoch}`, `val-core/openai/gsm8k/reward/mean@1`.
+- **Aggregation caveat (NeMo-RL)**: token-normalized loss metrics (`train/gen_kl_error`,
+  `approx_entropy`, ...) are summed over the optimizer batches of a step (each normalized by its
+  own token count), so NeMo-RL's own `train/*` values are N x the per-batch mean (N = 6 here); the
+  Verl-named `actor/*` copies divide by N. `actor/grad_norm` is the last optimizer step's norm
+  (Verl averages over mini-batches).
