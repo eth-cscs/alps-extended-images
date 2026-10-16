@@ -1,0 +1,6 @@
+devtools==0.12.2
+yappi==1.6.10
+gprof2dot==2025.4.14
+pydot==4.0.1
+anthropic==0.109.2
+mcp==1.28.0
