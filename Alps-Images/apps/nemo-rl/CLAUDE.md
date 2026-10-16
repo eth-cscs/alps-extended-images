@@ -1029,3 +1029,19 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
 - **Steps**: reward 0.62 0.58 0.64 0.67 (Adam run `3669709`: 0.61 0.55 0.61 0.68); printed gen-KL
   0.022-0.095; loss 0.017 -0.090 -0.072 0.041; mean generation length 83-86 tokens. Native refit
   16.8-17.1 s (same as with 32 trainer GPUs); step time 67-74 s after step 1 (360 s).
+
+### Run `3673498` — 2026-10-16 — md_decoupling, 32 nodes, repo script: 20/20 steps
+
+- **Setup**: repo `fe2ae00` unchanged (+ `preemptable`, 20 steps), own checkout `src-v7`. Ran
+  alongside `3673499`.
+- **Steps 1-20**: reward 0.58 0.60 0.63 0.68 0.66 0.60 0.64 0.65 0.53 0.71 0.64 0.66 0.59 0.70 0.62
+  0.72 0.63 0.67 0.66 0.64 (Adam run `3667575`, 20 steps: 0.58-0.79, mean of the last 10 ~0.70).
+  Loss within +-0.11; mean generation length 77-101 tokens. Native refit 16.0-17.3 s; step time
+  55-76 s after step 1 (362 s).
+- **Printed gen-KL**: 0.02-0.09 on 17 of 20 steps, with one-step spikes at step 6 (0.227), 11 (0.175)
+  and 19 (1.227), each back to baseline the next step (Adam 20-step run: 0.019-0.11, no spike above
+  0.11). Not cumulative, so not a stale or missing refit weight (that would grow step over step).
+  Likely the out-of-nucleus term: the metric averages k3 over ~22k tokens, a sampled token outside
+  the trainer's nucleus counts with trainer log-prob 0, contributing ~exp(|generator log-prob|);
+  one token at -10 (near-flat distribution) adds ~1.0. Masked from the loss (loss and reward
+  normal on those steps). Unverified: the per-token values are only in wandb.
