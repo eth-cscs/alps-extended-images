@@ -1045,3 +1045,21 @@ Also wanted back (user, 2026-10-09), not strictly a final-run blocker:
   the trainer's nucleus counts with trainer log-prob 0, contributing ~exp(|generator log-prob|);
   one token at -10 (near-flat distribution) adds ~1.0. Masked from the loss (loss and reward
   normal on those steps). Unverified: the per-token values are only in wandb.
+
+### Runs `3673499` / `3673870` — 2026-10-16 — `refit_transport: nccl_reshard`: plan builds, native m2n reshard fails on Slingshot
+
+- **Setup**: submitted copy of `fe2ae00` + memory diagnostics, 32 nodes, 4 steps, md_decoupling,
+  only `refit_transport: nccl_reshard` changed.
+- **`3673499`**: rejected at setup: `mcore_generation_config.refit_backend` must be unset unless
+  `refit_transport` is `mcore` (`megatron_generation.py`). Removed in the copy.
+- **`3673870`**: the reshard plan builds on every trainer rank: `[xferd-payload] ffn_only
+  nccl_reshard=193.42GiB bcast_misc=8.24GiB total=201.67GiB xfer_frac=95.9%` (Chonk's
+  `mlp.experts.*.{gate,up,down}_proj.weight` names match the bulk path; shared experts, KDA,
+  latent projections, router, embeddings take the packed-broadcast misc path). The first transfer
+  (setup-time sync) fails on all 128 ranks in `nccl.m2n.reshard`: `NCCLReshardError ... ncclDevCommCreate
+  ... failed: invalid usage`, preceded by 128x `NCCL WARN Communicator does not support symmetric
+  memory!` (NCCL 2.30.7). The native m2n reshard uses NCCL's device API, which needs symmetric memory;
+  the cross-node communicator over the Slingshot OFI plugin does not provide it.
+- **Next**: `NRL_XFERDTENSOR_PYTHON=1` selects NeMo-RL's pure-Python xferdtensor (exact shard
+  overlaps, batched P2P with striped receives, cached split-communicator broadcasts to replicas),
+  plain NCCL point-to-point and broadcast only.
