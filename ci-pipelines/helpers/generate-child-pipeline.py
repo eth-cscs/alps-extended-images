@@ -163,9 +163,8 @@ def base_env(family: str, name: str, variant: str) -> dict[str, str]:
 def app_env(app: str, variant: str) -> dict[str, str]:
     """Return generated-job variables for one app variant."""
     data = helper_env("write_app_build_env", app, variant)
-    # App variants are accelerator-family names today; validate_app_variant_name
-    # in meta.sh keeps them safe as generated-job metadata keys.
-    data.update({"FAMILY": variant, "NAME": app, "VARIANT": variant})
+    # The selected base determines the accelerator family, not the target name.
+    data.update({"NAME": app, "VARIANT": variant})
     return data
 
 
@@ -243,7 +242,7 @@ BASE_TEST_KINDS_BY_FAMILY = {
 
 APP_TEST_KINDS = {"custom", "cuda-vetnode"}
 APP_TEST_RUNNERS = {"cuda", "rocm"}
-APP_CUDA_VETNODE_KEYS = {"name", "kind"}
+APP_CUDA_VETNODE_KEYS = {"name", "kind", "runner"}
 
 
 def require_mapping(value: Any, context: str) -> dict[str, Any]:
@@ -297,7 +296,7 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
             if kind not in APP_TEST_KINDS:
                 raise RuntimeError(f"{path}: unsupported app test kind: {kind}")
             if kind == "cuda-vetnode":
-                if variant != "cuda":
+                if str(item.get("runner", variant)) != "cuda":
                     raise RuntimeError(f"{path}: cuda-vetnode is only supported for cuda app tests")
                 extra_keys = set(item) - APP_CUDA_VETNODE_KEYS
                 if extra_keys:
@@ -398,11 +397,13 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], va
 
 def add_app_test(child: Child, app: dict[str, str], test: dict[str, Any], needs: list[str]) -> str:
     """Emit one generated app test job and return its name."""
-    prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
+    prefix = slug(f"app-{app['NAME']}-{app['VARIANT']}")
     name = f"test-{prefix}-{slug(str(test['name']))}"
     kind = str(test.get("kind", "custom"))
     runner = str(test.get("runner", app["FAMILY"]))
     if kind == "cuda-vetnode":
+        if app["FAMILY"] != "cuda":
+            raise RuntimeError("cuda-vetnode requires a CUDA base image")
         child.add_job(name, ".child-cuda-app-vetnode-test-template", image=app["CANON_IMAGE_REF"], needs=needs)
         return name
     template = ".child-rocm-custom-test-template" if runner == "rocm" else ".child-cuda-custom-test-template"
@@ -425,11 +426,11 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
     App builds depend on base validation, not just base build completion. This
     keeps app images from being built on top of an untested base digest.
     """
-    prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
+    prefix = slug(f"app-{app['NAME']}-{app['VARIANT']}")
     base_ref = app["BASE_IMAGE"]
     base_needs = [base_marks[base_ref]] if base_marks.get(base_ref) else []
     if not base_valid.get(base_ref, False) and base_ref not in base_marks:
-        raise RuntimeError(f"base metadata missing for {app['NAME']}/{app['FAMILY']}: {base_ref}")
+        raise RuntimeError(f"base metadata missing for {app['NAME']}/{app['VARIANT']}: {base_ref}")
 
     valid = tested_marker_matches_existing_canonical(app["CANON_IMAGE_REF"], app["TESTED_IMAGE_REF"])
     if valid:
@@ -455,7 +456,7 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
         )
 
     if not tests:
-        raise RuntimeError(f"no tests declared for {app['NAME']}/{app['FAMILY']}")
+        raise RuntimeError(f"no tests declared for {app['NAME']}/{app['VARIANT']}")
     test_needs = [build_job] if build_job else base_needs
     test_jobs = [add_app_test(child, app, test, test_needs) for test in tests]
     mark = f"mark-{prefix}-tested"
