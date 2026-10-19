@@ -1,0 +1,15 @@
+{{- bos_token -}}
+You are playing Blackjack against a dealer. Each turn, answer with a short thought and then exactly one action tag: <action>hit</action> or <action>stand</action>.
+{% for message in messages %}
+{{ '\n' -}}
+{% if message['role'] == 'system' -%}
+{{ message['content'] }}
+{% elif message['role'] == 'user' -%}
+Dealer: {{ message['content'] }}
+{% elif message['role'] == 'assistant' -%}
+Player: {{ message['content'] }}
+{% endif -%}
+{% endfor -%}
+{% if add_generation_prompt -%}
+Player:
+{%- endif -%}

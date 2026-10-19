@@ -12,6 +12,7 @@
 set -Eeuo pipefail
 
 EXAMPLE_DIR="${EXAMPLE_DIR:-${SLURM_SUBMIT_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}}"
+GYM_ENV="${GYM_ENV:-math}"
 NEMO_RL_SOURCE="${NEMO_RL_SOURCE:-https://github.com/swiss-ai/Nemo-RL.git}"
 NEMO_GYM_SOURCE="${NEMO_GYM_SOURCE:-https://github.com/swiss-ai/nemo-gym.git}"
 NEMO_GYM_REF="${NEMO_GYM_REF:-93f232f02074deda2fec13a6848f22e5dca741f5}"
@@ -31,7 +32,8 @@ usage() {
         'Or: bash train-chonk.sh [sbatch options, e.g. --time 02:00:00]' \
         'NEMO_RL_SOURCE, NEMO_GYM_SOURCE, BRIDGE_SOURCE and MEGATRON_SOURCE accept local paths or Git URLs.' \
         'Overrides: NEMO_RL_ENVIRONMENT, HF_MODEL, MAX_NUM_STEPS, TRAIN_MICRO_BATCH,' \
-        'INFERENCE_REQUESTS, NUM_PROMPTS, NRL_MEGATRON_CHECKPOINT_DIR, CHONK_RUN_ROOT.'
+        'INFERENCE_REQUESTS, NUM_PROMPTS, NRL_MEGATRON_CHECKPOINT_DIR, CHONK_RUN_ROOT,' \
+        'GYM_ENV (math|blackjack), GYM_URL, GYM_CONFIG, GYM_TRAIN_DATA, GYM_CHAT_TEMPLATE_FILE.'
 }
 if [[ "${1:-}" == -h || "${1:-}" == --help ]]; then
     usage
@@ -46,7 +48,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     mkdir -p "$RUN_ROOT"
     exec sbatch \
         --output="$RUN_ROOT/slurm-%j.out" \
-        --export=ALL,EXAMPLE_DIR="$EXAMPLE_DIR",NEMO_RL_SOURCE="$NEMO_RL_SOURCE",BRIDGE_SOURCE="$BRIDGE_SOURCE",MEGATRON_SOURCE="$MEGATRON_SOURCE",HF_MODEL="$HF_MODEL",NEMO_RL_ENVIRONMENT="$ENV_FILE",CHONK_RUN_ROOT="$RUN_ROOT" \
+        --export=ALL,EXAMPLE_DIR="$EXAMPLE_DIR",NEMO_RL_SOURCE="$NEMO_RL_SOURCE",BRIDGE_SOURCE="$BRIDGE_SOURCE",MEGATRON_SOURCE="$MEGATRON_SOURCE",HF_MODEL="$HF_MODEL",NEMO_RL_ENVIRONMENT="$ENV_FILE",CHONK_RUN_ROOT="$RUN_ROOT",GYM_ENV="$GYM_ENV" \
         "$@" "$EXAMPLE_DIR/train-chonk.sh"
 fi
 
@@ -154,9 +156,18 @@ if [[ "${1:-}" != server && "${1:-}" != driver ]]; then
     NRL_MEGATRON_CHECKPOINT_DIR="${NRL_MEGATRON_CHECKPOINT_DIR:-$RUN_DIR/hf-import}"
 
     export RUN_DIR EXAMPLE_DIR HF_MODEL
-    export GYM_MATH_URL="${GYM_MATH_URL:-https://gym-dev.swissai.svc.cscs.ch/math_with_judge}"
-    export GYM_TRAIN_DATA="${GYM_TRAIN_DATA:-$EXAMPLE_DIR/math-smoke.jsonl}"
-    GYM_CHAT_TEMPLATE="$(< "$EXAMPLE_DIR/math-chat-template.jinja")"
+    # GYM_ENV selects the remote environment: gym-$GYM_ENV.yaml (Gym config),
+    # $GYM_ENV-smoke.jsonl (dataset) and $GYM_ENV-chat-template.jinja.
+    # The rl-gym Argo CD project serves both on the CSCS TDS cluster.
+    case "$GYM_ENV" in
+        math) gym_default_url="https://gym-math.shared-int-tds.tds.cscs.ch" ;;
+        blackjack) gym_default_url="https://gym-blackjack.shared-int-tds.tds.cscs.ch" ;;
+        *) echo "Unknown GYM_ENV '$GYM_ENV' (expected math or blackjack)." >&2; exit 2 ;;
+    esac
+    export GYM_URL="${GYM_URL:-$gym_default_url}"
+    export GYM_CONFIG="${GYM_CONFIG:-$EXAMPLE_DIR/gym-$GYM_ENV.yaml}"
+    export GYM_TRAIN_DATA="${GYM_TRAIN_DATA:-$EXAMPLE_DIR/$GYM_ENV-smoke.jsonl}"
+    GYM_CHAT_TEMPLATE="$(< "${GYM_CHAT_TEMPLATE_FILE:-$EXAMPLE_DIR/$GYM_ENV-chat-template.jinja}")"
     export GYM_CHAT_TEMPLATE
     export NEMO_RL_PATH="$RUN_DIR/sources/nemo-rl"
     export MEGATRON_BRIDGE_PATH="$RUN_DIR/sources/bridge/src"
@@ -225,7 +236,7 @@ if [[ "${1:-}" == server ]]; then
     fi
     ray "${args[@]}"
     if [[ "$SLURM_PROCID" == 0 ]]; then
-        curl --fail --silent --show-error --max-time 15 "$GYM_MATH_URL/" \
+        curl --fail --silent --show-error --max-time 15 "$GYM_URL/" \
             > "$RUN_DIR/gym-health.json"
         # The driver must share the head's container-local Raylet socket.
         set +e

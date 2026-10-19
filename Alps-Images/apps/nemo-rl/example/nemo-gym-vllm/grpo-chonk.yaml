@@ -5,7 +5,8 @@ cluster:
   num_nodes: ${oc.decode:${oc.env:TOTAL_NODES}}
   gpus_per_node: 4
 
-# Synchronous GRPO with vLLM generation and remote NeMo Gym math verification.
+# Synchronous GRPO with vLLM generation and a remote NeMo Gym environment
+# (math verifier or blackjack, selected by GYM_ENV in the launcher).
 grpo:
   async_grpo:
     enabled: false
@@ -180,7 +181,7 @@ env:
   nemo_gym:
     config_paths:
       - ${oc.env:NEMO_GYM_PATH}/responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-      - ${oc.env:EXAMPLE_DIR}/gym-math.yaml
+      - ${oc.env:GYM_CONFIG}
 
 data:
   max_input_seq_length: 900

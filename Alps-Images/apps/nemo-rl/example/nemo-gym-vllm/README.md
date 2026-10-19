@@ -1,9 +1,11 @@
 # Chonk GRPO with NeMo Gym
 
 This example uses Megatron training, async vLLM generation and packed NCCL
-weight updates. A remote NeMo Gym server verifies the math answers.
-The job starts its own Gym head, agent and policy adapter. It does not start
-a local math verifier.
+weight updates. A remote NeMo Gym resources server, running on the CSCS TDS
+Kubernetes cluster (Argo CD project `rl-gym`), provides the environment:
+`math` (stateless answer verification, default) or `blackjack` (stateful
+multi-turn Gymnasium-style game). The job starts its own Gym head, agent and
+policy adapter. It does not start a local resources server.
 
 ## Run
 
@@ -14,13 +16,19 @@ cd nemo-gym-vllm
 sbatch train-chonk.sh
 ```
 
-No environment variables are required for the default setup.
+No environment variables are required for the default (math) setup. For the
+blackjack environment:
+
+```bash
+GYM_ENV=blackjack sbatch train-chonk.sh
+```
 
 - Account: `csstaff`; partition: `normal`; time limit: two hours.
 - Training: 16 nodes. Generation: 8 nodes. Each node has 4 GPUs.
 - Two GRPO iterations, each with 32 questions and 8 responses per question.
 - Shared container environment: `../environment.toml`.
-- Math verifier: `https://gym-dev.swissai.svc.cscs.ch/math_with_judge`.
+- Math verifier: `https://gym-math.shared-int-tds.tds.cscs.ch`.
+- Blackjack environment: `https://gym-blackjack.shared-int-tds.tds.cscs.ch`.
 
 Check that the partition is available before submission. See the
 [parent README](../README.md) for training settings. The
@@ -41,6 +49,13 @@ The launcher loads `math-chat-template.jinja` for policy tokenization and HTTP
 serving. The template asks for a short solution and a boxed final answer.
 The verifier uses math verification, not an LLM judge.
 
+`blackjack-smoke.jsonl` holds 128 identical rows (system prompt and "Deal me
+in."); every reset deals a fresh random hand on the server. The
+`gymnasium_agent` plays up to four turns per episode, threading the session
+cookies so each step reaches the pod that holds the hand. Reward is +1, 0 or
+-1 per hand. `blackjack-chat-template.jinja` renders the multi-turn
+transcript for the base model.
+
 ## Environment overrides
 
 Set `MAX_NUM_STEPS` to change the maximum number of GRPO iterations
@@ -56,8 +71,11 @@ batch, container and output settings. This example also accepts:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GYM_MATH_URL` | Math verifier URL shown above | Remote math resources server. |
-| `GYM_TRAIN_DATA` | `$EXAMPLE_DIR/math-smoke.jsonl` | Gym-format training dataset. |
+| `GYM_ENV` | `math` | Environment: `math` or `blackjack`. Selects `gym-$GYM_ENV.yaml`, `$GYM_ENV-smoke.jsonl` and `$GYM_ENV-chat-template.jinja`. |
+| `GYM_URL` | URL for `GYM_ENV` shown above | Remote resources server (no path, no trailing slash). |
+| `GYM_CONFIG` | `$EXAMPLE_DIR/gym-$GYM_ENV.yaml` | Gym config with the remote server and agent. |
+| `GYM_CHAT_TEMPLATE_FILE` | `$EXAMPLE_DIR/$GYM_ENV-chat-template.jinja` | Chat template file. |
+| `GYM_TRAIN_DATA` | `$EXAMPLE_DIR/$GYM_ENV-smoke.jsonl` | Gym-format training dataset. |
 | `NEMO_GYM_SOURCE` | `https://github.com/swiss-ai/nemo-gym.git` | Gym Git URL or local checkout. |
 | `NEMO_GYM_REF` | Pinned revision in the launcher | Gym revision. Use matching client dependencies. |
 
@@ -76,7 +94,8 @@ Slurm's `--output` option selects the log file.
 Run this command on a compute node. The gateway restricts access by source.
 
 ```bash
-curl --fail --max-time 15 https://gym-dev.swissai.svc.cscs.ch/math_with_judge/
+curl --fail --max-time 15 https://gym-math.shared-int-tds.tds.cscs.ch/
+curl --fail --max-time 15 https://gym-blackjack.shared-int-tds.tds.cscs.ch/
 ```
 
 ## Test result

@@ -1,0 +1,29 @@
+# Remote blackjack environment (stateful, Gymnasium-style reset/step).
+# `url` marks the resources server as remote: the launcher skips spawning it
+# and the agent talks to it over HTTPS. The server keeps the episode in pod
+# memory keyed by a session cookie; the gymnasium agent threads the cookies
+# from reset to every step, which also carries the ingress affinity cookie.
+blackjack:
+  resources_servers:
+    blackjack:
+      entrypoint: app.py
+      url: ${oc.env:GYM_URL}
+      host: gym-blackjack.shared-int-tds.tds.cscs.ch
+      port: 443
+      domain: games
+      verified: false
+      description: Blackjack. Model hits or stands. Reward +1 win, 0 draw, -1 loss/bust.
+
+blackjack_gymnasium_agent:
+  responses_api_agents:
+    gymnasium_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: blackjack
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      # A hand ends after a few hits; keep the multi-turn transcript inside
+      # policy.max_total_sequence_length (1280) with max_new_tokens 256.
+      max_steps: 4
