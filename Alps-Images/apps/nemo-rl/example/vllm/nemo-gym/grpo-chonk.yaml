@@ -5,19 +5,22 @@ cluster:
   num_nodes: ${oc.decode:${oc.env:TOTAL_NODES}}
   gpus_per_node: 4
 
-# Synchronous GRPO with Megatron training and asynchronous vLLM generation.
+# Synchronous GRPO with vLLM generation and a remote NeMo Gym environment
+# (math verifier or blackjack, selected by GYM_ENV in the launcher).
 grpo:
+  seed: 42
   async_grpo:
     enabled: false
   max_num_steps: ${oc.decode:${oc.env:MAX_NUM_STEPS}}
   max_num_epochs: 6
   num_prompts_per_step: ${oc.decode:${oc.env:NUM_PROMPTS}}
-  num_generations_per_prompt: 8
+  num_generations_per_prompt: ${oc.decode:${oc.env:GENERATIONS_PER_PROMPT}}
   normalize_rewards: true
   use_leave_one_out_baseline: true
   advantage_clip_low: -5.0
   advantage_clip_high: 5.0
-  val_period: 0
+  max_val_samples: null
+  val_period: ${oc.decode:${oc.env:GYM_VAL_PERIOD,0}}
   val_at_start: false
   val_at_end: false
 
@@ -31,7 +34,7 @@ policy:
   model_name: ${oc.env:HF_MODEL}
   tokenizer:
     name: ${oc.env:HF_MODEL}
-    chat_template: "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"
+    chat_template: ${oc.env:GYM_CHAT_TEMPLATE}
   precision: bfloat16
   train_global_batch_size: ${oc.decode:${oc.env:TRAIN_GLOBAL_BATCH}}
   train_micro_batch_size: ${oc.decode:${oc.env:TRAIN_MICRO_BATCH}}
@@ -57,9 +60,8 @@ policy:
     activation_checkpointing: false
     gradient_accumulation_fusion: true
     cuda_graph_impl: none
-    freeze_moe_router: true
+    freeze_moe_router: true  # Router weights.
     moe_router_load_balancing_type: quantile_balancing
-    moe_router_quantile_balancing_freeze: true
     moe_router_dtype: fp32
     moe_router_bias_update_rate: 0.0
     moe_token_dispatcher_type: flex
@@ -78,6 +80,7 @@ policy:
       NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
       NRL_REFIT_NUM_BUFFERS: "1"
     model_overrides:
+      moe_router_quantile_balancing_freeze: true  # qb_beta.
       pipeline_model_parallel_layout: null
       virtual_pipeline_model_parallel_size: null
       overlap_moe_expert_parallel_comm: false
@@ -146,9 +149,11 @@ policy:
     backend: vllm
     temperature: 1.0
     top_p: 0.9
-    top_k: -1
+    top_k: null
+    val_top_k: ${.top_k}
     max_new_tokens: 256
-    stop_strings: ["Question:", "</s>", "<|im_end|>"]
+    stop_strings: null
+    stop_token_ids: null
     colocated:
       enabled: false
       resources:
@@ -157,6 +162,9 @@ policy:
     refit_transport: null
     vllm_cfg:
       async_engine: true
+      expose_http_server: true
+      http_server_serving_chat_kwargs:
+        chat_template: ${policy.tokenizer.chat_template}
       precision: ${policy.precision}
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
@@ -168,19 +176,30 @@ policy:
     vllm_kwargs:
       all2all_backend: allgather_reducescatter
 
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    config_paths:
+      - ${oc.env:NEMO_GYM_PATH}/responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - ${oc.env:GYM_CONFIG}
+
 data:
   max_input_seq_length: 900
   shuffle: true
   num_workers: 1
   train:
-    dataset_name: gsm8k
-    split_validation_size: 0.0
-  validation: null
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:GYM_TRAIN_DATA}
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: ${oc.env:GYM_VAL_DATA}
   default:
-    prompt_file: ${oc.env:EXAMPLE_DIR}/gsm8k-five-shot.txt
+    dataset_name: NemoGymDataset
+    prompt_file: null
     system_prompt_file: null
-    processor: math_hf_data_processor
-    env_name: math
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -194,6 +213,9 @@ loss_fn:
 
 logger:
   log_dir: ${oc.env:RUN_DIR}/nemo-rl-logs
-  wandb_enabled: false
+  wandb_enabled: ${oc.decode:${oc.env:WANDB_ENABLED,false}}
+  wandb:
+    project: ${oc.env:WANDB_PROJECT,chonk-grpo}
+    name: ${oc.env:WANDB_NAME,chonk-${oc.env:SLURM_JOB_ID,local}}
   tensorboard_enabled: false
   num_val_samples_to_print: 8

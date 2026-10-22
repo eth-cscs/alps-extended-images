@@ -1,0 +1,166 @@
+# Adapted from swiss-ai/rl-infra@8ff6156fd2bf324f409c3cb8f33c00ea26cd9990:
+# Common settings for its four Chonk recipes, plus envs/gsm8k.yaml.
+defaults: ${oc.env:NEMO_RL_PATH}/examples/configs/grpo_math_1B.yaml
+
+cluster:
+  num_nodes: ${oc.decode:${oc.env:TOTAL_NODES}}
+  gpus_per_node: 4
+
+grpo:
+  seed: 42
+  num_prompts_per_step: ${oc.decode:${oc.env:NUM_PROMPTS}}
+  num_generations_per_prompt: ${oc.decode:${oc.env:GENERATIONS_PER_PROMPT}}
+  max_num_steps: ${oc.decode:${oc.env:MAX_NUM_STEPS}}
+  # This cap permits the requested steps even when a step needs a new data epoch.
+  max_num_epochs: ${grpo.max_num_steps}
+  val_period: ${oc.decode:${oc.env:GSM8K_VAL_PERIOD,20}}
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 1319
+  val_batch_size: 1319
+  use_leave_one_out_baseline: false
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  ratio_clip_c: 3.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2.0
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:RUN_DIR}/checkpoints
+  save_period: 1000
+  keep_top_k: 1
+  checkpoint_must_save_by: "00:04:40:00"
+  save_optimizer: false
+
+policy:
+  model_name: ${oc.env:HF_MODEL}
+  tokenizer:
+    chat_template: "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"
+  optimizer: null
+  scheduler: null
+  train_global_batch_size: ${oc.decode:${oc.env:TRAIN_GLOBAL_BATCH}}
+  train_micro_batch_size: ${oc.decode:${oc.env:TRAIN_MICRO_BATCH}}
+  generation_batch_size: ${oc.decode:${oc.env:INFERENCE_REQUESTS}}
+  logprob_batch_size: 1
+  offload_optimizer_for_logprob: ${oc.decode:${oc.env:OFFLOAD_OPTIMIZER_FOR_LOGPROB}}
+  max_total_sequence_length: 2048
+  make_sequence_length_divisible_by: 2
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    enabled: true
+    train_mb_tokens: ${oc.decode:${oc.env:TRAIN_MB_TOKENS}}
+    logprob_mb_tokens: ${oc.decode:${oc.env:LOGPROB_MB_TOKENS}}
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: ${oc.decode:${oc.env:TRAIN_EXPERT_PARALLEL_SIZE}}
+    expert_tensor_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    gradient_accumulation_fusion: true
+    apply_rope_fusion: false
+    moe_router_load_balancing_type: quantile_balancing
+    moe_router_dtype: fp32
+    moe_router_bias_update_rate: 0.0
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: deepep
+    moe_enable_deepep: true
+    moe_permute_fusion: true
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: "1"
+      UCCL_EP_TRANSPORT: cxi
+      UCCL_EP_DISPATCH_CONFIG: "24,40,512,32,512"
+      UCCL_EP_COMBINE_CONFIG: ${oc.env:UCCL_EP_COMBINE_CONFIG}
+      UCCL_EP_CPU_TIMEOUT_SECS: "1200"
+      NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+      NRL_REFIT_NUM_BUFFERS: "1"
+      CUDA_ENABLE_COREDUMP_ON_EXCEPTION: "1"
+      CUDA_COREDUMP_GENERATION_FLAGS: skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_abort
+      CUDA_COREDUMP_FILE: ${logger.log_dir}/core_%h_%p
+      NCCL_DEBUG: WARN
+      TORCH_SHOW_CPP_STACKTRACES: "1"
+      TORCH_NCCL_TRACE_BUFFER_SIZE: "2000"
+      TORCH_NCCL_DUMP_ON_TIMEOUT: "1"
+      TORCH_FR_DUMP_TEMP_FILE: ${logger.log_dir}/fr-rank
+      TORCH_NCCL_DEBUG_INFO_TEMP_FILE: ${logger.log_dir}/fr-rank
+      NRL_LOG_LEVEL: DEBUG
+    model_overrides:
+      moe_router_quantile_balancing_freeze: true
+    checkpoint:
+      async_save: false
+      save: ${oc.env:RUN_DIR}/megatron-save
+    optimizer:
+      optimizer: ${oc.env:OPTIMIZER_NAME}
+      lr: ${oc.decode:${oc.env:BASE_LR}}
+      min_lr: ${oc.decode:${oc.env:MIN_LR}}
+      min_lr_mode: absolute
+      matrix_lr: ${oc.decode:${oc.env:MATRIX_LR,null}}
+      gains_lr: ${oc.decode:${oc.env:GAINS_LR,null}}
+      weight_decay: ${oc.decode:${oc.env:WEIGHT_DECAY}}
+      adam_beta2: ${oc.decode:${oc.env:ADAM_BETA2}}
+      optimizer_cpu_offload: ${oc.decode:${oc.env:OPTIMIZER_CPU_OFFLOAD}}
+      optimizer_offload_fraction: ${oc.decode:${oc.env:OPTIMIZER_OFFLOAD_FRACTION}}
+      use_distributed_optimizer: ${oc.decode:${oc.env:DISTRIBUTED_OPTIMIZER}}
+      use_layer_wise_distributed_optimizer: ${oc.decode:${oc.env:LAYER_WISE_OPTIMIZER}}
+      use_precision_aware_optimizer: ${oc.decode:${oc.env:PRECISION_AWARE_OPTIMIZER}}
+      hypersphere_preserve_init: ${oc.decode:${oc.env:HYPERSPHERE_PRESERVE_INIT}}
+      hypersphere_mode: row
+      hypersphere_embedding_mode: row
+      hypersphere_router_mode: row
+      hypersphere_radius_mode: fan_in
+      hypersphere_gains_mode: rowcol
+      hypersphere_gains_mode_router: rowcol
+      hypersphere_gains_mode_embedding: none
+      gain_parametrization: softplus
+      use_orthogonal_updates: true
+      muon_coefficient_type: polar_express
+      muon_scale_mode: shape_up
+      muon_router_scale_mode: none
+      muon_momentum: 0.95
+      muon_use_nesterov: true
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 0.0
+    distributed_data_parallel_config:
+      grad_reduce_in_fp32: true
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+  generation:
+    max_new_tokens: 2048
+    stop_strings: ["Question:"]
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: ${oc.decode:${oc.env:INFERENCE_NODES}}
+        gpus_per_node: 4
+
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: gsm8k
+    split_validation_size: 0.0
+  validation:
+    dataset_name: gsm8k
+    split: test
+  default:
+    prompt_file: ${oc.env:CHONK_EXAMPLES_DIR}/common/gsm8k-five-shot.txt
+    processor: math_hf_data_processor
+    env_name: math
+
+logger:
+  log_dir: ${oc.env:RUN_DIR}/nemo-rl-logs
+  tensorboard_enabled: true
+  wandb_enabled: ${oc.decode:${oc.env:WANDB_ENABLED,false}}
+  wandb:
+    project: ${oc.env:WANDB_PROJECT,chonk-grpo}
+    name: ${oc.env:WANDB_NAME,chonk-${oc.env:SLURM_JOB_ID,local}}

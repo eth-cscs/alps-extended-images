@@ -1,6 +1,5 @@
-# [2026-10-07T11:30] User-selected new PR64 image; registry verified linux/arm64.
-# Manifest digest sha256:6dc3748ee1e86d4eefe2265083a4a69d33b0e6da6a2f776743962c94421ab386.
-image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-cfcfede4262bfb99f4659aad30992344"
+# User-selected NeMo-RL runtime image.
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev-f7c5d1951b16c7fd04fb05238260b3bc"
 mounts = ["/capstor/", "/iopsstor/", "/ritom/", "${HOME}:${HOME}"]
 workdir = "/tmp"
 writable = true
@@ -17,6 +16,7 @@ HF_HOME = "/ritom/scratch/cscs/${USER}/cache/huggingface"
 HF_HUB_CACHE = "/ritom/scratch/cscs/${USER}/cache/huggingface/hub"
 TORCH_HOME = "/ritom/scratch/cscs/${USER}/cache/torch"
 VLLM_CACHE_ROOT = "/ritom/scratch/cscs/${USER}/cache/vllm"
+WANDB_CACHE_DIR = "/ritom/scratch/cscs/${USER}/cache/wandb"
 FLASHINFER_WORKSPACE_BASE = "/ritom/scratch/cscs/${USER}/cache/flashinfer"
 PIP_CACHE_DIR = "/ritom/scratch/cscs/${USER}/cache/pip"
 UV_CACHE_DIR = "/ritom/scratch/cscs/${USER}/cache/uv"

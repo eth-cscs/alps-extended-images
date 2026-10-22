@@ -211,7 +211,7 @@ ARG UV_PYTHON_DOWNLOADS=never
 ARG FLASHINFER_CACHE_REPO=https://github.com/flashinfer-ai/flashinfer.git
 ARG FLASHINFER_CACHE_REF=9dc1b2495b40314dec8a8cde8cd7faf5c5206702
 ARG FLASHINFER_CACHE_ARCH=9.0a
-ARG FLASHINFER_CACHE_MAX_JOBS=4
+ARG FLASHINFER_CACHE_MAX_JOBS=16
 ARG FLASHINFER_CACHE_NVCC_THREADS=1
 ARG FLASHINFER_CACHE_TVM_FFI_VERSION=0.1.11
 RUN set -eux; \
@@ -244,7 +244,7 @@ COPY Alps-Images/apps/nemo-rl/sources/package-additions.in /opt/alps/package-add
 # Match app/vllm-apertus2's full CUDA 13 wheel and public P2P library/headers,
 # including the DeepEP wrapper used by Megatron's flex dispatcher.
 ARG UCCL_REPO=https://github.com/uccl-project/uccl.git
-ARG UCCL_REF=540cc775ba8ab231122f9a98a6d832699f239f70
+ARG UCCL_REF=18b588a048a3a3fe3d4bd60aa5678c66e284df31
 ARG NANOBIND_VERSION=3.0.1
 ARG UCCL_NVL_PEERS=4     # NVLink peers per node (GH200: 4 GPUs/node)
 ARG UCCL_CUDA_ARCH=9.0   # GH200 = Hopper (sm_90)

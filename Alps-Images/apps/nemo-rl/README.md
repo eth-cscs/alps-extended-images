@@ -7,15 +7,11 @@ and set `PYTHONPATH`.
 
 ## Examples
 
-See [`example/`](example/README.md) for the Chonk Slurm/Ray launchers.
-[`example/vllm/`](example/vllm/) uses vLLM generation.
-[`example/megatron/`](example/megatron/) uses Megatron generation.
-Both use Megatron training, an HF model and GSM8K data. Each has its own Bash,
-YAML and prompt files. They share one EDF and a README with source pins,
-batch sizes and test limits.
+See [`example/`](example/README.md) for Chonk GSM8K training with AdamW or Muon/MD,
+using Megatron training and either vLLM or Megatron generation.
 
-[`example/nemo-gym-vllm/`](example/nemo-gym-vllm/) uses a remote NeMo Gym math
-verifier instead of the GSM8K environment.
+[`example/vllm/nemo-gym/`](example/vllm/nemo-gym/) uses a remote NeMo Gym math
+verifier.
 
 ## Build
 
