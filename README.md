@@ -43,7 +43,8 @@ Application images are built on top of accelerator-specific base images and incl
 | Image | Base | Description |
 |-------|------|-------------|
 | `apertus-1p5-cuda:alps7-dev` | `pytorch-cuda:26.02-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2-cuda:alps7-dev`   | `pytorch-cuda:26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `apertus-2-megatron-base:alps7-dev` | `pytorch-cuda:25.12-py3` | Minimal Apertus2 Chonk and Megachonk training stack |
+| `apertus-2-megatron:alps7-dev` | `pytorch-cuda:26.06-py3` | Full Megatron training, test, server and inference stack |
 | `sfttrainer-cuda:alps7-dev`  | `pytorch-cuda:26.02-py3` | Supervised fine-tuning trainer image |
 | `verl-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | VeRL reinforcement learning workloads |
 | `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | vLLM serving workloads built from source with Alps/NVIDIA PyTorch compatibility patches and Mooncake CXI KV transfer |

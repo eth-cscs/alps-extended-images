@@ -387,3 +387,52 @@ def test_manual_build_generates_valid_rocm_app_script(tmp_path):
     script = generate_manual("app", "vllm", "rocm", output=tmp_path / "app-rocm.sh")
     assert "Alps-Images/apps/vllm/Containerfile.rocm" in script
     assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-rocm:.*-[0-9a-f]{32}"', script)
+
+
+def test_meta_named_cuda_targets_use_the_selected_base(tmp_path):
+    targets = {"megatron-base": "25.12-py3", "megatron": "26.06-py3"}
+
+    for target, version in targets.items():
+        output = tmp_path / f"{target}.env"
+        run_meta(f"write_app_build_env {output} apertus-2 {target}")
+        data = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        base_ref = run_meta(f"ngc_base_refs pytorch {version}").stdout.split()[3]
+
+        assert data["FAMILY"] == "cuda"
+        assert data["VARIANT"] == target
+        assert data["BASE_IMAGE"] == base_ref
+        assert data["DOCKERFILE"] == f"Alps-Images/apps/apertus-2/Containerfile.{target}"
+        assert f"apertus-2-{target}:" in data["CANON_IMAGE_REF"]
+
+
+def test_megatron_hashes_use_the_selected_recipe_and_test_group():
+    app = ROOT / "Alps-Images/apps/apertus-2"
+    base_ref = run_meta("app_refs apertus-2 megatron-base").stdout
+    full_ref = run_meta("app_refs apertus-2 megatron").stdout
+    base_validation = run_meta("app_validation_hash apertus-2 megatron-base").stdout
+    full_validation = run_meta("app_validation_hash apertus-2 megatron").stdout
+
+    for relative in ("Containerfile.megatron", "tests/megatron/check-stack.py"):
+        path = app / relative
+        original = path.read_text()
+        try:
+            path.write_text(original + "\n# Changed hash input.\n")
+
+            assert run_meta("app_refs apertus-2 megatron-base").stdout == base_ref
+            assert run_meta("app_refs apertus-2 megatron").stdout != full_ref
+            assert run_meta("app_validation_hash apertus-2 megatron-base").stdout == base_validation
+            if relative.startswith("tests/"):
+                assert run_meta("app_validation_hash apertus-2 megatron").stdout != full_validation
+        finally:
+            path.write_text(original)
+
+
+def test_manual_build_generates_both_megatron_targets(tmp_path):
+    for target in ("megatron-base", "megatron"):
+        script = generate_manual("app", "apertus-2", target, output=tmp_path / f"{target}.sh")
+
+        assert f"Alps-Images/apps/apertus-2/Containerfile.{target}" in script
+        assert re.search(
+            r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-cuda:.*-[0-9a-f]{32}"',
+            script,
+        )

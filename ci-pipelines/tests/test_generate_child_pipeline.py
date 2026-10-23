@@ -44,6 +44,7 @@ def base_image(**overrides):
 def app_image(**overrides):
     data = {
         "FAMILY": "cuda",
+        "VARIANT": "cuda",
         "NAME": "vllm",
         "DOCKERFILE": "Alps-Images/apps/vllm/Containerfile",
         "CANON_IMAGE_REF": "registry/vllm-cuda:canon",
@@ -423,6 +424,54 @@ def test_schema_app_accepts_explicit_custom_kind(gen):
         ["cuda"],
         {"tests": {"cuda": [{"name": "smoke", "kind": "custom", "runner": "cuda", "script": ["true"]}]}},
     )
+
+
+def test_app_env_keeps_the_base_family(monkeypatch, gen):
+    monkeypatch.setattr(gen, "helper_env", lambda *args: {"FAMILY": "cuda"})
+
+    result = gen.app_env("apertus-2", "megatron-base")
+
+    assert result["FAMILY"] == "cuda"
+    assert result["VARIANT"] == "megatron-base"
+
+
+def test_named_cuda_targets_have_distinct_jobs(monkeypatch, gen):
+    fake_registry(monkeypatch, gen, {})
+    child = gen.Child()
+    tests = [{"name": "vetnode", "kind": "cuda-vetnode", "runner": "cuda"}]
+
+    for target in ("megatron-base", "megatron"):
+        base_ref = f"registry/pytorch-cuda:{target}-base"
+        app = app_image(
+            NAME="apertus-2",
+            VARIANT=target,
+            BASE_IMAGE=base_ref,
+            CANON_IMAGE_REF=f"registry/apertus-2-{target}:canon",
+            TESTED_IMAGE_REF=f"registry/apertus-2-{target}:canon-tested-hash",
+            STABLE_IMAGE_REF=f"registry/apertus-2-{target}:stable",
+        )
+        gen.validate_app_ci(Path("app.yaml"), [target], {"tests": {target: tests}})
+        gen.add_app(
+            child,
+            app,
+            tests,
+            base_marks={base_ref: f"validated-{target}"},
+            base_valid={base_ref: False},
+        )
+
+        prefix = f"app-apertus-2-{target}"
+        assert child.data[f"build-{prefix}"]["needs"] == [f"validated-{target}"]
+        assert child.data[f"test-{prefix}-vetnode"]["image"] == app["CANON_IMAGE_REF"]
+        assert child.data[f"mark-{prefix}-tested"]["needs"] == [f"test-{prefix}-vetnode"]
+        assert child.data[f"publish-{prefix}"]["needs"] == [f"mark-{prefix}-tested"]
+
+
+def test_cuda_vetnode_rejects_a_named_rocm_target(gen):
+    app = app_image(FAMILY="rocm", VARIANT="megatron")
+    test = {"name": "vetnode", "kind": "cuda-vetnode", "runner": "cuda"}
+
+    with pytest.raises(RuntimeError, match="requires a CUDA base"):
+        gen.add_app_test(gen.Child(), app, test, [])
 
 
 def test_schema_current_repo_metadata_is_valid(gen):

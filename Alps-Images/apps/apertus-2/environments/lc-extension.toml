@@ -1,0 +1,19 @@
+image = "jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/apertus-2-cuda:alps7-dev-3802febe0fec326b69512641b32deb1e"
+
+mounts = [
+    "/iopsstor/",
+    "/ritom/",
+    "/capstor/",
+    "/users/",
+]
+
+writable = true
+entrypoint = true
+
+[env]
+UCCL_EP_TRANSPORT = "cxi"
+PMIX_MCA_psec = "native"
+
+[annotations]
+com.hooks.netstack.source = "artifact"
+com.hooks.cxi.enabled = "false"

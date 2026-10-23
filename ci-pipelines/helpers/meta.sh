@@ -162,7 +162,8 @@ app_validation_hash() {
   [[ -f "$ci_file" ]] || { echo "ERROR: missing $ci_file" >&2; return 1; }
   [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
 
-  local variant_upper="${app_variant^^}"
+  local variant_upper
+  variant_upper="$(app_variant_prefix "$app_variant")"
   local test_dir_var="${variant_upper}_TEST_DIR"
   local patch_dir_var="${variant_upper}_PATCH_DIR"
   local app_variants common_test_dir common_patch_dir test_dir_rel patch_dir_rel declared_variant
@@ -462,10 +463,17 @@ validate_app_variant_name() {
   local app_variant="${1:?app variant required}"
   local context="${2:-app variant}"
 
-  [[ "$app_variant" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
-    echo "ERROR: ${context} '${app_variant}' must match [A-Za-z_][A-Za-z0-9_]* because app metadata uses shell variable names" >&2
+  [[ "$app_variant" =~ ^[A-Za-z_][A-Za-z0-9_-]*$ ]] || {
+    echo "ERROR: ${context} '${app_variant}' must match [A-Za-z_][A-Za-z0-9_-]*" >&2
     return 1
   }
+}
+
+app_variant_prefix() {
+  local app_variant="${1:?app variant required}"
+  validate_app_variant_name "$app_variant"
+  app_variant="${app_variant^^}"
+  printf '%s\n' "${app_variant//-/_}"
 }
 
 write_base_build_env() {
@@ -545,6 +553,7 @@ write_app_build_env() {
   local app_name="${2:?app name required}"
   local app_variant="${3:?app variant required}"
   local base_image_ref dockerfile canon_image_ref stable_image_ref tested_image_ref image_description validation_hash_value
+  local selected_base base_family family variant_prefix
 
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
   : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
@@ -552,11 +561,34 @@ write_app_build_env() {
   # App canonical hashes include the canonical base ref, so app images rebuild
   # automatically when their selected base content changes.
   read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
+  variant_prefix="$(app_variant_prefix "$app_variant")"
+  selected_base="$(
+    profile_value \
+      "Alps-Images/apps/${app_name}/profile.env" \
+      "${variant_prefix}_BASE_IMAGE"
+  )"
+  read -r base_family _ < <(parse_base_image "$selected_base")
+
+  case "$base_family" in
+    ngc)
+      family=cuda
+      ;;
+    rocm)
+      family=rocm
+      ;;
+    *)
+      echo "ERROR: unsupported app base family: $base_family" >&2
+      return 1
+      ;;
+  esac
+
   validation_hash_value="$(app_validation_hash "$app_name" "$app_variant")"
   tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash_value")"
   image_description="This image extends ${base_image_ref} with application software for Alps."
 
   cat > "${output_file}" <<EOF
+FAMILY=$family
+VARIANT=$app_variant
 DOCKERFILE=$dockerfile
 CANON_IMAGE_REF=$canon_image_ref
 STABLE_IMAGE_REF=$stable_image_ref
@@ -586,7 +618,8 @@ app_refs() {
   local package_helpers="Alps-Images/common/package-helpers.sh"
   local sources_dir="${app_dir}/sources"
   validate_app_variant_name "$app_variant" "requested app variant"
-  local variant_upper="${app_variant^^}"
+  local variant_upper
+  variant_upper="$(app_variant_prefix "$app_variant")"
   local base_image_var="${variant_upper}_BASE_IMAGE"
   local dockerfile_var="${variant_upper}_CONTAINERFILE"
   local test_dir_var="${variant_upper}_TEST_DIR"
