@@ -1,0 +1,168 @@
+# syntax=docker/dockerfile:1
+
+# Apertus2 Megatron kernel stack reconstructed from the training squashfs of Megachonk training image.
+# See README.md for inspected images, source provenance and validation limits.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    test "$(uname -m)" = aarch64; \
+    python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version'; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+      build-essential ca-certificates cmake git libibverbs-dev \
+      libnuma-dev ninja-build pkg-config python3-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    # The base can lack this linker symlink despite libibverbs-dev being installed.
+    libdir="/usr/lib/$(dpkg-architecture -qDEB_HOST_MULTIARCH)"; \
+    if [[ ! -e "${libdir}/libibverbs.so" && -e "${libdir}/libibverbs.so.1" ]]; then \
+        ln -sfn libibverbs.so.1 "${libdir}/libibverbs.so"; \
+    fi; \
+    test -e "${libdir}/libibverbs.so"
+
+# Keep the NGC Torch/CUDA ABI. Replace its TE pin deliberately, not its Torch,
+# Triton or NumPy. PIP_CONSTRAINT from the base may still require the old TE.
+# Use the training interpreter throughout (bare pip can target another tier).
+RUN set -eux; \
+    python3 - <<'PY'
+import importlib.metadata as metadata
+from pathlib import Path
+
+pins = []
+for name in ("torch", "torchvision", "triton", "pytorch-triton", "numpy"):
+    try:
+        pins.append(f"{name}=={metadata.version(name)}")
+    except metadata.PackageNotFoundError:
+        if name == "torch":
+            raise
+Path("/opt/alps/apertus2-base-pins.txt").write_text("\n".join(pins) + "\n")
+PY
+
+# Build-only settings; never export MAX_JOBS/TORCH_CUDA_ARCH_LIST as ARGs with
+# those names: an inherited ENV would silently override their defaults.
+ARG APERTUS_BUILD_MAX_JOBS=8
+ARG UCCL_MAX_JOBS=8
+ARG TE_MAX_JOBS=8
+
+ARG UCCL_REPO=https://github.com/swiss-ai/uccl.git
+ARG UCCL_REF=fa4c325c6113b798ae0a009ef8239e07352264fb
+ARG UCCL_NVL_PEERS=4
+ARG UCCL_CUDA_ARCH=9.0
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    export PIP_CONSTRAINT=/opt/alps/apertus2-base-pins.txt; \
+    python3 -m pip uninstall -y deep_ep uccl; \
+    pip_install python3 --no-cache-dir 'nanobind==3.0.1'; \
+    git init -q /opt/uccl; \
+    git -C /opt/uccl remote add origin "${UCCL_REPO}"; \
+    git -C /opt/uccl fetch --depth 1 origin "${UCCL_REF}"; \
+    git -C /opt/uccl checkout -q FETCH_HEAD; \
+    printf 'uccl %s %s\n' "${UCCL_REPO}" "$(git -C /opt/uccl rev-parse HEAD)" > /opt/alps/apertus2-source-pins.txt; \
+    hard_limit="$(ulimit -Hn)"; \
+    if [[ "${hard_limit}" == unlimited ]]; then hard_limit=65536; fi; \
+    ulimit -n "${hard_limit}"; \
+    site_dir="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    mkdir -p /tmp/gpustub "${site_dir}/uccl"; \
+    touch "${site_dir}/uccl/__init__.py"; \
+    # setup.py detects GH200 via nvidia-smi, unavailable during Podman builds.
+    # A shell stub can recurse through the base image's shell startup hooks.
+    printf '#!/usr/bin/python3\nimport sys\na = " ".join(sys.argv[1:])\nif "query-gpu=name" in a:\n    print("NVIDIA GH200 120GB")\nelif "query-gpu=compute_cap" in a:\n    print("9.0")\nelse:\n    sys.exit(1)\n' > /tmp/gpustub/nvidia-smi; \
+    chmod +x /tmp/gpustub/nvidia-smi; \
+    cd /opt/uccl/ep; \
+    PATH=/tmp/gpustub:"${PATH}" \
+    USE_LIBFABRIC_CXI=1 \
+    NUM_MAX_NVL_PEERS="${UCCL_NVL_PEERS}" \
+    TORCH_CUDA_ARCH_LIST="${UCCL_CUDA_ARCH}" \
+    MAX_JOBS="${UCCL_MAX_JOBS}" \
+    CUDA_HOME=/usr/local/cuda \
+    INSTALL_DIR="${site_dir}/uccl" \
+      python3 setup.py build --build-base /tmp/uccl-build install; \
+    rm -rf "${site_dir}/deep_ep"; \
+    cp -aL /opt/uccl/ep/deep_ep_wrapper/deep_ep "${site_dir}/deep_ep"; \
+    rm -rf /tmp/gpustub /tmp/uccl-build /opt/uccl/ep/*.egg-info
+
+# TE v2.12, not the TE 2.17 found in gfu's differently named Megachonk image.
+ARG TE_REF=5671fd3675906cda1ade26c24a65d3dedd88eb89
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    export PIP_CONSTRAINT=/opt/alps/apertus2-base-pins.txt; \
+    python3 -m pip uninstall -y transformer_engine transformer_engine_cu13 transformer_engine_torch; \
+    MAX_JOBS="${TE_MAX_JOBS}" NVTE_BUILD_MAX_JOBS="${TE_MAX_JOBS}" \
+    CMAKE_BUILD_PARALLEL_LEVEL="${TE_MAX_JOBS}" NVTE_CUDA_ARCHS=90 NVTE_FRAMEWORK=pytorch \
+      pip_install python3 --no-cache-dir --no-build-isolation \
+        "git+https://github.com/NVIDIA/TransformerEngine.git@${TE_REF}"; \
+    printf 'transformer-engine %s\n' "${TE_REF}" >> /opt/alps/apertus2-source-pins.txt
+
+# Rebuild the recorded sources instead of relying on undocumented local wheels.
+ARG DEEPGEMM_REPO=https://github.com/deepseek-ai/DeepGEMM.git
+ARG DEEPGEMM_REF=559d79fb6994a58b8a15b4b93bf13ccc16edf247
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    export PIP_CONSTRAINT=/opt/alps/apertus2-base-pins.txt; \
+    python3 -m pip uninstall -y deep_gemm; \
+    DG_FORCE_BUILD=1 DG_USE_LOCAL_VERSION=1 MAX_JOBS="${APERTUS_BUILD_MAX_JOBS}" \
+      pip_install python3 --no-cache-dir --no-build-isolation --no-deps \
+        "git+${DEEPGEMM_REPO}@${DEEPGEMM_REF}"; \
+    printf 'deep-gemm %s %s\n' "${DEEPGEMM_REPO}" "${DEEPGEMM_REF}" >> /opt/alps/apertus2-source-pins.txt
+
+ARG GROUPED_GEMM_REPO=https://github.com/swiss-ai/grouped_gemm.git
+ARG GROUPED_GEMM_REF=45118e547923803ed52f80f240cf974620c9bdc5
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    export PIP_CONSTRAINT=/opt/alps/apertus2-base-pins.txt; \
+    python3 -m pip uninstall -y grouped_gemm nv-grouped-gemm; \
+    GROUPED_GEMM_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS="${APERTUS_BUILD_MAX_JOBS}" \
+      pip_install python3 --no-cache-dir --no-build-isolation --no-deps \
+        "git+${GROUPED_GEMM_REPO}@${GROUPED_GEMM_REF}"; \
+    printf 'nv-grouped-gemm %s %s\n' "${GROUPED_GEMM_REPO}" "${GROUPED_GEMM_REF}" >> /opt/alps/apertus2-source-pins.txt
+
+# Avoid NVRX_VERSION: the base exports that ENV as 0.5.0, which beats an ARG.
+ARG NVRESILIENCY_VERSION=0.6.0
+ARG EMERGING_OPTIMIZERS_REF=cc1385eec1966aea2aebfb6dd6fc66a898312a55
+# v0.5.2 plus per-channel A_log decay gates used by the KDA model.
+ARG FLA_REPO=https://github.com/swiss-ai/flash-linear-attention.git
+ARG FLA_REF=1820dba7e15fb927294779f23ac5097eb3927b25
+ARG CAUSAL_CONV1D_REF=cd81f0413cad2fc1e6f17e785ac39f59aae690cd
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    export PIP_CONSTRAINT=/opt/alps/apertus2-base-pins.txt; \
+    python3 -m pip uninstall -y nvidia-resiliency-ext emerging-optimizers fla-core flash-linear-attention causal-conv1d; \
+    pip_install python3 --no-cache-dir "nvidia-resiliency-ext==${NVRESILIENCY_VERSION}"; \
+    pip_install python3 --no-cache-dir --no-build-isolation \
+      "git+https://github.com/FFGGSSJJ/Emerging-Optimizers.git@${EMERGING_OPTIMIZERS_REF}" \
+      "git+${FLA_REPO}@${FLA_REF}"; \
+    CAUSAL_CONV1D_FORCE_BUILD=TRUE TORCH_CUDA_ARCH_LIST=9.0 MAX_JOBS="${APERTUS_BUILD_MAX_JOBS}" \
+      pip_install python3 --no-cache-dir --no-build-isolation --no-deps \
+        "git+https://github.com/Dao-AILab/causal-conv1d.git@${CAUSAL_CONV1D_REF}"; \
+    printf 'emerging-optimizers %s\nflash-linear-attention %s\ncausal-conv1d %s\n' \
+      "${EMERGING_OPTIMIZERS_REF}" "${FLA_REF}" "${CAUSAL_CONV1D_REF}" >> /opt/alps/apertus2-source-pins.txt
+
+# Megachonk Python dependencies, shared by both training configurations.
+COPY Alps-Images/apps/apertus-2/sources/requirements.txt /opt/alps/apertus2-requirements.txt
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    export PIP_CONSTRAINT=/opt/alps/apertus2-base-pins.txt; \
+    pip_install python3 --no-cache-dir -r /opt/alps/apertus2-requirements.txt
+
+COPY Alps-Images/apps/apertus-2/tests/megatron-base/ /opt/tests/apertus-2/megatron-base/
+RUN set -eux; \
+    chmod -R a+rX /opt/tests/apertus-2; \
+    python3 /opt/tests/apertus-2/megatron-base/check-stack.py --metadata-only

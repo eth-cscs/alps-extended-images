@@ -305,7 +305,49 @@ include:
           print("ROCm device is not visible to PyTorch", file=sys.stderr, flush=True)
           sys.exit(1)
       print(torch.cuda.get_device_name(0), flush=True)
+      # Call MIOpen explicitly: a generic convolution could select another backend.
+      torch.manual_seed(0)
+      x = torch.randn(2, 3, 16, 16)
+      weight = torch.randn(5, 3, 3, 3) * 0.1
+      bias = torch.randn(5)
+      expected = torch.nn.functional.conv2d(x, weight, bias, padding=1)
+      actual = torch.ops.aten.miopen_convolution(
+          x.cuda(), weight.cuda(), bias.cuda(),
+          [1, 1], [1, 1], [1, 1], 1, False, True,
+      )
+      torch.testing.assert_close(actual.cpu(), expected, rtol=1e-4, atol=1e-4)
+      print("MIOpen GPU convolution agrees with the CPU reference", flush=True)
       PY
+    - |
+      set -euo pipefail
+      source /opt/alps/env/alps-rocm-build.env
+      work="$(mktemp -d)"
+      trap 'rm -rf "$work"' EXIT
+      cat > "$work/miopen.cpp" <<'CPP'
+      #include <miopen/miopen.h>
+      #include <miopen/version.h>
+      #include <cstdio>
+      int main() {
+          size_t major = 0, minor = 0, patch = 0;
+          if (miopenGetVersion(&major, &minor, &patch) != miopenStatusSuccess)
+              return 1;
+          if (major != MIOPEN_VERSION_MAJOR || minor != MIOPEN_VERSION_MINOR ||
+              patch != MIOPEN_VERSION_PATCH)
+              return 2;
+          miopenHandle_t handle = nullptr;
+          if (miopenCreate(&handle) != miopenStatusSuccess)
+              return 3;
+          if (miopenDestroy(handle) != miopenStatusSuccess)
+              return 4;
+          std::printf("MIOpen headers/runtime agree: %zu.%zu.%zu; GPU handle created\n",
+                      major, minor, patch);
+      }
+      CPP
+      env -u ROCM_PATH -u HIP_PATH "${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++" \
+        -std=c++17 -D__HIP_PLATFORM_AMD__ -I"${ROCM_BUILD_PREFIX}/include" "$work/miopen.cpp" \
+        -L"${ROCM_BUILD_PREFIX}/lib" -Wl,-rpath,"${ROCM_BUILD_PREFIX}/lib" \
+        -lMIOpen -o "$work/miopen"
+      "$work/miopen"
   variables:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1

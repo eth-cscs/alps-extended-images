@@ -298,10 +298,10 @@ generate_rocm_devel_compat() {
         "projects/hipsparselt/library/include|hipsparselt"
         "projects/hipsparse/library/include|hipsparse"
         "projects/hipsolver/library/include|hipsolver"
+        "projects/miopen/include/miopen|miopen"
     )
-    # Headers beyond the compile-time requirements above (miopen, rocblas, ...)
-    # stay uninstalled: torch's ATen/hip headers pull in hipblas, hipblaslt, hipsolver,
-    # and hipsparse; the remaining packages are consumed via find_package configs only.
+    # Install public consumer headers, not implementation headers such as rocblas'
+    # internal C++ interface. MIOpen's C API is also required by ATen/miopen headers.
     local -A lib_pkgs=(
         [amd_comgr]="libamd_comgr"
         [rocrand]="librocrand"
@@ -390,6 +390,57 @@ HIPSPARSEEXPORT
 #endif
 #endif
 HIPSOLVEREXPORT
+
+    # The wheel already supplies MIOpen. Add its pinned public C API without
+    # rebuilding/replacing that runtime or exposing MIOpen's private C++ headers.
+    # config.h records the public backend; private library build switches do not
+    # belong to this consumer-only compatibility payload.
+    rm "${root}/include/miopen/config.h.in" "${root}/include/miopen/version.h.in"
+    cat > "${root}/include/miopen/config.h" <<'MIOPENCONFIG'
+#ifndef GUARD_CONFIG_H_IN
+#define GUARD_CONFIG_H_IN
+#define MIOPEN_BACKEND_HIP 1
+#define MIOPEN_MODE_NOGPU 0
+#endif
+MIOPENCONFIG
+    cat > "${root}/include/miopen/export.h" <<'MIOPENEXPORT'
+#ifndef MIOPEN_EXPORT_H
+#define MIOPEN_EXPORT_H
+#define MIOPEN_EXPORT __attribute__((visibility("default")))
+#define MIOPEN_NO_EXPORT __attribute__((visibility("hidden")))
+#define MIOPEN_DEPRECATED __attribute__((__deprecated__))
+#define MIOPEN_DEPRECATED_EXPORT MIOPEN_EXPORT MIOPEN_DEPRECATED
+#define MIOPEN_DEPRECATED_NO_EXPORT MIOPEN_NO_EXPORT MIOPEN_DEPRECATED
+#endif
+MIOPENEXPORT
+    LD_LIBRARY_PATH="${ROCM_CORE_PREFIX}/lib:${ROCM_LIBRARIES_PREFIX}/lib:${LD_LIBRARY_PATH:-}" \
+        "${ROCM_PYTHON}" - "${src_dir}/projects/miopen" "${root}" <<'MIOPENVERSION'
+import ctypes
+from pathlib import Path
+import re
+import sys
+
+source, root = map(Path, sys.argv[1:])
+match = re.search(r"rocm_setup_version\(VERSION (\d+)\.(\d+)\.(\d+)\)", (source / "CMakeLists.txt").read_text())
+if match is None:
+    raise RuntimeError("Cannot determine the pinned MIOpen public-header version")
+expected = tuple(map(int, match.groups()))
+library = ctypes.CDLL(str(root / "lib/libMIOpen.so.1"))
+get_version = library.miopenGetVersion
+get_version.argtypes = [ctypes.POINTER(ctypes.c_size_t)] * 3
+get_version.restype = ctypes.c_int
+version = [ctypes.c_size_t() for _ in range(3)]
+status = get_version(*(ctypes.byref(part) for part in version))
+actual = tuple(part.value for part in version)
+if status != 0 or actual != expected:
+    raise RuntimeError(f"MIOpen header/runtime mismatch: headers={expected}, runtime={actual}, status={status}")
+header = (source / "include/miopen/version.h.in").read_text()
+for name, value in zip(("MAJOR", "MINOR", "PATCH", "TWEAK"), (*actual, 0)):
+    header = header.replace(f"@MIOpen_VERSION_{name}@", str(value))
+(root / "include/miopen/version.h").write_text(header)
+print(f"Installed public MIOpen headers matching runtime {'.'.join(map(str, actual))}")
+MIOPENVERSION
+
     local version_data pkg version
     local -A pkg_versions=()
     version_data="$(generate_rocm_component_metadata "${src_dir}" "${root}")" \
@@ -483,7 +534,7 @@ LIBPKGCFG
     [[ "${ROCM_CORE_PREFIX}" != "${root}" ]] || die "rocm devel compat: ROCM_CORE_PREFIX must differ from ${root}"
     ln -sfn "${root}/lib/cmake" "${ROCM_CORE_PREFIX}/lib/cmake"
     local hdr
-    for hdr in thrust hipcub rocprim rocrand hiprand hipblas hipblas-common hipblaslt hipsparselt hipsparse hipsolver; do
+    for hdr in thrust hipcub rocprim rocrand hiprand hipblas hipblas-common hipblaslt hipsparselt hipsparse hipsolver miopen; do
         ln -sfn "${root}/include/${hdr}" "${ROCM_CORE_PREFIX}/include/${hdr}"
     done
     ln -sfn "${root}/.info" "${ROCM_CORE_PREFIX}/.info"
@@ -967,19 +1018,22 @@ persist_rocm_sdk_env() {
 }
 
 rocm_sdk_prefix_candidates() {
-    local candidate build_devel=""
-    [[ "${1:-runtime}" != build ]] || build_devel="${ROCM_DEVEL_PREFIX:-}"
+    local candidate build_devel="" build_compat=""
+    if [[ "${1:-runtime}" == build ]]; then
+        build_devel="${ROCM_DEVEL_PREFIX:-}"
+        build_compat="/opt/rocm"
+    fi
     local -A emitted=()
 
-    # Runtime trees first: the ldconfig cache must map shared sonames
-    # (amdhip64, hsa-runtime, comgr) to the same trees torch resolves via
-    # RPATH; devel first maps them into both trees and LLVM aborts on
-    # duplicate options when a non-torch consumer (e.g. mooncake) loads
-    # before torch. Devel is still found for builds: only it ships headers.
+    # Runtime discovery stays wheel-first: ldconfig must map shared sonames
+    # to the same trees torch resolves via RPATH to avoid duplicate LLVM loads.
+    # Build discovery instead prefers the complete devel/compat view, even
+    # when a runtime wheel has enough HIP/HSA files to pass the minimum probes.
     for candidate in \
+        "${build_devel}" \
+        "${build_compat}" \
         "${ROCM_CORE_PREFIX:-}" \
         "${ROCM_LIBRARIES_PREFIX:-}" \
-        "${build_devel}" \
         "/opt/rocm" \
         "${ROCM_DEVEL_PREFIX:-}" \
         "${ROCM_BUILD_PREFIX:-}" \
@@ -1046,6 +1100,8 @@ load_rocm_sdk_env() {
 
 discover_rocm_build_prefix() {
     local candidate libdir
+    # Build tools need the complete development view. Runtime library candidate
+    # order stays wheel-first for ldconfig so Torch does not load duplicate LLVM.
     while IFS= read -r candidate; do
         [[ -n "${candidate}" ]] || continue
         [[ -f "${candidate}/include/hip/hip_runtime_api.h" ]] || continue

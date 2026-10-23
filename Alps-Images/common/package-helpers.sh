@@ -120,8 +120,17 @@ cleanup_new_apt_build_deps() {
         return 1
     }
 
+    # Build lists use unqualified names; dpkg may append a Multi-Arch suffix.
+    local installed_package
+    local -A installed_packages=()
+    while IFS= read -r installed_package || [[ -n "$installed_package" ]]; do
+        [[ -n "$installed_package" ]] || continue
+        installed_packages["$installed_package"]=1
+        installed_packages["${installed_package%%:*}"]=1
+    done < "${snapshot_file}"
+
     for pkg in "${packages[@]}"; do
-        if ! grep -Fxq "$pkg" "${snapshot_file}"; then
+        if [[ -z "${installed_packages[$pkg]+set}" ]]; then
             cleanup_packages+=("$pkg")
         fi
     done

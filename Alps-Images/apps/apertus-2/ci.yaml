@@ -1,20 +1,92 @@
 tests:
-  cuda:
+  megatron-base-cuda:
     - name: vetnode
       kind: cuda-vetnode
-    - name: pplx-garden
       runner: cuda
-      timeout: 2h
-      script:
-        - /opt/tests/apertus-2/pplx-garden-benchmark.sh
-      variables:
-        SLURM_JOB_NUM_NODES: "2"
-        SLURM_NTASKS: "2"
-    - name: deepep
+
+    - name: stack-smoke
       runner: cuda
-      timeout: 2h
+      timeout: 30m
       script:
-        - /opt/tests/apertus-2/deep-ep-benchmark.sh
+        - python3 /opt/tests/apertus-2/megatron-base/check-stack.py
       variables:
         SLURM_JOB_NUM_NODES: "1"
         SLURM_NTASKS: "1"
+        UCCL_EP_TRANSPORT: "cxi"
+
+    - name: uccl-internode
+      runner: cuda
+      timeout: 2h
+      script:
+        - bash /opt/tests/apertus-2/megatron-base/uccl-internode.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "8"
+
+  megatron-cuda:
+    - name: vetnode
+      kind: cuda-vetnode
+      runner: cuda
+
+    - name: stack-smoke
+      runner: cuda
+      timeout: 45m
+      script:
+        - python3 /opt/tests/apertus-2/megatron/check-stack.py
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+        UCCL_EP_TRANSPORT: "cxi"
+        UCCL_P2P_TRANSPORT: "cxi"
+        UCCL_CXI_THREADING: "safe"
+
+    - name: uccl-internode
+      runner: cuda
+      timeout: 2h
+      script:
+        - bash /opt/tests/apertus-2/megatron/uccl-internode.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "8"
+        UCCL_P2P_TRANSPORT: "cxi"
+        UCCL_CXI_THREADING: "safe"
+
+  megatron-rocm:
+    - name: stack-smoke
+      runner: rocm
+      timeout: 45m
+      script:
+        - python3 /opt/tests/apertus-2/rocm/check-stack.py
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+        SLURM_TIMELIMIT: "00:45:00"
+
+    - name: train-resume
+      runner: rocm
+      timeout: 45m
+      script:
+        - bash /opt/tests/apertus-2/rocm/train-smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+        SLURM_TIMELIMIT: "00:45:00"
+
+    - name: uccl-internode
+      runner: rocm
+      timeout: 45m
+      script:
+        - python3 /opt/tests/apertus-2/rocm/uccl-smoke.py
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "8"
+        SLURM_NTASKS_PER_NODE: "4"
+        SLURM_CPUS_PER_TASK: "8"
+        SLURM_CPU_BIND: "none"
+        SLURM_TIMELIMIT: "00:45:00"
+        SLURM_GPU_BIND: "none"
+        SLURM_EXCLUSIVE: "exclusive"
+        SLURM_DISTRIBUTION: "block"
+        SLURM_KILL_BAD_EXIT: "1"
+        UCCL_EP_TRANSPORT: "cxi"
+        FI_CXI_ENABLE_WRITEDATA: "1"

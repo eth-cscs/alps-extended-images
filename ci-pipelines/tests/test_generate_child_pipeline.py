@@ -44,6 +44,7 @@ def base_image(**overrides):
 def app_image(**overrides):
     data = {
         "FAMILY": "cuda",
+        "VARIANT": "cuda",
         "NAME": "vllm",
         "DOCKERFILE": "Alps-Images/apps/vllm/Containerfile",
         "CANON_IMAGE_REF": "registry/vllm-cuda:canon",
@@ -124,10 +125,63 @@ def test_slug_rejects_empty_result(gen):
 def test_app_variants_from_profile_parses_without_executing(gen, tmp_path):
     profile = tmp_path / "profile.env"
     marker = tmp_path / "executed"
-    profile.write_text(f'APP_VARIANTS="cuda rocm"\ntouch {marker}\n')
+    profile.write_text(
+        'export APP_VARIANTS="cuda rocm" # supported targets\n'
+        'CUDA_BASE_IMAGE=pytorch-cuda:26.06-py3\n'
+        'ROCM_BASE_IMAGE=pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13\n'
+        f'touch {marker}\n'
+    )
 
     assert gen.app_variants_from_profile(profile) == ["cuda", "rocm"]
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("profile_text", ["", 'APP_VARIANTS="   "\n'])
+def test_app_variants_rejects_missing_or_empty_target_list(gen, tmp_path, profile_text):
+    profile = tmp_path / "profile.env"
+    profile.write_text(profile_text)
+
+    with pytest.raises(RuntimeError):
+        gen.app_variants_from_profile(profile)
+
+
+@pytest.mark.parametrize(
+    "variants",
+    ["megatron-base-cuda megatron_base-cuda", "megatron-cuda MEGATRON-cuda", "megatron-cuda megatron-cuda"],
+)
+def test_app_variants_rejects_profile_prefix_collisions(gen, tmp_path, variants):
+    profile = tmp_path / "profile.env"
+    profile.write_text(f'APP_VARIANTS="{variants}"\n')
+
+    with pytest.raises(RuntimeError, match="share profile prefix"):
+        gen.app_variants_from_profile(profile)
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["megatron", "megatron-base", "megatron-tpu", "cuda-debug", "-cuda", "megatron.rocm", "2stage-cuda"],
+)
+def test_app_variants_rejects_invalid_target_name(gen, tmp_path, target):
+    profile = tmp_path / "profile.env"
+    profile.write_text(f'APP_VARIANTS="{target}"\n')
+
+    with pytest.raises(RuntimeError) as error:
+        gen.app_variants_from_profile(profile)
+
+    assert target in str(error.value)
+
+
+def test_app_variants_accepts_family_only_and_multi_part_targets(gen, tmp_path):
+    profile = tmp_path / "profile.env"
+    variants = ["cuda", "rocm", "_team-rocm-stage-cuda", "team-cuda-stage-rocm"]
+    lines = [f'APP_VARIANTS="{" ".join(variants)}"']
+    for target in variants:
+        prefix = target.upper().replace("-", "_")
+        family = target.rsplit("-", 1)[-1]
+        lines.append(f"{prefix}_BASE_IMAGE=pytorch-{family}:test")
+    profile.write_text("\n".join(lines) + "\n")
+
+    assert gen.app_variants_from_profile(profile) == variants
 
 
 def test_generate_missing_base_emits_build_tests_marker_publish(monkeypatch, gen):
@@ -391,12 +445,14 @@ def test_schema_base_rejects_rocm_vetnode(gen):
 
 def test_schema_app_rejects_empty_variant_tests(gen):
     with pytest.raises(RuntimeError, match="tests.cuda must not be empty"):
-        gen.validate_app_ci(Path("app.yaml"), ["cuda"], {"tests": {"cuda": []}})
+        gen.validate_app_ci(Path("app.yaml"), ["cuda"], {"tests": {"cuda": []}}, {"cuda": "cuda"})
 
 
 def test_schema_app_rejects_custom_test_without_script(gen):
     with pytest.raises(RuntimeError, match="script must be a list"):
-        gen.validate_app_ci(Path("app.yaml"), ["cuda"], {"tests": {"cuda": [{"name": "smoke", "runner": "cuda"}]}})
+        gen.validate_app_ci(
+            Path("app.yaml"), ["cuda"], {"tests": {"cuda": [{"name": "smoke", "runner": "cuda"}]}}, {"cuda": "cuda"}
+        )
 
 
 def test_schema_app_rejects_unknown_runner(gen):
@@ -405,6 +461,7 @@ def test_schema_app_rejects_unknown_runner(gen):
             Path("app.yaml"),
             ["cuda"],
             {"tests": {"cuda": [{"name": "smoke", "runner": "unknown", "script": ["true"]}]}},
+            {"cuda": "cuda"},
         )
 
 
@@ -414,6 +471,7 @@ def test_schema_app_rejects_extra_cuda_vetnode_fields(gen):
             Path("app.yaml"),
             ["cuda"],
             {"tests": {"cuda": [{"name": "vetnode", "kind": "cuda-vetnode", "timeout": "1h", "script": ["true"]}]}},
+            {"cuda": "cuda"},
         )
 
 
@@ -422,12 +480,170 @@ def test_schema_app_accepts_explicit_custom_kind(gen):
         Path("app.yaml"),
         ["cuda"],
         {"tests": {"cuda": [{"name": "smoke", "kind": "custom", "runner": "cuda", "script": ["true"]}]}},
+        {"cuda": "cuda"},
     )
 
 
-def test_schema_current_repo_metadata_is_valid(gen):
+def test_schema_app_requires_base_derived_family(gen):
+    with pytest.raises(KeyError):
+        gen.validate_app_ci(
+            Path("app.yaml"),
+            ["cuda"],
+            {"tests": {"cuda": [{"name": "smoke", "runner": "cuda", "script": ["true"]}]}},
+            {},
+        )
+
+
+@pytest.fixture()
+def named_targets(tmp_path, monkeypatch, gen):
+    for key, value in {
+        "IMAGE_PREFIX": "registry/alps",
+        "GHCR_IMAGE_PREFIX": "ghcr/alps",
+        "ALPS_REV": "alps7-dev",
+        "CI_COMMIT_SHORT_SHA": "abc123",
+        "CI_COMMIT_SHA": "abc123",
+        "CSCS_CI_ORIG_CLONE_URL": "https://example.invalid/repo.git",
+    }.items():
+        monkeypatch.setenv(key, value)
+    (tmp_path / "ci-pipelines").symlink_to(ROOT / "ci-pipelines", target_is_directory=True)
+    images = tmp_path / "Alps-Images"
+    images.mkdir()
+    for name in ("NGC", "ROCm", "common", "patches"):
+        (images / name).symlink_to(ROOT / "Alps-Images" / name, target_is_directory=True)
+    app = images / "apps" / "apertus-2"
+    app.mkdir(parents=True)
+    bases = {
+        "megatron-base-cuda": ("cuda", "25.12-py3"),
+        "megatron-cuda": ("cuda", "26.06-py3"),
+        "megatron-rocm": ("rocm", "rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+    }
+    paths = {
+        "megatron-base-cuda": ("Containerfile.megatron-base", "tests/megatron-base"),
+        "megatron-cuda": ("Containerfile.megatron", "tests/megatron"),
+        "megatron-rocm": ("Containerfile.megatron.rocm", "tests/rocm"),
+    }
+    profile = [f'APP_VARIANTS="{" ".join(bases)}"']
+    tests = {}
+    for target, (family, version) in bases.items():
+        prefix = target.upper().replace("-", "_")
+        base = f"pytorch-{family}"
+        recipe, test_dir = paths[target]
+        profile.extend([
+            f"{prefix}_BASE_IMAGE={base}:{version}",
+            f"{prefix}_CONTAINERFILE={recipe}",
+            f"{prefix}_TEST_DIR={test_dir}",
+        ])
+        (app / recipe).write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
+        (app / test_dir).mkdir(parents=True)
+        (app / test_dir / "check-stack.py").write_text("assert True\n")
+        tests[target] = (
+            [{"name": "vetnode", "kind": "cuda-vetnode"}]
+            if family == "cuda"
+            else [{"name": "stack", "script": ["/opt/tests/apertus-2/rocm/check-stack.py"]}]
+        )
+    (app / "profile.env").write_text("\n".join(profile) + "\n")
+    (app / "ci.yaml").write_text(yaml.safe_dump({"tests": tests}))
+    monkeypatch.setattr(gen, "ROOT", tmp_path)
+    return app, bases
+
+
+def test_named_targets_use_selected_base_and_distinct_jobs(monkeypatch, gen, named_targets):
+    _, bases = named_targets
+    fake_registry(monkeypatch, gen, {})
+    child = gen.Child()
+    base_marks = {}
+    base_valid = {}
+    expected_bases = {}
+    for family, version in set(bases.values()):
+        base = gen.base_env(family, "pytorch", version)
+        ref = base["CANON_IMAGE_REF"]
+        base_marks[ref] = gen.add_base(child, base, base_tests(), valid=False)
+        base_valid[ref] = False
+        expected_bases[(family, version)] = ref
+
+    apps = gen.discover_apps()
+    assert {data["VARIANT"] for data, _ in apps} == set(bases)
+    for app, tests in apps:
+        target = app["VARIANT"]
+        family, version = bases[target]
+        base_ref = expected_bases[(family, version)]
+        assert app["FAMILY"] == family
+        assert app["BASE_IMAGE"] == base_ref
+        recipe = {
+            "megatron-base-cuda": "Containerfile.megatron-base",
+            "megatron-cuda": "Containerfile.megatron",
+            "megatron-rocm": "Containerfile.megatron.rocm",
+        }[target]
+        assert app["DOCKERFILE"] == f"Alps-Images/apps/apertus-2/{recipe}"
+        assert f"/apertus-2-{target}:alps7-dev-" in app["CANON_IMAGE_REF"]
+        gen.add_app(child, app, tests, base_marks, base_valid)
+
+        prefix = f"app-apertus-2-{target}"
+        test_job = f"test-{prefix}-{tests[0]['name']}"
+        build = child.data[f"build-{prefix}"]
+        assert build["variables"]["BASE_IMAGE"] == base_ref
+        assert build["extends"] == [f".child-{family}-app-build-template"]
+        assert build["needs"] == [base_marks[base_ref]]
+        assert child.data[test_job]["image"] == app["CANON_IMAGE_REF"]
+        assert child.data[test_job]["needs"] == [f"build-{prefix}"]
+        template = ".child-cuda-app-vetnode-test-template" if family == "cuda" else ".child-rocm-custom-test-template"
+        assert child.data[test_job]["extends"] == [template]
+        assert child.data[f"mark-{prefix}-tested"]["needs"] == [test_job]
+        assert child.data[f"publish-{prefix}"]["needs"] == [f"mark-{prefix}-tested"]
+
+
+def test_discovery_rejects_target_base_family_mismatch(gen, named_targets):
+    app, _ = named_targets
+    profile = app / "profile.env"
+    wrong_base = "pytorch-cuda:26.06-py3"
+    profile.write_text(
+        profile.read_text().replace(
+            "MEGATRON_ROCM_BASE_IMAGE=pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13",
+            f"MEGATRON_ROCM_BASE_IMAGE={wrong_base}",
+        )
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        gen.discover_apps()
+
+    assert "megatron-rocm" in str(error.value)
+    assert wrong_base in str(error.value)
+
+
+@pytest.mark.parametrize("runner", [None, "cuda"])
+def test_discovery_rejects_cuda_vetnode_on_named_rocm_target(gen, named_targets, runner):
+    app, _ = named_targets
+    cfg = gen.load_yaml(app / "ci.yaml")
+    test = {"name": "vetnode", "kind": "cuda-vetnode"}
+    if runner is not None:
+        test["runner"] = runner
+    cfg["tests"]["megatron-rocm"] = [test]
+    (app / "ci.yaml").write_text(yaml.safe_dump(cfg))
+
+    with pytest.raises(RuntimeError, match="only supported for cuda"):
+        gen.discover_apps()
+
+
+def test_cuda_vetnode_rejects_a_named_rocm_target(gen):
+    app = app_image(FAMILY="rocm", VARIANT="megatron-rocm")
+    test = {"name": "vetnode", "kind": "cuda-vetnode", "runner": "cuda"}
+
+    with pytest.raises(RuntimeError, match="requires a CUDA base"):
+        gen.add_app_test(gen.Child(), app, test, [])
+
+
+def test_schema_current_repo_metadata_is_valid(gen, monkeypatch):
+    for key, value in {
+        "IMAGE_PREFIX": "registry/alps",
+        "GHCR_IMAGE_PREFIX": "ghcr/alps",
+        "ALPS_REV": "alps7-dev",
+        "CI_COMMIT_SHORT_SHA": "abc123",
+        "CSCS_CI_ORIG_CLONE_URL": "https://example.invalid/repo.git",
+    }.items():
+        monkeypatch.setenv(key, value)
     for path in [ROOT / "Alps-Images" / "NGC" / "ci.yaml", ROOT / "Alps-Images" / "ROCm" / "ci.yaml"]:
         gen.validate_base_ci(path, gen.load_yaml(path))
     for path in sorted((ROOT / "Alps-Images" / "apps").glob("*/ci.yaml")):
         variants = gen.app_variants_from_profile(path.parent / "profile.env")
-        gen.validate_app_ci(path, variants, gen.load_yaml(path))
+        families = {variant: gen.app_env(path.parent.name, variant)["FAMILY"] for variant in variants}
+        gen.validate_app_ci(path, variants, gen.load_yaml(path), families)

@@ -1,0 +1,121 @@
+Subject: [PATCH] Keep RDMA allocation and stream ownership with Torch
+
+The DeepEP wrapper owns the RDMA allocation through its DLPack capsule (or
+Torch tensor). Proxies borrow its address and must not free it during stop:
+that otherwise double-frees the allocation when Buffer is released.
+
+Dispatch/combine also record tensor lifetimes on the communication stream.
+Those tensors can outlive Buffer.destroy(), so destroying a private native
+stream leaves the caching allocator recording events on an invalid handle.
+Use a high-priority PyTorch pool stream and pass its borrowed handle to the
+native runtime. Preserve record_stream and all post-destroy GPU checks.
+
+Applies to UCCL 18b588a048a3a3fe3d4bd60aa5678c66e284df31.
+
+diff --git a/ep/bench/buffer.py b/ep/bench/buffer.py
+index 1fd4a24..cc95a25 100644
+--- a/ep/bench/buffer.py
++++ b/ep/bench/buffer.py
+@@ -179,9 +179,13 @@ class Buffer:
+         self.low_latency_mode = low_latency_mode
+         self.explicitly_destroy = explicitly_destroy
+         self._next_low_latency_combine_buffer = None
++        # Pool-owned streams remain valid for tensors recorded on them even
++        # after this Buffer is destroyed.
++        self._comm_stream = torch.cuda.Stream(device=device_index, priority=-1)
+         self.runtime = ep.Buffer(
+             self.rank,
+             self.group_size,
++            int(self._comm_stream.cuda_stream),
+             num_nvl_bytes,
+             num_rdma_bytes,
+             low_latency_mode,
+@@ -662,14 +666,7 @@ class Buffer:
+         Returns:
+             stream: the communication stream.
+         """
+-        ts = self.runtime.get_comm_stream()
+-        if isinstance(ts, torch.Stream):
+-            return torch.cuda.Stream(
+-                stream_id=ts.stream_id,
+-                device_index=ts.device_index,
+-                device_type=ts.device_type,
+-            )
+-        return torch.cuda.ExternalStream(int(ts))
++        return self._comm_stream
+ 
+     def get_local_buffer_tensor(
+         self,
+diff --git a/ep/src/uccl_ep.cc b/ep/src/uccl_ep.cc
+index c750baf..e025dd4 100644
+--- a/ep/src/uccl_ep.cc
++++ b/ep/src/uccl_ep.cc
+@@ -347,8 +347,9 @@ bool is_sm90_compiled() {
+ 
+ class Buffer {
+  public:
+-  Buffer(int rank, int num_ranks, long num_nvl_bytes, long num_rdma_bytes,
+-         bool low_latency_mode, bool explicitly_destroy, int num_local_ranks)
++  Buffer(int rank, int num_ranks, std::uintptr_t comm_stream_ptr,
++         long num_nvl_bytes, long num_rdma_bytes, bool low_latency_mode,
++         bool explicitly_destroy, int num_local_ranks)
+       : rank(rank),
+         num_ranks(num_ranks),
+         num_nvl_bytes(num_nvl_bytes),
+@@ -376,11 +377,8 @@ class Buffer {
+ 
+       {
+         CUDA_CHECK(cudaSetDevice(device_index));
+-        int least_priority = 0, greatest_priority = 0;
+-        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority,
+-                                                    &greatest_priority));
+-        CUDA_CHECK(cudaStreamCreateWithPriority(
+-            &comm_stream, cudaStreamNonBlocking, greatest_priority));
++        comm_stream = reinterpret_cast<cudaStream_t>(comm_stream_ptr);
++        EP_HOST_ASSERT(comm_stream != nullptr);
+         auto host_addrs = collect_d2h_channel_addrs_for_device(
+             device_index, low_latency_mode);
+         num_d2h_channel_addrs = static_cast<int>(host_addrs.size());
+@@ -674,10 +672,8 @@ class Buffer {
+     if (d_handles) {
+       CUDA_CHECK(cudaFree(d_handles));
+     }
+-    if (comm_stream != nullptr) {
+-      CUDA_CHECK(cudaStreamDestroy(comm_stream));
+-      comm_stream = nullptr;
+-    }
++    // PyTorch's pool owns this stream. Recorded tensors may outlive Buffer.
++    comm_stream = nullptr;
+     destroyed = true;
+     available = false;
+   }
+@@ -1968,9 +1964,10 @@ NB_MODULE(ep, m) {
+ 
+   nb::class_<EventOverlap>(m, "EventOverlap").def(nb::init<>());
+   nb::class_<Buffer>(m, "Buffer")
+-      .def(nb::init<int, int, long, long, bool, bool, int>(), nb::arg("rank"),
+-           nb::arg("num_ranks"), nb::arg("num_nvl_bytes") = 0,
+-           nb::arg("num_rdma_bytes") = 0, nb::arg("low_latency_mode") = false,
++      .def(nb::init<int, int, std::uintptr_t, long, long, bool, bool, int>(),
++           nb::arg("rank"), nb::arg("num_ranks"), nb::arg("comm_stream_ptr"),
++           nb::arg("num_nvl_bytes") = 0, nb::arg("num_rdma_bytes") = 0,
++           nb::arg("low_latency_mode") = false,
+            nb::arg("explicitly_destroy") = false,
+            nb::arg("num_local_ranks") = -1)
+       .def("destroy", &Buffer::destroy)
+diff --git a/ep/src/uccl_proxy.cpp b/ep/src/uccl_proxy.cpp
+index b570d94..f2660ce 100644
+--- a/ep/src/uccl_proxy.cpp
++++ b/ep/src/uccl_proxy.cpp
+@@ -155,9 +155,8 @@ void UcclProxy::stop() {
+   proxy_->set_progress_run(false);
+   if (thread_.joinable()) thread_.join();
+   running_.store(false, std::memory_order_release);
+-  // Because proxies share the gpu_buffer, only destroy gpu_buffer for the first
+-  // proxy.
+-  proxy_->destroy(thread_idx_ == 0);
++  // The supplied buffer is borrowed; its DLPack/Torch owner releases it.
++  proxy_->destroy(false);
+ }
+ 
+ void UcclProxy::start(Mode m) {

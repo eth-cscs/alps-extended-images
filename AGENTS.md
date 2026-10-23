@@ -16,6 +16,12 @@ This repo builds, tests, and publishes Alps-optimized container images. Preserve
 - `ci-pipelines/helpers/meta.sh`: image refs, content hashes, validation hashes, and generated job env. `ci-pipelines/helpers/skopeo.sh`: registry digest, marker, copy, and promotion behavior.
 - `manual-build/manual-build.sh`: local `podman build` script generation using the same ref/hash logic as CI.
 
+## Markdown Formatting
+
+- Write Markdown prose with one sentence per line.
+- Do not insert arbitrary line breaks within a sentence.
+- Preserve Markdown structures that require their own layout, such as tables, lists, and fenced code blocks.
+
 ## Core Invariants
 
 - Content hashes must not include timestamps or commit SHAs. OCI labels may include CI metadata.

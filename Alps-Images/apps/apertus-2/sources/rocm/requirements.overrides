@@ -1,0 +1,6 @@
+# Lock generation only: Torch/Triton come from the canonical ROCm base.
+# Marker overrides prevent resolution of PyPI CUDA wheels through accelerate.
+torch; sys_platform == 'never'
+triton; sys_platform == 'never'
+# Match the inherited NumPy ABI while resolving the portable additions.
+numpy==2.5.2
