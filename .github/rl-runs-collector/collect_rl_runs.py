@@ -4,27 +4,26 @@
 Training jobs launched from the FirecREST UI AI Training page write two files into a shared run
 tracker directory on the cluster: <job id>-run.json when they start and <job id>-result.json when
 they exit. This script reads them through FirecREST and turns them into one record per run,
-<recipe id>/<run id>.json, plus an index.json per recipe, in a checkout of the records branch.
+<recipe id>/<cluster>-<job id>.json, plus an index.json per recipe, in a checkout of the records
+branch.
 It runs in two phases, so that tracker files are only deleted once the records are pushed:
 
   collect_rl_runs.py collect --runs-dir <checkout> --manifest <file>
   collect_rl_runs.py delete --manifest <file> [--dry-run]
 
 Configuration (environment): FIRECREST_URL, FIRECREST_TOKEN_URL, FIRECREST_CLIENT_ID,
-FIRECREST_CLIENT_SECRET, FIRECREST_SYSTEM, RUN_TRACKER_DIR and RUN_ID_KEY, the secret key run ids
-are derived from (changing it gives every run a new id).
+FIRECREST_CLIENT_SECRET, FIRECREST_SYSTEM and RUN_TRACKER_DIR.
 
-Records are public, so they never contain anything that identifies a person:
+Records are public:
 - only an allowlist of fields is kept, each checked against a strict format, whatever else a file
   contains (everyone can write to the tracker directory, so files are untrusted)
-- the Slurm job id is replaced by a run id derived from it with the secret key, which keeps a
-  run's two files together without letting anyone look the job (and its user) up in Slurm
+- the cluster and Slurm job id are kept, so that the UI can link a run to its job. No user,
+  account or path is, though whoever can see the job in Slurm can see whose it is
 - dates are kept to the day; durations are kept exactly
 Output is deterministic, so a pass with nothing new leaves nothing to commit.
 
 Workflow logs are public too: they show counts, validation reasons and record paths, but never
-file contents or tracker file names. A tracker file name is a job id, and logging it next to the
-record path would link the run id back to the job.
+file contents.
 
 Standard library only, so the workflow needs no install step.
 """
@@ -32,7 +31,6 @@ Standard library only, so the workflow needs no install step.
 from __future__ import annotations
 
 import argparse
-import hmac
 import json
 import math
 import os
@@ -43,10 +41,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -68,8 +64,8 @@ FALLBACK_TIME_LIMIT = timedelta(days=7)
 # before a trailing newline
 TRACKER_FILE_PATTERN = re.compile(r"^(\d{1,20})-(run|result)\.json\Z", re.ASCII)
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
-# 128 bits, so that distinct runs never collide
-RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}\Z", re.ASCII)
+# <cluster>-<job id>
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}-\d{1,20}\Z", re.ASCII)
 PARAMETER_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z", re.ASCII)
 # Metric names may also use ':' as a separator, e.g. val:accuracy
 METRIC_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z", re.ASCII)
@@ -88,7 +84,6 @@ REQUEST_TIMEOUT_SECONDS = 60
 # again after these delays before it counts as failed
 RETRY_DELAYS_SECONDS = (5, 15, 45)
 RETRY_HTTP_CODES = frozenset({429, 502, 503, 504})
-MIN_RUN_ID_KEY_LENGTH = 32
 
 Json = dict[str, Any]
 
@@ -135,6 +130,11 @@ def parse_tracker_file_name(name: str) -> tuple[str, str] | None:
 
 def is_safe_id(value: Any) -> bool:
     return isinstance(value, str) and SAFE_ID_PATTERN.match(value) is not None
+
+
+def get_run_id(cluster: str, job_id: str) -> str:
+    # Job ids are only unique within a cluster
+    return f"{cluster}-{job_id}"
 
 
 def get_record_path(recipe_id: str, run_id: str) -> str:
@@ -296,6 +296,7 @@ def merge_into_record(existing: Json | None, parsed: ParsedTrackerFile, run_id: 
         "runId": run_id,
         "recipeId": parsed.recipe_id,
         "cluster": parsed.cluster,
+        "jobId": parsed.job_id,
         "startedOn": started_on,
         "run": parsed.data if parsed.kind == "run" else existing.get("run"),
         "result": parsed.data if parsed.kind == "result" else existing.get("result"),
@@ -306,14 +307,12 @@ def plan_collection(
     files: list[TrackerFile],
     contents: dict[str, str],
     existing: dict[str, Json],
-    get_run_id: Callable[[str, str], str],
     now: datetime,
 ) -> CollectionPlan:
     """Plans one collection pass.
 
     `contents` holds the downloaded content of each listed file (missing when it could not be
-    read), `existing` the records already in the records checkout, by path, and `get_run_id`
-    derives the public run id from a cluster and job id.
+    read) and `existing` the records already in the records checkout, by path.
     """
     plan = CollectionPlan()
     # A run's two files must name the same recipe: files are untrusted, and a result naming
@@ -348,8 +347,6 @@ def plan_collection(
             handle_invalid(file, parsed)
             continue
         run_id = get_run_id(parsed.cluster, parsed.job_id)
-        if not RUN_ID_PATTERN.match(run_id):
-            raise ValueError("get_run_id must return 32 hex characters")
         if recipe_by_run_id.setdefault(run_id, parsed.recipe_id) != parsed.recipe_id:
             handle_invalid(file, "recipe does not match the run's other file")
             continue
@@ -395,6 +392,7 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
             {
                 "runId": record["runId"],
                 "cluster": record["cluster"],
+                "jobId": record["jobId"],
                 "path": get_record_path(record["recipeId"], record["runId"]),
                 "status": get_run_status(record, now),
                 "startedOn": record.get("startedOn"),
@@ -418,14 +416,6 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
     return {"schemaVersion": RUN_RECORD_SCHEMA_VERSION, "recipeId": recipe_id, "runs": runs}
 
 
-def make_run_id_function(run_id_key: str) -> Callable[[str, str], str]:
-    # Keyed, so that the job id can't be recovered by hashing candidate job ids
-    def get_run_id(cluster: str, job_id: str) -> str:
-        return hmac.new(run_id_key.encode(), f"{cluster}:{job_id}".encode(), sha256).hexdigest()[:32]
-
-    return get_run_id
-
-
 # ----- FirecREST and files -----
 
 
@@ -442,7 +432,6 @@ class Config:
     client_secret: str
     system: str
     tracker_dir: str
-    run_id_key: str
 
 
 def get_config() -> Config:
@@ -457,13 +446,10 @@ def get_config() -> Config:
         "FIRECREST_CLIENT_SECRET",
         "FIRECREST_SYSTEM",
         "RUN_TRACKER_DIR",
-        "RUN_ID_KEY",
     ]
     missing = [name for name in names if not os.environ.get(name)]
     if missing:
         fail(f"Missing configuration: {', '.join(missing)}")
-    if len(os.environ["RUN_ID_KEY"]) < MIN_RUN_ID_KEY_LENGTH:
-        fail(f"RUN_ID_KEY must be at least {MIN_RUN_ID_KEY_LENGTH} characters")
     return Config(
         firecrest_url=os.environ["FIRECREST_URL"].rstrip("/"),
         token_url=os.environ["FIRECREST_TOKEN_URL"],
@@ -471,7 +457,6 @@ def get_config() -> Config:
         client_secret=os.environ["FIRECREST_CLIENT_SECRET"],
         system=os.environ["FIRECREST_SYSTEM"],
         tracker_dir=os.environ["RUN_TRACKER_DIR"].rstrip("/"),
-        run_id_key=os.environ["RUN_ID_KEY"],
     )
 
 
@@ -603,6 +588,9 @@ def load_records(runs_dir: Path) -> dict[str, Json]:
                 isinstance(record, dict)
                 and record.get("runId") == record_file.stem
                 and record.get("recipeId") == recipe_dir.name
+                and isinstance(record.get("cluster"), str)
+                and isinstance(record.get("jobId"), str)
+                and get_run_id(record["cluster"], record["jobId"]) == record_file.stem
             ):
                 records[f"{recipe_dir.name}/{record_file.name}"] = record
             else:
@@ -646,7 +634,7 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
 
     existing = load_records(runs_dir)
     now = datetime.now(timezone.utc)
-    plan = plan_collection(files, contents, existing, make_run_id_function(config.run_id_key), now)
+    plan = plan_collection(files, contents, existing, now)
     for record_path, record in plan.records.items():
         write_json(runs_dir / record_path, record)
     # Indexes are rebuilt for every recipe, so that statuses age (running -> unknown) even

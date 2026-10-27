@@ -2,12 +2,12 @@ name: collect-rl-runs
 
 # Collects the files that RL training jobs launched from the FirecREST UI AI Training page leave
 # in the run tracker directory on the cluster (<job id>-run.json, <job id>-result.json) into run
-# records on the rl-runs branch: one record per run (<recipe id>/<run id>.json) and an index.json
-# per recipe. Tracker files are deleted once the records are pushed. See
+# records on the rl-runs branch: one record per run (<recipe id>/<cluster>-<job id>.json) and an
+# index.json per recipe. Tracker files are deleted once the records are pushed. See
 # .github/rl-runs-collector/collect_rl_runs.py.
 #
-# Records contain nothing that identifies a person (no user, account, path, job id or exact
-# time), so they can be public. They live on their own branch so that the collector's commits
+# Records contain no user, account, path or exact time, so they can be public. They do contain
+# the cluster and job id, so that the UI can link a run to its job. They live on their own branch so that the collector's commits
 # never touch the image sources or their CI. A pass fails with the names of any missing
 # settings until the environment below is configured.
 #
@@ -19,8 +19,6 @@ name: collect-rl-runs
 #   (where scheduled runs come from), with:
 #   - secret FIRECREST_CLIENT_SECRET: FirecREST client secret. Its client must be bound to the
 #     owner of the tracker directory, the only user who can delete everyone's files there
-#   - secret RUN_ID_KEY: random key run ids are derived from, e.g. `openssl rand -hex 32`.
-#     Keep it: a new key gives every run a new id
 #   - variables FIRECREST_URL (FirecREST v2 base URL), FIRECREST_TOKEN_URL (OIDC token endpoint
 #     of the client), FIRECREST_CLIENT_ID, FIRECREST_SYSTEM (system the tracker directory is read
 #     through, e.g. clariden) and RUN_TRACKER_DIR (e.g. /capstor/scratch/cscs/palmee/rl-runs-tracker)
@@ -55,7 +53,6 @@ jobs:
       FIRECREST_CLIENT_SECRET: ${{ secrets.FIRECREST_CLIENT_SECRET }}
       FIRECREST_SYSTEM: ${{ vars.FIRECREST_SYSTEM }}
       RUN_TRACKER_DIR: ${{ vars.RUN_TRACKER_DIR }}
-      RUN_ID_KEY: ${{ secrets.RUN_ID_KEY }}
     steps:
       - name: Checkout the collector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

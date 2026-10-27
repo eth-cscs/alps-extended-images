@@ -20,11 +20,6 @@ OLD = "2026-10-20T11:00:00Z"
 RECIPE = "nemo-rl-apertus-gsm8k"
 
 
-def get_run_id(cluster, job_id):
-    """Stand-in for the keyed hash: 32 hex characters per cluster and job."""
-    return f"{'c' if cluster == 'clariden' else 'd'}{job_id.zfill(31)}"[:32]
-
-
 def run_file(job_id, **overrides):
     data = {
         "schemaVersion": crr.RUN_RECORD_SCHEMA_VERSION,
@@ -68,7 +63,6 @@ def collect(files, contents, existing=None):
         [crr.TrackerFile(name=name, size=size, last_modified=modified) for name, modified, size in files],
         {name: json.dumps(data) if not isinstance(data, str) else data for name, data in contents.items()},
         existing or {},
-        get_run_id,
         NOW,
     )
 
@@ -131,12 +125,13 @@ class TestPublishedRecords:
                 },
             ),
         )
-        record = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
         assert record == {
             "schemaVersion": crr.RUN_RECORD_SCHEMA_VERSION,
-            "runId": "c0000000000000000000000000000007",
+            "runId": "clariden-7",
             "recipeId": RECIPE,
             "cluster": "clariden",
+            "jobId": "7",
             "startedOn": "2026-10-23",
             "run": {
                 "recipe": {"id": RECIPE, "version": None},
@@ -152,7 +147,7 @@ class TestPublishedRecords:
             "result": None,
         }
         published = json.dumps(plan.records)
-        for leaked in ("alice", '"7"', "08:13"):
+        for leaked in ("alice", "08:13"):
             assert leaked not in published
 
     def test_keep_results_to_status_exit_day_duration_and_numeric_metrics(self):
@@ -167,7 +162,7 @@ class TestPublishedRecords:
                 user="alice",
             ),
         )
-        assert plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]["result"] == {
+        assert plan.records[f"{RECIPE}/clariden-7.json"]["result"] == {
             "status": "terminated",
             "exitCode": 143,
             "signal": "TERM",
@@ -178,7 +173,7 @@ class TestPublishedRecords:
 
     def test_booleans_are_not_numbers(self):
         plan = collect_one("7-result.json", result_file("7", exitCode=True, elapsedSeconds=False))
-        result = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]["result"]
+        result = plan.records[f"{RECIPE}/clariden-7.json"]["result"]
         assert result["exitCode"] is None
         assert result["elapsedSeconds"] is None
 
@@ -189,7 +184,7 @@ class TestPlanCollection:
             [("7-result.json", RECENT, None), ("7-run.json", RECENT, None)],
             {"7-run.json": run_file("7"), "7-result.json": result_file("7")},
         )
-        record = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
         assert record["run"]["preset"] == "muon"
         assert record["result"]["status"] == "completed"
         assert sorted(plan.processed) == ["7-result.json", "7-run.json"]
@@ -201,7 +196,7 @@ class TestPlanCollection:
             {"7-result.json": result_file("7", status="failed", exitCode=1)},
             first.records,
         )
-        record = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
         assert record["run"]["preset"] == "muon"
         assert record["result"]["status"] == "failed"
 
@@ -211,8 +206,8 @@ class TestPlanCollection:
             {"7-run.json": run_file("7"), "7-result.json": result_file("7", cluster="daint")},
         )
         assert sorted(plan.records) == [
-            f"{RECIPE}/c0000000000000000000000000000007.json",
-            f"{RECIPE}/d0000000000000000000000000000007.json",
+            f"{RECIPE}/clariden-7.json",
+            f"{RECIPE}/daint-7.json",
         ]
 
     def test_keeps_recent_invalid_or_unreadable_files_and_expires_old_invalid_ones(self):
@@ -237,8 +232,8 @@ class TestPlanCollection:
             [("7-run.json", RECENT, None), ("7-result.json", OLD, None)],
             {"7-run.json": run_file("7"), "7-result.json": result_file("7", recipeId="verl-grpo")},
         )
-        assert list(plan.records) == [f"{RECIPE}/c{'0' * 30}7.json"]
-        assert plan.records[f"{RECIPE}/c{'0' * 30}7.json"]["result"] is None
+        assert list(plan.records) == [f"{RECIPE}/clariden-7.json"]
+        assert plan.records[f"{RECIPE}/clariden-7.json"]["result"] is None
         assert plan.expired == [("7-result.json", "recipe does not match the run's other file")]
 
     def test_checks_the_recipe_against_records_from_earlier_passes(self):
@@ -250,16 +245,6 @@ class TestPlanCollection:
         )
         assert plan.records == {}
         assert [name for name, _ in plan.skipped] == ["7-result.json"]
-
-    def test_rejects_a_run_id_function_that_does_not_return_32_hex_characters(self):
-        with pytest.raises(ValueError):
-            crr.plan_collection(
-                [crr.TrackerFile("7-run.json", last_modified=RECENT)],
-                {"7-run.json": json.dumps(run_file("7"))},
-                {},
-                lambda cluster, job_id: job_id,
-                NOW,
-            )
 
 
 class TestRunIndex:
@@ -286,8 +271,8 @@ class TestRunIndex:
             {**self.record("3", "2026-10-23T09:00:00Z", False), "recipeId": "verl-grpo"},
         ]
         index = crr.build_run_index(RECIPE, records, NOW)
-        assert [run["runId"] for run in index["runs"]] == ["c0000000000000000000000000000002", "c0000000000000000000000000000001"]
-        assert index["runs"][1]["path"] == f"{RECIPE}/c0000000000000000000000000000001.json"
+        assert [run["runId"] for run in index["runs"]] == ["clariden-2", "clariden-1"]
+        assert index["runs"][1]["path"] == f"{RECIPE}/clariden-1.json"
         assert index["runs"][1]["status"] == "completed"
         assert index["runs"][1]["preset"] == "muon"
         assert index["runs"][1]["hyperparameters"]["MAX_NUM_STEPS"] == 58
@@ -296,13 +281,10 @@ class TestRunIndex:
         assert crr.build_run_index(RECIPE, records, NOW) == index
 
 
-def test_run_ids_are_keyed_and_per_cluster():
-    get_id = crr.make_run_id_function("k" * 32)
-    run_id = get_id("clariden", "501")
-    assert crr.RUN_ID_PATTERN.match(run_id)
-    assert get_id("clariden", "501") == run_id
-    assert get_id("daint", "501") != run_id
-    assert crr.make_run_id_function("j" * 32)("clariden", "501") != run_id
+def test_run_ids_are_the_cluster_and_job_id():
+    assert crr.get_run_id("clariden", "501") == "clariden-501"
+    assert crr.RUN_ID_PATTERN.match("clariden-501")
+    assert not crr.RUN_ID_PATTERN.match("index")
 
 
 def test_runs_without_a_known_time_limit_eventually_become_unknown():
@@ -319,7 +301,6 @@ class TestFirecrestErrors:
         client_secret="not-a-real-secret",
         system="clariden",
         tracker_dir="/tracker",
-        run_id_key="k" * 32,
     )
 
     @pytest.fixture(autouse=True)
@@ -443,7 +424,7 @@ class TestFirecrestErrors:
 
 def test_huge_time_limits_are_dropped_instead_of_crashing_the_pass():
     plan = collect_one("7-run.json", run_file("7", launch={**run_file("7")["launch"], "job": {"timeLimit": "999999999999-00:00:00"}}))
-    record = plan.records[f"{RECIPE}/c{'0' * 30}7.json"]
+    record = plan.records[f"{RECIPE}/clariden-7.json"]
     assert record["run"]["timeLimit"] is None
     assert crr.build_run_index(RECIPE, [record], NOW)["runs"][0]["status"] == "running"
 
@@ -453,8 +434,9 @@ class TestLoadRecords:
         good = collect_one("7-run.json", run_file("7")).records
         for path, record in good.items():
             crr.write_json(tmp_path / path, record)
-        (tmp_path / RECIPE / f"{'a' * 32}.json").write_text("{not json")
-        crr.write_json(tmp_path / RECIPE / f"{'b' * 32}.json", {**next(iter(good.values()))})
+        (tmp_path / RECIPE / "clariden-1.json").write_text("{not json")
+        # A record whose file name does not match its run
+        crr.write_json(tmp_path / RECIPE / "clariden-2.json", {**next(iter(good.values())), "runId": "clariden-2"})
         (tmp_path / RECIPE / "index.json").write_text("{}")
         assert crr.load_records(tmp_path) == good
         assert "2 existing records could not be read" in capsys.readouterr().out
@@ -472,7 +454,6 @@ class TestDeletePhase:
         client_secret="not-a-real-secret",
         system="clariden",
         tracker_dir="/tracker",
-        run_id_key="k" * 32,
     )
 
     @pytest.fixture()
