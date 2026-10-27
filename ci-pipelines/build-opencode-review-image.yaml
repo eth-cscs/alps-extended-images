@@ -1,0 +1,76 @@
+include:
+  - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
+
+stages: [build, publish]
+
+variables:
+  IMAGE_PREFIX: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images
+  GHCR_IMAGE_PREFIX: ghcr.io/eth-cscs/alps-extended-images
+  # Bootstrap refs are versioned tags; bump the suffix for baked runtime/config changes.
+  # Publication refuses to overwrite a different GHCR digest. The publish job
+  # prints a digest pin for .github/workflows/opencode-review-worker.yml.
+  OPENCODE_REVIEW_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/opencode-review:opencode-2.2.0-amd64-v1
+  OPENCODE_REVIEW_GHCR_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review:opencode-2.2.0-amd64-v1
+  OPENCODE_REVIEW_BASE_IMAGE: docker.io/library/node:24-bookworm-slim
+
+build-opencode-review-image:
+  stage: build
+  extends: [.container-builder-cscs-zen2]
+  timeout: 1h
+  when: manual
+  allow_failure: false
+  resource_group: opencode-review-image
+  variables:
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: if-not-exists
+    KUBERNETES_MEMORY_REQUEST: '16Gi'
+    KUBERNETES_MEMORY_LIMIT: '16Gi'
+    DOCKERFILE: .github/review/Containerfile
+    BASE_IMAGE: $OPENCODE_REVIEW_BASE_IMAGE
+    PERSIST_IMAGE_NAME: $OPENCODE_REVIEW_IMAGE
+    DOCKER_BUILD_ARGS: '["BASE_IMAGE"]'
+
+publish-opencode-review-image:
+  stage: publish
+  extends: [.container-runner-lightweight-zen2]
+  image: quay.io/skopeo/stable:v1.22.2
+  resource_group: opencode-review-image
+  needs:
+    - job: build-opencode-review-image
+      artifacts: false
+  script:
+    - |
+      set -euo pipefail
+      source ci-pipelines/helpers/skopeo.sh
+      skopeo_login
+      skopeo_login_ghcr
+      architecture="$(skopeo inspect --format '{{.Architecture}}' "docker://${OPENCODE_REVIEW_IMAGE}")"
+      if [[ "$architecture" != amd64 ]]; then
+        echo "ERROR: GitHub's ubuntu-latest review runner requires an amd64 image, got ${architecture}" >&2
+        exit 1
+      fi
+      source_digest="$(img_digest "$OPENCODE_REVIEW_IMAGE")"
+      promote_strict "$OPENCODE_REVIEW_IMAGE" "$OPENCODE_REVIEW_GHCR_IMAGE"
+      digest="$(img_digest "$OPENCODE_REVIEW_GHCR_IMAGE")"
+      if [[ -z "$digest" || "$digest" != "$source_digest" ]]; then
+        echo 'ERROR: published review image does not match the built digest' >&2
+        exit 1
+      fi
+      if ! public_digest="$(skopeo inspect --no-creds --format '{{.Digest}}' "docker://${OPENCODE_REVIEW_GHCR_IMAGE}")"; then
+        echo 'ERROR: make the GHCR review package public and retry this job; GitHub reviews pull without registry credentials' >&2
+        exit 1
+      fi
+      if [[ "$public_digest" != "$digest" ]]; then
+        echo 'ERROR: anonymous GHCR pull resolved a different image digest' >&2
+        exit 1
+      fi
+      image_repo="${OPENCODE_REVIEW_GHCR_IMAGE%:*}"
+      printf '%s\n' \
+        "OPENCODE_REVIEW_IMAGE=${OPENCODE_REVIEW_GHCR_IMAGE}" \
+        "OPENCODE_REVIEW_IMAGE_DIGEST=${digest}" \
+        "OPENCODE_REVIEW_IMAGE_PIN=${image_repo}@${digest}" \
+        | tee opencode-review-image.env
+  artifacts:
+    reports:
+      dotenv: opencode-review-image.env

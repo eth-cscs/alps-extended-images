@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+ARG BASE_IMAGE=node:24-bookworm-slim
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+COPY Alps-Images/common/package-helpers.sh /tmp/package-helpers.sh
+RUN set -eux; \
+    source /tmp/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends ca-certificates git ripgrep; \
+    rm -rf /var/lib/apt/lists/* /tmp/package-helpers.sh
+
+ARG OPENCODE_VERSION=2.2.0
+RUN set -eux; \
+    npm install --global --allow-scripts=@opencode/cli "@opencode/cli@${OPENCODE_VERSION}"; \
+    test "$(opencode --version)" = "opencode v${OPENCODE_VERSION}"; \
+    npm cache clean --force
+
+COPY .github/review/opencode.json /opt/review-config/opencode/opencode.json
+COPY .github/review/grumpy-reviewer.md /opt/review-config/opencode/agents/grumpy-reviewer.md
+COPY .github/review/entrypoint.sh /usr/local/bin/review-entrypoint
+RUN set -eux; \
+    chmod 0555 /usr/local/bin/review-entrypoint; \
+    mkdir -p /source /context /review; \
+    touch /context/context.md /opt/review-config/opencode/AGENTS.md
+
+LABEL org.opencontainers.image.source="https://github.com/eth-cscs/alps-extended-images" \
+      org.opencontainers.image.title="Isolated OpenCode PR reviewer"
+
+USER 1000:1000
+WORKDIR /review
+ENTRYPOINT ["/usr/local/bin/review-entrypoint"]
