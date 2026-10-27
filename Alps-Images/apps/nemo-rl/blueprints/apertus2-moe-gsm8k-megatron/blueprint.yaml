@@ -1,10 +1,10 @@
 # Apertus 2 MoE on GSM8K with native Megatron generation (example/megatron/gsm8k)
 schemaVersion: 1
 id: apertus2-moe-gsm8k-megatron
-name: NeMo-RL GRPO · GSM8K · Megatron generation
+name: NeMo-RL GRPO · Megatron generation
 description: >-
-  Asynchronous Group Relative Policy Optimization with Megatron training and Megatron rollouts, on
-  separate training and generation nodes.
+  Asynchronous Group Relative Policy Optimization with NeMo-RL (Swiss AI blueprint), Megatron
+  training and Megatron rollouts.
 status: validated
 algorithm: grpo
 topology:

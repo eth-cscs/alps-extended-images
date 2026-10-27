@@ -1,10 +1,10 @@
 # Apertus 2 MoE on GSM8K with vLLM generation (example/vllm/gsm8k)
 schemaVersion: 1
 id: apertus2-moe-gsm8k-vllm
-name: NeMo-RL GRPO · GSM8K · vLLM generation
+name: NeMo-RL GRPO · vLLM generation
 description: >-
-  Asynchronous Group Relative Policy Optimization with Megatron training and vLLM rollouts, on
-  separate training and generation nodes.
+  Asynchronous Group Relative Policy Optimization with NeMo-RL (Swiss AI blueprint), Megatron
+  training and vLLM rollouts.
 status: validated
 algorithm: grpo
 topology:
