@@ -54,7 +54,6 @@ jobs:
       FIRECREST_SYSTEM: ${{ vars.FIRECREST_SYSTEM }}
       RUN_TRACKER_DIR: ${{ vars.RUN_TRACKER_DIR }}
       RUN_ID_KEY: ${{ secrets.RUN_ID_KEY }}
-      MANIFEST: ${{ runner.temp }}/rl-runs-processed.json
     steps:
       - name: Checkout the collector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,7 +72,7 @@ jobs:
           python-version: '3.12'
 
       - name: Collect tracker files
-        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$MANIFEST"
+        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$RUNNER_TEMP/rl-runs-processed.json"
 
       # Rebased on whatever reached rl-runs since the checkout, never forced. If that conflicts or
       # the push is rejected, the step fails, nothing is deleted, and the next pass collects the
@@ -95,4 +94,4 @@ jobs:
       # Only reached when the push succeeded; files that fail to delete are collected again
       # next time, which is harmless
       - name: Delete collected tracker files
-        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$MANIFEST"
+        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$RUNNER_TEMP/rl-runs-processed.json"

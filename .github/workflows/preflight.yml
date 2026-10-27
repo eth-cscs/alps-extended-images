@@ -62,6 +62,10 @@ jobs:
       - name: ShellCheck
         run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh
 
+      - name: GitHub workflow lint
+        # Catches what the YAML parse below cannot, such as expression contexts a field does not allow
+        run: uvx --from actionlint-py actionlint .github/workflows/collect-rl-runs.yml
+
       - name: CI YAML and embedded shell syntax
         run: |
           # Parse the static CI YAML files and syntax-check literal shell snippets
