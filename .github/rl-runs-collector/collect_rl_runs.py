@@ -6,6 +6,10 @@ tracker directory on the cluster: <job id>-run.json when they start and <job id>
 they exit. This script reads them through FirecREST and turns them into one record per run,
 <recipe id>/<cluster>-<job id>.json, plus an index.json per recipe, in a checkout of the records
 branch.
+
+A job can't always report how it ended: preemption or a cancellation may kill it before its exit
+handler runs, or leave it to record the signal as an ordinary failure. So for recent runs the
+final state is also asked from Slurm, which then decides the status (e.g. preempted).
 It runs in two phases, so that tracker files are only deleted once the records are pushed:
 
   collect_rl_runs.py collect --runs-dir <checkout> --manifest <file>
@@ -77,6 +81,22 @@ DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}", re.ASCII)
 MAX_PARAMETERS = 100
 MAX_METRICS = 50
 RESULT_STATUSES = ("completed", "failed", "terminated")
+# Slurm states of jobs that have ended, and the run status each means. Other states (pending,
+# running, requeued, ...) mean the job hasn't ended.
+SCHEDULER_END_STATES = {
+    "COMPLETED": "completed",
+    "FAILED": "failed",
+    "NODE_FAIL": "failed",
+    "OUT_OF_MEMORY": "failed",
+    "BOOT_FAIL": "failed",
+    "PREEMPTED": "preempted",
+    "CANCELLED": "terminated",
+    "TIMEOUT": "terminated",
+    "DEADLINE": "terminated",
+}
+# Runs are checked with Slurm until it confirms how they ended, for at most this long; Slurm
+# forgets old jobs anyway
+SCHEDULER_CHECK_MAX_AGE = timedelta(days=30)
 RESULT_SIGNALS = ("TERM", "INT")
 
 REQUEST_TIMEOUT_SECONDS = 60
@@ -357,6 +377,52 @@ def plan_collection(
     return plan
 
 
+def needs_scheduler_check(record: Json, system: str, now: datetime) -> bool:
+    """Whether Slurm should be asked how the record's job ended.
+
+    Only jobs on the system the collector reads through, until Slurm has confirmed their end.
+    """
+    result = record.get("result") or {}
+    started_on = _parse_time(record.get("startedOn"))
+    return (
+        record.get("cluster") == system
+        and isinstance(record.get("jobId"), str)
+        and "schedulerState" not in result
+        and started_on is not None
+        and now - started_on <= SCHEDULER_CHECK_MAX_AGE
+    )
+
+
+def apply_scheduler_state(record: Json, job: Any) -> Json | None:
+    """The record updated with Slurm's account of its job, or None when the job hasn't ended.
+
+    Slurm's state decides the status. What the job reported itself (exit code, metrics) is
+    kept; for a job that couldn't report, the end and duration come from Slurm.
+    """
+    if not isinstance(job, dict):
+        return None
+    status = job.get("status") if isinstance(job.get("status"), dict) else {}
+    state = status.get("state")
+    # e.g. "CANCELLED by 1234"
+    state = state.split()[0].upper() if isinstance(state, str) and state.strip() else None
+    if state not in SCHEDULER_END_STATES:
+        return None
+    times = job.get("time") if isinstance(job.get("time"), dict) else {}
+    end = _to_integer(times.get("end"), 1, 2**40)
+    reported = record.get("result")
+    result = dict(reported) if reported else {
+        "status": None,
+        "exitCode": _to_integer(status.get("exitCode"), 0, 255),
+        "signal": None,
+        "endedOn": datetime.fromtimestamp(end, timezone.utc).date().isoformat() if end else None,
+        "elapsedSeconds": _to_integer(times.get("elapsed"), 0, 10 * 365 * 24 * 3600),
+        "metrics": None,
+    }
+    result["status"] = SCHEDULER_END_STATES[state]
+    result["schedulerState"] = state
+    return {**record, "result": result}
+
+
 def parse_time_limit(time_limit: Any) -> timedelta | None:
     """[D-]HH:MM:SS, as accepted at launch."""
     if not isinstance(time_limit, str):
@@ -530,6 +596,50 @@ def firecrest(config: Config, access_token: str, method: str, operation: str, pa
         raise FirecrestError(f"{method} ops/{operation} failed: {type(error).__name__}") from None
 
 
+def get_scheduler_job(config: Config, access_token: str, job_id: str) -> Any:
+    """Slurm's record of a job, or None when Slurm doesn't know it (anymore).
+
+    Only jobs the collector's FirecREST user may see are found: those of its own accounts.
+    """
+    system = urllib.parse.quote(config.system, safe="")
+    request = urllib.request.Request(
+        f"{config.firecrest_url}/compute/{system}/jobs/{urllib.parse.quote(job_id, safe='')}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    try:
+        response = json.loads(send(request))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise FirecrestError(f"GET compute/jobs failed with HTTP {error.code}", error.code) from None
+    except OSError as error:
+        raise FirecrestError(f"GET compute/jobs failed: {type(error).__name__}") from None
+    except ValueError:
+        raise FirecrestError("GET compute/jobs returned an unexpected response") from None
+    jobs = response.get("jobs") if isinstance(response, dict) else None
+    return jobs[0] if isinstance(jobs, list) and jobs else None
+
+
+def check_scheduler(
+    config: Config, access_token: str, records: dict[str, Json], now: datetime
+) -> tuple[dict[str, Json], int, int]:
+    """Records whose job Slurm reports as ended, updated, with the number checked and failed."""
+    updated: dict[str, Json] = {}
+    candidates = [path for path in sorted(records) if needs_scheduler_check(records[path], config.system, now)]
+    failures = 0
+    for path in candidates:
+        try:
+            job = get_scheduler_job(config, access_token, records[path]["jobId"])
+        except FirecrestError:
+            # Asked again next pass
+            failures += 1
+            continue
+        record = apply_scheduler_state(records[path], job)
+        if record:
+            updated[path] = record
+    return updated, len(candidates), failures
+
+
 def parse_listing(content: bytes) -> list[TrackerFile]:
     """The tracker files in an ops/ls response, which is {"output": [File, ...]}."""
     listing = json.loads(content)
@@ -635,6 +745,11 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
     existing = load_records(runs_dir)
     now = datetime.now(timezone.utc)
     plan = plan_collection(files, contents, existing, now)
+    # How jobs ended, from Slurm, also for runs collected in earlier passes
+    ended, checked, check_failures = check_scheduler(
+        config, access_token, {**existing, **plan.records}, now
+    )
+    plan.records.update(ended)
     for record_path, record in plan.records.items():
         write_json(runs_dir / record_path, record)
     # Indexes are rebuilt for every recipe, so that statuses age (running -> unknown) even
@@ -655,12 +770,15 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
         f"Tracker files: {len(files)} listed, {len(plan.processed)} collected, "
         f"{len(plan.expired)} invalid and expired, {len(plan.skipped)} skipped"
     )
+    print(f"Slurm: {checked} runs checked, {len(ended)} confirmed as ended")
     for record_path in sorted(plan.records):
         print(f"  updated {record_path}")
     log_reasons("expired", plan.expired)
     log_reasons("skipped", plan.skipped)
     if read_failures:
         print(f"::warning::{read_failures} tracker files could not be downloaded; the next pass retries them")
+    if check_failures:
+        print(f"::warning::{check_failures} runs could not be checked with Slurm; the next pass retries them")
 
 
 def delete_processed(config: Config, manifest_path: Path, dry_run: bool) -> None:

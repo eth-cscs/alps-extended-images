@@ -287,6 +287,57 @@ def test_run_ids_are_the_cluster_and_job_id():
     assert not crr.RUN_ID_PATTERN.match("index")
 
 
+class TestSchedulerState:
+    RECORD = {"runId": "clariden-7", "cluster": "clariden", "jobId": "7", "startedOn": "2026-10-23", "result": None}
+
+    @pytest.mark.parametrize(
+        ("state", "status"),
+        [
+            ("COMPLETED", "completed"),
+            ("FAILED", "failed"),
+            ("OUT_OF_MEMORY", "failed"),
+            ("PREEMPTED", "preempted"),
+            ("TIMEOUT", "terminated"),
+            ("CANCELLED by 1234", "terminated"),
+        ],
+    )
+    def test_maps_end_states_to_run_statuses(self, state, status):
+        job = {"status": {"state": state, "exitCode": 1}, "time": {"end": 1793102823, "elapsed": 287}}
+        result = crr.apply_scheduler_state(self.RECORD, job)["result"]
+        assert result["status"] == status
+        # A job that couldn't report gets its end and duration from Slurm
+        assert result["endedOn"] == "2026-10-27"
+        assert result["elapsedSeconds"] == 287
+        assert result["exitCode"] == 1
+        assert result["metrics"] is None
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {"status": {"state": "RUNNING"}},
+            {"status": {"state": "PENDING"}},
+            {"status": {"state": "REQUEUED"}},
+            {"status": {"state": ""}},
+            {"status": "PREEMPTED"},
+            None,
+            "garbage",
+        ],
+    )
+    def test_jobs_that_have_not_ended_change_nothing(self, job):
+        assert crr.apply_scheduler_state(self.RECORD, job) is None
+
+    def test_only_recent_runs_on_this_system_without_a_confirmed_end_are_checked(self):
+        now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+        assert crr.needs_scheduler_check(self.RECORD, "clariden", now)
+        assert not crr.needs_scheduler_check(self.RECORD, "daint", now)
+        assert not crr.needs_scheduler_check({**self.RECORD, "startedOn": "2026-09-01"}, "clariden", now)
+        confirmed = {**self.RECORD, "result": {"status": "preempted", "schedulerState": "PREEMPTED"}}
+        assert not crr.needs_scheduler_check(confirmed, "clariden", now)
+        # A result the job wrote itself is still confirmed with Slurm
+        reported = {**self.RECORD, "result": {"status": "failed"}}
+        assert crr.needs_scheduler_check(reported, "clariden", now)
+
+
 def test_runs_without_a_known_time_limit_eventually_become_unknown():
     record = {"startedOn": "2026-10-01", "run": {"timeLimit": None}, "result": None}
     assert crr.get_run_status(record, NOW) == "unknown"
@@ -378,6 +429,25 @@ class TestFirecrestErrors:
             ("1-run.json", 120, RECENT),
             ("2-run.json", 99, None),
         ]
+
+    def test_reads_a_job_from_slurm(self, monkeypatch):
+        self.respond_with(monkeypatch, b'{"jobs": [{"jobId": "7", "status": {"state": "PREEMPTED"}}]}')
+        assert crr.get_scheduler_job(self.CONFIG, "token", "7")["status"]["state"] == "PREEMPTED"
+
+    @pytest.mark.parametrize("outcome", [b'{"jobs": []}', b"{}"])
+    def test_jobs_slurm_does_not_know_are_none(self, monkeypatch, outcome):
+        self.respond_with(monkeypatch, outcome)
+        assert crr.get_scheduler_job(self.CONFIG, "token", "7") is None
+
+    def test_a_job_not_found_is_none_and_other_errors_raise(self, monkeypatch):
+        self.respond_with(monkeypatch, self.http_error(404))
+        assert crr.get_scheduler_job(self.CONFIG, "token", "7") is None
+        self.respond_with(monkeypatch, self.http_error(403))
+        with pytest.raises(crr.FirecrestError, match="HTTP 403"):
+            crr.get_scheduler_job(self.CONFIG, "token", "7")
+        self.respond_with(monkeypatch, b"<html>")
+        with pytest.raises(crr.FirecrestError, match="unexpected response"):
+            crr.get_scheduler_job(self.CONFIG, "token", "7")
 
     def test_download_failures_are_retried_rather_than_crashing(self, monkeypatch):
         self.respond_with(monkeypatch, TimeoutError())
@@ -529,7 +599,58 @@ class TestCollectPhase:
             return content
 
         monkeypatch.setattr(crr, "firecrest", firecrest)
+        # Slurm's records by job id: a job dict, or an exception the request raises
+        self.jobs = {}
+        self.job_requests = []
+
+        def get_scheduler_job(config, access_token, job_id):
+            self.job_requests.append(job_id)
+            job = self.jobs.get(job_id)
+            if isinstance(job, Exception):
+                raise job
+            return job
+
+        monkeypatch.setattr(crr, "get_scheduler_job", get_scheduler_job)
         return files
+
+    @staticmethod
+    def started_today():
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_slurm_decides_how_a_job_ended(self, tmp_path, tracker, capsys):
+        # The job was killed by preemption and recorded the signal as an ordinary failure
+        tracker["7-run.json"] = json.dumps(run_file("7", startedAt=self.started_today())).encode()
+        tracker["7-result.json"] = json.dumps(
+            result_file("7", status="failed", exitCode=143, startedAt=self.started_today())
+        ).encode()
+        self.jobs["7"] = {"status": {"state": "PREEMPTED", "exitCode": 0}, "time": {"elapsed": 287}}
+        crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
+        record = json.loads((tmp_path / RECIPE / "clariden-7.json").read_text())
+        assert record["result"]["status"] == "preempted"
+        assert record["result"]["schedulerState"] == "PREEMPTED"
+        # What the job reported itself is kept
+        assert record["result"]["exitCode"] == 143
+        index = json.loads((tmp_path / RECIPE / "index.json").read_text())
+        assert index["runs"][0]["status"] == "preempted"
+        assert "Slurm: 1 runs checked, 1 confirmed as ended" in capsys.readouterr().out
+
+        # Once confirmed, a run isn't asked about again
+        self.job_requests.clear()
+        tracker.clear()
+        crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
+        assert self.job_requests == []
+
+    def test_runs_still_going_or_unknown_to_slurm_keep_waiting(self, tmp_path, tracker, capsys):
+        tracker["7-run.json"] = json.dumps(run_file("7", startedAt=self.started_today())).encode()
+        tracker["8-run.json"] = json.dumps(run_file("8", startedAt=self.started_today())).encode()
+        tracker["9-run.json"] = json.dumps(run_file("9", startedAt=self.started_today())).encode()
+        self.jobs["7"] = {"status": {"state": "RUNNING"}}
+        self.jobs["9"] = crr.FirecrestError("GET compute/jobs failed with HTTP 500", 500)
+        crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
+        index = json.loads((tmp_path / RECIPE / "index.json").read_text())
+        assert [run["status"] for run in index["runs"]] == ["running"] * 3
+        output = capsys.readouterr().out
+        assert "::warning::1 runs could not be checked with Slurm" in output
 
     def test_retries_files_that_could_not_be_downloaded_and_says_so(self, tmp_path, tracker, capsys):
         tracker["7-run.json"] = json.dumps(run_file("7")).encode()
