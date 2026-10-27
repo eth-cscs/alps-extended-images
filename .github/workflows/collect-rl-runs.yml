@@ -8,7 +8,8 @@ name: collect-rl-runs
 #
 # Records contain nothing that identifies a person (no user, account, path, job id or exact
 # time), so they can be public. They live on their own branch so that the collector's commits
-# never touch the image sources or their CI. Nothing runs until FIRECREST_URL is set.
+# never touch the image sources or their CI. A pass fails with the names of any missing
+# settings until the environment below is configured.
 #
 # Setup:
 # - Create the records branch once:
@@ -39,7 +40,8 @@ concurrency:
 
 jobs:
   collect:
-    if: github.repository == 'eth-cscs/alps-extended-images' && vars.FIRECREST_URL != ''
+    # Environment variables and secrets are not visible to a job's `if`, only to its steps
+    if: github.repository == 'eth-cscs/alps-extended-images'
     runs-on: ubuntu-latest
     environment: rl-runs-collector
     timeout-minutes: 20
