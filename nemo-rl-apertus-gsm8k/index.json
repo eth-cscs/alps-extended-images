@@ -7,7 +7,7 @@
       "cluster": "clariden",
       "jobId": "3764225",
       "path": "nemo-rl-apertus-gsm8k/clariden-3764225.json",
-      "status": "terminated",
+      "status": "failed",
       "startedOn": "2026-10-27",
       "endedOn": "2026-10-27",
       "elapsedSeconds": 1068,

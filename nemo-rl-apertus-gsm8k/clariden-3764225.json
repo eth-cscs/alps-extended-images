@@ -7,11 +7,12 @@
   "startedOn": "2026-10-27",
   "run": null,
   "result": {
-    "status": "terminated",
+    "status": "failed",
     "exitCode": 143,
     "signal": "TERM",
     "endedOn": "2026-10-27",
     "elapsedSeconds": 1068,
-    "metrics": null
+    "metrics": null,
+    "schedulerState": "NODE_FAIL"
   }
 }
