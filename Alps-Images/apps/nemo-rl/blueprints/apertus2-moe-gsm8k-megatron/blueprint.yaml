@@ -1,0 +1,187 @@
+# Apertus 2 MoE on GSM8K with native Megatron generation (example/megatron/gsm8k)
+schemaVersion: 1
+id: apertus2-moe-gsm8k-megatron
+name: NeMo-RL GRPO · GSM8K · Megatron generation
+description: >-
+  Asynchronous Group Relative Policy Optimization with Megatron training and Megatron rollouts, on
+  separate training and generation nodes.
+status: validated
+algorithm: grpo
+topology:
+  mode: async
+  placement: split
+engines:
+  training: megatron
+  generation: megatron
+launch:
+  recipe: megatron/gsm8k
+  image: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/nemo-rl-cuda:alps7-dev
+# The config sets Apertus 2 MoE options (expert parallelism, DeepEP dispatch, quantile
+# balancing), so only MoE checkpoints fit
+models:
+  - apertus-2-chonk
+datasets:
+  - gsm8k
+resources:
+  gpusPerNode: 4
+  nodes: [TRAIN_NODES, INFERENCE_NODES]
+  timeLimitVariable: JOB_TIME
+  sbatch: ['--cpus-per-task=288', '--exclusive']
+profiles:
+  - id: adamw
+    name: AdamW
+    description: AdamW with CPU-offloaded optimizer state.
+  - id: muon
+    name: Muon
+    description: Muon with MD decoupling.
+parameters:
+  - key: TRAIN_NODES
+    label: Training nodes
+    group: Resources
+    type: int
+    min: 1
+    max: 128
+  - key: INFERENCE_NODES
+    label: Generation nodes
+    description: Nodes running Megatron generation.
+    group: Resources
+    type: int
+    min: 1
+    max: 64
+  - key: TRAIN_EXPERT_PARALLEL_SIZE
+    label: Training expert parallelism
+    description: Must divide the training GPUs (4 per training node).
+    group: Resources
+    type: int
+    min: 1
+    max: 512
+  - key: MAX_NUM_STEPS
+    label: GRPO steps
+    group: Rollout
+    type: int
+    min: 1
+    max: 100000
+  - key: NUM_PROMPTS
+    label: Prompts per step
+    group: Rollout
+    type: int
+    min: 1
+    max: 8192
+  - key: GENERATIONS_PER_PROMPT
+    label: Generations per prompt
+    group: Rollout
+    type: int
+    min: 1
+    max: 256
+  - key: UPDATES_PER_ROLLOUT
+    label: Optimizer updates per step
+    description: The rollout batch is split into this many training batches.
+    group: Rollout
+    type: int
+    min: 1
+    max: 256
+  - key: INFERENCE_REQUESTS
+    label: Generation batch size
+    description: Concurrent generation requests.
+    group: Rollout
+    type: int
+    min: 1
+    max: 4096
+  - key: TRAIN_MICRO_BATCH
+    label: Micro batch size
+    group: Batching
+    type: int
+    min: 1
+    max: 1024
+  - key: TRAIN_MB_TOKENS
+    label: Training tokens per micro batch
+    group: Batching
+    type: int
+    min: 1
+    max: 1048576
+  - key: LOGPROB_MB_TOKENS
+    label: Log-prob tokens per micro batch
+    group: Batching
+    type: int
+    min: 1
+    max: 1048576
+  - key: BASE_LR
+    label: Learning rate
+    group: Optimization
+    type: float
+    min: 0
+    max: 1
+  - key: MIN_LR
+    label: Minimum learning rate
+    description: Must not exceed the learning rate.
+    group: Optimization
+    type: float
+    min: 0
+    max: 1
+  - key: MATRIX_LR
+    label: Matrix learning rate
+    description: Muon matrix parameters.
+    group: Optimization
+    type: float
+    min: 0
+    max: 1
+    profiles: [muon]
+  - key: GAINS_LR
+    label: Gains learning rate
+    group: Optimization
+    type: float
+    min: 0
+    max: 1
+    profiles: [muon]
+# submit.sh rejects fractional batches; Megatron checks expert parallelism once the job runs
+rules:
+  - kind: atMost
+    value: MIN_LR
+    limit: BASE_LR
+    target: MIN_LR
+    message: Minimum learning rate must not exceed the learning rate
+  - kind: divisible
+    dividend: [NUM_PROMPTS, GENERATIONS_PER_PROMPT]
+    divisor: [UPDATES_PER_ROLLOUT]
+    target: UPDATES_PER_ROLLOUT
+    message: Prompts per step × generations per prompt must divide into this many updates
+  - kind: divisible
+    dividend: [TRAIN_NODES, 4]
+    divisor: [TRAIN_EXPERT_PARALLEL_SIZE]
+    target: TRAIN_EXPERT_PARALLEL_SIZE
+    message: Must divide the training GPUs
+# common/gsm8k.yaml always writes TensorBoard logs; W&B is toggled by environment
+monitoring:
+  - id: tensorboard
+    name: TensorBoard
+    description: Event files are written to the run directory. No account or network access needed.
+    environment:
+      WANDB_ENABLED: 'false'
+    parameters: []
+  - id: wandb
+    name: Weights & Biases
+    description: Streams metrics to a W&B project, in addition to TensorBoard.
+    environment:
+      WANDB_ENABLED: 'true'
+    parameters:
+      - variable: WANDB_PROJECT
+        label: Project
+        required: true
+        default: chonk-grpo
+      - variable: WANDB_ENTITY
+        label: Entity
+        description: User or team namespace.
+        required: false
+      - variable: WANDB_NAME
+        label: Run name
+        description: Defaults to chonk-<Slurm job id>.
+        required: false
+      - variable: WANDB_RUN_GROUP
+        label: Run group
+        required: false
+# From the reference results in example/README.md
+references:
+  - profile: adamw
+    summary: 8 + 4 nodes, GSM8K 48.1% → 91.1% in 132 minutes (job 3686429)
+  - profile: muon
+    summary: 16 + 4 nodes, GSM8K 47.2% → 78.7% in 110 minutes (job 3689066)

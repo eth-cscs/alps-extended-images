@@ -1,0 +1,8 @@
+# Datasets and environments blueprints train on
+schemaVersion: 1
+datasets:
+  - id: gsm8k
+    name: GSM8K
+    description: >-
+      Grade school math with a five-shot prompt. 7,473 training prompts; validates on all 1,319
+      test questions.

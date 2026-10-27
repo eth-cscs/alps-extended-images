@@ -14,6 +14,9 @@ using Megatron training and either vLLM or Megatron generation.
 [`example/vllm/nemo-gym/`](example/vllm/nemo-gym/) uses a remote NeMo Gym math
 verifier.
 
+[`blueprints/`](blueprints/README.md) describes the GSM8K examples in a machine-readable form,
+for tools that launch them, such as the FirecREST UI.
+
 ## Build
 
 Run the [manual-build workflow](../../../manual-build/README.md) from the

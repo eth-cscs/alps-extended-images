@@ -1,0 +1,256 @@
+# JSON Schema for blueprints/<id>/blueprint.yaml. build_index.py checks every blueprint against it,
+# then cross-checks what a schema can't express (profiles, catalogs, rules).
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://github.com/eth-cscs/alps-extended-images/Alps-Images/apps/nemo-rl/blueprints/schema/blueprint.schema.yaml
+title: NeMo-RL blueprint
+type: object
+additionalProperties: false
+required:
+  - schemaVersion
+  - id
+  - name
+  - description
+  - status
+  - algorithm
+  - topology
+  - engines
+  - launch
+  - models
+  - datasets
+  - resources
+  - profiles
+  - parameters
+  - monitoring
+properties:
+  schemaVersion:
+    const: 1
+  id:
+    # Also the blueprint's folder name
+    $ref: '#/$defs/id'
+  name:
+    $ref: '#/$defs/text'
+  description:
+    $ref: '#/$defs/text'
+  status:
+    description: validated setups have a reference run; experimental ones don't yet
+    enum: [validated, experimental]
+  algorithm:
+    enum: [grpo]
+  topology:
+    type: object
+    additionalProperties: false
+    required: [mode, placement]
+    properties:
+      mode:
+        description: sync waits for each rollout before training; async overlaps them
+        enum: [sync, async]
+      placement:
+        description: split runs training and generation on separate nodes, colocated shares them
+        enum: [split, colocated]
+  engines:
+    type: object
+    additionalProperties: false
+    required: [training, generation]
+    properties:
+      training:
+        enum: [megatron, dtensor]
+      generation:
+        enum: [vllm, megatron]
+  launch:
+    type: object
+    additionalProperties: false
+    required: [recipe, image]
+    properties:
+      recipe:
+        description: recipe folder under example/, as passed to train.sh
+        type: string
+        pattern: '^[a-z0-9][a-z0-9-]*(/[a-z0-9][a-z0-9-]*)*$'
+      image:
+        description: container image, passed to train.sh as NEMO_RL_IMAGE
+        type: string
+        pattern: '^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+:[A-Za-z0-9._-]+$'
+  models:
+    description: ids from models.yaml that this setup has been tested with
+    $ref: '#/$defs/idList'
+  datasets:
+    description: ids from datasets.yaml
+    $ref: '#/$defs/idList'
+  resources:
+    type: object
+    additionalProperties: false
+    required: [gpusPerNode, nodes, timeLimitVariable, sbatch]
+    properties:
+      gpusPerNode:
+        type: integer
+        minimum: 1
+      nodes:
+        description: parameters whose sum is the job's node count
+        type: array
+        minItems: 1
+        uniqueItems: true
+        items:
+          $ref: '#/$defs/variable'
+      timeLimitVariable:
+        description: profile variable holding the job's time limit
+        $ref: '#/$defs/variable'
+      sbatch:
+        type: array
+        items:
+          type: string
+          pattern: '^--[a-z][a-z-]*(=[A-Za-z0-9_.:,-]+)?$'
+  profiles:
+    description: one per <recipe>/<id>.env; the first is the default
+    type: array
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, name, description]
+      properties:
+        id:
+          $ref: '#/$defs/id'
+        name:
+          $ref: '#/$defs/text'
+        description:
+          $ref: '#/$defs/text'
+  parameters:
+    description: >-
+      The values a run may change: every `VAR="${VAR:-default}"` of the profiles they apply to,
+      with the default taken from the profile
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [key, label, group, type, min, max]
+      properties:
+        key:
+          $ref: '#/$defs/variable'
+        label:
+          $ref: '#/$defs/text'
+        description:
+          $ref: '#/$defs/text'
+        group:
+          $ref: '#/$defs/text'
+        type:
+          enum: [int, float]
+        min:
+          type: number
+        max:
+          type: number
+        profiles:
+          description: profiles the parameter applies to; all when left out
+          $ref: '#/$defs/idList'
+  rules:
+    description: checks across parameters, evaluated by the UI and against every profile here
+    type: array
+    items:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [kind, value, limit, target, message]
+          properties:
+            kind:
+              const: atMost
+            value:
+              $ref: '#/$defs/variable'
+            limit:
+              $ref: '#/$defs/variable'
+            target:
+              $ref: '#/$defs/variable'
+            message:
+              $ref: '#/$defs/text'
+        - type: object
+          additionalProperties: false
+          required: [kind, dividend, divisor, target, message]
+          properties:
+            kind:
+              const: divisible
+            dividend:
+              $ref: '#/$defs/product'
+            divisor:
+              $ref: '#/$defs/product'
+            target:
+              $ref: '#/$defs/variable'
+            message:
+              $ref: '#/$defs/text'
+  monitoring:
+    type: array
+    minItems: 1
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, name, description, environment, parameters]
+      properties:
+        id:
+          $ref: '#/$defs/id'
+        name:
+          $ref: '#/$defs/text'
+        description:
+          $ref: '#/$defs/text'
+        environment:
+          description: fixed variables exported when this destination is chosen
+          type: object
+          propertyNames:
+            $ref: '#/$defs/variable'
+          additionalProperties:
+            type: string
+            pattern: '^[A-Za-z0-9._-]*$'
+        parameters:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [variable, label, required]
+            properties:
+              variable:
+                $ref: '#/$defs/variable'
+              label:
+                $ref: '#/$defs/text'
+              description:
+                $ref: '#/$defs/text'
+              required:
+                type: boolean
+              default:
+                type: string
+                pattern: '^[A-Za-z0-9._-]*$'
+  references:
+    description: reference runs of this setup
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [profile, summary]
+      properties:
+        profile:
+          $ref: '#/$defs/id'
+        summary:
+          $ref: '#/$defs/text'
+        url:
+          type: string
+          pattern: '^https://'
+$defs:
+  id:
+    type: string
+    pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+  idList:
+    type: array
+    minItems: 1
+    uniqueItems: true
+    items:
+      $ref: '#/$defs/id'
+  variable:
+    type: string
+    pattern: '^[A-Z][A-Z0-9_]{0,63}$'
+  text:
+    type: string
+    minLength: 1
+    maxLength: 400
+  product:
+    description: factors multiplied together, each a parameter or a positive integer
+    type: array
+    minItems: 1
+    items:
+      oneOf:
+        - $ref: '#/$defs/variable'
+        - type: integer
+          minimum: 1
