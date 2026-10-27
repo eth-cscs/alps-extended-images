@@ -33,5 +33,12 @@
     "gpusPerNode": 4,
     "timeLimit": "07:00:00"
   },
-  "result": null
+  "result": {
+    "status": "failed",
+    "exitCode": 143,
+    "signal": null,
+    "endedOn": "2026-10-27",
+    "elapsedSeconds": 274,
+    "metrics": null
+  }
 }
