@@ -38,6 +38,7 @@ import math
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,6 +84,10 @@ RESULT_STATUSES = ("completed", "failed", "terminated")
 RESULT_SIGNALS = ("TERM", "INT")
 
 REQUEST_TIMEOUT_SECONDS = 60
+# Gateway errors, rate limiting and dropped connections are usually brief: each request is tried
+# again after these delays before it counts as failed
+RETRY_DELAYS_SECONDS = (5, 15, 45)
+RETRY_HTTP_CODES = frozenset({429, 502, 503, 504})
 MIN_RUN_ID_KEY_LENGTH = 32
 
 Json = dict[str, Any]
@@ -470,6 +475,29 @@ def get_config() -> Config:
     )
 
 
+class FirecrestError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def send(request: urllib.request.Request) -> bytes:
+    """The response body, after retrying temporary failures; raises the last error otherwise."""
+    for delay in (*RETRY_DELAYS_SECONDS, None):
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+                return response.read()
+        except urllib.error.HTTPError as error:
+            if delay is None or error.code not in RETRY_HTTP_CODES:
+                raise
+        except OSError:
+            # URLError, timeouts and connection errors
+            if delay is None:
+                raise
+        time.sleep(delay)
+    raise AssertionError("unreachable")
+
+
 def get_access_token(config: Config) -> str:
     body = urllib.parse.urlencode(
         {
@@ -486,8 +514,7 @@ def get_access_token(config: Config) -> str:
     )
     # Errors are reported without details: neither the request nor the response is logged
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            data = json.load(response)
+        data = json.loads(send(request))
     except urllib.error.HTTPError as error:
         fail(f"Token request failed with HTTP {error.code}")
     except (OSError, ValueError) as error:
@@ -508,13 +535,14 @@ def firecrest(config: Config, access_token: str, method: str, operation: str, pa
     )
     # FirecREST v2 returns the raw file content for ops/download (not base64 in JSON as v1 did)
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            return response.read()
+        return send(request)
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"{method} ops/{operation} failed with HTTP {error.code}") from None
+        raise FirecrestError(
+            f"{method} ops/{operation} failed with HTTP {error.code}", error.code
+        ) from None
     except OSError as error:
         # URLError, timeouts and connection errors
-        raise RuntimeError(f"{method} ops/{operation} failed: {type(error).__name__}") from None
+        raise FirecrestError(f"{method} ops/{operation} failed: {type(error).__name__}") from None
 
 
 def parse_listing(content: bytes) -> list[TrackerFile]:
@@ -670,7 +698,10 @@ def delete_processed(config: Config, manifest_path: Path, dry_run: bool) -> None
     for name in names:
         try:
             firecrest(config, access_token, "DELETE", "rm", f"{config.tracker_dir}/{name}")
-        except RuntimeError:
+        except FirecrestError as error:
+            if error.status == 404:
+                # Already gone, e.g. deleted by an attempt whose response was lost
+                continue
             # Collecting again is idempotent, so the file is simply processed again next time
             failures += 1
     print(f"Deleted {len(names) - failures} of {len(names)} tracker files")

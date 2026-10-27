@@ -322,6 +322,11 @@ class TestFirecrestErrors:
         run_id_key="k" * 32,
     )
 
+    @pytest.fixture(autouse=True)
+    def no_retry_delays(self, monkeypatch):
+        self.delays = []
+        monkeypatch.setattr(crr.time, "sleep", self.delays.append)
+
     @staticmethod
     def respond_with(monkeypatch, outcome):
         class Response:
@@ -337,10 +342,14 @@ class TestFirecrestErrors:
             def __exit__(self, *args):
                 return False
 
+        # One outcome for every attempt, or a list with one per attempt
+        outcomes = list(outcome) if isinstance(outcome, list) else None
+
         def urlopen(request, timeout):
-            if isinstance(outcome, Exception):
-                raise outcome
-            return Response(outcome)
+            current = outcomes.pop(0) if outcomes is not None else outcome
+            if isinstance(current, Exception):
+                raise current
+            return Response(current)
 
         monkeypatch.setattr(crr.urllib.request, "urlopen", urlopen)
 
@@ -393,6 +402,43 @@ class TestFirecrestErrors:
         self.respond_with(monkeypatch, TimeoutError())
         with pytest.raises(RuntimeError, match="GET ops/download failed: TimeoutError"):
             crr.firecrest(self.CONFIG, "token", "GET", "download", "/tracker/1-run.json")
+        assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
+
+    @staticmethod
+    def http_error(code):
+        return crr.urllib.error.HTTPError("https://firecrest.example", code, "error", {}, None)
+
+    def test_temporary_failures_are_tried_again(self, monkeypatch):
+        listing = b'{"output": [{"name": "1-run.json", "type": "-"}]}'
+        self.respond_with(
+            monkeypatch,
+            [self.http_error(504), crr.urllib.error.URLError("reset"), self.http_error(503), listing],
+        )
+        files = crr.list_tracker_files(self.CONFIG, "token")
+        assert [f.name for f in files] == ["1-run.json"]
+        assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
+
+    def test_gateway_errors_fail_after_the_last_attempt(self, monkeypatch, capsys):
+        self.respond_with(monkeypatch, self.http_error(504))
+        with pytest.raises(SystemExit):
+            crr.list_tracker_files(self.CONFIG, "token")
+        assert "HTTP 504" in capsys.readouterr().err
+        assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
+
+    def test_files_already_gone_count_as_deleted(self, monkeypatch, tmp_path, capsys):
+        manifest = TestDeletePhase.manifest(tmp_path, delete=["1-run.json", "1-result.json"])
+        monkeypatch.setattr(crr, "get_access_token", lambda config: "token")
+        # The first delete times out at the gateway after removing the file
+        self.respond_with(monkeypatch, [self.http_error(504), self.http_error(404), b"{}"])
+        crr.delete_processed(self.CONFIG, manifest, dry_run=False)
+        assert "Deleted 2 of 2" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("code", [401, 403, 404, 500])
+    def test_other_http_errors_are_not_tried_again(self, monkeypatch, code):
+        self.respond_with(monkeypatch, self.http_error(code))
+        with pytest.raises(RuntimeError, match=f"HTTP {code}"):
+            crr.firecrest(self.CONFIG, "token", "GET", "download", "/tracker/1-run.json")
+        assert self.delays == []
 
 
 def test_huge_time_limits_are_dropped_instead_of_crashing_the_pass():
@@ -437,7 +483,7 @@ class TestDeletePhase:
         def firecrest(config, access_token, method, operation, path):
             calls.append((method, operation, path))
             if path.endswith("/9-run.json"):
-                raise RuntimeError("DELETE ops/rm failed with HTTP 500")
+                raise crr.FirecrestError("DELETE ops/rm failed with HTTP 500", 500)
             return b""
 
         monkeypatch.setattr(crr, "firecrest", firecrest)
