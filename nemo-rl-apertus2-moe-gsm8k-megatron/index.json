@@ -235,6 +235,56 @@
       }
     },
     {
+      "runId": "clariden-3783425",
+      "cluster": "clariden",
+      "jobId": "3783425",
+      "path": "nemo-rl-apertus2-moe-gsm8k-megatron/clariden-3783425.json",
+      "status": "terminated",
+      "startedOn": "2026-10-28",
+      "endedOn": "2026-10-28",
+      "elapsedSeconds": 3841,
+      "recipeVersion": "b956397f30e3639754e359c2eebcffa7671303b7",
+      "model": "apertus-2-chonk",
+      "environment": "gsm8k",
+      "preset": "adamw",
+      "hyperparameters": {
+        "TRAIN_NODES": 8,
+        "INFERENCE_NODES": 4,
+        "TRAIN_EXPERT_PARALLEL_SIZE": 32,
+        "MAX_NUM_STEPS": 58,
+        "NUM_PROMPTS": 128,
+        "GENERATIONS_PER_PROMPT": 16,
+        "UPDATES_PER_ROLLOUT": 4,
+        "INFERENCE_REQUESTS": 128,
+        "TRAIN_MICRO_BATCH": 1,
+        "TRAIN_MB_TOKENS": 4096,
+        "LOGPROB_MB_TOKENS": 4096,
+        "BASE_LR": 1e-06,
+        "MIN_LR": 5e-07
+      },
+      "monitoring": "wandb",
+      "monitoringSettings": {
+        "WANDB_PROJECT": "chonk-grpo",
+        "wandb.mode": "online",
+        "wandb.publishLink": "true"
+      },
+      "monitoringUrl": "https://wandb.ai/ml-team-cscs/chonk-grpo/runs/clariden-3783425",
+      "nodes": 12,
+      "gpusPerNode": 4,
+      "timeLimit": "07:00:00",
+      "partition": null,
+      "account": "csstaff",
+      "metricsIntervalSeconds": 600,
+      "metrics": {
+        "step_time_s": 92.900543,
+        "steps": 22,
+        "tokens_per_s": 14878.146973,
+        "tokens_per_s_per_gpu": 309.961411,
+        "val:accuracy": 0.890068,
+        "val:accuracy_start": 0.477635
+      }
+    },
+    {
       "runId": "clariden-3767132",
       "cluster": "clariden",
       "jobId": "3767132",
