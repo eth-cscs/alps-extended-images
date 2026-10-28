@@ -44,5 +44,14 @@
     "partition": "preemptable",
     "account": "csstaff"
   },
-  "result": null
+  "result": null,
+  "progress": {
+    "metrics": {
+      "step_time_s": 246.848709,
+      "steps": 1,
+      "tokens_per_s": 5678.145996,
+      "tokens_per_s_per_gpu": 70.976822,
+      "val:accuracy": 0.473844
+    }
+  }
 }
