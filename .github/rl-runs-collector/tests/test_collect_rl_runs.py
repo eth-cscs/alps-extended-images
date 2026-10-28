@@ -140,6 +140,8 @@ class TestPublishedRecords:
                 "preset": "muon",
                 "hyperparameters": {"MAX_NUM_STEPS": 58, "MODE": "fast"},
                 "monitoring": "wandb",
+                "monitoringSettings": {},
+                "monitoringUrl": None,
                 "nodes": 20,
                 "gpusPerNode": 4,
                 "timeLimit": "07:00:00",
@@ -149,6 +151,47 @@ class TestPublishedRecords:
         published = json.dumps(plan.records)
         for leaked in ("alice", "08:13"):
             assert leaked not in published
+
+    def test_keep_short_monitoring_settings_for_cloning(self):
+        settings = {
+            "WANDB_PROJECT": "chonk-grpo",
+            "WANDB_ENTITY": "my-team",
+            "wandb.host": "https://forge.example.org/wandb",
+            "wandb.publishLink": "true",
+            "NOTE": "contact me",
+            "QUOTE": 'a"b',
+            "NUMBER": 3,
+            "bad key": "x",
+        }
+        launch = {**run_file("7")["launch"], "monitoring": {"destination": "wandb", "settings": settings}}
+        plan = collect_one("7-run.json", run_file("7", launch=launch))
+        assert plan.records[f"{RECIPE}/clariden-7.json"]["run"]["monitoringSettings"] == {
+            "WANDB_PROJECT": "chonk-grpo",
+            "WANDB_ENTITY": "my-team",
+            "wandb.host": "https://forge.example.org/wandb",
+            "wandb.publishLink": "true",
+        }
+
+    def test_keep_the_monitoring_link_only_when_it_points_to_the_run(self):
+        def url_of(url):
+            launch = {**run_file("7")["launch"], "monitoring": {"destination": "wandb", "url": url}}
+            plan = collect_one("7-run.json", run_file("7", launch=launch))
+            return plan.records[f"{RECIPE}/clariden-7.json"]["run"]["monitoringUrl"]
+
+        url = "https://forge.example.org/wandb/team/project/runs/clariden-7"
+        assert url_of(url) == url
+        assert url_of("https://wandb.ai/team/project/runs/clariden-7") is not None
+        for bad in (
+            "https://wandb.ai/team/project/runs/clariden-8",
+            "http://wandb.ai/team/project/runs/clariden-7",
+            "https://wandb.ai/project/runs/clariden-7",
+            "https://wandb.ai/team/project/runs/clariden-7?x=1",
+            "https://wandb.ai/te am/project/runs/clariden-7",
+            "javascript:alert(1)//runs/clariden-7",
+            None,
+            42,
+        ):
+            assert url_of(bad) is None, bad
 
     def test_keep_results_to_status_exit_day_duration_and_numeric_metrics(self):
         plan = collect_one(

@@ -78,6 +78,16 @@ PARAMETER_STRING_PATTERN = re.compile(r"^[A-Za-z0-9._:+-]{0,64}\Z", re.ASCII)
 # Slurm time limits are at most a few years; three digits of days is plenty
 TIME_LIMIT_PATTERN = re.compile(r"^(?:(\d{1,3})-)?(\d{1,2}):(\d{2}):(\d{2})\Z", re.ASCII)
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}", re.ASCII)
+# Monitoring settings (W&B project, entity, mode, server URL, ...) for cloning a run: short
+# values without spaces or quotes. The launcher never records secrets or file paths.
+MONITORING_SETTING_PATTERN = re.compile(r"^[A-Za-z0-9._:/+-]{0,256}\Z", re.ASCII)
+MAX_MONITORING_SETTINGS = 20
+# Link to the run in W&B, recorded only when chosen at launch:
+# https://<host>[:<port>][/<path>]/<entity>/<project>/runs/<run id>
+MONITORING_URL_PATTERN = re.compile(
+    r"^https://[A-Za-z0-9.-]{1,253}(?::\d{1,5})?(?:/[A-Za-z0-9._-]{1,128}){2,6}/runs/([A-Za-z0-9._-]{1,128})\Z",
+    re.ASCII,
+)
 MAX_PARAMETERS = 100
 MAX_METRICS = 50
 RESULT_STATUSES = ("completed", "failed", "terminated")
@@ -220,12 +230,32 @@ def _to_metrics(value: Any) -> dict[str, float] | None:
     return {key: value[key] for key in keys[:MAX_METRICS]}
 
 
-def _to_public_run(launch: Json, recipe_id: str) -> Json:
+def _to_monitoring_settings(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    keys = [
+        key
+        for key in value
+        if PARAMETER_KEY_PATTERN.match(key)
+        and isinstance(value[key], str)
+        and MONITORING_SETTING_PATTERN.match(value[key])
+    ]
+    return {key: value[key] for key in keys[:MAX_MONITORING_SETTINGS]}
+
+
+def _to_monitoring_url(value: Any, run_id: str) -> str | None:
+    # Only links to this run's id, so a record can't show another W&B run as its own
+    match = MONITORING_URL_PATTERN.match(value) if isinstance(value, str) else None
+    return value if match and match.group(1) == run_id else None
+
+
+def _to_public_run(launch: Json, recipe_id: str, run_id: str) -> Json:
     job = launch.get("job")
     job = job if isinstance(job, dict) else {}
     recipe = launch.get("recipe")
     recipe = recipe if isinstance(recipe, dict) else {}
     monitoring = launch.get("monitoring")
+    monitoring = monitoring if isinstance(monitoring, dict) else {}
     time_limit = job.get("timeLimit")
     return {
         "recipe": {"id": recipe_id, "version": _safe_id(recipe.get("version"))},
@@ -233,7 +263,9 @@ def _to_public_run(launch: Json, recipe_id: str) -> Json:
         "environment": _id_of(launch.get("environment")),
         "preset": _id_of(launch.get("preset")),
         "hyperparameters": _to_hyperparameters(launch.get("hyperparameters")),
-        "monitoring": _safe_id(monitoring.get("destination")) if isinstance(monitoring, dict) else None,
+        "monitoring": _safe_id(monitoring.get("destination")),
+        "monitoringSettings": _to_monitoring_settings(monitoring.get("settings")),
+        "monitoringUrl": _to_monitoring_url(monitoring.get("url"), run_id),
         "nodes": _to_integer(job.get("nodes"), 1, 100000),
         "gpusPerNode": _to_integer(job.get("gpusPerNode"), 0, 64),
         "timeLimit": (
@@ -300,7 +332,11 @@ def parse_tracker_file(name: str, content: str) -> ParsedTrackerFile | str:
         cluster=data["cluster"],
         recipe_id=recipe_id,
         started_on=_to_day(data.get("startedAt")),
-        data=_to_public_run(launch, recipe_id) if kind == "run" else _to_public_result(data),
+        data=(
+            _to_public_run(launch, recipe_id, get_run_id(data["cluster"], job_id))
+            if kind == "run"
+            else _to_public_result(data)
+        ),
     )
 
 
@@ -470,6 +506,8 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
                 "preset": run.get("preset"),
                 "hyperparameters": run.get("hyperparameters") or {},
                 "monitoring": run.get("monitoring"),
+                "monitoringSettings": run.get("monitoringSettings") or {},
+                "monitoringUrl": run.get("monitoringUrl"),
                 "nodes": run.get("nodes"),
                 "gpusPerNode": run.get("gpusPerNode"),
                 "timeLimit": run.get("timeLimit"),
