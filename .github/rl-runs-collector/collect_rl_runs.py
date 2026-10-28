@@ -21,8 +21,9 @@ FIRECREST_CLIENT_SECRET, FIRECREST_SYSTEM and RUN_TRACKER_DIR.
 Records are public:
 - only an allowlist of fields is kept, each checked against a strict format, whatever else a file
   contains (everyone can write to the tracker directory, so files are untrusted)
-- the cluster and Slurm job id are kept, so that the UI can link a run to its job. No user,
-  account or path is, though whoever can see the job in Slurm can see whose it is
+- the cluster and Slurm job id are kept, so that the UI can link a run to its job, and the
+  partition, account and monitoring settings (e.g. the W&B project), so that it can clone the
+  run. No user or path is, though whoever can see the job in Slurm can see whose it is
 - dates are kept to the day; durations are kept exactly
 Output is deterministic, so a pass with nothing new leaves nothing to commit.
 
@@ -271,6 +272,8 @@ def _to_public_run(launch: Json, recipe_id: str, run_id: str) -> Json:
         "timeLimit": (
             time_limit if isinstance(time_limit, str) and TIME_LIMIT_PATTERN.match(time_limit) else None
         ),
+        "partition": _safe_id(job.get("partition")),
+        "account": _safe_id(job.get("account")),
     }
 
 
@@ -511,6 +514,8 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
                 "nodes": run.get("nodes"),
                 "gpusPerNode": run.get("gpusPerNode"),
                 "timeLimit": run.get("timeLimit"),
+                "partition": run.get("partition"),
+                "account": run.get("account"),
                 "metrics": result.get("metrics"),
             }
         )

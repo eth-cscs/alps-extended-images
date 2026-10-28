@@ -121,7 +121,14 @@ class TestPublishedRecords:
                         "TRAILING": "fast\n",
                     },
                     "monitoring": {"destination": "wandb", "environment": {"WANDB_ENTITY": "alice"}},
-                    "job": {"name": "alice-test", "nodes": 20, "gpusPerNode": 4, "timeLimit": "07:00:00"},
+                    "job": {
+                        "name": "alice-test",
+                        "nodes": 20,
+                        "gpusPerNode": 4,
+                        "timeLimit": "07:00:00",
+                        "partition": "normal",
+                        "account": "../alice",
+                    },
                 },
             ),
         )
@@ -145,12 +152,23 @@ class TestPublishedRecords:
                 "nodes": 20,
                 "gpusPerNode": 4,
                 "timeLimit": "07:00:00",
+                "partition": "normal",
+                "account": None,
             },
             "result": None,
         }
         published = json.dumps(plan.records)
         for leaked in ("alice", "08:13"):
             assert leaked not in published
+
+    def test_keep_the_partition_and_account_for_cloning(self):
+        launch = run_file("7")["launch"]
+        launch = {**launch, "job": {**launch["job"], "partition": "debug", "account": "a-csstaff"}}
+        plan = collect_one("7-run.json", run_file("7", launch=launch))
+        run = plan.records[f"{RECIPE}/clariden-7.json"]["run"]
+        assert (run["partition"], run["account"]) == ("debug", "a-csstaff")
+        index = crr.build_run_index(RECIPE, list(plan.records.values()), NOW)
+        assert (index["runs"][0]["partition"], index["runs"][0]["account"]) == ("debug", "a-csstaff")
 
     def test_keep_short_monitoring_settings_for_cloning(self):
         settings = {
