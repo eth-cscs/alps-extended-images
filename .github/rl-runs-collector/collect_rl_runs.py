@@ -258,6 +258,8 @@ def _to_public_run(launch: Json, recipe_id: str, run_id: str) -> Json:
     recipe = recipe if isinstance(recipe, dict) else {}
     monitoring = launch.get("monitoring")
     monitoring = monitoring if isinstance(monitoring, dict) else {}
+    metrics = launch.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
     time_limit = job.get("timeLimit")
     return {
         "recipe": {"id": recipe_id, "version": _safe_id(recipe.get("version"))},
@@ -275,6 +277,8 @@ def _to_public_run(launch: Json, recipe_id: str, run_id: str) -> Json:
         ),
         "partition": _safe_id(job.get("partition")),
         "account": _safe_id(job.get("account")),
+        # How often the job reports its metrics while running, when it does
+        "metricsIntervalSeconds": _to_integer(metrics.get("intervalSeconds"), 1, 24 * 3600),
     }
 
 
@@ -525,6 +529,7 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
                 "timeLimit": run.get("timeLimit"),
                 "partition": run.get("partition"),
                 "account": run.get("account"),
+                "metricsIntervalSeconds": run.get("metricsIntervalSeconds"),
                 # The job's final metrics, else the last ones it reported while running
                 "metrics": result.get("metrics") or (record.get("progress") or {}).get("metrics"),
             }

@@ -112,6 +112,16 @@ class TestMetricsFiles:
             "steps": 21,
         }
 
+    def test_publish_whether_a_run_reports_metrics(self):
+        launch = {**run_file("7")["launch"], "metrics": {"intervalSeconds": 600}}
+        _, entry = self.index_entry({"7-run.json": run_file("7", launch=launch)})
+        assert entry["metricsIntervalSeconds"] == 600
+        # Launched before jobs reported metrics, or with a value that isn't an interval
+        assert self.index_entry({"7-run.json": run_file("7")})[1]["metricsIntervalSeconds"] is None
+        launch["metrics"] = {"intervalSeconds": "600; id"}
+        _, entry = self.index_entry({"7-run.json": run_file("7", launch=launch)})
+        assert entry["metricsIntervalSeconds"] is None
+
     def test_leave_records_without_metrics_files_unchanged(self):
         record, _ = self.index_entry({"7-run.json": run_file("7")})
         assert "progress" not in record
@@ -205,6 +215,7 @@ class TestPublishedRecords:
                 "timeLimit": "07:00:00",
                 "partition": "normal",
                 "account": None,
+                "metricsIntervalSeconds": None,
             },
             "result": None,
         }
