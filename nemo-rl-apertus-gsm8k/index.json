@@ -17,9 +17,13 @@
       "preset": null,
       "hyperparameters": {},
       "monitoring": null,
+      "monitoringSettings": {},
+      "monitoringUrl": null,
       "nodes": null,
       "gpusPerNode": null,
       "timeLimit": null,
+      "partition": null,
+      "account": null,
       "metrics": null
     }
   ]

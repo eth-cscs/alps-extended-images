@@ -35,5 +35,13 @@
     "gpusPerNode": 4,
     "timeLimit": "1:00:00"
   },
-  "result": null
+  "result": {
+    "status": "terminated",
+    "exitCode": 143,
+    "signal": "TERM",
+    "endedOn": "2026-10-28",
+    "elapsedSeconds": 3613,
+    "metrics": null,
+    "schedulerState": "TIMEOUT"
+  }
 }
