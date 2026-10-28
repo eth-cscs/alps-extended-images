@@ -44,13 +44,27 @@
     "partition": "preemptable",
     "account": "csstaff"
   },
-  "result": null,
+  "result": {
+    "status": "failed",
+    "exitCode": 143,
+    "signal": "TERM",
+    "endedOn": "2026-10-28",
+    "elapsedSeconds": 2690,
+    "metrics": {
+      "step_time_s": 108.065636,
+      "steps": 14,
+      "tokens_per_s": 15122.610352,
+      "tokens_per_s_per_gpu": 189.032631,
+      "val:accuracy": 0.473844
+    },
+    "schedulerState": "NODE_FAIL"
+  },
   "progress": {
     "metrics": {
-      "step_time_s": 246.848709,
-      "steps": 1,
-      "tokens_per_s": 5678.145996,
-      "tokens_per_s_per_gpu": 70.976822,
+      "step_time_s": 108.065636,
+      "steps": 12,
+      "tokens_per_s": 15122.610352,
+      "tokens_per_s_per_gpu": 189.032631,
       "val:accuracy": 0.473844
     }
   }

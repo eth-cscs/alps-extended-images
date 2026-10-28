@@ -38,6 +38,7 @@
       "timeLimit": "00:30:00",
       "partition": null,
       "account": null,
+      "metricsIntervalSeconds": null,
       "metrics": null
     }
   ]

@@ -40,6 +40,7 @@
       "timeLimit": "1:00:00",
       "partition": null,
       "account": null,
+      "metricsIntervalSeconds": null,
       "metrics": null
     },
     {
@@ -84,6 +85,7 @@
       "timeLimit": "1:00:00",
       "partition": null,
       "account": null,
+      "metricsIntervalSeconds": null,
       "metrics": null
     },
     {
@@ -129,6 +131,7 @@
       "timeLimit": "1:00:00",
       "partition": null,
       "account": "csstaff",
+      "metricsIntervalSeconds": null,
       "metrics": null
     },
     {
@@ -174,6 +177,7 @@
       "timeLimit": "1:00:00",
       "partition": null,
       "account": "csstaff",
+      "metricsIntervalSeconds": null,
       "metrics": {
         "val:accuracy": 0.469295
       }
@@ -183,10 +187,10 @@
       "cluster": "clariden",
       "jobId": "3782613",
       "path": "nemo-rl-apertus2-moe-gsm8k-megatron/clariden-3782613.json",
-      "status": "running",
+      "status": "failed",
       "startedOn": "2026-10-28",
-      "endedOn": null,
-      "elapsedSeconds": null,
+      "endedOn": "2026-10-28",
+      "elapsedSeconds": 2690,
       "recipeVersion": "b956397f30e3639754e359c2eebcffa7671303b7",
       "model": "apertus-2-chonk",
       "environment": "gsm8k",
@@ -221,11 +225,12 @@
       "timeLimit": "1:00:00",
       "partition": "preemptable",
       "account": "csstaff",
+      "metricsIntervalSeconds": null,
       "metrics": {
-        "step_time_s": 246.848709,
-        "steps": 1,
-        "tokens_per_s": 5678.145996,
-        "tokens_per_s_per_gpu": 70.976822,
+        "step_time_s": 108.065636,
+        "steps": 14,
+        "tokens_per_s": 15122.610352,
+        "tokens_per_s_per_gpu": 189.032631,
         "val:accuracy": 0.473844
       }
     },
@@ -265,6 +270,7 @@
       "timeLimit": "07:00:00",
       "partition": null,
       "account": null,
+      "metricsIntervalSeconds": null,
       "metrics": null
     }
   ]

@@ -24,6 +24,7 @@
       "timeLimit": null,
       "partition": null,
       "account": null,
+      "metricsIntervalSeconds": null,
       "metrics": null
     }
   ]
