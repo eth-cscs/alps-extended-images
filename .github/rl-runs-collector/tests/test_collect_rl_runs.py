@@ -71,9 +71,60 @@ def collect_one(name, data):
     return collect([(name, RECENT, None)], {name: data})
 
 
+def metrics_file(job_id, **overrides):
+    data = {
+        "schemaVersion": crr.RUN_RECORD_SCHEMA_VERSION,
+        "jobId": job_id,
+        "cluster": "clariden",
+        "recipeId": RECIPE,
+        "updatedAt": "2026-10-23T09:00:00Z",
+        "metrics": {"val:accuracy": 0.55, "steps": 21, "note": "x"},
+    }
+    data.update(overrides)
+    return data
+
+
+class TestMetricsFiles:
+    def index_entry(self, files):
+        plan = collect(
+            [(name, RECENT, None) for name in files], {name: data for name, data in files.items()}
+        )
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
+        return record, crr.build_run_index(RECIPE, [record], NOW)["runs"][0]
+
+    def test_show_the_metrics_so_far_of_a_running_run(self):
+        record, entry = self.index_entry({"7-run.json": run_file("7"), "7-metrics.json": metrics_file("7")})
+        assert record["progress"] == {"metrics": {"val:accuracy": 0.55, "steps": 21}}
+        assert entry["status"] == "running"
+        assert entry["metrics"] == {"val:accuracy": 0.55, "steps": 21}
+
+    def test_prefer_the_final_metrics_and_fall_back_to_the_last_reported(self):
+        files = {"7-run.json": run_file("7"), "7-metrics.json": metrics_file("7")}
+        final = result_file("7", metrics={"val:accuracy": 0.6, "steps": 58})
+        assert self.index_entry({**files, "7-result.json": final})[1]["metrics"] == {
+            "val:accuracy": 0.6,
+            "steps": 58,
+        }
+        # A job killed before it could read its metrics
+        killed = result_file("7", status="terminated", metrics=None)
+        assert self.index_entry({**files, "7-result.json": killed})[1]["metrics"] == {
+            "val:accuracy": 0.55,
+            "steps": 21,
+        }
+
+    def test_leave_records_without_metrics_files_unchanged(self):
+        record, _ = self.index_entry({"7-run.json": run_file("7")})
+        assert "progress" not in record
+
+    def test_reject_metrics_files_without_a_recipe(self):
+        plan = collect_one("7-metrics.json", metrics_file("7", recipeId="../x"))
+        assert plan.records == {}
+
+
 class TestTrackerFiles:
     def test_only_accepts_job_id_run_and_result_names(self):
         assert crr.parse_tracker_file_name("123-run.json") == ("123", "run")
+        assert crr.parse_tracker_file_name("123-metrics.json") == ("123", "metrics")
         assert crr.parse_tracker_file_name("123-result.json") == ("123", "result")
         assert crr.parse_tracker_file_name(".123-run.json.tmp") is None
         assert crr.parse_tracker_file_name("../123-run.json") is None

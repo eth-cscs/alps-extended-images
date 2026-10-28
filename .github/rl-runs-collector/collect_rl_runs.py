@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Collect RL training run files from the run tracker directory into public run records.
 
-Training jobs launched from the FirecREST UI AI Training page write two files into a shared run
-tracker directory on the cluster: <job id>-run.json when they start and <job id>-result.json when
-they exit. This script reads them through FirecREST and turns them into one record per run,
+Training jobs launched from the FirecREST UI AI Training page write files into a shared run
+tracker directory on the cluster: <job id>-run.json when they start, <job id>-metrics.json with
+the metrics so far every few minutes while they run, and <job id>-result.json when they exit. This script reads them through FirecREST and turns them into one record per run,
 <recipe id>/<cluster>-<job id>.json, plus an index.json per recipe, in a checkout of the records
 branch.
 
@@ -67,7 +67,7 @@ FALLBACK_TIME_LIMIT = timedelta(days=7)
 
 # ASCII only (\d also matches other scripts' digits), and \Z rather than $, which also matches
 # before a trailing newline
-TRACKER_FILE_PATTERN = re.compile(r"^(\d{1,20})-(run|result)\.json\Z", re.ASCII)
+TRACKER_FILE_PATTERN = re.compile(r"^(\d{1,20})-(run|metrics|result)\.json\Z", re.ASCII)
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
 # <cluster>-<job id>
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}-\d{1,20}\Z", re.ASCII)
@@ -137,7 +137,8 @@ class ParsedTrackerFile:
     cluster: str
     recipe_id: str
     started_on: str | None
-    # The public run settings (kind "run") or result (kind "result")
+    # The public run settings (kind "run"), metrics so far (kind "metrics") or result (kind
+    # "result")
     data: Json
 
 
@@ -154,7 +155,7 @@ class CollectionPlan:
 
 
 def parse_tracker_file_name(name: str) -> tuple[str, str] | None:
-    """Returns (job id, kind) for <job id>-run.json and <job id>-result.json, else None."""
+    """Returns (job id, kind) for <job id>-run.json, -metrics.json and -result.json, else None."""
     match = TRACKER_FILE_PATTERN.match(name)
     return (match.group(1), match.group(2)) if match else None
 
@@ -339,6 +340,8 @@ def parse_tracker_file(name: str, content: str) -> ParsedTrackerFile | str:
             _to_public_run(launch, recipe_id, get_run_id(data["cluster"], job_id))
             if kind == "run"
             else _to_public_result(data)
+            if kind == "result"
+            else {"metrics": _to_metrics(data.get("metrics"))}
         ),
     )
 
@@ -350,7 +353,7 @@ def merge_into_record(existing: Json | None, parsed: ParsedTrackerFile, run_id: 
     else:
         # The run file's start is authoritative; a result arriving first gives a provisional one
         started_on = existing.get("startedOn") or parsed.started_on
-    return {
+    record = {
         "schemaVersion": RUN_RECORD_SCHEMA_VERSION,
         "runId": run_id,
         "recipeId": parsed.recipe_id,
@@ -360,6 +363,11 @@ def merge_into_record(existing: Json | None, parsed: ParsedTrackerFile, run_id: 
         "run": parsed.data if parsed.kind == "run" else existing.get("run"),
         "result": parsed.data if parsed.kind == "result" else existing.get("result"),
     }
+    # Metrics while the run goes on; only in records that got some, so others don't change
+    progress = parsed.data if parsed.kind == "metrics" else existing.get("progress")
+    if progress:
+        record["progress"] = progress
+    return record
 
 
 def plan_collection(
@@ -390,8 +398,9 @@ def plan_collection(
         for file in files
         if (parsed_name := parse_tracker_file_name(file.name)) is not None
     ]
-    # A run's settings are merged before its result
-    tracker_files.sort(key=lambda entry: (entry[1][0], entry[1][1] != "run"))
+    # A run's settings are merged before its metrics and result
+    kind_order = {"run": 0, "metrics": 1, "result": 2}
+    tracker_files.sort(key=lambda entry: (entry[1][0], kind_order[entry[1][1]]))
     for file, _ in tracker_files:
         if file.size is not None and file.size > MAX_TRACKER_FILE_SIZE:
             handle_invalid(file, "file too large")
@@ -516,7 +525,8 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
                 "timeLimit": run.get("timeLimit"),
                 "partition": run.get("partition"),
                 "account": run.get("account"),
-                "metrics": result.get("metrics"),
+                # The job's final metrics, else the last ones it reported while running
+                "metrics": result.get("metrics") or (record.get("progress") or {}).get("metrics"),
             }
         )
     # Newest first; the run id only makes the order stable within a day
