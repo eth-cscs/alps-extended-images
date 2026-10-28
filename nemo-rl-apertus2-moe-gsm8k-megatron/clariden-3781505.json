@@ -43,5 +43,13 @@
     "partition": null,
     "account": null
   },
-  "result": null
+  "result": {
+    "status": "failed",
+    "exitCode": 143,
+    "signal": null,
+    "endedOn": "2026-10-28",
+    "elapsedSeconds": 1313,
+    "metrics": null,
+    "schedulerState": "FAILED"
+  }
 }
