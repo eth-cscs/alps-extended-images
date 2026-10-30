@@ -1,14 +1,17 @@
 name: collect-rl-runs
 
 # Collects the files that RL training jobs launched from the FirecREST UI AI Training page leave
-# in the run tracker directory on the cluster (<job id>-run.json, <job id>-result.json) into run
-# records on the rl-runs branch: one record per run (<recipe id>/<run id>.json) and an index.json
-# per recipe. Tracker files are deleted once the records are pushed. See
-# .github/rl-runs-collector/collect_rl_runs.py.
+# in the run tracker directory on the cluster (<job id>-run.json, <job id>-metrics.json,
+# <job id>-result.json) into run records on the rl-runs branch: one record per run
+# (<recipe id>/<cluster>-<job id>.json) and an index.json per recipe. Tracker files are deleted
+# once the records are pushed. See .github/rl-runs-collector/collect_rl_runs.py.
 #
-# Records contain nothing that identifies a person (no user, account, path, job id or exact
-# time), so they can be public. They live on their own branch so that the collector's commits
-# never touch the image sources or their CI. Nothing runs until FIRECREST_URL is set.
+# Records are public. They contain no user name, path or exact time, but they do contain the
+# cluster and Slurm job id, so that the UI can link a run to its job, and the partition, account
+# and monitoring settings (e.g. the W&B project), so that it can clone the run. Whoever can see
+# the job in Slurm can see whose it is. They live on their own branch so that the collector's
+# commits never touch the image sources or their CI. A pass fails with the names of any missing
+# settings until the environment below is configured.
 #
 # Setup:
 # - Create the records branch once:
@@ -18,8 +21,6 @@ name: collect-rl-runs
 #   (where scheduled runs come from), with:
 #   - secret FIRECREST_CLIENT_SECRET: FirecREST client secret. Its client must be bound to the
 #     owner of the tracker directory, the only user who can delete everyone's files there
-#   - secret RUN_ID_KEY: random key run ids are derived from, e.g. `openssl rand -hex 32`.
-#     Keep it: a new key gives every run a new id
 #   - variables FIRECREST_URL (FirecREST v2 base URL), FIRECREST_TOKEN_URL (OIDC token endpoint
 #     of the client), FIRECREST_CLIENT_ID, FIRECREST_SYSTEM (system the tracker directory is read
 #     through, e.g. clariden) and RUN_TRACKER_DIR (e.g. /capstor/scratch/cscs/palmee/rl-runs-tracker)
@@ -39,7 +40,10 @@ concurrency:
 
 jobs:
   collect:
-    if: github.repository == 'eth-cscs/alps-extended-images' && vars.FIRECREST_URL != ''
+    # Not gated on vars.FIRECREST_URL: the settings are variables of the rl-runs-collector
+    # environment, which a job's `if` is evaluated before it enters, so they always read as empty
+    # there and every pass was skipped. Without them, the collector fails naming what is missing.
+    if: github.repository == 'eth-cscs/alps-extended-images'
     runs-on: ubuntu-latest
     environment: rl-runs-collector
     timeout-minutes: 20
@@ -53,8 +57,6 @@ jobs:
       FIRECREST_CLIENT_SECRET: ${{ secrets.FIRECREST_CLIENT_SECRET }}
       FIRECREST_SYSTEM: ${{ vars.FIRECREST_SYSTEM }}
       RUN_TRACKER_DIR: ${{ vars.RUN_TRACKER_DIR }}
-      RUN_ID_KEY: ${{ secrets.RUN_ID_KEY }}
-      MANIFEST: ${{ runner.temp }}/rl-runs-processed.json
     steps:
       - name: Checkout the collector
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,8 +74,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The files the collect step processed, for the delete step. Set here because the runner
+      # context, and so the runner's temporary directory, is not available in the job's env.
+      - name: Set the manifest path
+        run: echo "RL_RUNS_MANIFEST=$RUNNER_TEMP/rl-runs-processed.json" >> "$GITHUB_ENV"
+
       - name: Collect tracker files
-        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$MANIFEST"
+        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$RL_RUNS_MANIFEST"
 
       # Rebased on whatever reached rl-runs since the checkout, never forced. If that conflicts or
       # the push is rejected, the step fails, nothing is deleted, and the next pass collects the
@@ -95,4 +102,4 @@ jobs:
       # Only reached when the push succeeded; files that fail to delete are collected again
       # next time, which is harmless
       - name: Delete collected tracker files
-        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$MANIFEST"
+        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$RL_RUNS_MANIFEST"

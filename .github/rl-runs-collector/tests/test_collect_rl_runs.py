@@ -20,11 +20,6 @@ OLD = "2026-10-20T11:00:00Z"
 RECIPE = "nemo-rl-apertus-gsm8k"
 
 
-def get_run_id(cluster, job_id):
-    """Stand-in for the keyed hash: 32 hex characters per cluster and job."""
-    return f"{'c' if cluster == 'clariden' else 'd'}{job_id.zfill(31)}"[:32]
-
-
 def run_file(job_id, **overrides):
     data = {
         "schemaVersion": crr.RUN_RECORD_SCHEMA_VERSION,
@@ -68,7 +63,6 @@ def collect(files, contents, existing=None):
         [crr.TrackerFile(name=name, size=size, last_modified=modified) for name, modified, size in files],
         {name: json.dumps(data) if not isinstance(data, str) else data for name, data in contents.items()},
         existing or {},
-        get_run_id,
         NOW,
     )
 
@@ -77,9 +71,70 @@ def collect_one(name, data):
     return collect([(name, RECENT, None)], {name: data})
 
 
+def metrics_file(job_id, **overrides):
+    data = {
+        "schemaVersion": crr.RUN_RECORD_SCHEMA_VERSION,
+        "jobId": job_id,
+        "cluster": "clariden",
+        "recipeId": RECIPE,
+        "updatedAt": "2026-10-23T09:00:00Z",
+        "metrics": {"val:accuracy": 0.55, "steps": 21, "note": "x"},
+    }
+    data.update(overrides)
+    return data
+
+
+class TestMetricsFiles:
+    def index_entry(self, files):
+        plan = collect(
+            [(name, RECENT, None) for name in files], {name: data for name, data in files.items()}
+        )
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
+        return record, crr.build_run_index(RECIPE, [record], NOW)["runs"][0]
+
+    def test_show_the_metrics_so_far_of_a_running_run(self):
+        record, entry = self.index_entry({"7-run.json": run_file("7"), "7-metrics.json": metrics_file("7")})
+        assert record["progress"] == {"metrics": {"val:accuracy": 0.55, "steps": 21}}
+        assert entry["status"] == "running"
+        assert entry["metrics"] == {"val:accuracy": 0.55, "steps": 21}
+
+    def test_prefer_the_final_metrics_and_fall_back_to_the_last_reported(self):
+        files = {"7-run.json": run_file("7"), "7-metrics.json": metrics_file("7")}
+        final = result_file("7", metrics={"val:accuracy": 0.6, "steps": 58})
+        assert self.index_entry({**files, "7-result.json": final})[1]["metrics"] == {
+            "val:accuracy": 0.6,
+            "steps": 58,
+        }
+        # A job killed before it could read its metrics
+        killed = result_file("7", status="terminated", metrics=None)
+        assert self.index_entry({**files, "7-result.json": killed})[1]["metrics"] == {
+            "val:accuracy": 0.55,
+            "steps": 21,
+        }
+
+    def test_publish_whether_a_run_reports_metrics(self):
+        launch = {**run_file("7")["launch"], "metrics": {"intervalSeconds": 600}}
+        _, entry = self.index_entry({"7-run.json": run_file("7", launch=launch)})
+        assert entry["metricsIntervalSeconds"] == 600
+        # Launched before jobs reported metrics, or with a value that isn't an interval
+        assert self.index_entry({"7-run.json": run_file("7")})[1]["metricsIntervalSeconds"] is None
+        launch["metrics"] = {"intervalSeconds": "600; id"}
+        _, entry = self.index_entry({"7-run.json": run_file("7", launch=launch)})
+        assert entry["metricsIntervalSeconds"] is None
+
+    def test_leave_records_without_metrics_files_unchanged(self):
+        record, _ = self.index_entry({"7-run.json": run_file("7")})
+        assert "progress" not in record
+
+    def test_reject_metrics_files_without_a_recipe(self):
+        plan = collect_one("7-metrics.json", metrics_file("7", recipeId="../x"))
+        assert plan.records == {}
+
+
 class TestTrackerFiles:
     def test_only_accepts_job_id_run_and_result_names(self):
         assert crr.parse_tracker_file_name("123-run.json") == ("123", "run")
+        assert crr.parse_tracker_file_name("123-metrics.json") == ("123", "metrics")
         assert crr.parse_tracker_file_name("123-result.json") == ("123", "result")
         assert crr.parse_tracker_file_name(".123-run.json.tmp") is None
         assert crr.parse_tracker_file_name("../123-run.json") is None
@@ -127,16 +182,24 @@ class TestPublishedRecords:
                         "TRAILING": "fast\n",
                     },
                     "monitoring": {"destination": "wandb", "environment": {"WANDB_ENTITY": "alice"}},
-                    "job": {"name": "alice-test", "nodes": 20, "gpusPerNode": 4, "timeLimit": "07:00:00"},
+                    "job": {
+                        "name": "alice-test",
+                        "nodes": 20,
+                        "gpusPerNode": 4,
+                        "timeLimit": "07:00:00",
+                        "partition": "normal",
+                        "account": "../alice",
+                    },
                 },
             ),
         )
-        record = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
         assert record == {
             "schemaVersion": crr.RUN_RECORD_SCHEMA_VERSION,
-            "runId": "c0000000000000000000000000000007",
+            "runId": "clariden-7",
             "recipeId": RECIPE,
             "cluster": "clariden",
+            "jobId": "7",
             "startedOn": "2026-10-23",
             "run": {
                 "recipe": {"id": RECIPE, "version": None},
@@ -145,15 +208,70 @@ class TestPublishedRecords:
                 "preset": "muon",
                 "hyperparameters": {"MAX_NUM_STEPS": 58, "MODE": "fast"},
                 "monitoring": "wandb",
+                "monitoringSettings": {},
+                "monitoringUrl": None,
                 "nodes": 20,
                 "gpusPerNode": 4,
                 "timeLimit": "07:00:00",
+                "partition": "normal",
+                "account": None,
+                "metricsIntervalSeconds": None,
             },
             "result": None,
         }
         published = json.dumps(plan.records)
-        for leaked in ("alice", '"7"', "08:13"):
+        for leaked in ("alice", "08:13"):
             assert leaked not in published
+
+    def test_keep_the_partition_and_account_for_cloning(self):
+        launch = run_file("7")["launch"]
+        launch = {**launch, "job": {**launch["job"], "partition": "debug", "account": "a-csstaff"}}
+        plan = collect_one("7-run.json", run_file("7", launch=launch))
+        run = plan.records[f"{RECIPE}/clariden-7.json"]["run"]
+        assert (run["partition"], run["account"]) == ("debug", "a-csstaff")
+        index = crr.build_run_index(RECIPE, list(plan.records.values()), NOW)
+        assert (index["runs"][0]["partition"], index["runs"][0]["account"]) == ("debug", "a-csstaff")
+
+    def test_keep_short_monitoring_settings_for_cloning(self):
+        settings = {
+            "WANDB_PROJECT": "chonk-grpo",
+            "WANDB_ENTITY": "my-team",
+            "wandb.host": "https://forge.example.org/wandb",
+            "wandb.publishLink": "true",
+            "NOTE": "contact me",
+            "QUOTE": 'a"b',
+            "NUMBER": 3,
+            "bad key": "x",
+        }
+        launch = {**run_file("7")["launch"], "monitoring": {"destination": "wandb", "settings": settings}}
+        plan = collect_one("7-run.json", run_file("7", launch=launch))
+        assert plan.records[f"{RECIPE}/clariden-7.json"]["run"]["monitoringSettings"] == {
+            "WANDB_PROJECT": "chonk-grpo",
+            "WANDB_ENTITY": "my-team",
+            "wandb.host": "https://forge.example.org/wandb",
+            "wandb.publishLink": "true",
+        }
+
+    def test_keep_the_monitoring_link_only_when_it_points_to_the_run(self):
+        def url_of(url):
+            launch = {**run_file("7")["launch"], "monitoring": {"destination": "wandb", "url": url}}
+            plan = collect_one("7-run.json", run_file("7", launch=launch))
+            return plan.records[f"{RECIPE}/clariden-7.json"]["run"]["monitoringUrl"]
+
+        url = "https://forge.example.org/wandb/team/project/runs/clariden-7"
+        assert url_of(url) == url
+        assert url_of("https://wandb.ai/team/project/runs/clariden-7") is not None
+        for bad in (
+            "https://wandb.ai/team/project/runs/clariden-8",
+            "http://wandb.ai/team/project/runs/clariden-7",
+            "https://wandb.ai/project/runs/clariden-7",
+            "https://wandb.ai/team/project/runs/clariden-7?x=1",
+            "https://wandb.ai/te am/project/runs/clariden-7",
+            "javascript:alert(1)//runs/clariden-7",
+            None,
+            42,
+        ):
+            assert url_of(bad) is None, bad
 
     def test_keep_results_to_status_exit_day_duration_and_numeric_metrics(self):
         plan = collect_one(
@@ -167,7 +285,7 @@ class TestPublishedRecords:
                 user="alice",
             ),
         )
-        assert plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]["result"] == {
+        assert plan.records[f"{RECIPE}/clariden-7.json"]["result"] == {
             "status": "terminated",
             "exitCode": 143,
             "signal": "TERM",
@@ -178,7 +296,7 @@ class TestPublishedRecords:
 
     def test_booleans_are_not_numbers(self):
         plan = collect_one("7-result.json", result_file("7", exitCode=True, elapsedSeconds=False))
-        result = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]["result"]
+        result = plan.records[f"{RECIPE}/clariden-7.json"]["result"]
         assert result["exitCode"] is None
         assert result["elapsedSeconds"] is None
 
@@ -189,7 +307,7 @@ class TestPlanCollection:
             [("7-result.json", RECENT, None), ("7-run.json", RECENT, None)],
             {"7-run.json": run_file("7"), "7-result.json": result_file("7")},
         )
-        record = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
         assert record["run"]["preset"] == "muon"
         assert record["result"]["status"] == "completed"
         assert sorted(plan.processed) == ["7-result.json", "7-run.json"]
@@ -201,7 +319,7 @@ class TestPlanCollection:
             {"7-result.json": result_file("7", status="failed", exitCode=1)},
             first.records,
         )
-        record = plan.records[f"{RECIPE}/c0000000000000000000000000000007.json"]
+        record = plan.records[f"{RECIPE}/clariden-7.json"]
         assert record["run"]["preset"] == "muon"
         assert record["result"]["status"] == "failed"
 
@@ -211,8 +329,8 @@ class TestPlanCollection:
             {"7-run.json": run_file("7"), "7-result.json": result_file("7", cluster="daint")},
         )
         assert sorted(plan.records) == [
-            f"{RECIPE}/c0000000000000000000000000000007.json",
-            f"{RECIPE}/d0000000000000000000000000000007.json",
+            f"{RECIPE}/clariden-7.json",
+            f"{RECIPE}/daint-7.json",
         ]
 
     def test_keeps_recent_invalid_or_unreadable_files_and_expires_old_invalid_ones(self):
@@ -237,8 +355,8 @@ class TestPlanCollection:
             [("7-run.json", RECENT, None), ("7-result.json", OLD, None)],
             {"7-run.json": run_file("7"), "7-result.json": result_file("7", recipeId="verl-grpo")},
         )
-        assert list(plan.records) == [f"{RECIPE}/c{'0' * 30}7.json"]
-        assert plan.records[f"{RECIPE}/c{'0' * 30}7.json"]["result"] is None
+        assert list(plan.records) == [f"{RECIPE}/clariden-7.json"]
+        assert plan.records[f"{RECIPE}/clariden-7.json"]["result"] is None
         assert plan.expired == [("7-result.json", "recipe does not match the run's other file")]
 
     def test_checks_the_recipe_against_records_from_earlier_passes(self):
@@ -250,16 +368,6 @@ class TestPlanCollection:
         )
         assert plan.records == {}
         assert [name for name, _ in plan.skipped] == ["7-result.json"]
-
-    def test_rejects_a_run_id_function_that_does_not_return_32_hex_characters(self):
-        with pytest.raises(ValueError):
-            crr.plan_collection(
-                [crr.TrackerFile("7-run.json", last_modified=RECENT)],
-                {"7-run.json": json.dumps(run_file("7"))},
-                {},
-                lambda cluster, job_id: job_id,
-                NOW,
-            )
 
 
 class TestRunIndex:
@@ -286,8 +394,8 @@ class TestRunIndex:
             {**self.record("3", "2026-10-23T09:00:00Z", False), "recipeId": "verl-grpo"},
         ]
         index = crr.build_run_index(RECIPE, records, NOW)
-        assert [run["runId"] for run in index["runs"]] == ["c0000000000000000000000000000002", "c0000000000000000000000000000001"]
-        assert index["runs"][1]["path"] == f"{RECIPE}/c0000000000000000000000000000001.json"
+        assert [run["runId"] for run in index["runs"]] == ["clariden-2", "clariden-1"]
+        assert index["runs"][1]["path"] == f"{RECIPE}/clariden-1.json"
         assert index["runs"][1]["status"] == "completed"
         assert index["runs"][1]["preset"] == "muon"
         assert index["runs"][1]["hyperparameters"]["MAX_NUM_STEPS"] == 58
@@ -296,13 +404,68 @@ class TestRunIndex:
         assert crr.build_run_index(RECIPE, records, NOW) == index
 
 
-def test_run_ids_are_keyed_and_per_cluster():
-    get_id = crr.make_run_id_function("k" * 32)
-    run_id = get_id("clariden", "501")
-    assert crr.RUN_ID_PATTERN.match(run_id)
-    assert get_id("clariden", "501") == run_id
-    assert get_id("daint", "501") != run_id
-    assert crr.make_run_id_function("j" * 32)("clariden", "501") != run_id
+def test_run_ids_are_the_cluster_and_job_id():
+    assert crr.get_run_id("clariden", "501") == "clariden-501"
+    assert crr.RUN_ID_PATTERN.match("clariden-501")
+    assert not crr.RUN_ID_PATTERN.match("index")
+
+
+class TestSchedulerState:
+    RECORD = {"runId": "clariden-7", "cluster": "clariden", "jobId": "7", "startedOn": "2026-10-23", "result": None}
+
+    @pytest.mark.parametrize(
+        ("state", "status"),
+        [
+            ("COMPLETED", "completed"),
+            ("FAILED", "failed"),
+            ("OUT_OF_MEMORY", "failed"),
+            ("PREEMPTED", "preempted"),
+            ("TIMEOUT", "terminated"),
+            ("CANCELLED by 1234", "terminated"),
+        ],
+    )
+    def test_maps_end_states_to_run_statuses(self, state, status):
+        job = {"status": {"state": state, "exitCode": 1}, "time": {"end": 1793102823, "elapsed": 287}}
+        result = crr.apply_scheduler_state(self.RECORD, job)["result"]
+        assert result["status"] == status
+        # A job that couldn't report gets its end and duration from Slurm
+        assert result["endedOn"] == "2026-10-27"
+        assert result["elapsedSeconds"] == 287
+        assert result["exitCode"] == 1
+        assert result["metrics"] is None
+
+    def test_keeps_what_the_job_reported_itself(self):
+        reported = {"status": "terminated", "exitCode": 143, "signal": "TERM", "endedOn": "2026-10-28",
+                    "elapsedSeconds": 3600, "metrics": {"steps": 21}}
+        job = {"status": {"state": "PREEMPTED", "exitCode": 0}, "time": {"end": 1793102823, "elapsed": 287}}
+        result = crr.apply_scheduler_state({**self.RECORD, "result": reported}, job)["result"]
+        assert result == {**reported, "status": "preempted", "schedulerState": "PREEMPTED"}
+
+    @pytest.mark.parametrize(
+        "job",
+        [
+            {"status": {"state": "RUNNING"}},
+            {"status": {"state": "PENDING"}},
+            {"status": {"state": "REQUEUED"}},
+            {"status": {"state": ""}},
+            {"status": "PREEMPTED"},
+            None,
+            "garbage",
+        ],
+    )
+    def test_jobs_that_have_not_ended_change_nothing(self, job):
+        assert crr.apply_scheduler_state(self.RECORD, job) is None
+
+    def test_only_recent_runs_on_this_system_without_a_confirmed_end_are_checked(self):
+        now = datetime(2026, 10, 27, 12, 0, tzinfo=timezone.utc)
+        assert crr.needs_scheduler_check(self.RECORD, "clariden", now)
+        assert not crr.needs_scheduler_check(self.RECORD, "daint", now)
+        assert not crr.needs_scheduler_check({**self.RECORD, "startedOn": "2026-09-01"}, "clariden", now)
+        confirmed = {**self.RECORD, "result": {"status": "preempted", "schedulerState": "PREEMPTED"}}
+        assert not crr.needs_scheduler_check(confirmed, "clariden", now)
+        # A result the job wrote itself is still confirmed with Slurm
+        reported = {**self.RECORD, "result": {"status": "failed"}}
+        assert crr.needs_scheduler_check(reported, "clariden", now)
 
 
 def test_runs_without_a_known_time_limit_eventually_become_unknown():
@@ -319,8 +482,12 @@ class TestFirecrestErrors:
         client_secret="not-a-real-secret",
         system="clariden",
         tracker_dir="/tracker",
-        run_id_key="k" * 32,
     )
+
+    @pytest.fixture(autouse=True)
+    def no_retry_delays(self, monkeypatch):
+        self.delays = []
+        monkeypatch.setattr(crr.time, "sleep", self.delays.append)
 
     @staticmethod
     def respond_with(monkeypatch, outcome):
@@ -337,10 +504,14 @@ class TestFirecrestErrors:
             def __exit__(self, *args):
                 return False
 
+        # One outcome for every attempt, or a list with one per attempt
+        outcomes = list(outcome) if isinstance(outcome, list) else None
+
         def urlopen(request, timeout):
-            if isinstance(outcome, Exception):
-                raise outcome
-            return Response(outcome)
+            current = outcomes.pop(0) if outcomes is not None else outcome
+            if isinstance(current, Exception):
+                raise current
+            return Response(current)
 
         monkeypatch.setattr(crr.urllib.request, "urlopen", urlopen)
 
@@ -389,15 +560,71 @@ class TestFirecrestErrors:
             ("2-run.json", 99, None),
         ]
 
+    def test_reads_a_job_from_slurm(self, monkeypatch):
+        self.respond_with(monkeypatch, b'{"jobs": [{"jobId": "7", "status": {"state": "PREEMPTED"}}]}')
+        assert crr.get_scheduler_job(self.CONFIG, "token", "7")["status"]["state"] == "PREEMPTED"
+
+    @pytest.mark.parametrize("outcome", [b'{"jobs": []}', b"{}"])
+    def test_jobs_slurm_does_not_know_are_none(self, monkeypatch, outcome):
+        self.respond_with(monkeypatch, outcome)
+        assert crr.get_scheduler_job(self.CONFIG, "token", "7") is None
+
+    def test_a_job_not_found_is_none_and_other_errors_raise(self, monkeypatch):
+        self.respond_with(monkeypatch, self.http_error(404))
+        assert crr.get_scheduler_job(self.CONFIG, "token", "7") is None
+        self.respond_with(monkeypatch, self.http_error(403))
+        with pytest.raises(crr.FirecrestError, match="HTTP 403"):
+            crr.get_scheduler_job(self.CONFIG, "token", "7")
+        self.respond_with(monkeypatch, b"<html>")
+        with pytest.raises(crr.FirecrestError, match="unexpected response"):
+            crr.get_scheduler_job(self.CONFIG, "token", "7")
+
     def test_download_failures_are_retried_rather_than_crashing(self, monkeypatch):
         self.respond_with(monkeypatch, TimeoutError())
-        with pytest.raises(RuntimeError, match="GET ops/download failed: TimeoutError"):
+        with pytest.raises(crr.FirecrestError, match="GET ops/download failed: TimeoutError"):
             crr.firecrest(self.CONFIG, "token", "GET", "download", "/tracker/1-run.json")
+        assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
+
+    @staticmethod
+    def http_error(code):
+        return crr.urllib.error.HTTPError("https://firecrest.example", code, "error", {}, None)
+
+    def test_temporary_failures_are_tried_again(self, monkeypatch):
+        listing = b'{"output": [{"name": "1-run.json", "type": "-"}]}'
+        self.respond_with(
+            monkeypatch,
+            [self.http_error(504), crr.urllib.error.URLError("reset"), self.http_error(503), listing],
+        )
+        files = crr.list_tracker_files(self.CONFIG, "token")
+        assert [f.name for f in files] == ["1-run.json"]
+        assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
+
+    def test_gateway_errors_fail_after_the_last_attempt(self, monkeypatch, capsys):
+        self.respond_with(monkeypatch, self.http_error(504))
+        with pytest.raises(SystemExit):
+            crr.list_tracker_files(self.CONFIG, "token")
+        assert "HTTP 504" in capsys.readouterr().err
+        assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
+
+    def test_files_already_gone_count_as_deleted(self, monkeypatch, tmp_path, capsys):
+        manifest = TestDeletePhase.manifest(tmp_path, delete=["1-run.json", "1-result.json"])
+        monkeypatch.setattr(crr, "get_access_token", lambda config: "token")
+        # The first delete times out at the gateway after removing the file
+        self.respond_with(monkeypatch, [self.http_error(504), self.http_error(404), b"{}"])
+        crr.delete_processed(self.CONFIG, manifest, dry_run=False)
+        assert "Deleted 2 of 2" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("code", [401, 403, 404, 500])
+    def test_other_http_errors_are_not_tried_again(self, monkeypatch, code):
+        self.respond_with(monkeypatch, self.http_error(code))
+        with pytest.raises(crr.FirecrestError, match=f"HTTP {code}"):
+            crr.firecrest(self.CONFIG, "token", "GET", "download", "/tracker/1-run.json")
+        assert self.delays == []
 
 
 def test_huge_time_limits_are_dropped_instead_of_crashing_the_pass():
     plan = collect_one("7-run.json", run_file("7", launch={**run_file("7")["launch"], "job": {"timeLimit": "999999999999-00:00:00"}}))
-    record = plan.records[f"{RECIPE}/c{'0' * 30}7.json"]
+    record = plan.records[f"{RECIPE}/clariden-7.json"]
     assert record["run"]["timeLimit"] is None
     assert crr.build_run_index(RECIPE, [record], NOW)["runs"][0]["status"] == "running"
 
@@ -407,8 +634,9 @@ class TestLoadRecords:
         good = collect_one("7-run.json", run_file("7")).records
         for path, record in good.items():
             crr.write_json(tmp_path / path, record)
-        (tmp_path / RECIPE / f"{'a' * 32}.json").write_text("{not json")
-        crr.write_json(tmp_path / RECIPE / f"{'b' * 32}.json", {**next(iter(good.values()))})
+        (tmp_path / RECIPE / "clariden-1.json").write_text("{not json")
+        # A record whose file name does not match its run
+        crr.write_json(tmp_path / RECIPE / "clariden-2.json", {**next(iter(good.values())), "runId": "clariden-2"})
         (tmp_path / RECIPE / "index.json").write_text("{}")
         assert crr.load_records(tmp_path) == good
         assert "2 existing records could not be read" in capsys.readouterr().out
@@ -426,7 +654,6 @@ class TestDeletePhase:
         client_secret="not-a-real-secret",
         system="clariden",
         tracker_dir="/tracker",
-        run_id_key="k" * 32,
     )
 
     @pytest.fixture()
@@ -437,7 +664,7 @@ class TestDeletePhase:
         def firecrest(config, access_token, method, operation, path):
             calls.append((method, operation, path))
             if path.endswith("/9-run.json"):
-                raise RuntimeError("DELETE ops/rm failed with HTTP 500")
+                raise crr.FirecrestError("DELETE ops/rm failed with HTTP 500", 500)
             return b""
 
         monkeypatch.setattr(crr, "firecrest", firecrest)
@@ -502,11 +729,62 @@ class TestCollectPhase:
             return content
 
         monkeypatch.setattr(crr, "firecrest", firecrest)
+        # Slurm's records by job id: a job dict, or an exception the request raises
+        self.jobs = {}
+        self.job_requests = []
+
+        def get_scheduler_job(config, access_token, job_id):
+            self.job_requests.append(job_id)
+            job = self.jobs.get(job_id)
+            if isinstance(job, Exception):
+                raise job
+            return job
+
+        monkeypatch.setattr(crr, "get_scheduler_job", get_scheduler_job)
         return files
+
+    @staticmethod
+    def started_today():
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_slurm_decides_how_a_job_ended(self, tmp_path, tracker, capsys):
+        # The job was killed by preemption and recorded the signal as an ordinary failure
+        tracker["7-run.json"] = json.dumps(run_file("7", startedAt=self.started_today())).encode()
+        tracker["7-result.json"] = json.dumps(
+            result_file("7", status="failed", exitCode=143, startedAt=self.started_today())
+        ).encode()
+        self.jobs["7"] = {"status": {"state": "PREEMPTED", "exitCode": 0}, "time": {"elapsed": 287}}
+        crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
+        record = json.loads((tmp_path / RECIPE / "clariden-7.json").read_text())
+        assert record["result"]["status"] == "preempted"
+        assert record["result"]["schedulerState"] == "PREEMPTED"
+        # What the job reported itself is kept
+        assert record["result"]["exitCode"] == 143
+        index = json.loads((tmp_path / RECIPE / "index.json").read_text())
+        assert index["runs"][0]["status"] == "preempted"
+        assert "Slurm: 1 runs checked, 1 confirmed as ended" in capsys.readouterr().out
+
+        # Once confirmed, a run isn't asked about again
+        self.job_requests.clear()
+        tracker.clear()
+        crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
+        assert self.job_requests == []
+
+    def test_runs_still_going_or_unknown_to_slurm_keep_waiting(self, tmp_path, tracker, capsys):
+        tracker["7-run.json"] = json.dumps(run_file("7", startedAt=self.started_today())).encode()
+        tracker["8-run.json"] = json.dumps(run_file("8", startedAt=self.started_today())).encode()
+        tracker["9-run.json"] = json.dumps(run_file("9", startedAt=self.started_today())).encode()
+        self.jobs["7"] = {"status": {"state": "RUNNING"}}
+        self.jobs["9"] = crr.FirecrestError("GET compute/jobs failed with HTTP 500", 500)
+        crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
+        index = json.loads((tmp_path / RECIPE / "index.json").read_text())
+        assert [run["status"] for run in index["runs"]] == ["running"] * 3
+        output = capsys.readouterr().out
+        assert "::warning::1 runs could not be checked with Slurm" in output
 
     def test_retries_files_that_could_not_be_downloaded_and_says_so(self, tmp_path, tracker, capsys):
         tracker["7-run.json"] = json.dumps(run_file("7")).encode()
-        tracker["8-run.json"] = RuntimeError("GET ops/download failed: TimeoutError")
+        tracker["8-run.json"] = crr.FirecrestError("GET ops/download failed: TimeoutError")
         crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
         manifest = json.loads((tmp_path / "manifest.json").read_text())
         # Even though it is old, the file that couldn't be read is kept for the next pass

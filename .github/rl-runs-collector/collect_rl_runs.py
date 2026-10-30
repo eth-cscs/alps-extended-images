@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """Collect RL training run files from the run tracker directory into public run records.
 
-Training jobs launched from the FirecREST UI AI Training page write two files into a shared run
-tracker directory on the cluster: <job id>-run.json when they start and <job id>-result.json when
-they exit. This script reads them through FirecREST and turns them into one record per run,
-<recipe id>/<run id>.json, plus an index.json per recipe, in a checkout of the records branch.
+Training jobs launched from the FirecREST UI AI Training page write files into a shared run
+tracker directory on the cluster: <job id>-run.json when they start, <job id>-metrics.json with
+the metrics so far every few minutes while they run, and <job id>-result.json when they exit.
+This script reads them through FirecREST and turns them into one record per run,
+<recipe id>/<cluster>-<job id>.json, plus an index.json per recipe, in a checkout of the records
+branch.
+
+A job can't always report how it ended: preemption or a cancellation may kill it before its exit
+handler runs, or leave it to record the signal as an ordinary failure. So for recent runs the
+final state is also asked from Slurm, which then decides the status (e.g. preempted).
 It runs in two phases, so that tracker files are only deleted once the records are pushed:
 
   collect_rl_runs.py collect --runs-dir <checkout> --manifest <file>
   collect_rl_runs.py delete --manifest <file> [--dry-run]
 
 Configuration (environment): FIRECREST_URL, FIRECREST_TOKEN_URL, FIRECREST_CLIENT_ID,
-FIRECREST_CLIENT_SECRET, FIRECREST_SYSTEM, RUN_TRACKER_DIR and RUN_ID_KEY, the secret key run ids
-are derived from (changing it gives every run a new id).
+FIRECREST_CLIENT_SECRET, FIRECREST_SYSTEM and RUN_TRACKER_DIR.
 
-Records are public, so they never contain anything that identifies a person:
+Records are public:
 - only an allowlist of fields is kept, each checked against a strict format, whatever else a file
   contains (everyone can write to the tracker directory, so files are untrusted)
-- the Slurm job id is replaced by a run id derived from it with the secret key, which keeps a
-  run's two files together without letting anyone look the job (and its user) up in Slurm
+- the cluster and Slurm job id are kept, so that the UI can link a run to its job, and the
+  partition, account and monitoring settings (e.g. the W&B project), so that it can clone the
+  run. No user name or path is, though whoever can see the job in Slurm can see whose it is
 - dates are kept to the day; durations are kept exactly
 Output is deterministic, so a pass with nothing new leaves nothing to commit.
 
 Workflow logs are public too: they show counts, validation reasons and record paths, but never
-file contents or tracker file names. A tracker file name is a job id, and logging it next to the
-record path would link the run id back to the job.
+file contents.
 
 Standard library only, so the workflow needs no install step.
 """
@@ -32,20 +37,18 @@ Standard library only, so the workflow needs no install step.
 from __future__ import annotations
 
 import argparse
-import hmac
 import json
 import math
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -65,10 +68,10 @@ FALLBACK_TIME_LIMIT = timedelta(days=7)
 
 # ASCII only (\d also matches other scripts' digits), and \Z rather than $, which also matches
 # before a trailing newline
-TRACKER_FILE_PATTERN = re.compile(r"^(\d{1,20})-(run|result)\.json\Z", re.ASCII)
+TRACKER_FILE_PATTERN = re.compile(r"^(\d{1,20})-(run|metrics|result)\.json\Z", re.ASCII)
 SAFE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
-# 128 bits, so that distinct runs never collide
-RUN_ID_PATTERN = re.compile(r"^[0-9a-f]{32}\Z", re.ASCII)
+# <cluster>-<job id>
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}-\d{1,20}\Z", re.ASCII)
 PARAMETER_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z", re.ASCII)
 # Metric names may also use ':' as a separator, e.g. val:accuracy
 METRIC_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z", re.ASCII)
@@ -77,13 +80,42 @@ PARAMETER_STRING_PATTERN = re.compile(r"^[A-Za-z0-9._:+-]{0,64}\Z", re.ASCII)
 # Slurm time limits are at most a few years; three digits of days is plenty
 TIME_LIMIT_PATTERN = re.compile(r"^(?:(\d{1,3})-)?(\d{1,2}):(\d{2}):(\d{2})\Z", re.ASCII)
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}", re.ASCII)
+# Monitoring settings (W&B project, entity, mode, server URL, ...) for cloning a run: short
+# values without spaces or quotes. The launcher never records secrets or file paths.
+MONITORING_SETTING_PATTERN = re.compile(r"^[A-Za-z0-9._:/+-]{0,256}\Z", re.ASCII)
+MAX_MONITORING_SETTINGS = 20
+# Link to the run in W&B, recorded only when chosen at launch:
+# https://<host>[:<port>][/<path>]/<entity>/<project>/runs/<run id>
+MONITORING_URL_PATTERN = re.compile(
+    r"^https://[A-Za-z0-9.-]{1,253}(?::\d{1,5})?(?:/[A-Za-z0-9._-]{1,128}){2,6}/runs/([A-Za-z0-9._-]{1,128})\Z",
+    re.ASCII,
+)
 MAX_PARAMETERS = 100
 MAX_METRICS = 50
 RESULT_STATUSES = ("completed", "failed", "terminated")
+# Slurm states of jobs that have ended, and the run status each means. Other states (pending,
+# running, requeued, ...) mean the job hasn't ended.
+SCHEDULER_END_STATES = {
+    "COMPLETED": "completed",
+    "FAILED": "failed",
+    "NODE_FAIL": "failed",
+    "OUT_OF_MEMORY": "failed",
+    "BOOT_FAIL": "failed",
+    "PREEMPTED": "preempted",
+    "CANCELLED": "terminated",
+    "TIMEOUT": "terminated",
+    "DEADLINE": "terminated",
+}
+# Runs are checked with Slurm until it confirms how they ended, for at most this long; Slurm
+# forgets old jobs anyway
+SCHEDULER_CHECK_MAX_AGE = timedelta(days=30)
 RESULT_SIGNALS = ("TERM", "INT")
 
 REQUEST_TIMEOUT_SECONDS = 60
-MIN_RUN_ID_KEY_LENGTH = 32
+# Gateway errors, rate limiting and dropped connections are usually brief: each request is tried
+# again after these delays before it counts as failed
+RETRY_DELAYS_SECONDS = (5, 15, 45)
+RETRY_HTTP_CODES = frozenset({429, 502, 503, 504})
 
 Json = dict[str, Any]
 
@@ -106,7 +138,8 @@ class ParsedTrackerFile:
     cluster: str
     recipe_id: str
     started_on: str | None
-    # The public run settings (kind "run") or result (kind "result")
+    # The public run settings (kind "run"), metrics so far (kind "metrics") or result (kind
+    # "result")
     data: Json
 
 
@@ -123,13 +156,18 @@ class CollectionPlan:
 
 
 def parse_tracker_file_name(name: str) -> tuple[str, str] | None:
-    """Returns (job id, kind) for <job id>-run.json and <job id>-result.json, else None."""
+    """Returns (job id, kind) for <job id>-run.json, -metrics.json and -result.json, else None."""
     match = TRACKER_FILE_PATTERN.match(name)
     return (match.group(1), match.group(2)) if match else None
 
 
 def is_safe_id(value: Any) -> bool:
     return isinstance(value, str) and SAFE_ID_PATTERN.match(value) is not None
+
+
+def get_run_id(cluster: str, job_id: str) -> str:
+    # Job ids are only unique within a cluster
+    return f"{cluster}-{job_id}"
 
 
 def get_record_path(recipe_id: str, run_id: str) -> str:
@@ -195,12 +233,34 @@ def _to_metrics(value: Any) -> dict[str, float] | None:
     return {key: value[key] for key in keys[:MAX_METRICS]}
 
 
-def _to_public_run(launch: Json, recipe_id: str) -> Json:
+def _to_monitoring_settings(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict):
+        return {}
+    keys = [
+        key
+        for key in value
+        if PARAMETER_KEY_PATTERN.match(key)
+        and isinstance(value[key], str)
+        and MONITORING_SETTING_PATTERN.match(value[key])
+    ]
+    return {key: value[key] for key in keys[:MAX_MONITORING_SETTINGS]}
+
+
+def _to_monitoring_url(value: Any, run_id: str) -> str | None:
+    # Only links to this run's id, so a record can't show another W&B run as its own
+    match = MONITORING_URL_PATTERN.match(value) if isinstance(value, str) else None
+    return value if match and match.group(1) == run_id else None
+
+
+def _to_public_run(launch: Json, recipe_id: str, run_id: str) -> Json:
     job = launch.get("job")
     job = job if isinstance(job, dict) else {}
     recipe = launch.get("recipe")
     recipe = recipe if isinstance(recipe, dict) else {}
     monitoring = launch.get("monitoring")
+    monitoring = monitoring if isinstance(monitoring, dict) else {}
+    metrics = launch.get("metrics")
+    metrics = metrics if isinstance(metrics, dict) else {}
     time_limit = job.get("timeLimit")
     return {
         "recipe": {"id": recipe_id, "version": _safe_id(recipe.get("version"))},
@@ -208,12 +268,18 @@ def _to_public_run(launch: Json, recipe_id: str) -> Json:
         "environment": _id_of(launch.get("environment")),
         "preset": _id_of(launch.get("preset")),
         "hyperparameters": _to_hyperparameters(launch.get("hyperparameters")),
-        "monitoring": _safe_id(monitoring.get("destination")) if isinstance(monitoring, dict) else None,
+        "monitoring": _safe_id(monitoring.get("destination")),
+        "monitoringSettings": _to_monitoring_settings(monitoring.get("settings")),
+        "monitoringUrl": _to_monitoring_url(monitoring.get("url"), run_id),
         "nodes": _to_integer(job.get("nodes"), 1, 100000),
         "gpusPerNode": _to_integer(job.get("gpusPerNode"), 0, 64),
         "timeLimit": (
             time_limit if isinstance(time_limit, str) and TIME_LIMIT_PATTERN.match(time_limit) else None
         ),
+        "partition": _safe_id(job.get("partition")),
+        "account": _safe_id(job.get("account")),
+        # How often the job reports its metrics while running, when it does
+        "metricsIntervalSeconds": _to_integer(metrics.get("intervalSeconds"), 1, 24 * 3600),
     }
 
 
@@ -275,7 +341,13 @@ def parse_tracker_file(name: str, content: str) -> ParsedTrackerFile | str:
         cluster=data["cluster"],
         recipe_id=recipe_id,
         started_on=_to_day(data.get("startedAt")),
-        data=_to_public_run(launch, recipe_id) if kind == "run" else _to_public_result(data),
+        data=(
+            _to_public_run(launch, recipe_id, get_run_id(data["cluster"], job_id))
+            if kind == "run"
+            else _to_public_result(data)
+            if kind == "result"
+            else {"metrics": _to_metrics(data.get("metrics"))}
+        ),
     )
 
 
@@ -286,29 +358,33 @@ def merge_into_record(existing: Json | None, parsed: ParsedTrackerFile, run_id: 
     else:
         # The run file's start is authoritative; a result arriving first gives a provisional one
         started_on = existing.get("startedOn") or parsed.started_on
-    return {
+    record = {
         "schemaVersion": RUN_RECORD_SCHEMA_VERSION,
         "runId": run_id,
         "recipeId": parsed.recipe_id,
         "cluster": parsed.cluster,
+        "jobId": parsed.job_id,
         "startedOn": started_on,
         "run": parsed.data if parsed.kind == "run" else existing.get("run"),
         "result": parsed.data if parsed.kind == "result" else existing.get("result"),
     }
+    # Metrics while the run goes on; only in records that got some, so others don't change
+    progress = parsed.data if parsed.kind == "metrics" else existing.get("progress")
+    if progress:
+        record["progress"] = progress
+    return record
 
 
 def plan_collection(
     files: list[TrackerFile],
     contents: dict[str, str],
     existing: dict[str, Json],
-    get_run_id: Callable[[str, str], str],
     now: datetime,
 ) -> CollectionPlan:
     """Plans one collection pass.
 
     `contents` holds the downloaded content of each listed file (missing when it could not be
-    read), `existing` the records already in the records checkout, by path, and `get_run_id`
-    derives the public run id from a cluster and job id.
+    read) and `existing` the records already in the records checkout, by path.
     """
     plan = CollectionPlan()
     # A run's two files must name the same recipe: files are untrusted, and a result naming
@@ -327,8 +403,9 @@ def plan_collection(
         for file in files
         if (parsed_name := parse_tracker_file_name(file.name)) is not None
     ]
-    # A run's settings are merged before its result
-    tracker_files.sort(key=lambda entry: (entry[1][0], entry[1][1] != "run"))
+    # A run's settings are merged before its metrics and result
+    kind_order = {"run": 0, "metrics": 1, "result": 2}
+    tracker_files.sort(key=lambda entry: (entry[1][0], kind_order[entry[1][1]]))
     for file, _ in tracker_files:
         if file.size is not None and file.size > MAX_TRACKER_FILE_SIZE:
             handle_invalid(file, "file too large")
@@ -343,8 +420,6 @@ def plan_collection(
             handle_invalid(file, parsed)
             continue
         run_id = get_run_id(parsed.cluster, parsed.job_id)
-        if not RUN_ID_PATTERN.match(run_id):
-            raise ValueError("get_run_id must return 32 hex characters")
         if recipe_by_run_id.setdefault(run_id, parsed.recipe_id) != parsed.recipe_id:
             handle_invalid(file, "recipe does not match the run's other file")
             continue
@@ -353,6 +428,52 @@ def plan_collection(
         plan.records[path] = merge_into_record(current, parsed, run_id)
         plan.processed.append(file.name)
     return plan
+
+
+def needs_scheduler_check(record: Json, system: str, now: datetime) -> bool:
+    """Whether Slurm should be asked how the record's job ended.
+
+    Only jobs on the system the collector reads through, until Slurm has confirmed their end.
+    """
+    result = record.get("result") or {}
+    started_on = _parse_time(record.get("startedOn"))
+    return (
+        record.get("cluster") == system
+        and isinstance(record.get("jobId"), str)
+        and "schedulerState" not in result
+        and started_on is not None
+        and now - started_on <= SCHEDULER_CHECK_MAX_AGE
+    )
+
+
+def apply_scheduler_state(record: Json, job: Any) -> Json | None:
+    """The record updated with Slurm's account of its job, or None when the job hasn't ended.
+
+    Slurm's state decides the status. What the job reported itself (exit code, metrics) is
+    kept; for a job that couldn't report, the end and duration come from Slurm.
+    """
+    if not isinstance(job, dict):
+        return None
+    status = job.get("status") if isinstance(job.get("status"), dict) else {}
+    state = status.get("state")
+    # e.g. "CANCELLED by 1234"
+    state = state.split()[0].upper() if isinstance(state, str) and state.strip() else None
+    if state not in SCHEDULER_END_STATES:
+        return None
+    times = job.get("time") if isinstance(job.get("time"), dict) else {}
+    end = _to_integer(times.get("end"), 1, 2**40)
+    reported = record.get("result")
+    result = dict(reported) if reported is not None else {
+        "status": None,
+        "exitCode": _to_integer(status.get("exitCode"), 0, 255),
+        "signal": None,
+        "endedOn": datetime.fromtimestamp(end, timezone.utc).date().isoformat() if end else None,
+        "elapsedSeconds": _to_integer(times.get("elapsed"), 0, 10 * 365 * 24 * 3600),
+        "metrics": None,
+    }
+    result["status"] = SCHEDULER_END_STATES[state]
+    result["schedulerState"] = state
+    return {**record, "result": result}
 
 
 def parse_time_limit(time_limit: Any) -> timedelta | None:
@@ -390,6 +511,7 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
             {
                 "runId": record["runId"],
                 "cluster": record["cluster"],
+                "jobId": record["jobId"],
                 "path": get_record_path(record["recipeId"], record["runId"]),
                 "status": get_run_status(record, now),
                 "startedOn": record.get("startedOn"),
@@ -401,24 +523,22 @@ def build_run_index(recipe_id: str, records: list[Json], now: datetime) -> Json:
                 "preset": run.get("preset"),
                 "hyperparameters": run.get("hyperparameters") or {},
                 "monitoring": run.get("monitoring"),
+                "monitoringSettings": run.get("monitoringSettings") or {},
+                "monitoringUrl": run.get("monitoringUrl"),
                 "nodes": run.get("nodes"),
                 "gpusPerNode": run.get("gpusPerNode"),
                 "timeLimit": run.get("timeLimit"),
-                "metrics": result.get("metrics"),
+                "partition": run.get("partition"),
+                "account": run.get("account"),
+                "metricsIntervalSeconds": run.get("metricsIntervalSeconds"),
+                # The job's final metrics, else the last ones it reported while running
+                "metrics": result.get("metrics") or (record.get("progress") or {}).get("metrics"),
             }
         )
     # Newest first; the run id only makes the order stable within a day
     runs.sort(key=lambda entry: entry["runId"])
     runs.sort(key=lambda entry: entry["startedOn"] or "", reverse=True)
     return {"schemaVersion": RUN_RECORD_SCHEMA_VERSION, "recipeId": recipe_id, "runs": runs}
-
-
-def make_run_id_function(run_id_key: str) -> Callable[[str, str], str]:
-    # Keyed, so that the job id can't be recovered by hashing candidate job ids
-    def get_run_id(cluster: str, job_id: str) -> str:
-        return hmac.new(run_id_key.encode(), f"{cluster}:{job_id}".encode(), sha256).hexdigest()[:32]
-
-    return get_run_id
 
 
 # ----- FirecREST and files -----
@@ -437,7 +557,6 @@ class Config:
     client_secret: str
     system: str
     tracker_dir: str
-    run_id_key: str
 
 
 def get_config() -> Config:
@@ -452,13 +571,10 @@ def get_config() -> Config:
         "FIRECREST_CLIENT_SECRET",
         "FIRECREST_SYSTEM",
         "RUN_TRACKER_DIR",
-        "RUN_ID_KEY",
     ]
     missing = [name for name in names if not os.environ.get(name)]
     if missing:
         fail(f"Missing configuration: {', '.join(missing)}")
-    if len(os.environ["RUN_ID_KEY"]) < MIN_RUN_ID_KEY_LENGTH:
-        fail(f"RUN_ID_KEY must be at least {MIN_RUN_ID_KEY_LENGTH} characters")
     return Config(
         firecrest_url=os.environ["FIRECREST_URL"].rstrip("/"),
         token_url=os.environ["FIRECREST_TOKEN_URL"],
@@ -466,8 +582,34 @@ def get_config() -> Config:
         client_secret=os.environ["FIRECREST_CLIENT_SECRET"],
         system=os.environ["FIRECREST_SYSTEM"],
         tracker_dir=os.environ["RUN_TRACKER_DIR"].rstrip("/"),
-        run_id_key=os.environ["RUN_ID_KEY"],
     )
+
+
+class FirecrestError(RuntimeError):
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _open(request: urllib.request.Request) -> bytes:
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        return response.read()
+
+
+def send(request: urllib.request.Request) -> bytes:
+    """The response body, after retrying temporary failures; raises the last error otherwise."""
+    for delay in RETRY_DELAYS_SECONDS:
+        try:
+            return _open(request)
+        except urllib.error.HTTPError as error:
+            if error.code not in RETRY_HTTP_CODES:
+                raise
+        except OSError:
+            # URLError, timeouts and connection errors
+            pass
+        time.sleep(delay)
+    # The last attempt, whose error is not retried
+    return _open(request)
 
 
 def get_access_token(config: Config) -> str:
@@ -486,8 +628,7 @@ def get_access_token(config: Config) -> str:
     )
     # Errors are reported without details: neither the request nor the response is logged
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            data = json.load(response)
+        data = json.loads(send(request))
     except urllib.error.HTTPError as error:
         fail(f"Token request failed with HTTP {error.code}")
     except (OSError, ValueError) as error:
@@ -508,13 +649,58 @@ def firecrest(config: Config, access_token: str, method: str, operation: str, pa
     )
     # FirecREST v2 returns the raw file content for ops/download (not base64 in JSON as v1 did)
     try:
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-            return response.read()
+        return send(request)
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"{method} ops/{operation} failed with HTTP {error.code}") from None
+        raise FirecrestError(
+            f"{method} ops/{operation} failed with HTTP {error.code}", error.code
+        ) from None
     except OSError as error:
         # URLError, timeouts and connection errors
-        raise RuntimeError(f"{method} ops/{operation} failed: {type(error).__name__}") from None
+        raise FirecrestError(f"{method} ops/{operation} failed: {type(error).__name__}") from None
+
+
+def get_scheduler_job(config: Config, access_token: str, job_id: str) -> Any:
+    """Slurm's record of a job, or None when Slurm doesn't know it (anymore).
+
+    Only jobs the collector's FirecREST user may see are found: those of its own accounts.
+    """
+    system = urllib.parse.quote(config.system, safe="")
+    request = urllib.request.Request(
+        f"{config.firecrest_url}/compute/{system}/jobs/{urllib.parse.quote(job_id, safe='')}",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    try:
+        response = json.loads(send(request))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise FirecrestError(f"GET compute/jobs failed with HTTP {error.code}", error.code) from None
+    except OSError as error:
+        raise FirecrestError(f"GET compute/jobs failed: {type(error).__name__}") from None
+    except ValueError:
+        raise FirecrestError("GET compute/jobs returned an unexpected response") from None
+    jobs = response.get("jobs") if isinstance(response, dict) else None
+    return jobs[0] if isinstance(jobs, list) and jobs else None
+
+
+def check_scheduler(
+    config: Config, access_token: str, records: dict[str, Json], now: datetime
+) -> tuple[dict[str, Json], int, int]:
+    """Records whose job Slurm reports as ended, updated, with the number checked and failed."""
+    updated: dict[str, Json] = {}
+    candidates = [path for path in sorted(records) if needs_scheduler_check(records[path], config.system, now)]
+    failures = 0
+    for path in candidates:
+        try:
+            job = get_scheduler_job(config, access_token, records[path]["jobId"])
+        except FirecrestError:
+            # Asked again next pass
+            failures += 1
+            continue
+        record = apply_scheduler_state(records[path], job)
+        if record:
+            updated[path] = record
+    return updated, len(candidates), failures
 
 
 def parse_listing(content: bytes) -> list[TrackerFile]:
@@ -545,7 +731,7 @@ def parse_listing(content: bytes) -> list[TrackerFile]:
 def list_tracker_files(config: Config, access_token: str) -> list[TrackerFile]:
     try:
         return parse_listing(firecrest(config, access_token, "GET", "ls", config.tracker_dir))
-    except RuntimeError as error:
+    except FirecrestError as error:
         fail(f"Listing the tracker directory failed: {error}")
     except ValueError:
         fail("Listing the tracker directory returned an unexpected response")
@@ -575,6 +761,9 @@ def load_records(runs_dir: Path) -> dict[str, Json]:
                 isinstance(record, dict)
                 and record.get("runId") == record_file.stem
                 and record.get("recipeId") == recipe_dir.name
+                and isinstance(record.get("cluster"), str)
+                and isinstance(record.get("jobId"), str)
+                and get_run_id(record["cluster"], record["jobId"]) == record_file.stem
             ):
                 records[f"{recipe_dir.name}/{record_file.name}"] = record
             else:
@@ -606,7 +795,7 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
             content = firecrest(
                 config, access_token, "GET", "download", f"{config.tracker_dir}/{file.name}"
             )
-        except RuntimeError:
+        except FirecrestError:
             # A failed download says nothing about the file, so it isn't expired or deleted:
             # plan_collection skips it and the next pass tries again
             read_failures += 1
@@ -618,7 +807,12 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
 
     existing = load_records(runs_dir)
     now = datetime.now(timezone.utc)
-    plan = plan_collection(files, contents, existing, make_run_id_function(config.run_id_key), now)
+    plan = plan_collection(files, contents, existing, now)
+    # How jobs ended, from Slurm, also for runs collected in earlier passes
+    ended, checked, check_failures = check_scheduler(
+        config, access_token, {**existing, **plan.records}, now
+    )
+    plan.records.update(ended)
     for record_path, record in plan.records.items():
         write_json(runs_dir / record_path, record)
     # Indexes are rebuilt for every recipe, so that statuses age (running -> unknown) even
@@ -639,12 +833,15 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
         f"Tracker files: {len(files)} listed, {len(plan.processed)} collected, "
         f"{len(plan.expired)} invalid and expired, {len(plan.skipped)} skipped"
     )
+    print(f"Slurm: {checked} runs checked, {len(ended)} confirmed as ended")
     for record_path in sorted(plan.records):
         print(f"  updated {record_path}")
     log_reasons("expired", plan.expired)
     log_reasons("skipped", plan.skipped)
     if read_failures:
         print(f"::warning::{read_failures} tracker files could not be downloaded; the next pass retries them")
+    if check_failures:
+        print(f"::warning::{check_failures} runs could not be checked with Slurm; the next pass retries them")
 
 
 def delete_processed(config: Config, manifest_path: Path, dry_run: bool) -> None:
@@ -670,7 +867,10 @@ def delete_processed(config: Config, manifest_path: Path, dry_run: bool) -> None
     for name in names:
         try:
             firecrest(config, access_token, "DELETE", "rm", f"{config.tracker_dir}/{name}")
-        except RuntimeError:
+        except FirecrestError as error:
+            if error.status == 404:
+                # Already gone, e.g. deleted by an attempt whose response was lost
+                continue
             # Collecting again is idempotent, so the file is simply processed again next time
             failures += 1
     print(f"Deleted {len(names) - failures} of {len(names)} tracker files")
