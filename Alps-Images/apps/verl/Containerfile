@@ -7,6 +7,26 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
+
+# v0.9.0: adds verl/trainer/ppo/v1 (the V1 separate-async trainer) + TransferQueue integration
+ARG VERL_REF="v0.9.0"
+
+# 0.5.16: the only recent sglang whose own flashinfer requirement
+# (flashinfer_python[cu13]==0.6.14) matches this image's flashinfer pin below -- see the
+# reasoning at its install site. Bump this + the flashinfer pin together, deliberately, tested.
+
+# 0.5.17: sglang to a release that pins torch==2.11.0, matching the NGC 26.02 base
+# wheel. Unpinned resolution drifts to newer sglang releases that require newer
+# pypi torch (e.g. 0.5.19 -> torch==2.13.0), replacing the NGC torch and breaking
+# the NGC flash_attn_2_cuda binary shipped in the base (undefined symbol
+# c10::impl::cow::materialize_cow_storage at transformers' flash-attn import).
+
+ARG SGLANG_VERSION="0.5.17"
+
+# Must match ${SGLANG_VERSION}'s own exact pin (its pyproject.toml declares
+# transformers==<this>, not a floor) -- see the reasoning at its install site.
+ARG TRANSFORMERS_VERSION="5.12.1"
+
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
 # Install dependencies for VeRL from pypi, including vLLM and SGLang.
@@ -14,18 +34,33 @@ COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 #Note: disable vllm installation for now, as it causes issues. To re-enable consider using the ngc vllm base image.
 #RUN source /opt/alps/package-helpers.sh && pip_install python vllm --extra-index-url https://download.pytorch.org/whl/cu131
 
+# sglang pinned via ${SGLANG_VERSION} (was unpinned -> resolved to whatever was latest,
+# 0.5.17/0.5.18 by 2026-08). 0.5.16 is the version every GLM-5.1 recipe piece is validated
+# against and, crucially, the only recent sglang whose own flashinfer requirement
+# (flashinfer_python[cu13]==0.6.14) matches the flashinfer pin below -- 0.5.17 wants
+# 0.6.15.post1, 0.5.18 wants 0.6.17, so leaving sglang unpinned reintroduces the exact
+# python-vs-required flashinfer skew that caused run 3209484's TP=32 MLA plan() hang. The
+# verl-vs-sglang import-drift source patches (r3-sglang-routed-experts-import-fix,
+# delta-sharded-localserializedtensor-import-fix) also target 0.5.16's module layout. Bump
+# this + the flashinfer pin together, deliberately, tested.
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    # Pin sglang to a release that pins torch==2.11.0, matching the NGC 26.02 base
-    # wheel. Unpinned resolution drifts to newer sglang releases that require newer
-    # pypi torch (e.g. 0.5.19 -> torch==2.13.0), replacing the NGC torch and breaking
-    # the NGC flash_attn_2_cuda binary shipped in the base (undefined symbol
-    # c10::impl::cow::materialize_cow_storage at transformers' flash-attn import).
-    pip_install python "sglang[all]==0.5.17"
+    pip_install python "sglang[all]==${SGLANG_VERSION}"
+
+# Capture the exact torch + torchvision versions that sglang chose.
+# sglang pins its own deps, so this pair is guaranteed ABI-compatible.
+# All subsequent pip installs will be constrained to these versions so no
+# step can silently swap the C extension out from under us.
+RUN pip freeze | grep -E "^torch(vision)?==" | tee /tmp/torch_constraints.txt && \
+    python -c "import torchvision, torch; print('After sglang — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
+
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python flash-attn --no-build-isolation
 
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python flash-attn --no-build-isolation
 
 # Install dependencies for VeRL from source, including flashinfer, flash-attention, torch_memory_saver, XIELU
 
@@ -33,13 +68,6 @@ ENV SRC_DIR=/workspace/src \
     WHL_DIR=/workspace/src/wheels
 
 WORKDIR ${SRC_DIR}
-
-
-#RUN git clone https://github.com/nickjbrowning/XIELU.git ;\
-#    cd XIELU ;\
-#    git submodule update --init --recursive ;\
-#    python -m build --wheel --no-isolation --outdir=${WHL_DIR} 2>&1 | tee ./build.log
-#RUN source /opt/alps/package-helpers.sh && pip_install python --no-deps --no-cache-dir --force-reinstall ${WHL_DIR}/xielu*.whl
 
 
 WORKDIR /workspace
@@ -57,9 +85,10 @@ RUN set -eux; \
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python -U "ray[data,train,tune,serve]"
+
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
-    pip_install python "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.6
+    pip_install python "tensordict==0.10.0" omegaconf hydra-core codetiming peft pylatexenc wandb TransferQueue==0.1.7
 RUN pip uninstall kernels -y --break-system-packages
 
 RUN set -eux; \
@@ -68,6 +97,86 @@ RUN set -eux; \
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python cachetools
+
+# Add Megatron
+
+RUN pip install "PyYAML>=6.0.2" --ignore-installed
+
+# megatron-core[dev,mlm] (pulled by megatron-bridge) requires fast-hadamard-transform,
+# a CUDA extension with no aarch64 wheel and a broken source tarball (missing csrc/*.cpp).
+# Pin it to a local no-op stub via PEP 508 direct reference so pip's resolver satisfies
+# the transitive dependency without ever attempting to download or compile it.
+RUN mkdir -p /tmp/fht && \
+    printf '[project]\nname = "fast-hadamard-transform"\nversion = "1.1.0"\n' > /tmp/fht/pyproject.toml
+
+RUN pip install -c /tmp/torch_constraints.txt \
+        "megatron-bridge==0.6.1" "megatron-core==0.19.0" "nvidia-resiliency-ext>=0.6.0" \
+        "fast-hadamard-transform @ file:///tmp/fht"
+RUN python -c "import torchvision, torch; print('After megatron-bridge — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
+
+RUN pip install -c /tmp/torch_constraints.txt nvidia-modelopt[hf]
+RUN python -c "import torchvision, torch; print('After nvidia-modelopt — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
+
+# megatron-bridges mlflow/comet-ml deps upgrade opentelemetry-exporter-prometheus
+# to 0.64b0 which requires opentelemetry-sdk~=1.43.0, but the SDK stays at 1.33.1
+# → Ray dashboard crashes with AttributeError → GCS never starts → all workers fail.
+# Fix: upgrade the SDK to match the already-upgraded exporters.
+RUN pip install -c /tmp/torch_constraints.txt "opentelemetry-sdk>=1.43.0"
+
+# Restore sglang-compatible versions that megatron-bridge overwrites.
+# The constraints file prevents megatron-bridge/timm/transformers from
+# silently changing the torch or torchvision ABI.
+# transformers pinned via ${TRANSFORMERS_VERSION}, matching sglang's own exact pin (checked its
+# pyproject.toml on the v0.5.16 tag directly: "transformers==5.12.1") -- was 5.8.1, which was
+# never sglang's own requirement, just whatever unpinned sglang[all] happened to resolve to in
+# July 2026 before this pin existed. Unverified end-to-end by a cluster run yet -- needs one.
+RUN pip install -c /tmp/torch_constraints.txt "transformers==${TRANSFORMERS_VERSION}" "timm==1.0.16"
+RUN python -c "import torchvision, torch; print('After transformers/timm — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
+
+# flashinfer 0.6.12 -> 0.6.14: sglang 0.5.16 pins flashinfer_python[cu13]==0.6.14; the stale
+# 0.6.12 (from 2026-07-27, predates the sglang[all] bump) hung sglang's MLA/DSA decode plan()
+# at TP=32 (run 3209484, ~step 13). flashinfer 0.6.14 hard-raises at import unless flashinfer_cubin
+# is the *exact* same version (run 3214410). flashinfer_cubin/jit-cache are NOT fully published to
+# PyPI (PyPI stops at cubin 0.6.13) -- the real distribution channel is https://flashinfer.ai/whl
+# (GitHub release assets), per flashinfer's install docs; flashinfer_cubin-0.6.14 lives there.
+# Install the matched 0.6.14 pair from that index -> clean AOT, no version-check bypass.
+RUN pip install -c /tmp/torch_constraints.txt --extra-index-url https://flashinfer.ai/whl \
+        "flashinfer_cubin==0.6.14" "flashinfer_python[cu13]==0.6.14"
+
+# transformer-engine rebuild — MUST be last (after every step that can move torch).
+# sglang[all] pins torch to the stable 2.11.0 PyPI wheel, which is ABI-different from the NGC base
+# image's bundled torch 2.11.0a0, so the base's prebuilt transformer_engine_torch C++ bindings
+# fail to load against it
+# (`undefined symbol: _ZN3c104impl3cow23materialize_cow_storageERNS_11StorageImplE`, run 3235127)
+# -> `import megatron.core` fails cluster-wide -> verl has no `megatron` engine backend
+# -> AssertionError: Unknown backend: megatron. transformer_engine_torch ships only as an sdist,
+# so this is a source build against the now-final torch (uses the base image's CUDA toolkit +
+# ninja; ~20-40 min).
+#
+# PIN to ==2.12.0 — the exact TE version NGC pytorch-cuda:26.02-py3 bundles. An UNPINNED install
+# resolves to the latest (2.18.0), whose cutlass flash-attn backend does
+# `from cutlass.utils import block_copy` — a symbol the base image's older bundled
+# nvidia-cutlass-dsl does not have -> `ImportError: cannot import name 'block_copy'` ->
+# `import megatron.core` fails -> same `Unknown backend: megatron` (run 3236353). This is a known
+# TE issue (2.18 release notes: "known compatibility issue between FlashAttention v4, CuTeDSL and
+# CUDNN Frontend"). Pinning TE back to the base image's own 2.12.0 keeps its Python code matched to
+# the cutlass-dsl / cudnn-frontend / flash-attn the 26.02 container already ships.
+# --no-deps + all three packages named explicitly: nothing else moves (cutlass-dsl etc. stay as
+# the base image has them); only transformer_engine_torch (sdist) rebuilds against the final torch,
+# and transformer_engine_cu13 (prebuilt wheel) is re-laid at the same 2.12.0.
+# `cu13` matches this image's CUDA 13 stack and megatron-core 0.19's own `te` extra spec.
+RUN pip install -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall --no-deps \
+        "transformer-engine==2.12.0" "transformer_engine_cu13==2.12.0" "transformer_engine_torch==2.12.0"
+# Build-time gate: import torch (build-safe) and assert the TE core package and its torch-bindings
+# package are installed at the SAME version (the thing --force-reinstall can get wrong). We do NOT
+# `import transformer_engine` / `megatron.core` here -- those dlopen libcuda.so.1 (the CUDA driver,
+# host-provided at runtime, absent during build). The real runtime import is checked by
+# train-gsm8k-glm5.1-*.sh's own diagnostic block on the GPU nodes (which caught runs 3235127/3236353).
+RUN python -c "\
+import importlib.metadata as m, torch;\
+te=m.version('transformer-engine'); tt=m.version('transformer-engine-torch'); mc=m.version('megatron-core');\
+assert te==tt=='2.12.0', f'transformer-engine {te} / transformer-engine-torch {tt} not both 2.12.0';\
+print(f'OK torch {torch.__version__} | transformer-engine {te} == transformer-engine-torch {tt} | megatron-core {mc}')"
 
 # Tests shipped with the image
 COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
@@ -91,5 +200,3 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.repo="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
-
-

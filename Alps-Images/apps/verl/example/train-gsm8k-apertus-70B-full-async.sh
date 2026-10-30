@@ -11,7 +11,7 @@ export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:
 export MODEL_NAME="Apertus-70B-Instruct-2509"
 export MODEL_REPO="swiss-ai"
 
-export PROJECT_NAME="cscs-async-grpo-gsm8k"
+export PROJECT_NAME="async-grpo-gsm8k"
 export EXPERIMENT_NAME="${MODEL_NAME}-grpo-gsm8k-Async-on-${SLURM_JOB_NUM_NODES}-nodes"
 export RUN_NAME="${EXPERIMENT_NAME}-run-${SLURM_JOB_ID}"
 export TRAINING_HOME=/capstor/scratch/cscs/${USER}/RL/${MODEL_NAME}

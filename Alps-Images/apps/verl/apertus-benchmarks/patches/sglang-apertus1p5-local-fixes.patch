@@ -1,0 +1,52 @@
+# Local fixes on top of sgl-project/sglang#32979 (still open/unmerged).
+# Apply *after* that PR's patch — this diff is against the new file it adds
+# (python/sglang/srt/models/apertus_mm.py), not upstream SGLang.
+#
+# 1. _init_component_model calls component_config.to_dict() unconditionally,
+#    assuming a PreTrainedConfig-like object; against the transformers
+#    commit this script installs it's already a plain dict. Fixed to accept
+#    either shape.
+# 2. load_component_weight raises when a checkpoint key claims to be a
+#    vision/audio tensor but the tower model has no matching parameter —
+#    the checkpoint's vision-tokenizer weight names don't line up with the
+#    structure this PR builds. Harmless to skip: this benchmark is
+#    text-only GSM8K and never calls get_image_feature/get_audio_feature,
+#    so vision/audio tower weights never need to be numerically correct,
+#    only present so the model instantiates. The language-model weight path
+#    (everything load_component_weight returns False for) is untouched.
+#
+# Re-diff against the PR's current head if it moves and this stops applying.
+--- a/python/sglang/srt/models/apertus_mm.py
++++ b/python/sglang/srt/models/apertus_mm.py
+@@ -50,7 +50,11 @@
+     component_config: Any,
+     model_cls: type[nn.Module] | None = None,
+ ) -> nn.Module:
+-    config_dict = component_config.to_dict()
++    config_dict = (
++        component_config.to_dict()
++        if hasattr(component_config, "to_dict")
++        else dict(component_config)
++    )
+     config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
+     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
+
+@@ -301,9 +305,16 @@
+
+             component_tensor = component_tensors.get(name)
+             if component_tensor is None:
+-                raise ValueError(
+-                    f"No vision/audio tensor matches checkpoint key: {name}"
++                # Vision/audio tower weights never need to be numerically
++                # correct for a text-only benchmark that never calls
++                # get_image_feature/get_audio_feature -- skip instead of
++                # aborting the whole load.
++                print(
++                    "[apertus1p5-local-fixes] WARNING: skipping unmatched "
++                    f"vision/audio checkpoint key {name}",
++                    flush=True,
+                 )
++                return True
+             weight_loader = getattr(
+                 component_tensor, "weight_loader", default_weight_loader
+             )
