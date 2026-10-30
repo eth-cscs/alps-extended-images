@@ -1,0 +1,61 @@
+include:
+  - remote: 'https://gitlab.com/cscs-ci/recipes/-/raw/master/templates/v2/.ci-ext.yml'
+
+stages: [build, report]
+
+variables:
+  # Output ref for the manual bootstrap image build. This is intentionally a tag:
+  # the digest is only known after this pipeline publishes the image. Consumers
+  # that want a digest pin can use the digest printed by the digest job below.
+  # Treat this tag as immutable: bump the suffix for every generator image rebuild.
+  CI_GENERATOR_IMAGE: jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/ci-generator:skopeo-1.22.2-python3-arm64-v1
+  CI_GENERATOR_DOCKERFILE: ci-pipelines/generator-image/Containerfile
+  CI_GENERATOR_BASE_IMAGE: quay.io/skopeo/stable:v1.22.2
+
+build-ci-generator-image:
+  stage: build
+  extends: [.container-builder-cscs-gh200]
+  timeout: 1h
+  when: manual
+  variables:
+    CUSTOM_REGISTRY_USERNAME: $JFROG_USER
+    CUSTOM_REGISTRY_PASSWORD: $JFROG_KEY
+    CSCS_REBUILD_POLICY: if-not-exists
+    KUBERNETES_MEMORY_REQUEST: '16Gi'
+    KUBERNETES_MEMORY_LIMIT: '16Gi'
+    DOCKERFILE: $CI_GENERATOR_DOCKERFILE
+    BASE_IMAGE: $CI_GENERATOR_BASE_IMAGE
+    PERSIST_IMAGE_NAME: $CI_GENERATOR_IMAGE
+    DOCKER_BUILD_ARGS: '[
+      "BASE_IMAGE"
+    ]'
+
+print-ci-generator-image-digest:
+  stage: report
+  extends: [.container-runner-lightweight-gh200]
+  image: $CI_GENERATOR_BASE_IMAGE
+  needs:
+    - job: build-ci-generator-image
+      artifacts: false
+  script:
+    - |
+      set -euo pipefail
+      registry="${CI_GENERATOR_IMAGE%%/*}"
+      printf '%s' "$JFROG_KEY" | skopeo login --username "$JFROG_USER" --password-stdin "$registry" >/dev/null
+      image_repo="${CI_GENERATOR_IMAGE%:*}"
+      digest="$(skopeo inspect --format '{{.Digest}}' "docker://${CI_GENERATOR_IMAGE}")"
+      if [ -z "$digest" ]; then
+        echo "ERROR: failed to resolve manifest digest for ${CI_GENERATOR_IMAGE}" >&2
+        exit 1
+      fi
+      echo "CI_GENERATOR_IMAGE=${CI_GENERATOR_IMAGE}"
+      echo "CI_GENERATOR_IMAGE_DIGEST=${digest}"
+      echo "CI_GENERATOR_IMAGE_PIN=${image_repo}@${digest}"
+      printf '%s\n' \
+        "CI_GENERATOR_IMAGE=${CI_GENERATOR_IMAGE}" \
+        "CI_GENERATOR_IMAGE_DIGEST=${digest}" \
+        "CI_GENERATOR_IMAGE_PIN=${image_repo}@${digest}" \
+        > ci-generator-image.env
+  artifacts:
+    reports:
+      dotenv: ci-generator-image.env

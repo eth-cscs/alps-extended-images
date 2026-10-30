@@ -7,20 +7,6 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG OCI_SOURCE="unknown"
-ARG OCI_REVISION="unknown"
-ARG OCI_CREATED="unknown"
-ARG OCI_DESCRIPTION="unknown"
-ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
-
-LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
-      org.opencontainers.image.revision="${OCI_REVISION}" \
-      org.opencontainers.image.created="${OCI_CREATED}" \
-      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
-      com.cscs.alps.git.repo="${OCI_SOURCE}" \
-      com.cscs.alps.git.commit="${OCI_REVISION}" \
-      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
-
 
 # v0.9.0: adds verl/trainer/ppo/v1 (the V1 separate-async trainer) + TransferQueue integration
 ARG VERL_REF="v0.9.0"
@@ -28,7 +14,14 @@ ARG VERL_REF="v0.9.0"
 # 0.5.16: the only recent sglang whose own flashinfer requirement
 # (flashinfer_python[cu13]==0.6.14) matches this image's flashinfer pin below -- see the
 # reasoning at its install site. Bump this + the flashinfer pin together, deliberately, tested.
-ARG SGLANG_VERSION="0.5.16"
+
+# 0.5.17: sglang to a release that pins torch==2.11.0, matching the NGC 26.02 base
+# wheel. Unpinned resolution drifts to newer sglang releases that require newer
+# pypi torch (e.g. 0.5.19 -> torch==2.13.0), replacing the NGC torch and breaking
+# the NGC flash_attn_2_cuda binary shipped in the base (undefined symbol
+# c10::impl::cow::materialize_cow_storage at transformers' flash-attn import).
+
+ARG SGLANG_VERSION="0.5.17"
 
 # Must match ${SGLANG_VERSION}'s own exact pin (its pyproject.toml declares
 # transformers==<this>, not a floor) -- see the reasoning at its install site.
@@ -80,6 +73,8 @@ WORKDIR ${SRC_DIR}
 WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
+
+ARG VERL_REF="v0.8.0"
 
 RUN git clone --branch ${VERL_REF} --depth 1 https://github.com/verl-project/verl
 RUN set -eux; \
@@ -187,3 +182,21 @@ print(f'OK torch {torch.__version__} | transformer-engine {te} == transformer-en
 COPY Alps-Images/apps/verl/tests/ /opt/tests/verl/
 RUN find /opt/tests/verl -name "*.sh" -exec chmod a+x {} \; && \
     chmod -R a+rX /opt/tests/verl
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"

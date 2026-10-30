@@ -1,0 +1,12 @@
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -370,7 +370,8 @@
+         if not self.param_update_in_fp32:
+             return
+         for param, v in self.state.items():
+-            fp32_param = self.param_to_fp32_param[param]
++            # fp32 params get no fp32 clone; their inner param is the CPU copy (or the param).
++            fp32_param = self.param_to_inner_param[param]
+             fp32_param.data.copy_(v["master_param"])
+ 
+     def update_fp32_param_by_new_param(self):

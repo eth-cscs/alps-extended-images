@@ -1,0 +1,23 @@
+# vLLM generation from swiss-ai/rl-infra@8ff6156fd2bf324f409c3cb8f33c00ea26cd9990.
+defaults: ../../common/gsm8k.yaml
+
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      tensor_parallel_size: 1
+      expert_parallel_size: ${oc.decode:${oc.env:GENERATION_EXPERT_PARALLEL_SIZE}}
+      gpu_memory_utilization: 0.8
+      enforce_eager: false
+      load_format: dummy
+      async_engine: true
+      env_vars:
+        NRL_REFIT_BUFFER_MEMORY_RATIO: "0.005"
+        NRL_REFIT_NUM_BUFFERS: "1"
+        NCCL_DEBUG: WARN
+        CUDA_ENABLE_COREDUMP_ON_EXCEPTION: "1"
+        CUDA_COREDUMP_GENERATION_FLAGS: skip_nonrelocated_elf_images,skip_global_memory,skip_shared_memory,skip_local_memory,skip_abort
+        CUDA_COREDUMP_FILE: ${logger.log_dir}/core_vllm_%h_%p
+    vllm_kwargs:
+      all2all_backend: allgather_reducescatter
+      max_num_batched_tokens: 16384

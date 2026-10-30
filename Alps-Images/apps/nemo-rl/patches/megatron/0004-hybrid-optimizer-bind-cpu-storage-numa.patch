@@ -1,0 +1,145 @@
+Subject: [PATCH] Bind CPU-offloaded optimizer storage with an optional VMA policy
+
+Adapt the mbind mechanism from swiss-ai/Nemo-RL#13 to Megatron's allocation
+and optimizer lifecycle, without process-wide mapping scans or diagnostics.
+
+Co-authored-by: davmels <davmelous@gmail.com>
+
+--- a/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
++++ b/megatron/core/optimizer/cpu_offloading/hybrid_optimizer.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2025, NVIDIA CORPORATION and Alibaba PAI. All rights reserved.
++import os
+ from collections import defaultdict
+ from typing import Dict
+ 
+@@ -77,6 +78,12 @@
+         self.param_update_in_fp32 = param_update_in_fp32
+         self.sub_optimizer_kwargs = kwargs
+ 
++        # Explicit opt-in: importing libnuma is unnecessary on other platforms.
++        self._cpu_memory_binder = None
++        if nodes := os.environ.get("MCORE_CPU_OFFLOAD_NUMA_NODES"):
++            from .numa import CpuMemoryBinder
++
++            self._cpu_memory_binder = CpuMemoryBinder(nodes)
+         self._init_sub_optimizers()
+         self._register_load_state_dict_hooks()
+ 
+@@ -109,6 +116,8 @@
+                     self.cpu_copy_map_grad[param] = torch.empty(
+                         param.shape, dtype=param.dtype, pin_memory=self.pin_cpu_grads, device="cpu"
+                     )
++                    if self._cpu_memory_binder is not None:
++                        self._cpu_memory_binder.bind(self.cpu_copy_map_grad[param])
+                     param.grad = self.cpu_copy_map_grad[param]
+ 
+                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
+@@ -117,6 +126,7 @@
+     def _register_param_copy_back_gpu_hook(self):
+         def param_copy_back_gpu_hook_closure():
+             def param_copy_back_gpu_hook(optimizer, args, kwargs):
++                self._bind_cpu_optimizer_state(optimizer)
+                 self._h2d_stream.wait_stream(torch.cuda.current_stream())
+                 with torch.cuda.stream(self._h2d_stream):
+                     for param in _param_generator(optimizer):
+@@ -147,6 +157,13 @@
+             elif self.param_update_in_fp32:
+                 optimizer.register_step_post_hook(fp32_param_copy_back_gpu_hook_closure())
+ 
++    def _bind_cpu_optimizer_state(self, optimizer):
++        if self._cpu_memory_binder is not None:
++            for state in optimizer.state.values():
++                for value in state.values():
++                    if isinstance(value, torch.Tensor):
++                        self._cpu_memory_binder.bind(value)
++
+     def step(self, closure=None):
+         """
+         Override the step method to perform the following operations:
+@@ -285,6 +302,8 @@
+                 if param.is_cuda:
+                     gpu_group["params"].append(param)
+                 else:
++                    if self._cpu_memory_binder is not None:
++                        self._cpu_memory_binder.bind(param)
+                     cpu_group["params"].append(param)
+             if len(gpu_group["params"]) != 0:
+                 gpu_param_groups.append(gpu_group)
+@@ -363,6 +382,8 @@
+                     orig_param = self.inner_param_to_orig_param.get(param, param)
+                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
+                         self.state[orig_param][k] = state[k] = v.to("cpu")
++                        if self._cpu_memory_binder is not None:
++                            self._cpu_memory_binder.bind(state[k])
+                     else:
+                         self.state[orig_param][k] = state[k] = v.to("cuda")
+ 
+--- /dev/null
++++ b/megatron/core/optimizer/cpu_offloading/numa.py
+@@ -0,0 +1,65 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++"""Optional CPU-storage VMA policy for ATS systems (like GH200), requires Linux libnuma."""
++
++import ctypes
++import os
++
++
++class CpuMemoryBinder:
++    """Bind pageable storage to explicit NUMA nodes, not just the allocating thread.
++
++    mbind works at page granularity, so boundary pages shared with other allocations
++    receive the same policy. Pinned storage is already locked against migration.
++    """
++
++    def __init__(self, nodes):
++        class Bitmask(ctypes.Structure):
++            _fields_ = [("size", ctypes.c_ulong), ("maskp", ctypes.POINTER(ctypes.c_ulong))]
++
++        try:
++            self.lib = ctypes.CDLL("libnuma.so.1", use_errno=True)
++        except OSError as error:
++            raise RuntimeError(
++                "CPU-offload NUMA binding requires libnuma.so.1; install libnuma "
++                "or unset MCORE_CPU_OFFLOAD_NUMA_NODES to disable binding."
++            ) from error
++        self.lib.numa_parse_nodestring.argtypes = [ctypes.c_char_p]
++        self.lib.numa_parse_nodestring.restype = ctypes.POINTER(Bitmask)
++        self.lib.numa_bitmask_free.argtypes = [ctypes.POINTER(Bitmask)]
++        self.lib.numa_bitmask_free.restype = None
++        self.lib.mbind.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_ulong,
++            ctypes.c_int,
++            ctypes.POINTER(ctypes.c_ulong),
++            ctypes.c_ulong,
++            ctypes.c_uint,
++        ]
++        self.lib.mbind.restype = ctypes.c_int
++        mask = self.lib.numa_parse_nodestring(nodes.encode())
++        if not mask:
++            raise ValueError(f"Invalid MCORE_CPU_OFFLOAD_NUMA_NODES: {nodes!r}")
++        try:
++            self.maxnode = mask.contents.size
++            words = (self.maxnode + 8 * ctypes.sizeof(ctypes.c_ulong) - 1) // (
++                8 * ctypes.sizeof(ctypes.c_ulong)
++            )
++            self.mask = (ctypes.c_ulong * words)(*mask.contents.maskp[:words])
++        finally:
++            self.lib.numa_bitmask_free(mask)
++        if not any(self.mask):
++            raise ValueError("MCORE_CPU_OFFLOAD_NUMA_NODES must select at least one node")
++        self.page_size = os.sysconf("SC_PAGE_SIZE")
++
++    def bind(self, tensor):
++        if tensor.device.type != "cpu" or tensor.is_pinned():
++            return
++        storage = tensor.untyped_storage()
++        if not storage.nbytes():
++            return
++        start = storage.data_ptr() // self.page_size * self.page_size
++        end = (storage.data_ptr() + storage.nbytes() + self.page_size - 1) // self.page_size
++        # MPOL_BIND, MPOL_MF_MOVE: constrain the VMA and move existing movable pages.
++        if self.lib.mbind(start, end * self.page_size - start, 2, self.mask, self.maxnode, 2):
++            error = ctypes.get_errno()
++            raise OSError(error, f"CPU offload mbind failed: {os.strerror(error)}")
