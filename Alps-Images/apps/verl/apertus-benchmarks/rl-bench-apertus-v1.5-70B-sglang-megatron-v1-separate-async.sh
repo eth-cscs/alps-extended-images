@@ -1100,9 +1100,7 @@ export RAY_memory_usage_threshold=0.99
 #             step 3 with PARAMETER_SYNC_STEP=1) and validated fixed in run
 #             3408011 (RSS flat 49-52 GB across 5 steps). Authored from this
 #             recipe's own decoupled-cpu-snapshot-reuse-fix.patch (removed from
-#             the repo once superseded; the earlier diagnostic-only
-#             decoupled-cpu-snapshot-memdump.patch stays in
-#             apertus-benchmarks/patches/ as an unapplied reference)
+#             the repo once superseded)
 #             -- opened as https://github.com/verl-project/verl/pull/7881,
 #             stripped of this recipe's [CPU-SNAPSHOT-DIAG] debug prints for
 #             upstream (a hot-path library function should not print on every
