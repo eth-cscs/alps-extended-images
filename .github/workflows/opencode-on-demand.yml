@@ -9,10 +9,8 @@ on:
 jobs:
   opencode:
     if: |
-      github.event.issue.pull_request &&
-      github.event.comment.user.type != 'Bot' &&
-      startsWith(github.event.comment.body, '/oc-review') &&
-      contains(fromJSON('["theely","boeschf"]'), github.event.comment.user.login)
+      contains(github.event.comment.body, '/oc') ||
+      contains(github.event.comment.body, '/opencode')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -34,4 +32,3 @@ jobs:
         with:
           agent: grumpy-reviewer
           model: cscs/moonshotai/Kimi-K2.7-Code
-          share: false
