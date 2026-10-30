@@ -48,7 +48,7 @@ Accelerator-specific source lists in `profile.env` keep changes to `sources/inst
 
 Each compiled-component step installs and removes newly introduced build-only APT packages in the same layer.
 This repeats package setup on cold builds but avoids retaining deleted compiler packages in lower image layers.
-Package snapshots normalize multi-arch names so inherited development packages are preserved; the CUDA base's matching RDMA headers remain available until Mooncake's explicit final purge.
+Cleanup normalizes both snapshot and requested package names to preserve inherited development packages regardless of architecture qualifiers; the CUDA base's matching RDMA headers remain available until Mooncake's explicit final purge.
 Only `libibverbs1`, not `libibverbs-dev`, is held during component cleanup.
 Base-provided Torch/Triton constraints and ROCm SDK shell state are restored for each component.
 
