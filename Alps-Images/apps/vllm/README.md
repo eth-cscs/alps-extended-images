@@ -48,7 +48,7 @@ Accelerator-specific source lists in `profile.env` keep changes to `sources/inst
 
 Each compiled-component step installs and removes newly introduced build-only APT packages in the same layer.
 This repeats package setup on cold builds but avoids retaining deleted compiler packages in lower image layers.
-Package snapshots normalize multi-arch names so inherited development packages are preserved; the CUDA base's matching RDMA headers remain available until Mooncake's explicit final purge.
+Cleanup normalizes both snapshot and requested package names to preserve inherited development packages regardless of architecture qualifiers; the CUDA base's matching RDMA headers remain available until Mooncake's explicit final purge.
 Only `libibverbs1`, not `libibverbs-dev`, is held during component cleanup.
 Base-provided Torch/Triton constraints and ROCm SDK shell state are restored for each component.
 
@@ -61,7 +61,6 @@ This exercises CXI endpoint setup, GPU-memory registration, and the UCCL data pa
 
 The ROCm variant keeps a GPU-less-safe build-time smoke check: `import vllm` runs the platform probe and the module-level GCN-arch query, which initializes CUDA and fails on build containers without a visible GPU.
 The build only imports torch and locates the vLLM package via `importlib.util.find_spec`; the real ROCm `import vllm` coverage lives in the `ray-rccl-uccl-ep` test job.
-
 Older vLLM releases may need fewer changes.
 Releases `0.22` and older are suspected to work without these compatibility patches, but that still needs to be verified against the Alps CUDA/HPC stack.
 

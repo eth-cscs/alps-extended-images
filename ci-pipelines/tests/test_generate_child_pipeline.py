@@ -532,7 +532,6 @@ def test_schema_app_requires_base_derived_family(gen, variant):
     assert variant in str(error.value)
     assert "missing base-derived family" in str(error.value)
 
-
 @pytest.fixture()
 def named_targets(tmp_path, monkeypatch, gen):
     for key, value in {
