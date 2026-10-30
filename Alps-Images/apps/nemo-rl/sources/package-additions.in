@@ -1,0 +1,20 @@
+aniso8601==10.0.1
+comet-ml==3.58.7
+cupy-cuda13x==14.2.0
+fastokens==0.3.2
+flashinfer-jit-cache==0.6.16.post3
+Flask-RESTful==0.3.10
+nemo-lens==0.1.0
+nemo-run==0.11.1
+# NemoRun imports Lepton's v1 API, removed in newer releases.
+leptonai==0.26.6
+# NemoRun/TorchX requires urllib3 < 1.27.
+urllib3==1.26.20
+nltk==3.10.3
+open-clip-torch==3.3.0
+peft==0.21.2
+soundfile==0.14.0
+tensorstore==0.1.85
+timm==1.0.30
+torch-memory-saver==0.0.10
+wget==3.2

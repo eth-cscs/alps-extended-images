@@ -1,0 +1,4 @@
+tests:
+  cuda:
+    - name: vetnode
+      kind: cuda-vetnode

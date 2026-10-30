@@ -1,15 +1,17 @@
 # Manual Builds On Alps
 
-Images are normally built by GitLab CI, but they can also be built manually from a repository checkout on Alps. Run these commands on a node where rootless `podman` is available and where the target architecture matches the image you want to build.
+Images are normally built by GitLab CI, but they can also be built manually from a repository checkout on Alps.
+Run these commands on a node where rootless `podman` is available and where the target architecture matches the image you want to build.
 
-The helper uses the same reference and hash logic as CI. By default it writes local tags under `localhost/alps-images`; override `IMAGE_PREFIX` if you want registry-style tags.
+The helper uses the same reference and hash logic as CI.
+By default it writes local tags under `localhost/alps-images`; override `IMAGE_PREFIX` if you want registry-style tags.
 
 ## Generate A Build Script
 
 Generate a base-image build script:
 
 ```bash
-manual-build/manual-build.sh base ngc pytorch 26.06-py3 /tmp/build-pytorch-cuda-26.06.sh
+manual-build/manual-build.sh base cuda pytorch 26.06-py3 /tmp/build-pytorch-cuda-26.06.sh
 ```
 
 Generate a ROCm base-image build script on an x86/AMD-capable builder:
@@ -36,14 +38,32 @@ Run it:
 bash /tmp/build-vllm-cuda.sh
 ```
 
-For app images, the generated script uses the canonical base image reference computed from `profile.env`. If you built that base locally first, keep the default `IMAGE_PREFIX` consistent so the app build can find the local base tag.
+For app images, the generated script uses the canonical base image reference computed from `profile.env`.
+If you built that base locally first, keep the default `IMAGE_PREFIX` consistent so the app build can find the local base tag.
+
+App `APP_VARIANTS` entries are flat build targets: `cuda` / `rocm` for family-only apps, otherwise `<variant>-cuda` / `<variant>-rocm`.
+Target names must start with a lowercase letter and match `^[a-z][a-z0-9]*((_|__|-+)[a-z0-9]+)*$`.
+Separators must occur between lowercase alphanumeric groups: one or two underscores, or one or more hyphens; mixed adjacent separators such as `a_-cuda` are rejected.
+In qualified targets, `cuda` and `rocm` are reserved for the final suffix and cannot appear as hyphen- or underscore-delimited variant components.
+The selected `<TARGET>_BASE_IMAGE` determines the family, and a contradictory target suffix is an error.
+Profile-key prefixes uppercase the target and replace `-` with `_`.
+For example, a hypothetical `app example megatron-cuda` selector would use `MEGATRON_CUDA_BASE_IMAGE` and image name `example-megatron-cuda`; this illustrates the convention, not an available image.
+Existing `app vllm cuda` / `app vllm rocm` selectors remain unchanged.
+
+CI discovery, manual builds, and ref/hash helpers share `app_variants_from_profile` in `ci-pipelines/helpers/meta.sh`.
+Profiles are read as data, not sourced.
+The validator checks target syntax, normalized-prefix collisions, base-family agreement, and requested target membership; Python has no separate naming policy.
+Validation covers every declared target and base selector, so malformed unselected target or base declarations also block a selected-target build.
+
+The shared `app_refs APP_NAME APP_VARIANT` helper returns one space-separated five-field record: `BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF FAMILY`.
+The generated app build uses the canonical `BASE_IMAGE_REF`; `FAMILY` identifies the selected base's accelerator family (`cuda` or `rocm`).
 
 ## Useful Overrides
 
 Set `IMAGE_PREFIX` to choose the output namespace:
 
 ```bash
-IMAGE_PREFIX=localhost/my-alps-images manual-build/manual-build.sh base ngc pytorch 26.06-py3 /tmp/build-base.sh
+IMAGE_PREFIX=localhost/my-alps-images manual-build/manual-build.sh base cuda pytorch 26.06-py3 /tmp/build-base.sh
 ```
 
 Set `ALPS_REV` to use a different revision suffix:
@@ -52,10 +72,24 @@ Set `ALPS_REV` to use a different revision suffix:
 ALPS_REV=alps7-dev manual-build/manual-build.sh app vllm cuda /tmp/build-vllm-cuda.sh
 ```
 
-Set `CSCS_CI_ORIG_CLONE_URL`, `CI_COMMIT_SHA`, or `CI_COMMIT_SHORT_SHA` if you need labels and hashes to match a specific CI context.
+Set `CSCS_CI_ORIG_CLONE_URL` if you need hashes to match a specific CI context.
+Set `CI_COMMIT_SHA` or `CI_COMMIT_SHORT_SHA` if you need OCI labels to match a specific CI context.
 
 ## Direct Podman Build
 
-The generated scripts are plain shell scripts. Inspect them if you need to customize `podman build` arguments, for example to add `--no-cache`, use a different storage location, or tag an additional image name.
+The generated scripts are plain shell scripts.
+Inspect them if you need to customize `podman build` arguments, for example to add `--no-cache`, use a different storage location, or tag an additional image name.
 
-For NGC base images, the important build arguments are `BASE_IMAGE`, `NGC_VARIANT_DIR`, and `REMOVE_HPCX_DIRS`. For ROCm base images, the important build arguments are `BASE_IMAGE`, `ROCM_VARIANT_DIR`, derived `ROCM_VERSION`, profile-provided `ROCM_PYPI_INDEX_URL`, and optional `ROCM_REBUILD_RCCL`. For app images, the important build argument is `BASE_IMAGE`, which should be the canonical base image reference from `ci-pipelines/helpers/meta.sh` rather than a stable or commit-SHA tag.
+The generated scripts run `podman build -f Alps-Images/... .` from the repository root.
+`.dockerignore` is read from that build-context root, not the Containerfile's directory, so it applies to nested Containerfiles too.
+
+Normal builds reuse Podman's layer cache.
+Changing only OCI timestamps or commit labels reruns the final metadata-only step, not software compilation.
+Use `--no-cache` when deliberately refreshing mutable upstream downloads; a cached `RUN` does not check upstream repositories or package indexes for updates.
+
+Manual builds only produce local image tags.
+CI validation markers and publish promotion are generated by the GitLab child pipeline from `ci.yaml` metadata and are not created by manual build scripts.
+
+For NGC base images, the important build arguments are `BASE_IMAGE`, `NGC_VARIANT_DIR`, and `REMOVE_HPCX_DIRS`.
+For ROCm base images, the important build arguments are `BASE_IMAGE`, `ROCM_VARIANT_DIR`, derived `ROCM_VERSION`, profile-provided `ROCM_PYPI_INDEX_URL`, and optional `ROCM_REBUILD_RCCL`.
+For app images, the important build argument is `BASE_IMAGE`, which should be the canonical base image reference from `ci-pipelines/helpers/meta.sh` rather than a stable tag.

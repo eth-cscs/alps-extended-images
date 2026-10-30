@@ -5,20 +5,6 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG OCI_SOURCE="unknown"
-ARG OCI_REVISION="unknown"
-ARG OCI_CREATED="unknown"
-ARG OCI_DESCRIPTION="unknown"
-ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
-
-LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
-      org.opencontainers.image.revision="${OCI_REVISION}" \
-      org.opencontainers.image.created="${OCI_CREATED}" \
-      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
-      com.cscs.alps.git.repo="${OCI_SOURCE}" \
-      com.cscs.alps.git.commit="${OCI_REVISION}" \
-      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
-
 # Shared stack build args. Defaults live in common/alps-stack-versions.env.
 ARG BOOST_VER=""
 ARG BOOST_BUILD_JOBS=""
@@ -38,20 +24,21 @@ ARG AWS_OFI_NCCL_COMMIT=""
 ARG AWS_OFI_NCCL_PATCH=""
 ARG OSU_VERSION=""
 
-ARG ROCM_VARIANT_DIR=""
 ARG ROCM_VERSION
 ARG ROCM_REBUILD_RCCL
 ARG ROCM_SYSTEMS_REPO
 ARG ROCM_SYSTEMS_COMMIT
+ARG ROCM_LIBRARIES_REPO=""
+ARG ROCM_LIBRARIES_COMMIT=""
 ARG RCCL_GPU_TARGETS
 ARG RCCL_TESTS_GPU_TARGETS
 ARG ROCM_PYPI_INDEX_URL
 
-COPY Alps-Images/patches/ /opt/alps/patches/
+COPY Alps-Images/patches/libfabric/ /opt/alps/patches/libfabric/
+COPY Alps-Images/patches/aws-ofi-nccl/ /opt/alps/patches/aws-ofi-nccl/
 COPY Alps-Images/common/alps-stack-versions.env /opt/alps/alps-stack-versions.env
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
-COPY Alps-Images/common/run-alps-variant-hooks.sh /opt/alps/run-alps-variant-hooks.sh
 COPY Alps-Images/ROCm/install-alps-rocm-components.sh /opt/alps/install-alps-rocm-components.sh
 COPY Alps-Images/ROCm/install-alps-rocm-stack.sh /opt/alps/install-alps-rocm-stack.sh
 
@@ -84,7 +71,28 @@ RUN set -eux; \
     /opt/alps/env/install-alps-runtime-warnings.sh --python /opt/venv/bin/python
 
 # Optional image-specific fixes (late hooks)
+ARG ROCM_VARIANT_DIR=""
+COPY Alps-Images/common/run-alps-variant-hooks.sh /opt/alps/run-alps-variant-hooks.sh
 COPY Alps-Images/ROCm/${ROCM_VARIANT_DIR}/ /opt/alps/rocm-variant/
 RUN set -eux; \
     chmod +x /opt/alps/run-alps-variant-hooks.sh; \
     /opt/alps/run-alps-variant-hooks.sh /opt/alps/rocm-variant "ROCM_VARIANT_DIR=${ROCM_VARIANT_DIR}"
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+

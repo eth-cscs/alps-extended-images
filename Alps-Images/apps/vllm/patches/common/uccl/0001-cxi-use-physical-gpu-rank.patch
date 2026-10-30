@@ -1,0 +1,81 @@
+From 7f9d1ea5d0cebb8f3a37b0a76c6f71507ee35442 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Fri, 25 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: select CXI domains by physical GPU rank
+
+Ray exposes one GPU per worker, so every worker sees its assigned GPU as
+logical device zero.  Selecting cxi0 from that logical index sends all four
+MI300A workers through the same CXI device and can crash UCCL while its
+per-rank endpoints and IPC mappings are initialized.
+
+The topology detector already records each visible device's rank in the
+node-wide physical PCI ordering as nic_local_rank.  Use that rank only for
+CXI domain selection while retaining the logical device index for HIP memory
+registration.
+---
+ ep/include/cxi_transport.hpp | 1 +
+ ep/src/cxi_transport.cpp     | 9 ++++++---
+ ep/src/proxy.cpp             | 2 +-
+ 3 files changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/ep/include/cxi_transport.hpp b/ep/include/cxi_transport.hpp
+index e6fcc39..fa29c6a 100644
+--- a/ep/include/cxi_transport.hpp
++++ b/ep/include/cxi_transport.hpp
+@@ -20,6 +20,7 @@ class CxiTransport final : public EpTransport {
+   ~CxiTransport() override;
+ 
+   void init(ProxyCtx& ctx) override;
++  void init(ProxyCtx& ctx, int cxi_local_rank);
+   void register_main_buffer(void* ptr, size_t len, int cuda_device) override;
+   void register_atomic_buffer(void* ptr, size_t len, int cuda_device) override;
+   LocalConnInfo local_info() const override;
+diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
+index 3e92888..fd6908d 100644
+--- a/ep/src/cxi_transport.cpp
++++ b/ep/src/cxi_transport.cpp
+@@ -20,7 +20,8 @@ void CxiTransport::unavailable() {
+ 
+ #ifndef USE_LIBFABRIC_CXI
+ 
+-void CxiTransport::init(ProxyCtx&) { unavailable(); }
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++void CxiTransport::init(ProxyCtx&, int) { unavailable(); }
+ void CxiTransport::register_main_buffer(void*, size_t, int) { unavailable(); }
+ void CxiTransport::register_atomic_buffer(void*, size_t, int) { unavailable(); }
+ LocalConnInfo CxiTransport::local_info() const { unavailable(); }
+@@ -136,7 +137,9 @@ fi_info* select_cxi_info(fi_info* infos, int local_rank) {
+ 
+ }  // namespace
+ 
+-void CxiTransport::init(ProxyCtx& ctx) {
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++
++void CxiTransport::init(ProxyCtx& ctx, int cxi_local_rank) {
+   ctx_ = &ctx;
+ 
+   fi_info* hints = fi_allocinfo();
+@@ -157,7 +160,7 @@ void CxiTransport::init(ProxyCtx& ctx) {
+   check_fi(rc, "fi_getinfo(cxi)");
+ 
+   try {
+-    fi_info* selected = select_cxi_info(info, ctx.local_rank);
++    fi_info* selected = select_cxi_info(info, cxi_local_rank);
+ 
+     check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr), "fi_fabric");
+     check_fi(fi_domain(fabric_, selected, &domain_, nullptr), "fi_domain");
+diff --git a/ep/src/proxy.cpp b/ep/src/proxy.cpp
+index beb513e..d585294 100644
+--- a/ep/src/proxy.cpp
++++ b/ep/src/proxy.cpp
+@@ -272,7 +272,7 @@ void Proxy::init_common() {
+       if (!should_connect_peer(peer)) continue;
+ 
+       auto transport = std::make_unique<CxiTransport>();
+-      transport->init(ctx_);
++      transport->init(ctx_, cfg_.nic_local_rank);
+       transport->register_main_buffer(cfg_.gpu_buffer, cfg_.total_size,
+                                       cfg_.local_rank);
+       transport->register_atomic_buffer(atomic_buffer_ptr_, kAtomicBufferSize,
+-- 
+2.51.0
