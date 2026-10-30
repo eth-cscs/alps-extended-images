@@ -1,14 +1,16 @@
 name: collect-rl-runs
 
 # Collects the files that RL training jobs launched from the FirecREST UI AI Training page leave
-# in the run tracker directory on the cluster (<job id>-run.json, <job id>-result.json) into run
-# records on the rl-runs branch: one record per run (<recipe id>/<cluster>-<job id>.json) and an
-# index.json per recipe. Tracker files are deleted once the records are pushed. See
-# .github/rl-runs-collector/collect_rl_runs.py.
+# in the run tracker directory on the cluster (<job id>-run.json, <job id>-metrics.json,
+# <job id>-result.json) into run records on the rl-runs branch: one record per run
+# (<recipe id>/<cluster>-<job id>.json) and an index.json per recipe. Tracker files are deleted
+# once the records are pushed. See .github/rl-runs-collector/collect_rl_runs.py.
 #
-# Records contain no user, account, path or exact time, so they can be public. They do contain
-# the cluster and job id, so that the UI can link a run to its job. They live on their own branch so that the collector's commits
-# never touch the image sources or their CI. A pass fails with the names of any missing
+# Records are public. They contain no user name, path or exact time, but they do contain the
+# cluster and Slurm job id, so that the UI can link a run to its job, and the partition, account
+# and monitoring settings (e.g. the W&B project), so that it can clone the run. Whoever can see
+# the job in Slurm can see whose it is. They live on their own branch so that the collector's
+# commits never touch the image sources or their CI. A pass fails with the names of any missing
 # settings until the environment below is configured.
 #
 # Setup:
@@ -38,7 +40,9 @@ concurrency:
 
 jobs:
   collect:
-    # Environment variables and secrets are not visible to a job's `if`, only to its steps
+    # Not gated on vars.FIRECREST_URL: the settings are variables of the rl-runs-collector
+    # environment, which a job's `if` is evaluated before it enters, so they always read as empty
+    # there and every pass was skipped. Without them, the collector fails naming what is missing.
     if: github.repository == 'eth-cscs/alps-extended-images'
     runs-on: ubuntu-latest
     environment: rl-runs-collector
@@ -70,8 +74,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      # The files the collect step processed, for the delete step. Set here because the runner
+      # context, and so the runner's temporary directory, is not available in the job's env.
+      - name: Set the manifest path
+        run: echo "RL_RUNS_MANIFEST=$RUNNER_TEMP/rl-runs-processed.json" >> "$GITHUB_ENV"
+
       - name: Collect tracker files
-        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$RUNNER_TEMP/rl-runs-processed.json"
+        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$RL_RUNS_MANIFEST"
 
       # Rebased on whatever reached rl-runs since the checkout, never forced. If that conflicts or
       # the push is rejected, the step fails, nothing is deleted, and the next pass collects the
@@ -93,4 +102,4 @@ jobs:
       # Only reached when the push succeeded; files that fail to delete are collected again
       # next time, which is harmless
       - name: Delete collected tracker files
-        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$RUNNER_TEMP/rl-runs-processed.json"
+        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$RL_RUNS_MANIFEST"

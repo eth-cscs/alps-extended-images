@@ -63,8 +63,10 @@ jobs:
         run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh
 
       - name: GitHub workflow lint
-        # Catches what the YAML parse below cannot, such as expression contexts a field does not allow
-        run: uvx --from actionlint-py actionlint .github/workflows/collect-rl-runs.yml
+        # All workflows: expression contexts a field does not allow and the like, and ShellCheck on
+        # their run steps. Both pinned so that a new release can't break unrelated changes;
+        # actionlint skips the shell checks silently when shellcheck isn't on its PATH.
+        run: uvx --from actionlint-py==1.7.12.25 --with shellcheck-py==0.11.0.1 actionlint .github/workflows/*.yml
 
       - name: CI YAML and embedded shell syntax
         run: |
@@ -88,14 +90,6 @@ jobs:
                       for script in job.get(key) or []:
                           if isinstance(script, str):
                               subprocess.run(['bash', '-n'], input=script, text=True, check=True)
-
-          # GitHub workflows with shell steps of their own
-          for path in ['.github/workflows/collect-rl-runs.yml']:
-              data = yaml.safe_load(Path(path).read_text())
-              for job in data['jobs'].values():
-                  for step in job['steps']:
-                      if 'run' in step:
-                          subprocess.run(['bash', '-n'], input=step['run'], text=True, check=True)
           PY
 
       - name: Generated child pipeline smoke

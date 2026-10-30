@@ -3,7 +3,8 @@
 
 Training jobs launched from the FirecREST UI AI Training page write files into a shared run
 tracker directory on the cluster: <job id>-run.json when they start, <job id>-metrics.json with
-the metrics so far every few minutes while they run, and <job id>-result.json when they exit. This script reads them through FirecREST and turns them into one record per run,
+the metrics so far every few minutes while they run, and <job id>-result.json when they exit.
+This script reads them through FirecREST and turns them into one record per run,
 <recipe id>/<cluster>-<job id>.json, plus an index.json per recipe, in a checkout of the records
 branch.
 
@@ -23,7 +24,7 @@ Records are public:
   contains (everyone can write to the tracker directory, so files are untrusted)
 - the cluster and Slurm job id are kept, so that the UI can link a run to its job, and the
   partition, account and monitoring settings (e.g. the W&B project), so that it can clone the
-  run. No user or path is, though whoever can see the job in Slurm can see whose it is
+  run. No user name or path is, though whoever can see the job in Slurm can see whose it is
 - dates are kept to the day; durations are kept exactly
 Output is deterministic, so a pass with nothing new leaves nothing to commit.
 
@@ -462,7 +463,7 @@ def apply_scheduler_state(record: Json, job: Any) -> Json | None:
     times = job.get("time") if isinstance(job.get("time"), dict) else {}
     end = _to_integer(times.get("end"), 1, 2**40)
     reported = record.get("result")
-    result = dict(reported) if reported else {
+    result = dict(reported) if reported is not None else {
         "status": None,
         "exitCode": _to_integer(status.get("exitCode"), 0, 255),
         "signal": None,
@@ -590,21 +591,25 @@ class FirecrestError(RuntimeError):
         self.status = status
 
 
+def _open(request: urllib.request.Request) -> bytes:
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
+        return response.read()
+
+
 def send(request: urllib.request.Request) -> bytes:
     """The response body, after retrying temporary failures; raises the last error otherwise."""
-    for delay in (*RETRY_DELAYS_SECONDS, None):
+    for delay in RETRY_DELAYS_SECONDS:
         try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                return response.read()
+            return _open(request)
         except urllib.error.HTTPError as error:
-            if delay is None or error.code not in RETRY_HTTP_CODES:
+            if error.code not in RETRY_HTTP_CODES:
                 raise
         except OSError:
             # URLError, timeouts and connection errors
-            if delay is None:
-                raise
+            pass
         time.sleep(delay)
-    raise AssertionError("unreachable")
+    # The last attempt, whose error is not retried
+    return _open(request)
 
 
 def get_access_token(config: Config) -> str:
@@ -726,7 +731,7 @@ def parse_listing(content: bytes) -> list[TrackerFile]:
 def list_tracker_files(config: Config, access_token: str) -> list[TrackerFile]:
     try:
         return parse_listing(firecrest(config, access_token, "GET", "ls", config.tracker_dir))
-    except RuntimeError as error:
+    except FirecrestError as error:
         fail(f"Listing the tracker directory failed: {error}")
     except ValueError:
         fail("Listing the tracker directory returned an unexpected response")
@@ -790,7 +795,7 @@ def collect(config: Config, runs_dir: Path, manifest: Path) -> None:
             content = firecrest(
                 config, access_token, "GET", "download", f"{config.tracker_dir}/{file.name}"
             )
-        except RuntimeError:
+        except FirecrestError:
             # A failed download says nothing about the file, so it isn't expired or deleted:
             # plan_collection skips it and the next pass tries again
             read_failures += 1

@@ -434,6 +434,13 @@ class TestSchedulerState:
         assert result["exitCode"] == 1
         assert result["metrics"] is None
 
+    def test_keeps_what_the_job_reported_itself(self):
+        reported = {"status": "terminated", "exitCode": 143, "signal": "TERM", "endedOn": "2026-10-28",
+                    "elapsedSeconds": 3600, "metrics": {"steps": 21}}
+        job = {"status": {"state": "PREEMPTED", "exitCode": 0}, "time": {"end": 1793102823, "elapsed": 287}}
+        result = crr.apply_scheduler_state({**self.RECORD, "result": reported}, job)["result"]
+        assert result == {**reported, "status": "preempted", "schedulerState": "PREEMPTED"}
+
     @pytest.mark.parametrize(
         "job",
         [
@@ -574,7 +581,7 @@ class TestFirecrestErrors:
 
     def test_download_failures_are_retried_rather_than_crashing(self, monkeypatch):
         self.respond_with(monkeypatch, TimeoutError())
-        with pytest.raises(RuntimeError, match="GET ops/download failed: TimeoutError"):
+        with pytest.raises(crr.FirecrestError, match="GET ops/download failed: TimeoutError"):
             crr.firecrest(self.CONFIG, "token", "GET", "download", "/tracker/1-run.json")
         assert self.delays == list(crr.RETRY_DELAYS_SECONDS)
 
@@ -610,7 +617,7 @@ class TestFirecrestErrors:
     @pytest.mark.parametrize("code", [401, 403, 404, 500])
     def test_other_http_errors_are_not_tried_again(self, monkeypatch, code):
         self.respond_with(monkeypatch, self.http_error(code))
-        with pytest.raises(RuntimeError, match=f"HTTP {code}"):
+        with pytest.raises(crr.FirecrestError, match=f"HTTP {code}"):
             crr.firecrest(self.CONFIG, "token", "GET", "download", "/tracker/1-run.json")
         assert self.delays == []
 
@@ -777,7 +784,7 @@ class TestCollectPhase:
 
     def test_retries_files_that_could_not_be_downloaded_and_says_so(self, tmp_path, tracker, capsys):
         tracker["7-run.json"] = json.dumps(run_file("7")).encode()
-        tracker["8-run.json"] = RuntimeError("GET ops/download failed: TimeoutError")
+        tracker["8-run.json"] = crr.FirecrestError("GET ops/download failed: TimeoutError")
         crr.collect(self.CONFIG, tmp_path, tmp_path / "manifest.json")
         manifest = json.loads((tmp_path / "manifest.json").read_text())
         # Even though it is old, the file that couldn't be read is kept for the next pass
