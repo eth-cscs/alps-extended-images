@@ -434,6 +434,7 @@ ARG TVM_FFI_VERSION=0.1.11
 RUN set -eux; \
     UV_CONCURRENT_INSTALLS=1 uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
       "ray[default]==${RAY_VERSION}" \
+      "opentelemetry-exporter-prometheus==0.66b1" \
       "hydra-core==1.3.2" \
       "transformers==5.17.0" \
       "megatron-energon==7.4.0" \
@@ -611,7 +612,7 @@ RUN set -eux; \
 # Install vLLM runtime requirements with the NeMo API/runtime pins protected.
 # Install its source-built wheel without dependencies to preserve NGC torch.
 RUN set -eux; \
-    printf 'openai==2.7.2\nray==2.56.1\ntransformers==5.17.0\nflashinfer-python==0.6.16.post3\napache-tvm-ffi==0.1.11\nnvidia-cutlass-dsl==4.6.2\nnvtx==0.2.15\nopentelemetry-api==1.45.1\nopentelemetry-sdk==1.45.1\nopentelemetry-exporter-otlp-proto-grpc==1.45.1\nopentelemetry-exporter-otlp-proto-http==1.45.1\nprotobuf==6.33.6\n' \
+    printf 'openai==2.7.2\nray==2.56.1\ntransformers==5.17.0\nflashinfer-python==0.6.16.post3\napache-tvm-ffi==0.1.11\nnvidia-cutlass-dsl==4.6.2\nnvtx==0.2.15\nopentelemetry-api==1.45.1\nopentelemetry-sdk==1.45.1\nopentelemetry-exporter-otlp-proto-grpc==1.45.1\nopentelemetry-exporter-otlp-proto-http==1.45.1\nopentelemetry-exporter-prometheus==0.66b1\nprotobuf==6.33.6\n' \
       > /tmp/vllm-runtime-constraints.txt; \
     uv pip install --system --no-cache \
       -c /opt/alps/base-pins.txt -c /tmp/vllm-runtime-constraints.txt \
@@ -705,11 +706,12 @@ ENV NEMO_RL_PATH=/opt/nemo-rl \
 # Fails the build if any install above moved the NGC torch stack, or if a layer
 # resolved to a version other than the one it asked for -- a later `uv pip install`
 # is free to upgrade an earlier package, and only a check after the last layer
-# catches that. Imports are not checked here: the build host has no GPU, so
-# tests/import-smoke.sh asserts them on a compute node instead.
+# catches that. Check Ray's CPU-only telemetry import here as well; GPU-dependent
+# imports remain covered by tests/import-smoke.sh on a compute node.
 RUN set -eux; \
     python3 - <<'VERIFY'
 import importlib.metadata as md
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
 
 pins = dict(line.split("==", 1) for line in open("/opt/alps/base-pins.txt").read().split())
 for pkg, want in pins.items():
@@ -747,6 +749,7 @@ assert md.version("vllm") == "0.28.0+apertus2", md.version("vllm")
 assert md.version("flashinfer-jit-cache") == "0.6.16.post3"
 assert md.version("nemo-lens") == "0.1.0"
 assert md.version("opentelemetry-sdk") == "1.45.1"
+assert md.version("opentelemetry-exporter-prometheus") == "0.66b1"
 assert md.version("protobuf") == "6.33.6"
 print("torch stack unchanged:", pins)
 VERIFY
