@@ -98,6 +98,24 @@ def test_child_write_does_not_fold_long_values(tmp_path, monkeypatch, gen):
     assert yaml.safe_load(generated)["long-value-job"]["variables"]["LONG_VALUE"] == long_value
 
 
+@pytest.mark.parametrize("walltime", ["00:45:00", "04:00:00", "12:34:56"])
+def test_child_write_quotes_walltimes_for_gitlab(tmp_path, monkeypatch, gen, walltime):
+    output = tmp_path / "child.yaml"
+    monkeypatch.setattr(gen, "OUTPUT", output)
+    child = gen.Child()
+    child.add_job("timed-job", ".template", variables={"SLURM_TIMELIMIT": walltime})
+    child.write()
+
+    document = {key.value: value for key, value in yaml.compose(output.read_text()).value}
+    job = {key.value: value for key, value in document["timed-job"].value}
+    variables = {key.value: value for key, value in job["variables"].value}
+    # GitLab's YAML parser treats unquoted HH:MM:SS as a base-60 integer,
+    # including leading-zero hours that PyYAML itself leaves as strings.
+    duration = variables["SLURM_TIMELIMIT"]
+    assert duration.style in {"'", '"'}
+    assert duration.value == walltime
+
+
 def test_main_generates_base_and_app_graph(tmp_path, monkeypatch, gen):
     output = tmp_path / "child.yaml"
     base = base_image()
