@@ -65,6 +65,7 @@ def test_profile_defaults_come_from_the_env_files():
     # Profile-specific parameters only appear in their profiles
     assert "MATRIX_LR" not in adamw["defaults"] and muon["defaults"]["MATRIX_LR"] == 5.0e-6
     assert adamw["timeLimit"] == "07:00:00"
+    assert adamw["configFile"] == "config.yaml"
     # Catalog entries are expanded
     assert vllm["models"][0]["architecture"] == "moe"
 

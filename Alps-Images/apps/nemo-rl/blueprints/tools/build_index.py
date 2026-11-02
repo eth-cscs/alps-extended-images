@@ -86,10 +86,11 @@ def validate(data: Any, schema: Json, path: Path) -> list[str]:
     ]
 
 
-def read_profile(path: Path) -> tuple[dict[str, str], set[str]]:
-    """The overridable variables with their defaults, and the fixed variables, of a .env profile."""
+def read_profile(path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """The overridable variables with their defaults, and the fixed variables with their values,
+    of a .env profile."""
     overridable: dict[str, str] = {}
-    fixed: set[str] = set()
+    fixed: dict[str, str] = {}
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -98,7 +99,7 @@ def read_profile(path: Path) -> tuple[dict[str, str], set[str]]:
         if match:
             overridable[match.group(1)] = match.group(2)
         elif assignment := ASSIGNMENT_PATTERN.match(line):
-            fixed.add(assignment.group(1))
+            fixed[assignment.group(1)] = line.split("=", 1)[1].split("#", 1)[0].strip().strip('"')
     return overridable, fixed
 
 
@@ -195,7 +196,11 @@ def check_blueprint(
         if not profile_path.is_file():
             errors.append(f"{where}: profile file {profile_path.name} not found")
             continue
-        overridable, _ = read_profile(profile_path)
+        overridable, fixed = read_profile(profile_path)
+        config_file = fixed.get("CONFIG_FILE")
+        if not config_file or not re.fullmatch(r"[A-Za-z0-9._-]+\.yaml", config_file):
+            errors.append(f"{where}/{profile['id']}: CONFIG_FILE is not a .yaml file next to the profile")
+            continue
         if time_limit not in overridable:
             errors.append(f"{where}/{profile['id']}: {time_limit} is not overridable")
         applicable = {
@@ -221,7 +226,15 @@ def check_blueprint(
         for rule in blueprint.get("rules", []):
             if rule_variables(rule) <= defaults.keys() and not rule_holds(rule, defaults):
                 errors.append(f"{where}/{profile['id']}: defaults break rule '{rule['message']}'")
-        profiles.append({**profile, "timeLimit": overridable.get(time_limit), "defaults": defaults})
+        # The config file lets tools build a custom profile on top of this one
+        profiles.append(
+            {
+                **profile,
+                "configFile": config_file,
+                "timeLimit": overridable.get(time_limit),
+                "defaults": defaults,
+            }
+        )
     if errors:
         return None, errors
 

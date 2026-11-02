@@ -28,7 +28,8 @@ blueprints/
   the current configs set Apertus 2 MoE options, so dense models need their own setup
 - `resources`: GPUs per node, the parameters that add up to the node count, the profile variable
   holding the time limit, and fixed `sbatch` options
-- `profiles`: one per `<recipe>/<id>.env`, the first being the default
+- `profiles`: one per `<recipe>/<id>.env`, the first being the default. The index also gives
+  each profile's `configFile` (its `CONFIG_FILE`)
 - `parameters`: the values a run may change, with labels and ranges. They must be exactly the
   `VAR="${VAR:-default}"` lines of the profiles they apply to; defaults are read from the
   profiles, so they are never written twice
@@ -49,6 +50,28 @@ blueprint:
   the parameters that the config reads. With `submit.sh`, repeat `--override KEY=VALUE`. A profile
   can also set `CONFIG_OVERRIDES_FILE` to a file of overrides next to it, applied before the
   run's own.
+
+## Custom blueprints
+
+The FirecREST UI can export a run's settings as a custom blueprint, into
+`~/.ai-training-blueprints/<id>/` on the system. It has the same format as the blueprints here,
+on top of one of them:
+
+```text
+<id>/
+  blueprint.yaml               this schema; launch.recipe is custom/<id>
+  base.yaml                    the blueprint it is based on: repository, commit, blueprint id,
+                               recipe folder and profile
+  recipe/<profile>.env         the run's values as defaults, then the base profile
+  recipe/config.yaml           the base recipe's config (defaults: ../../<base recipe>/<config>)
+  recipe/config-overrides.txt  its config overrides, one per line (CONFIG_OVERRIDES_FILE)
+  README.md
+```
+
+A job copies `recipe/` to `example/custom/<id>/` of a checkout at the base commit, where the
+relative paths resolve, and runs `train.sh custom/<id> --profile <profile>`. To make one an
+official blueprint, move `recipe/` to its own folder under `example/`, `blueprint.yaml` to
+`blueprints/<id>/` with `launch.recipe` pointing to it, and regenerate the index.
 
 ## Adding or changing a blueprint
 
