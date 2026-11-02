@@ -26,9 +26,10 @@ It includes the remote Gym client. Gym can still create isolated server venvs
 for local environments. See
 [`sources/package-additions.in`](sources/package-additions.in) for package pins.
 
-NemoLens 0.1.0 requires Python `>=3.13` in its package metadata. This Python 3.12
-image overrides that metadata for the NemoLens wheel only. The SDK and exporter
-use the base OpenTelemetry 1.45.1 and protobuf 6.33.6 packages.
+NemoLens 0.1.0 requires Python `>=3.13` in its package metadata.
+This Python 3.12 image overrides that metadata for the NemoLens wheel only.
+The SDK and OTLP exporters use the base OpenTelemetry 1.45.1 and protobuf 6.33.6 packages.
+Ray's Prometheus exporter is pinned to `0.66b1` to match that SDK; the image build and package-additions smoke check its import and version.
 
 The image preloads TorchMemorySaver's CUDA 13 hook. Applications still use its
 region/pause/resume API. Set `LD_PRELOAD=` to disable the hook.

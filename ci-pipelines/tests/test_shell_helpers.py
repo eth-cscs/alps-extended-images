@@ -1301,6 +1301,199 @@ def test_rocm_sdk_refuses_mismatched_preinstalled_wheels(tmp_path, mismatch):
     assert f"Incompatible {mismatch}: installed 7.13.0, expected ROCm 7.14.0" in result.stderr
 
 
+def fake_apt_cleanup_env(tmp_path):
+    status = tmp_path / "status"
+    status.write_text(
+        "\n".join(
+            f"Package: {name}\nStatus: install ok installed\n"
+            f"Architecture: {architecture}\nVersion: 1.0\n"
+            f"{dependencies}Description: isolated cleanup regression fixture\n"
+            for name, architecture, dependencies in (
+                ("libnuma-dev", "amd64", ""),
+                ("libnuma-dev", "arm64", ""),
+                ("cmake", "amd64", ""),
+                ("ninja-build", "amd64", "Depends: build-support\n"),
+                ("build-support", "amd64", ""),
+                ("libtool", "amd64", ""),
+                ("libtool", "arm64", ""),
+                ("libibverbs1", "amd64", ""),
+            )
+        )
+    )
+    apt_lists = tmp_path / "apt-lists"
+    apt_lists.mkdir()
+    (apt_lists / "packages").write_text("isolated APT cache")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command = bin_dir / "fake-apt"
+    command.write_text(
+        f"#!{sys.executable}\n"
+        r"""
+import os
+import sys
+from pathlib import Path
+
+status = Path(os.environ["FAKE_DPKG_STATUS"])
+packages = [
+    dict(line.split(": ", 1) for line in stanza.splitlines())
+    for stanza in status.read_text().strip().split("\n\n")
+    if stanza
+]
+args = sys.argv[1:]
+command = Path(sys.argv[0]).name
+
+def key(package):
+    return package["Package"] + ":" + package["Architecture"]
+
+def matches(package, requested):
+    return key(package) == requested if ":" in requested else package["Package"] == requested
+
+def save():
+    status.write_text("".join(
+        "".join(f"{field}: {value}\n" for field, value in package.items()) + "\n"
+        for package in packages
+    ))
+
+if command == "dpkg-query":
+    assert args[:2] == ["-W", "-f=${db:Status-Abbrev}\\n"], args
+    found = [package for package in packages if matches(package, args[2])]
+    for package in found:
+        print("hi " if package["Status"].startswith("hold ") else "ii ")
+    raise SystemExit(0 if found else 1)
+elif command == "apt-mark":
+    assert args[0] in ("hold", "unhold"), args
+    for requested in args[1:]:
+        found = [package for package in packages if matches(package, requested)]
+        assert found, requested
+        for package in found:
+            package["Status"] = ("hold" if args[0] == "hold" else "install") + " ok installed"
+    save()
+elif command == "apt-get":
+    if args[:3] == ["remove", "--purge", "-y"]:
+        removed = [package for package in packages if any(matches(package, requested) for requested in args[3:])]
+        assert not any(package["Status"].startswith("hold ") for package in removed)
+        packages = [package for package in packages if package not in removed]
+    elif args == ["autoremove", "-y"]:
+        needed = {
+            dependency.strip()
+            for package in packages
+            for dependency in package.get("Depends", "").split(",")
+            if dependency.strip()
+        }
+        automatic = set(os.environ["FAKE_APT_AUTOMATIC"].split())
+        packages = [
+            package for package in packages
+            if key(package) not in automatic
+            or package["Package"] in needed
+            or package["Status"].startswith("hold ")
+        ]
+    else:
+        raise AssertionError(args)
+    save()
+elif command == "rm":
+    # Redirect the real helper's absolute APT-cache cleanup to the fixture.
+    assert args[0] == "-rf" and all(path.startswith("/var/lib/apt/lists/") for path in args[1:]), args
+    for entry in Path(os.environ["FAKE_APT_LISTS"]).iterdir():
+        entry.unlink()
+else:
+    raise AssertionError(command)
+"""
+    )
+    command.chmod(0o755)
+    for name in ("dpkg-query", "apt-get", "apt-mark", "rm"):
+        (bin_dir / name).symlink_to(command.name)
+    return {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_DPKG_STATUS": str(status),
+        "FAKE_APT_LISTS": str(apt_lists),
+        "FAKE_APT_AUTOMATIC": "build-support:amd64 libibverbs1:amd64",
+        "APT_CLEANUP_HOLD_PACKAGES": "libibverbs1",
+    }, status, apt_lists
+
+
+def read_fake_apt_status(status):
+    packages = [
+        dict(line.split(": ", 1) for line in stanza.splitlines())
+        for stanza in status.read_text().strip().split("\n\n")
+        if stanza
+    ]
+    return {
+        f"{package['Package']}:{package['Architecture']}": package["Status"]
+        for package in packages
+    }
+
+
+@pytest.mark.parametrize("snapshot_package", ["libnuma-dev", "libnuma-dev:amd64", "libnuma-dev:arm64"])
+@pytest.mark.parametrize("requested_package", ["libnuma-dev", "libnuma-dev:amd64", "libnuma-dev:arm64"])
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_new_build_dependency_cleanup_preserves_inherited_multiarch_packages(
+    tmp_path, snapshot_package, requested_package, final_newline
+):
+    env, status, apt_lists = fake_apt_cleanup_env(tmp_path)
+    snapshot = tmp_path / "packages-before.txt"
+    snapshot.write_text(f"cmake\n\n{snapshot_package}" + ("\n" if final_newline else ""))
+    env.update({"SNAPSHOT_FILE": str(snapshot), "REQUESTED_PACKAGE": requested_package})
+
+    run_bash(
+        """
+source Alps-Images/common/package-helpers.sh
+cleanup_new_apt_build_deps "$SNAPSHOT_FILE" "$REQUESTED_PACKAGE" cmake ninja-build libtool:amd64
+""",
+        env=env,
+    )
+
+    assert read_fake_apt_status(status) == {
+        "libnuma-dev:amd64": "install ok installed",
+        "libnuma-dev:arm64": "install ok installed",
+        "cmake:amd64": "install ok installed",
+        # Keeping the other architecture proves qualified cleanup was not broadened.
+        "libtool:arm64": "install ok installed",
+        # Autoremove must respect the temporary hold, which cleanup then releases.
+        "libibverbs1:amd64": "install ok installed",
+    }
+    assert not list(apt_lists.iterdir())
+
+
+def test_new_build_dependency_cleanup_does_nothing_when_all_requests_are_inherited(tmp_path):
+    env, status, apt_lists = fake_apt_cleanup_env(tmp_path)
+    snapshot = tmp_path / "packages-before.txt"
+    snapshot.write_text("cmake\nlibnuma-dev")
+    env["SNAPSHOT_FILE"] = str(snapshot)
+    before = status.read_text()
+
+    run_bash(
+        """
+source Alps-Images/common/package-helpers.sh
+cleanup_new_apt_build_deps "$SNAPSHOT_FILE" libnuma-dev:amd64 cmake
+""",
+        env=env,
+    )
+
+    assert status.read_text() == before
+    assert (apt_lists / "packages").read_text() == "isolated APT cache"
+
+
+def test_new_build_dependency_cleanup_refuses_missing_snapshot_without_mutating_packages(tmp_path):
+    env, status, apt_lists = fake_apt_cleanup_env(tmp_path)
+    snapshot = tmp_path / "missing-snapshot.txt"
+    env["SNAPSHOT_FILE"] = str(snapshot)
+    before = status.read_text()
+
+    result = run_bash(
+        """
+source Alps-Images/common/package-helpers.sh
+cleanup_new_apt_build_deps "$SNAPSHOT_FILE" libnuma-dev:amd64 ninja-build
+""",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert f"ERROR: missing apt package snapshot: {snapshot}" in result.stderr
+    assert status.read_text() == before
+    assert (apt_lists / "packages").read_text() == "isolated APT cache"
+
+
 def test_exact_build_package_purge_refuses_reverse_dependency_removal(tmp_path):
     import shutil
 
