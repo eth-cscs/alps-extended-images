@@ -40,6 +40,14 @@ A tool launching a blueprint exports the chosen parameter values, `HF_MODEL` (th
 and `NEMO_RL_IMAGE`, and runs `train.sh <recipe> --profile <profile>`. Blueprints contain no
 shell code, so a blueprint can't change what a job runs beyond these values.
 
+The index's `launcher` lists what `train.sh` accepts besides the parameters, the same for every
+blueprint:
+
+- `configOverrides`: `NRL_CONFIG_OVERRIDES`, Hydra overrides of the recipe's config, one per
+  line, such as `grpo.val_period=5`, `+key=value` to add a key or `~key` to remove one. They are
+  checked before submission and passed to NeMo-RL after the config, so they win over it and over
+  the parameters that the config reads. With `submit.sh`, repeat `--override KEY=VALUE`.
+
 ## Adding or changing a blueprint
 
 1. Add or edit the recipe and its `.env` profiles under `example/` as usual.

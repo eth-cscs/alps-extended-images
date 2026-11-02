@@ -11,6 +11,8 @@ usage() {
         'Training options: --grpo-steps, --prompts, --generations-per-prompt, --updates-per-rollout,' \
         '  --micro-batch, --train-nodes, --generation-nodes, --inference-requests,' \
         '  --lr, --min-lr, --matrix-lr, --gains-lr, --train-mb-tokens, --logprob-mb-tokens.' \
+        'Config: repeat --override KEY=VALUE (Hydra syntax, e.g. --override grpo.val_period=5,' \
+        '  +KEY=VALUE to add a key, ~KEY to remove one). Also NRL_CONFIG_OVERRIDES, one per line.' \
         'Development: --dev-COMPONENT-checkout PATH, or --dev-COMPONENT-ref REF' \
         '  with optional --dev-COMPONENT-repo URL; COMPONENT is nemo, core, bridge or gym.' \
         '  Repeat --dev-COMPONENT-pr NUMBER_OR_GITHUB_URL, --dev-COMPONENT-merge REF' \
@@ -50,6 +52,7 @@ load_settings() {
             --gains-lr) key=GAINS_LR ;;
             --train-mb-tokens) key=TRAIN_MB_TOKENS ;;
             --logprob-mb-tokens) key=LOGPROB_MB_TOKENS ;;
+            --override) key=NRL_CONFIG_OVERRIDES; field=OVERRIDE ;;
             --dev-*)
                 [[ "$option" =~ ^--dev-(nemo|core|bridge|gym)-(checkout|repo|ref|merge|pr|patch)$ ]] ||
                     die "Unknown development option: $option"
@@ -77,7 +80,7 @@ load_settings() {
                 die "Invalid PR number or GitHub PR URL: $value"
             fi
         fi
-        if [[ "$field" == MERGE || "$field" == PR || "$field" == PATCH ]]; then
+        if [[ "$field" == MERGE || "$field" == PR || "$field" == PATCH || "$field" == OVERRIDE ]]; then
             overrides[$key]="${overrides[$key]:+${overrides[$key]}$'\n'}$value"
         else
             overrides[$key]="$value"
@@ -141,6 +144,15 @@ load_settings() {
         fi
     done
 
+    # ----- Config overrides -----
+    # Hydra overrides that train.sh passes to NeMo-RL after the config. Checked here so that a bad
+    # one fails before submission rather than once the job runs.
+    override_pattern='^((\+\+?)?[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*=.*|~[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*)$'
+    NRL_CONFIG_OVERRIDES="${NRL_CONFIG_OVERRIDES:-}"
+    while IFS= read -r override; do
+        [[ -z "$override" || "$override" =~ $override_pattern ]] || die "Invalid config override: $override"
+    done <<< "$NRL_CONFIG_OVERRIDES"
+
     # ----- Batch sizing -----
     TRAIN_MICRO_BATCH="${TRAIN_MICRO_BATCH:-$DEFAULT_MICRO_BATCH}"
     INFERENCE_REQUESTS="${INFERENCE_REQUESTS:-32}"
@@ -179,7 +191,7 @@ load_settings() {
     export TRAIN_NODES INFERENCE_NODES TOTAL_NODES TRAIN_GLOBAL_BATCH GENERATIONS_PER_PROMPT
     export TRAIN_MICRO_BATCH INFERENCE_REQUESTS MAX_NUM_STEPS NUM_PROMPTS GYM_ENABLED
     export UPDATES_PER_ROLLOUT TRAIN_EXPERT_PARALLEL_SIZE TRAIN_MB_TOKENS LOGPROB_MB_TOKENS
-    export BASE_LR MIN_LR MATRIX_LR GAINS_LR
+    export BASE_LR MIN_LR MATRIX_LR GAINS_LR NRL_CONFIG_OVERRIDES
     export CHONK_SETTINGS_READY=1
 }
 

@@ -36,6 +36,11 @@ INDEX_SCHEMA_VERSION = 1
 BLUEPRINTS_DIR = Path(__file__).resolve().parent.parent
 EXAMPLE_DIR = BLUEPRINTS_DIR.parent / "example"
 
+# What train.sh accepts besides the blueprint parameters, for tools to offer. The same for every
+# blueprint, since they share the launcher.
+# - configOverrides: NRL_CONFIG_OVERRIDES, Hydra overrides of the config, one per line
+LAUNCHER = {"configOverrides": True}
+
 # VAR="${VAR:-default}" lets a run override VAR; anything else is fixed by the profile
 OVERRIDABLE_PATTERN = re.compile(r'^([A-Z][A-Z0-9_]*)="\$\{\1:-([^}"]*)\}"\s*(?:#.*)?$')
 ASSIGNMENT_PATTERN = re.compile(r"^([A-Z][A-Z0-9_]*)=")
@@ -254,7 +259,7 @@ def build_index() -> tuple[Json, list[str]]:
             entries.append(entry)
     if not entries and not errors:
         errors.append("no blueprints found")
-    return {"schemaVersion": INDEX_SCHEMA_VERSION, "blueprints": entries}, errors
+    return {"schemaVersion": INDEX_SCHEMA_VERSION, "launcher": LAUNCHER, "blueprints": entries}, errors
 
 
 def render(index: Json) -> str:

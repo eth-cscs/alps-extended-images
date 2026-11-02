@@ -1,5 +1,8 @@
 {
   "schemaVersion": 1,
+  "launcher": {
+    "configOverrides": true
+  },
   "blueprints": [
     {
       "id": "apertus2-moe-gsm8k-megatron",

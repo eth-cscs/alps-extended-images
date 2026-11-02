@@ -306,8 +306,13 @@ if [[ "$mode" == driver ]]; then
     done
     (( ready )) || { echo "Timed out waiting for all $TOTAL_NODES Ray nodes and $TOTAL_GPUS GPUs." >&2; exit 1; }
     export RAY_ADDRESS
+    # NRL_CONFIG_OVERRIDES: Hydra overrides of the config, one per line (checked by load_settings)
+    config_overrides=()
+    while IFS= read -r override; do
+        [[ -z "$override" ]] || config_overrides+=("$override")
+    done <<< "${NRL_CONFIG_OVERRIDES:-}"
     exec uv run --no-project --python /usr/bin/python3.12 python \
-        "$NEMO_RL_PATH/$ENTRYPOINT" --config "$EXAMPLE_DIR/$CONFIG_FILE"
+        "$NEMO_RL_PATH/$ENTRYPOINT" --config "$EXAMPLE_DIR/$CONFIG_FILE" "${config_overrides[@]}"
 fi
 
 # ----- Gym client and data downloading -----

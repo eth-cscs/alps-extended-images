@@ -46,6 +46,16 @@ def test_the_committed_blueprints_are_valid_and_the_index_is_up_to_date():
     assert (bi.BLUEPRINTS_DIR / "index.json").read_text() == bi.render(index)
 
 
+def test_the_launcher_features_are_those_train_sh_implements():
+    index, _ = bi.build_index()
+    assert index["launcher"] == {"configOverrides": True}
+    train = (bi.EXAMPLE_DIR / "train.sh").read_text()
+    submit = (bi.EXAMPLE_DIR / "submit.sh").read_text()
+    # Passed to NeMo-RL after the config, and checked before submission
+    assert '--config "$EXAMPLE_DIR/$CONFIG_FILE" "${config_overrides[@]}"' in train
+    assert 'die "Invalid config override: $override"' in submit
+
+
 def test_profile_defaults_come_from_the_env_files():
     index, _ = bi.build_index()
     vllm = next(entry for entry in index["blueprints"] if entry["id"] == VLLM)
