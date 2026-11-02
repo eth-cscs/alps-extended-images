@@ -25,6 +25,7 @@ PACKAGES = {
     "nemo-run": ("nemo_run", "0.11.1"),
     "nltk": ("nltk", "3.10.3"),
     "open-clip-torch": ("open_clip", "3.3.0"),
+    "opentelemetry-exporter-prometheus": ("opentelemetry.exporter.prometheus", "0.66b1"),
     "peft": ("peft", "0.21.2"),
     "soundfile": ("soundfile", "0.14.0"),
     "tensorstore": ("tensorstore", "0.1.85"),
