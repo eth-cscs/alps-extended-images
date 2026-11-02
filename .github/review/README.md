@@ -22,6 +22,9 @@ The review reports static findings and states any verification limits.
 - Requests enter a per-PR concurrency group after authorization.
   Entering that group cancels any active review for the same PR.
   Preparation checks access again before fetching review metadata and history.
+- The `acknowledge` job adds a 👀 reaction to an accepted request before review preparation starts.
+  The reaction confirms acceptance, not successful completion.
+  A reaction API error stops the review before inference.
 - Each request selects the current head of an open PR through the GitHub API.
   Context includes PR metadata, the full merge-base diff, prior bot and human reviews, conversation comments, and inline threads with all replies.
   The diff starts at the merge base of the PR head and its target branch.
@@ -58,7 +61,8 @@ The reviewer combines three trusted instruction sources:
 - The [review workflow](../workflows/opencode-review.yml) runs an `authorize` job to validate the command and check the requester's repository write access.
   Conversation-comment events load this workflow from the repository's default branch, currently `main`.
 - Authorized requests call the [reusable worker](../workflows/opencode-review-worker.yml) from `main`.
-  Its `review` job prepares context and runs the reviewer, and its separate `publish` job posts the findings.
+  Its `acknowledge` job adds the reaction, `review` prepares context and runs the reviewer, and `publish` posts the findings.
+  The reaction and publication jobs each have `issues: write` permission but do not run the model or receive the inference key.
 - The `authorize` and `review` jobs each check out the default branch into `default-branch/` and execute helpers from its `.github/review/host/` directory.
   The validated PR-head checkout is separate, in `pr-source/`.
 - The [image definition](image/Containerfile) pins the reviewer software and installs it with its configuration, agent definition, and entrypoint under `/opt/reviewer/`.
@@ -85,6 +89,11 @@ On failure or interruption, it attempts to remove the container.
 Cleanup failures are logged without hiding the original failure, and checkout verification still runs.
 
 ## Review output
+
+The `Run isolated CSCS reviewer` step logs the container launch, exit status, and elapsed time.
+While waiting, it reports captured-output byte counts every 30 seconds, even when no output arrives.
+A report confirms the runner is waiting; unchanged byte counts do not show whether the model is active.
+The reports do not print model text, reasoning, or tool output.
 
 - [extract.py](host/extract.py) selects completed text parts from the final reviewer response.
   Extraction runs only after a successful reviewer exit and rejects missing, malformed or incomplete final output.
@@ -113,7 +122,7 @@ After changing the PR, post another request when the updated code is ready for r
 
 Provide the repository or organization secret `CSCS_INFERENCE_KEY` to the caller workflow.
 The worker supplies it only to the inference step as `CSCS_INFERENCE_API_KEY`.
-The GitHub review jobs use their automatically issued `GITHUB_TOKEN` for metadata requests and comment publication.
+The GitHub jobs use their automatically issued `GITHUB_TOKEN` for metadata requests, request reactions, and comment publication.
 
 ## Publish or update the image
 

@@ -120,3 +120,24 @@ def test_cleanup_timeout_preserves_failure_and_checks_source(
         runner.run_review("/bin/false", "unused", checkout, context,
                           tmp_path / "events.jsonl", instructions)
     assert "container cleanup failed" in capsys.readouterr().err
+
+
+def test_progress_reports_silence_without_exposing_event_text(tmp_path, runner, capsys):
+    private_event = b'{"type":"reasoning","text":"private reasoning and credential marker"}\n'
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        class Reports:
+            count = 0
+
+            def wait(self, interval):
+                self.count += 1
+                if self.count == 2:
+                    os.write(output.fileno(), private_event)
+                return self.count > 2
+
+        # Drive a quiet tick and an output tick without waiting for wall-clock time.
+        runner._report_progress(output, Reports(), runner.time.monotonic())
+    progress = capsys.readouterr().out
+    assert "0 bytes (+0)" in progress
+    assert f"{len(private_event)} bytes (+{len(private_event)})" in progress
+    assert "private reasoning" not in progress
+    assert "credential marker" not in progress

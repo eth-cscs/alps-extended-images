@@ -1,17 +1,10 @@
 name: opencode-review-worker
 
-# TEMPORARY: restore this file from 184fbf0507c4799e059090b95ce803d7b5e5d182 before merging.
-
 # opencode-review.yml checks write access before calling this worker.
-# The review job runs OpenCode; the publish job posts its final text.
+# The acknowledge job reacts to the request; review runs OpenCode; publish posts its final text.
 # See .github/review/README.md for setup, security boundaries, and image updates.
 on:
   workflow_call:
-    inputs:
-      test_event_json:
-        description: Temporary normalized issue_comment event for the inline test
-        required: true
-        type: string
     secrets:
       CSCS_INFERENCE_KEY:
         required: true
@@ -20,7 +13,26 @@ on:
 permissions: {}
 
 jobs:
+  # Keep the reaction's write permission separate from the job that runs the reviewer.
+  acknowledge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Acknowledge accepted review request
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              ...context.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
+
   review:
+    needs: acknowledge
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Read PR metadata and source on the host; do not pass the GitHub token to the container.
@@ -35,12 +47,12 @@ jobs:
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
-      # TEMPORARY: use the reviewed helper and AGENTS.md snapshot pinned below.
-      - name: Checkout pinned test helpers and instructions
+      # Load host helpers and AGENTS.md from the default branch, never from the PR.
+      - name: Checkout trusted default-branch harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
-          ref: 184fbf0507c4799e059090b95ce803d7b5e5d182
+          ref: ${{ github.event.repository.default_branch }}
           path: default-branch
           persist-credentials: false
 
@@ -51,15 +63,11 @@ jobs:
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
-          TEST_EVENT_JSON: ${{ inputs.test_event_json }}
         run: |
           set -euo pipefail
-          # TEMPORARY: use the same normalized event that passed authorization.
-          event_path="$RUNNER_TEMP/opencode-inline-test-event.json"
-          printf '%s\n' "$TEST_EVENT_JSON" > "$event_path"
           python3 default-branch/.github/review/host/context.py prepare \
-            --event-name issue_comment \
-            --event-path "$event_path" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
             --output "$RUNNER_TEMP/opencode-review/input" \
             --github-output "$GITHUB_OUTPUT"
@@ -93,7 +101,7 @@ jobs:
       - name: Pull trusted prebuilt review image
         run: docker pull "$OPENCODE_REVIEW_IMAGE"
 
-      # run.py mounts the PR checkout, context, and pinned AGENTS.md read-only.
+      # run.py mounts the PR checkout, context, and default-branch AGENTS.md read-only.
       # Only CSCS_INFERENCE_API_KEY is forwarded from the host environment; the Docker socket is not mounted.
       # Runtime files go in /work and /tmp; the image filesystem is read-only.
       # Failed or interrupted runs attempt container removal before checking HEAD and Git status.
@@ -128,7 +136,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Only this job receives comment-writing permission; it does not run the reviewer.
+  # Publish on a separate runner without executing the reviewer or PR code.
   publish:
     needs: review
     runs-on: ubuntu-latest

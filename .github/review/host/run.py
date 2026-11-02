@@ -9,9 +9,25 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 
 from context import git, worktree_root
+
+
+_PROGRESS_INTERVAL = 30
+
+
+def _report_progress(output, stopped, started):
+    previous = 0
+    while not stopped.wait(_PROGRESS_INTERVAL):
+        size = os.fstat(output.fileno()).st_size
+        elapsed = int(time.monotonic() - started)
+        # Report activity without exposing model text, reasoning, or tool output.
+        print(f"review runner: running; elapsed={elapsed}s; stdout={size} bytes (+{size - previous})",
+              flush=True)
+        previous = size
 
 
 def checkout_state(checkout):
@@ -65,7 +81,23 @@ def run_review(engine, image, checkout, context, events, instructions):
         try:
             with events.open("w", encoding="utf-8") as output:
                 os.fchmod(output.fileno(), 0o600)
-                result = subprocess.run(command, stdout=output, check=False)
+                started = time.monotonic()
+                print(f"review runner: starting isolated reviewer; progress every {_PROGRESS_INTERVAL}s "
+                      "(output byte counts only)", flush=True)
+                stopped = threading.Event()
+                reporter = threading.Thread(target=_report_progress,
+                                            args=(output, stopped, started), daemon=True)
+                reporter.start()
+                try:
+                    result = subprocess.run(command, stdout=output, check=False)
+                finally:
+                    # Stop and join before closing the event file or removing the container.
+                    stopped.set()
+                    reporter.join()
+                elapsed = int(time.monotonic() - started)
+                size = os.fstat(output.fileno()).st_size
+                print(f"review runner: exited; status={result.returncode}; elapsed={elapsed}s; "
+                      f"stdout={size} bytes", flush=True)
             if result.returncode:
                 raise ValueError(f"isolated reviewer failed (exit {result.returncode})")
         except BaseException:
