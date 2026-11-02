@@ -1113,6 +1113,7 @@ def test_miopen_public_headers_refuse_invalid_payloads(miopen_headers_runtime, f
     else:
         assert ("internal.hpp" if failure == "private-header" else "internal") in result.stderr
 
+
 def test_rocm_build_prefix_uses_development_view_without_reordering_runtime_libraries(tmp_path):
     core = tmp_path / "core"
     libraries = tmp_path / "libraries"

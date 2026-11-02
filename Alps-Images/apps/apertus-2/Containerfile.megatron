@@ -58,9 +58,6 @@ COPY Alps-Images/apps/apertus-2/sources/megatron/requirements.in /opt/alps/megat
 COPY Alps-Images/apps/apertus-2/tests/megatron/ /opt/tests/apertus-2/megatron/
 RUN python3 /opt/tests/apertus-2/megatron/check-stack.py --metadata-only
 
-ENV PYTHONNOUSERSITE=1 \
-    LD_PRELOAD="/usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so:${LD_PRELOAD}"
-
 ARG OCI_SOURCE="unknown"
 ARG OCI_REVISION="unknown"
 ARG OCI_CREATED="unknown"
@@ -70,6 +67,10 @@ ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
 # Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
 RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
       "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+# Enable the driver-dependent preload only after the last build-time RUN.
+ENV PYTHONNOUSERSITE=1 \
+    LD_PRELOAD="/usr/local/lib/python3.12/dist-packages/torch_memory_saver_hook_mode_preload_cu13.abi3.so:${LD_PRELOAD}"
 
 LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       org.opencontainers.image.revision="${OCI_REVISION}" \

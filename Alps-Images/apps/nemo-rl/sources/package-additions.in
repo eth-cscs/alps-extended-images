@@ -12,6 +12,8 @@ leptonai==0.26.6
 urllib3==1.26.20
 nltk==3.10.3
 open-clip-torch==3.3.0
+# Ray's Prometheus exporter must match the OpenTelemetry 1.45.1 SDK.
+opentelemetry-exporter-prometheus==0.66b1
 peft==0.21.2
 soundfile==0.14.0
 tensorstore==0.1.85
