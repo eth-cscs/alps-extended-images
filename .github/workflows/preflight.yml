@@ -60,7 +60,7 @@ jobs:
         run: git ls-files '*.sh' | xargs -r -n1 bash -n
 
       - name: ShellCheck
-        run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh
+        run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh .github/review/entrypoint.sh
 
       - name: CI YAML and embedded shell syntax
         run: |
@@ -74,6 +74,7 @@ jobs:
           for path in [
               'ci-pipelines/build-alps-extended-images.yaml',
               'ci-pipelines/build-ci-generator-image.yaml',
+              'ci-pipelines/build-opencode-review-image.yaml',
               'ci-pipelines/child-templates.yaml',
           ]:
               data = yaml.safe_load(Path(path).read_text())

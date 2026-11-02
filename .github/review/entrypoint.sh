@@ -16,7 +16,6 @@ git config --global --add safe.directory /source
 cd /review
 
 exec opencode run --standalone --auto \
-    --model cscs/zai-org/GLM-5.3 \
     --agent grumpy-reviewer \
     --format json \
     --title 'Read-only PR review' \
