@@ -46,7 +46,9 @@ blueprint:
 - `configOverrides`: `NRL_CONFIG_OVERRIDES`, Hydra overrides of the recipe's config, one per
   line, such as `grpo.val_period=5`, `+key=value` to add a key or `~key` to remove one. They are
   checked before submission and passed to NeMo-RL after the config, so they win over it and over
-  the parameters that the config reads. With `submit.sh`, repeat `--override KEY=VALUE`.
+  the parameters that the config reads. With `submit.sh`, repeat `--override KEY=VALUE`. A profile
+  can also set `CONFIG_OVERRIDES_FILE` to a file of overrides next to it, applied before the
+  run's own.
 
 ## Adding or changing a blueprint
 

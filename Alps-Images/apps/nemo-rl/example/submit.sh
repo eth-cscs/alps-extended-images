@@ -145,10 +145,18 @@ load_settings() {
     done
 
     # ----- Config overrides -----
-    # Hydra overrides that train.sh passes to NeMo-RL after the config. Checked here so that a bad
-    # one fails before submission rather than once the job runs.
+    # Hydra overrides that train.sh passes to NeMo-RL after the config. A profile can list its own
+    # in CONFIG_OVERRIDES_FILE, next to it (one per line, # for comments); those of the run
+    # (NRL_CONFIG_OVERRIDES or --override) come after them, so they win. Checked here so that a
+    # bad one fails before submission rather than once the job runs.
     override_pattern='^((\+\+?)?[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*=.*|~[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*)$'
     NRL_CONFIG_OVERRIDES="${NRL_CONFIG_OVERRIDES:-}"
+    if [[ -n "${CONFIG_OVERRIDES_FILE:-}" ]]; then
+        overrides_file="$EXAMPLE_DIR/$CONFIG_OVERRIDES_FILE"
+        [[ -f "$overrides_file" ]] || die "Config overrides not found: $overrides_file"
+        profile_overrides="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^#/d' -e '/^$/d' "$overrides_file")"
+        NRL_CONFIG_OVERRIDES="${profile_overrides}${profile_overrides:+${NRL_CONFIG_OVERRIDES:+$'\n'}}${NRL_CONFIG_OVERRIDES}"
+    fi
     while IFS= read -r override; do
         [[ -z "$override" || "$override" =~ $override_pattern ]] || die "Invalid config override: $override"
     done <<< "$NRL_CONFIG_OVERRIDES"
