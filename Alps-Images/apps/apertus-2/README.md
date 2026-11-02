@@ -220,6 +220,7 @@ The runtime defaults are `UCCL_EP_TRANSPORT=cxi`, `UCCL_P2P_TRANSPORT=cxi` and `
 Runtime settings can override these values.
 
 The image preloads the CUDA 13 TorchMemorySaver library.
+The preload is enabled only after the final build-time `RUN`, because GPU-free builders do not provide its `libcuda.so.1` driver dependency.
 Set `LD_PRELOAD=` to disable this hook when it is not needed.
 The TorchMemorySaver smoke test requires the default preload.
 
