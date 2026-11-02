@@ -136,6 +136,13 @@ Source lists are whitespace-separated, app-relative files and must cover every s
 
 When adding a build-affecting profile key, update its reader, hash inputs, this contract, and accelerator-invalidation regression coverage together. Unselected accelerator settings must not invalidate the selected image.
 
+### PR reviews
+
+- The OpenCode workflow reviews same-repository and fork PRs and posts findings as a GitHub comment.
+- Reviews run only after a user with repository write access posts a new `/oc-review` comment in the PR's Conversation tab.
+- The reviewer runs in a read-only container, and a separate job publishes its output.
+- See the [review documentation](.github/review/README.md) for trigger rules, trusted code, review history, sandbox permissions, credentials, and image publication.
+
 ## Manual Builds
 
 Images can be built manually on Alps with `podman` using generated build scripts that reuse the CI image-reference logic. See `manual-build/README.md`.

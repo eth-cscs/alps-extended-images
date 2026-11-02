@@ -54,13 +54,15 @@ jobs:
           # The RL run collector is standard library only
           python -m py_compile .github/rl-runs-collector/collect_rl_runs.py
           uvx pytest .github/rl-runs-collector/tests
+          # Reviewer helpers use only the standard library; no model or credentials.
+          uvx pytest .github/review/host/tests
 
       - name: Shell syntax
         # Catch syntax errors in tracked shell scripts, including sourced helpers.
         run: git ls-files '*.sh' | xargs -r -n1 bash -n
 
       - name: ShellCheck
-        run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh .github/review/entrypoint.sh
+        run: uvx --from shellcheck-py shellcheck -x ci-pipelines/helpers/meta.sh ci-pipelines/helpers/skopeo.sh manual-build/manual-build.sh .github/review/image/entrypoint.sh
 
       - name: CI YAML and embedded shell syntax
         run: |
@@ -86,11 +88,15 @@ jobs:
                           if isinstance(script, str):
                               subprocess.run(['bash', '-n'], input=script, text=True, check=True)
 
-          # GitHub workflows with shell steps of their own
-          for path in ['.github/workflows/collect-rl-runs.yml']:
+          # Include the comment-triggered caller and the trusted worker.
+          for path in [
+              '.github/workflows/collect-rl-runs.yml',
+              '.github/workflows/opencode-review.yml',
+              '.github/workflows/opencode-review-worker.yml',
+          ]:
               data = yaml.safe_load(Path(path).read_text())
               for job in data['jobs'].values():
-                  for step in job['steps']:
+                  for step in job.get('steps', []):
                       if 'run' in step:
                           subprocess.run(['bash', '-n'], input=step['run'], text=True, check=True)
           PY
