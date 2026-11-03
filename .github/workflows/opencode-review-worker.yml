@@ -51,7 +51,7 @@ jobs:
     env:
       # Built by ci-pipelines/build-opencode-review-image.yaml.
       # A digest pin prevents later tag updates from changing the downloaded image.
-      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review@sha256:1900a73ab2c197e6a863d9f1d469d635d5b44945a275855fb7c3d45601073b98
+      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review@sha256:f1514b5a54994d5ccd733faa7d71422f4be86e6f3c3135dab161f7452f18e4ed
     outputs:
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
@@ -61,7 +61,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
-          ref: f9a7e070b37069a545a6e99ead249b58a26b6d7f
+          ref: 646ab9afb7ff31d3463fa4cc9f2b18a14c611ccd
           path: default-branch
           persist-credentials: false
 
