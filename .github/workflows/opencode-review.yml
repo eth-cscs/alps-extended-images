@@ -1,7 +1,8 @@
 name: opencode-review
 
 # TEMPORARY pre-merge test for the same-repository fix/opencode-review branch.
-# Restore this file from ed5c9432044d6c1d8991393587af6d296e3d617d before merging.
+# Before merging, restore the Conversation trigger, default-branch helpers, and @main worker.
+# Remove the branch restriction and event adapter; keep later permission and runtime fixes.
 
 on:
   # Inline comments load the PR's workflow; Conversation comments still use the default branch.
@@ -10,7 +11,6 @@ on:
 
 # Allow the worker to read PR data, react to requests, and post the final comment.
 # Its acknowledge, review, and publish jobs restrict these permissions separately.
-# TEMPORARY: allow the acknowledgement job to react to inline review comments.
 permissions:
   contents: read
   pull-requests: write

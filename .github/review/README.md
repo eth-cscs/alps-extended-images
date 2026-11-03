@@ -62,7 +62,8 @@ The reviewer combines three trusted instruction sources:
   Conversation-comment events load this workflow from the repository's default branch, currently `main`.
 - Authorized requests call the [reusable worker](../workflows/opencode-review-worker.yml) from `main`.
   Its `acknowledge` job adds the reaction, `review` prepares context and runs the reviewer, and `publish` posts the findings.
-  The reaction and publication jobs each have `issues: write` permission but do not run the model or receive the inference key.
+  The reaction job has `issues: write` permission, and the publisher has `pull-requests: write` permission.
+  Neither job runs the model or receives the inference key.
 - The `authorize` and `review` jobs each check out the default branch into `default-branch/` and execute helpers from its `.github/review/host/` directory.
   The validated PR-head checkout is separate, in `pr-source/`.
 - The [image definition](image/Containerfile) pins the reviewer software and installs it with its configuration, agent definition, and entrypoint under `/opt/reviewer/`.
@@ -93,16 +94,18 @@ Cleanup failures are logged without hiding the original failure, and checkout ve
 The `Run isolated CSCS reviewer` step logs the container launch, exit status, and elapsed time.
 While waiting, it reports captured-output byte counts, counts of known JSON event types, and the last known step-finish reason every 30 seconds.
 The report distinguishes bookkeeping events such as `step_start` from `tool_use`, `text`, or `error` events.
+Tool-result counts use fixed tool names and status labels, with unknown values reported as `other`.
+Code Mode errors and nonzero shell exits count as errors even when OpenCode marks the call `completed`.
 A final event summary is printed when the process exits, including failed or interrupted runs.
 Reports continue when no output arrives, but do not prove that an inference request is making progress.
-Model text, reasoning content, tool arguments, and tool output are not printed in these reports.
+Model text, reasoning content, tool arguments, tool errors, and tool output are not printed in these reports.
 
 - [extract.py](host/extract.py) selects completed text parts from the final reviewer response.
   Extraction runs only after a successful reviewer exit and rejects missing, malformed or incomplete final output.
   Only `review.md` is uploaded to the `opencode-review` artifact, with seven-day retention.
   Raw events and prepared context are not uploaded as artifacts.
 - A separate publisher job reads `review.md` and posts it through the GitHub API.
-  It has no source checkout or inference key and requests `issues: write` and `pull-requests: read` permissions.
+  It has no source checkout or inference key and requests only `pull-requests: write` permission.
   It validates the PR number and reviewed SHA before inserting the review text into the comment body.
   Empty or oversized reviews fail rather than posting partial text, and oversized output remains in the artifact.
   Before posting, the publisher checks the current PR head and skips a stale result if it differs from the reviewed SHA.
@@ -125,6 +128,14 @@ After changing the PR, post another request when the updated code is ready for r
 Provide the repository or organization secret `CSCS_INFERENCE_KEY` to the caller workflow.
 The worker supplies it only to the inference step as `CSCS_INFERENCE_API_KEY`.
 The GitHub jobs use their automatically issued `GITHUB_TOKEN` for metadata requests, request reactions, and comment publication.
+
+## Web search
+
+[opencode.json](image/opencode.json) explicitly selects TinyFish so the headless worker does not prompt for a search provider.
+Search queries can include repository-specific text and are sent to TinyFish, separately from CSCS model inference.
+The worker supplies no TinyFish API key; the [OpenCode integration](https://opencode.ai/v2/docs/websearch) supports keyless access.
+Treat keyless access as best-effort: TinyFish's [published account quotas](https://www.tinyfish.ai/pricing) do not establish a dedicated allowance for this repository.
+The provider setting applies to `websearch`; `webfetch` remains a separate tool.
 
 ## Publish or update the image
 

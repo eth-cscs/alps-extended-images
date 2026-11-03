@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -177,4 +178,27 @@ def test_progress_summarizes_final_errors_without_exposing_unknown_fields(tmp_pa
     progress = capsys.readouterr().out
     assert "error:1" in progress and "unknown:1" in progress
     assert "step_finish:1" in progress and "last_finish=other" in progress
+    assert "private" not in progress
+
+
+@pytest.mark.parametrize(("tool", "state", "result"), [
+    ("read", {"status": "completed"}, "read/completed"),
+    ("read", {"status": "error"}, "read/error"),
+    ("execute", {"status": "completed", "metadata": {"metadata": {"error": True}}}, "execute/error"),
+    ("shell", {"status": "completed", "metadata": {"metadata": {"exit": 128}}}, "shell/error"),
+    ("shell", {"status": "completed", "metadata": {"metadata": {"exit": 0}}}, "shell/completed"),
+    ("private tool marker", {"status": "private status marker"}, "other/other"),
+])
+def test_progress_classifies_tool_results_without_exposing_payload(
+        tmp_path, runner, capsys, tool, state, result):
+    state = dict(state, input={"command": "private command marker"},
+                 output="private output marker", error="private error marker")
+    event = {"type": "tool_use", "part": {"tool": tool, "state": state}}
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        os.write(output.fileno(), json.dumps(event).encode() + b"\n")
+        stopped = runner.threading.Event()
+        stopped.set()
+        runner._report_progress(output, stopped, runner.time.monotonic())
+    progress = capsys.readouterr().out
+    assert f"tools={result}:1" in progress
     assert "private" not in progress

@@ -1,6 +1,7 @@
 name: opencode-review-worker
 
-# TEMPORARY: restore this file from ed5c9432044d6c1d8991393587af6d296e3d617d before merging.
+# TEMPORARY: remove test_event_json and restore default-branch helpers and Conversation reactions before merging.
+# Keep later permission and runtime fixes when removing the test wiring.
 
 # opencode-review.yml checks write access before calling this worker.
 # The acknowledge job reacts to the request; review runs OpenCode; publish posts its final text.
@@ -154,8 +155,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      issues: write
-      pull-requests: read
+      # The comment targets a PR, so grant PR write access rather than issue write access.
+      pull-requests: write
     steps:
       # Read review.md without a source checkout, inference key, or model process.
       - name: Download review text

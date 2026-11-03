@@ -21,11 +21,35 @@ from extract import EVENT_TYPES
 
 _PROGRESS_INTERVAL = 30
 _FINISH_REASONS = {"stop", "end_turn", "length", "tool-calls", "content-filter", "error", "unknown"}
+_TOOL_NAMES = {"execute", "glob", "grep", "question", "read", "shell",
+               "skill", "subagent", "webfetch", "websearch"}
+_TOOL_STATUSES = {"pending", "running", "completed", "error"}
+
+
+def _tool_result(part):
+    if not isinstance(part, dict):
+        return "other/other"
+    name = part.get("tool")
+    name = name if isinstance(name, str) and name in _TOOL_NAMES else "other"
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return f"{name}/other"
+    status = state.get("status")
+    status = status if isinstance(status, str) and status in _TOOL_STATUSES else "other"
+    metadata = state.get("metadata")
+    details = metadata.get("metadata") if isinstance(metadata, dict) else None
+    if isinstance(details, dict):
+        # Code Mode and shell failures can arrive with status=completed.
+        exit_code = details.get("exit")
+        if details.get("error") is True or (type(exit_code) is int and exit_code != 0):
+            status = "error"
+    return f"{name}/{status}"
 
 
 def _report_progress(output, stopped, started):
     previous = 0
     counts = Counter()
+    tool_counts = Counter()
     last_finish = "none"
     # A separate descriptor keeps reads from moving the container's stdout write position.
     with open(output.name, "rb") as events:
@@ -58,14 +82,19 @@ def _report_progress(output, stopped, started):
                     part = event.get("part")
                     reason = part.get("reason") if isinstance(part, dict) else None
                     last_finish = reason if isinstance(reason, str) and reason in _FINISH_REASONS else "other"
-            # Only fixed event names and finish reasons reach logs, never payload fields.
-            summary = ", ".join(f"{kind}:{count}" for kind, count in sorted(counts.items())) or "none"
+                elif kind == "tool_use":
+                    tool_counts[_tool_result(event.get("part"))] += 1
+            # Only fixed labels reach logs, never arguments, errors, output, or model text.
+            summary = "; ".join(
+                f"{label}=" + (", ".join(f"{name}:{count}" for name, count in sorted(counter.items())) or "none")
+                for label, counter in (("events", counts), ("tools", tool_counts))
+            )
             if finished:
-                print(f"review runner: final events={summary}; last_finish={last_finish}", flush=True)
+                print(f"review runner: final {summary}; last_finish={last_finish}", flush=True)
                 return
             elapsed = int(time.monotonic() - started)
             print(f"review runner: running; elapsed={elapsed}s; stdout={size} bytes (+{size - previous}); "
-                  f"events={summary}; last_finish={last_finish}", flush=True)
+                  f"{summary}; last_finish={last_finish}", flush=True)
             previous = size
 
 
@@ -122,7 +151,7 @@ def run_review(engine, image, checkout, context, events, instructions):
                 os.fchmod(output.fileno(), 0o600)
                 started = time.monotonic()
                 print(f"review runner: starting isolated reviewer; progress every {_PROGRESS_INTERVAL}s "
-                      "(byte counts and event types only)", flush=True)
+                      "(byte counts and fixed event/tool summaries only)", flush=True)
                 stopped = threading.Event()
                 reporter = threading.Thread(target=_report_progress,
                                             args=(output, stopped, started), daemon=True)
