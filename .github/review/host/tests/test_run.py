@@ -139,5 +139,42 @@ def test_progress_reports_silence_without_exposing_event_text(tmp_path, runner, 
     progress = capsys.readouterr().out
     assert "0 bytes (+0)" in progress
     assert f"{len(private_event)} bytes (+{len(private_event)})" in progress
+    assert "reasoning:1" in progress
     assert "private reasoning" not in progress
     assert "credential marker" not in progress
+
+
+def test_progress_waits_for_complete_events_and_counts_them_once(tmp_path, runner, capsys):
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        class Reports:
+            count = 0
+
+            def wait(self, interval):
+                self.count += 1
+                if self.count == 1:
+                    os.write(output.fileno(), b'{"type":"step_finish","part":{"reason":"length')
+                elif self.count == 2:
+                    os.write(output.fileno(), b'"}}\n')
+                return self.count > 2
+
+        runner._report_progress(output, Reports(), runner.time.monotonic())
+    lines = capsys.readouterr().out.splitlines()
+    assert "events=none" in lines[0]
+    assert "step_finish:1" in lines[1] and "last_finish=length" in lines[1]
+    assert "step_finish:1" in lines[2] and "step_finish:2" not in lines[2]
+    assert "invalid" not in "\n".join(lines)
+
+
+def test_progress_summarizes_final_errors_without_exposing_unknown_fields(tmp_path, runner, capsys):
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        os.write(output.fileno(),
+                 b'{"type":"error","error":{"message":"private error marker"}}\n'
+                 b'{"type":"private event marker"}\n'
+                 b'{"type":"step_finish","part":{"reason":"private finish marker"}}')
+        stopped = runner.threading.Event()
+        stopped.set()
+        runner._report_progress(output, stopped, runner.time.monotonic())
+    progress = capsys.readouterr().out
+    assert "error:1" in progress and "unknown:1" in progress
+    assert "step_finish:1" in progress and "last_finish=other" in progress
+    assert "private" not in progress

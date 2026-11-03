@@ -2,6 +2,8 @@
 """Run the trusted reviewer without exposing host credentials or writable source."""
 
 import argparse
+from collections import Counter
+import json
 import os
 from pathlib import Path
 import shutil
@@ -14,20 +16,57 @@ import time
 import uuid
 
 from context import git, worktree_root
+from extract import EVENT_TYPES
 
 
 _PROGRESS_INTERVAL = 30
+_FINISH_REASONS = {"stop", "end_turn", "length", "tool-calls", "content-filter", "error", "unknown"}
 
 
 def _report_progress(output, stopped, started):
     previous = 0
-    while not stopped.wait(_PROGRESS_INTERVAL):
-        size = os.fstat(output.fileno()).st_size
-        elapsed = int(time.monotonic() - started)
-        # Report activity without exposing model text, reasoning, or tool output.
-        print(f"review runner: running; elapsed={elapsed}s; stdout={size} bytes (+{size - previous})",
-              flush=True)
-        previous = size
+    counts = Counter()
+    last_finish = "none"
+    # A separate descriptor keeps reads from moving the container's stdout write position.
+    with open(output.name, "rb") as events:
+        while True:
+            finished = stopped.wait(_PROGRESS_INTERVAL)
+            # Bound each scan so a busy producer cannot delay cancellation.
+            size = os.fstat(output.fileno()).st_size
+            while events.tell() < size:
+                position = events.tell()
+                line = events.readline(size - position)
+                if not line:
+                    break
+                if not finished and not line.endswith(b"\n"):
+                    # A write may stop mid-event; retry that line on the next report.
+                    events.seek(position)
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    counts["invalid"] += 1
+                    continue
+                kind = event.get("type") if isinstance(event, dict) else None
+                if not isinstance(kind, str) or kind not in EVENT_TYPES:
+                    counts["unknown"] += 1
+                    continue
+                counts[kind] += 1
+                if kind == "step_finish":
+                    part = event.get("part")
+                    reason = part.get("reason") if isinstance(part, dict) else None
+                    last_finish = reason if isinstance(reason, str) and reason in _FINISH_REASONS else "other"
+            # Only fixed event names and finish reasons reach logs, never payload fields.
+            summary = ", ".join(f"{kind}:{count}" for kind, count in sorted(counts.items())) or "none"
+            if finished:
+                print(f"review runner: final events={summary}; last_finish={last_finish}", flush=True)
+                return
+            elapsed = int(time.monotonic() - started)
+            print(f"review runner: running; elapsed={elapsed}s; stdout={size} bytes (+{size - previous}); "
+                  f"events={summary}; last_finish={last_finish}", flush=True)
+            previous = size
 
 
 def checkout_state(checkout):
@@ -83,7 +122,7 @@ def run_review(engine, image, checkout, context, events, instructions):
                 os.fchmod(output.fileno(), 0o600)
                 started = time.monotonic()
                 print(f"review runner: starting isolated reviewer; progress every {_PROGRESS_INTERVAL}s "
-                      "(output byte counts only)", flush=True)
+                      "(byte counts and event types only)", flush=True)
                 stopped = threading.Event()
                 reporter = threading.Thread(target=_report_progress,
                                             args=(output, stopped, started), daemon=True)

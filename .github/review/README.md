@@ -91,9 +91,11 @@ Cleanup failures are logged without hiding the original failure, and checkout ve
 ## Review output
 
 The `Run isolated CSCS reviewer` step logs the container launch, exit status, and elapsed time.
-While waiting, it reports captured-output byte counts every 30 seconds, even when no output arrives.
-A report confirms the runner is waiting; unchanged byte counts do not show whether the model is active.
-The reports do not print model text, reasoning, or tool output.
+While waiting, it reports captured-output byte counts, counts of known JSON event types, and the last known step-finish reason every 30 seconds.
+The report distinguishes bookkeeping events such as `step_start` from `tool_use`, `text`, or `error` events.
+A final event summary is printed when the process exits, including failed or interrupted runs.
+Reports continue when no output arrives, but do not prove that an inference request is making progress.
+Model text, reasoning content, tool arguments, and tool output are not printed in these reports.
 
 - [extract.py](host/extract.py) selects completed text parts from the final reviewer response.
   Extraction runs only after a successful reviewer exit and rejects missing, malformed or incomplete final output.
