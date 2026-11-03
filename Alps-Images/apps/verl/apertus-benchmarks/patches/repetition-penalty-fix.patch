@@ -1,0 +1,26 @@
+# [CSCS, 2026-09-09] verl v0.9.0's V1 separate-async generation path
+# (verl/trainer/ppo/v1/agent_loop_tq.py:AgentLoopWorkerTQ.generate_sequences) hardcodes
+# repetition_penalty=1.0 (off) in the sampling_params dict it builds for SGLang, never reading
+# RolloutConfig.repetition_penalty (verl/workers/config/rollout.py, a real field, default 1.0) at
+# all -- so setting actor_rollout_ref.rollout.repetition_penalty in config has zero effect on this
+# trainer path. Confirmed by contrast: the vLLM async server path (vllm_async_server.py) DOES read
+# config.repetition_penalty correctly; only this SGLang/V1/TransferQueue path is stale. One-line
+# fix: read the config value instead of the literal. Safe by default (config value is 1.0 unless
+# explicitly set, i.e. unchanged behavior for every other recipe that does not set it).
+#
+# Generated from a real git worktree at verl v0.9.0; git apply --check / py_compile /
+# --reverse --check verified. Touches only verl/trainer/ppo/v1/agent_loop_tq.py (no overlap with
+# the other patches this recipe applies).
+diff --git a/verl/trainer/ppo/v1/agent_loop_tq.py b/verl/trainer/ppo/v1/agent_loop_tq.py
+index 05f5604..715c2d7 100644
+--- a/verl/trainer/ppo/v1/agent_loop_tq.py
++++ b/verl/trainer/ppo/v1/agent_loop_tq.py
+@@ -65,7 +65,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
+             temperature=config.temperature,
+             top_p=config.top_p,
+             top_k=config.top_k,
+-            repetition_penalty=1.0,
++            repetition_penalty=config.repetition_penalty,
+             logprobs=config.calculate_log_probs,
+         )
+ 

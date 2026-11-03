@@ -1,0 +1,79 @@
+# One-off diagnostic, NOT a fix. Applies on top of fsdp2-rank0-load-fix.patch
+# against verl v0.9.0's verl/workers/engine/fsdp/transformer_impl.py.
+#
+# Context (see CLAUDE.md's "Megatron vs FSDP2" section): job 3185943 (FSDP2) showed
+# zero learning signal over 47 training steps while the Megatron sibling (job
+# 3184869) converged cleanly over a comparable step count, with 17% of FSDP2 steps
+# showing an exact-zero grad_norm (every sample in the batch got an identical
+# GRPO-standardized reward). Leading hypothesis: fsdp2-rank0-load-fix.patch's
+# rank-0-loads-then-broadcasts weight loading (only global rank 0 calls
+# from_pretrained; every other rank receives its shard via
+# fsdp2_load_full_state_dict(..., broadcast_from_rank0=True)) is silently
+# corrupting or mismatching weights on some ranks, producing a degenerate policy
+# whose rollout samples collapse to identical (hence zero-variance) rewards.
+#
+# This patch does not confirm or refute that hypothesis by itself -- it adds
+# instrumentation to let the next run's log answer it directly: checksums a
+# small, deterministically-chosen parameter's true value on rank 0 right before
+# sharding (from the real state_dict loaded from disk), then re-gathers that same
+# parameter's full value via DTensor.full_tensor() on every rank right after
+# fsdp2_load_full_state_dict returns, and prints both SHA-256 hashes. If every
+# rank's post-load hash matches rank 0's pre-shard hash, the broadcast is
+# reproducing weights correctly and this hypothesis is refuted; if any rank's
+# hash differs, that is direct, positive evidence the broadcast/load path is the
+# root cause and should be pursued further, not the sampling/reward pipeline.
+#
+# Remove once the mechanism is confirmed one way or the other -- same
+# instrument-once-then-remove discipline as every other diagnostic patch in this
+# repo (see CLAUDE.md's GLM section, runs 3137775 through 3144665, for the
+# precedent).
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -517,8 +517,46 @@
+             # broadcasts it to all other ranks via broadcast_from_rank0=True.
+             # Loading on every rank would OOM for large models (e.g. 4 workers × 140 GB = 560 GB).
+             full_state = module.state_dict() if torch.distributed.get_rank() == 0 else {}
++
++            # [DIAG-FSDP2-BROADCAST] One-off diagnostic: confirm fsdp2_load_full_state_dict's
++            # broadcast_from_rank0 actually reproduces rank 0's real on-disk weights on every
++            # other rank, rather than assuming it from the API's name/docs. Checksum a small,
++            # deterministically-chosen parameter's true value on rank 0 before sharding, then
++            # re-gather the same parameter's full value on every rank after loading and print
++            # both hashes -- any rank whose post-load hash doesn't match rank 0's pre-shard hash
++            # has a corrupted/mismatched broadcast for this parameter.
++            import hashlib
++
++            _diag_param_names = sorted(dict(module.named_parameters()).keys())
++            _diag_param_name = min(
++                _diag_param_names, key=lambda n: dict(module.named_parameters())[n].numel()
++            )
++            if torch.distributed.get_rank() == 0:
++                _diag_pre = full_state[_diag_param_name].detach().float().cpu().contiguous()
++                _diag_pre_hash = hashlib.sha256(_diag_pre.numpy().tobytes()).hexdigest()[:16]
++                print(
++                    f"[DIAG-FSDP2-BROADCAST] rank0 pre-shard param={_diag_param_name} "
++                    f"shape={tuple(_diag_pre.shape)} sha256={_diag_pre_hash}",
++                    flush=True,
++                )
++
+             apply_fsdp2(module, fsdp_kwargs, self.engine_config)
+             fsdp2_load_full_state_dict(module, full_state, fsdp_mesh, offload_policy)
++
++            _diag_post_param = dict(module.named_parameters())[_diag_param_name]
++            _diag_post_full = (
++                _diag_post_param.full_tensor()
++                if hasattr(_diag_post_param, "full_tensor")
++                else _diag_post_param
++            )
++            _diag_post_full = _diag_post_full.detach().float().cpu().contiguous()
++            _diag_post_hash = hashlib.sha256(_diag_post_full.numpy().tobytes()).hexdigest()[:16]
++            print(
++                f"[DIAG-FSDP2-BROADCAST] rank{torch.distributed.get_rank()} post-load "
++                f"param={_diag_param_name} shape={tuple(_diag_post_full.shape)} "
++                f"sha256={_diag_post_hash}",
++                flush=True,
++            )
+         else:
+             raise NotImplementedError(f"Unknown strategy {self.engine_config.strategy}")
+ 

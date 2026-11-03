@@ -1,0 +1,98 @@
+# [CSCS diagnostic, 2026-09-01/02] step-1 GPU memory instrumentation + the empty_cache() fix.
+#
+# _step1_oom_memdump() fires ONCE per rank, right before the first optimizer.step(): prints this
+# process's torch CUDA accounting (every rank) plus a full nvidia-smi -- all GPUs, all compute
+# processes, per-process used_memory (local rank 0 only, i.e. the GPU that used to OOM). The
+# [MEMDUMP] lines land in the main slurm log. This diagnostic block (run 3246683) proved the
+# step-1 GPU OOM (runs 3241496-3246683) was a genuine hairline miss, not a phantom co-resident
+# process -- nvidia-smi always showed exactly one WorkerDict per GPU.
+#
+# Also makes optimizer_step()'s empty_cache() call UNCONDITIONAL (was gated on the unused
+# _distillation_use_topk_active path): returns PyTorch's reserved-but-unallocated cache to the
+# driver right before the optimizer's large contiguous allocations, closing the hairline miss.
+#
+# MUST be applied AFTER wsync-debug-progress-log.patch -- both touch transformer_impl.py and this
+# diff's context lines assume _wsync_progress_log is already present.
+#
+# DIAGNOSTIC (memdump) kept indefinitely for now -- cheap, and useful signal on any future
+# step-1 memory question. Generated from a real edited git worktree at the verl v0.9.0 tag
+# (+ wsync-debug-progress-log.patch applied); git apply --check clean, py_compile clean,
+# git apply --reverse --check detects "already applied".
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 259cdd7..fa9d585 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -134,6 +134,57 @@ def _wsync_progress_log(gen, tag):
+         print(f"[WSYNC-DBG] rank={_rank} {tag} generator exited after {_n} tensors, {_t.time() - _t0:.0f}s", flush=True)
+ 
+ 
++
++def _step1_oom_memdump(engine):
++    """[CSCS step-1 OOM diagnostic] Fire once, on this rank's FIRST optimizer.step(), right
++    before it runs. Dumps this process's torch CUDA accounting + a full nvidia-smi (all GPUs,
++    all compute processes, per-process used memory) so GPU memory pressure at the optimizer step
++    can be attributed to a concrete pid/process. Every rank dumps its own torch numbers; only
++    local rank 0 (the GPU that OOMs) also shells out to nvidia-smi. Remove once no longer needed
++    for diagnosis."""
++    if getattr(engine, "_step1_oom_memdump_done", False):
++        return
++    engine._step1_oom_memdump_done = True
++    import subprocess
++
++    _rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "?"
++    _lrank = os.environ.get("LOCAL_RANK", "0")
++    _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
++    try:
++        _dev = torch.cuda.current_device()
++        _free, _total = torch.cuda.mem_get_info(_dev)
++        _alloc = torch.cuda.memory_allocated(_dev)
++        _resv = torch.cuda.memory_reserved(_dev)
++        print(
++            f"[MEMDUMP] rank={_rank} lrank={_lrank} pid={os.getpid()} CUDA_VISIBLE_DEVICES={_cvd} "
++            f"cur_dev={_dev} free={_free / 2**30:.2f}G total={_total / 2**30:.2f}G "
++            f"gpu_used={(_total - _free) / 2**30:.2f}G torch_alloc={_alloc / 2**30:.2f}G "
++            f"torch_reserved={_resv / 2**30:.2f}G "
++            f"non_torch_this_proc={((_total - _free) - _resv) / 2**30:.2f}G(incl other procs)",
++            flush=True,
++        )
++    except Exception as _e:
++        print(f"[MEMDUMP] rank={_rank} torch mem read failed: {_e}", flush=True)
++
++    if str(_lrank) != "0":
++        return
++    for _args, _tag in (
++        (["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
++          "--format=csv,noheader"], "compute-apps"),
++        (["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
++          "--format=csv,noheader"], "gpu-mem"),
++    ):
++        try:
++            _out = subprocess.run(_args, capture_output=True, text=True, timeout=25).stdout.strip()
++            print(f"[MEMDUMP] rank={_rank} nvidia-smi {_tag}:\n{_out}", flush=True)
++        except Exception as _e:
++            print(f"[MEMDUMP] rank={_rank} nvidia-smi {_tag} failed: {_e}", flush=True)
++    try:
++        print(f"[MEMDUMP] rank={_rank} torch.cuda.memory_summary():\n{torch.cuda.memory_summary()}", flush=True)
++    except Exception as _e:
++        print(f"[MEMDUMP] rank={_rank} memory_summary failed: {_e}", flush=True)
++
++
+ def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
+     """Return the scalar temperature required by fused linear cross entropy."""
+     values = torch.as_tensor(temperature).detach().flatten()
+@@ -733,8 +784,13 @@ class MegatronEngine(BaseEngine):
+         """
+         # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
+         # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
+-        if getattr(self, "_distillation_use_topk_active", False):
+-            get_torch_device().empty_cache()
++        # [CSCS] made unconditional (was gated on _distillation_use_topk_active): the
++        # Megatron distributed-optimizer state init allocates large contiguous blocks on GPU 0
++        # during the FIRST optimizer.step() and used to OOM a few MiB short against PyTorch's
++        # reserved-but-unallocated cache (runs 3241496-3246683). Returning that cache to the
++        # driver first hands the optimizer a clean arena.
++        get_torch_device().empty_cache()
++        _step1_oom_memdump(self)
+         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
+ 
+         if update_successful:
