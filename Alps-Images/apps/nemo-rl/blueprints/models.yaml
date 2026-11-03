@@ -1,0 +1,10 @@
+# Models blueprints can be tested with. A blueprint lists the ids of those it supports.
+schemaVersion: 1
+models:
+  - id: apertus-2-chonk
+    name: Apertus 2.0
+    family: apertus
+    architecture: moe
+    parameters: MoE
+    path: /capstor/store/cscs/swissai/infra01/apertus_checkpoints/v2/hf/chonk/pretraining/long_context/long-context-iter-0003576
+    description: Long-context pretraining checkpoint (iteration 3576), read-only on the cluster.

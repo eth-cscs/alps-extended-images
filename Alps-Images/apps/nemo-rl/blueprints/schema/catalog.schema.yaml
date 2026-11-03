@@ -1,0 +1,59 @@
+# JSON Schema for blueprints/models.yaml and blueprints/datasets.yaml
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://github.com/eth-cscs/alps-extended-images/Alps-Images/apps/nemo-rl/blueprints/schema/catalog.schema.yaml
+title: NeMo-RL blueprint catalogs
+type: object
+additionalProperties: false
+properties:
+  schemaVersion:
+    const: 1
+  models:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, name, family, architecture, path, description]
+      properties:
+        id:
+          $ref: '#/$defs/id'
+        name:
+          $ref: '#/$defs/text'
+        family:
+          $ref: '#/$defs/id'
+        architecture:
+          description: blueprints only list models whose architecture their config supports
+          enum: [moe, dense]
+        parameters:
+          description: size, e.g. 8B, or MoE when the checkpoint has no single size
+          type: string
+          pattern: '^[A-Za-z0-9.-]{1,16}$'
+        path:
+          description: Hugging Face checkpoint on the cluster, passed to train.sh as HF_MODEL
+          type: string
+          pattern: '^/[A-Za-z0-9._/-]+$'
+        description:
+          $ref: '#/$defs/text'
+  datasets:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, name, description]
+      properties:
+        id:
+          $ref: '#/$defs/id'
+        name:
+          $ref: '#/$defs/text'
+        description:
+          $ref: '#/$defs/text'
+oneOf:
+  - required: [schemaVersion, models]
+  - required: [schemaVersion, datasets]
+$defs:
+  id:
+    type: string
+    pattern: '^[a-z0-9][a-z0-9-]{0,63}$'
+  text:
+    type: string
+    minLength: 1
+    maxLength: 400
