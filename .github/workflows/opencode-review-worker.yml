@@ -60,7 +60,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
-          ref: ed5c9432044d6c1d8991393587af6d296e3d617d
+          ref: f9a7e070b37069a545a6e99ead249b58a26b6d7f
           path: default-branch
           persist-credentials: false
 
