@@ -31,7 +31,10 @@ RUN bash /opt/alps/apertus2-rocm/install.sh transformer-engine
 
 RUN bash /opt/alps/apertus2-rocm/install.sh training
 
-RUN bash /opt/alps/apertus2-rocm/install.sh megatron
+COPY Alps-Images/apps/apertus-2/patches/rocm/megatron/ /opt/alps/apertus2-rocm/patches/megatron/
+COPY Alps-Images/apps/apertus-2/sources/rocm/finalize-megatron.sh /opt/alps/apertus2-rocm/finalize-megatron.sh
+RUN bash /opt/alps/apertus2-rocm/install.sh megatron \
+    && bash /opt/alps/apertus2-rocm/finalize-megatron.sh
 
 COPY Alps-Images/apps/apertus-2/sources/rocm/requirements.in /opt/alps/apertus2-rocm/requirements.in
 COPY Alps-Images/apps/apertus-2/sources/rocm/requirements.overrides /opt/alps/apertus2-rocm/requirements.overrides

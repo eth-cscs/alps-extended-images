@@ -45,6 +45,57 @@ def configure_slurm():
     return rank, local_rank, world
 
 
+def check_fused_gradients(torch, dist, buffer, x, indices, weights):
+    """Exercise the installed patch, without a hook that repairs the gradient."""
+    from deep_ep import Buffer
+    from megatron.core.transformer.moe import fused_a2a
+
+    config_keys = ("UCCL_EP_DISPATCH_CONFIG", "UCCL_EP_COMBINE_CONFIG")
+    saved_env = {key: os.environ.get(key) for key in config_keys}
+    saved_buffer, saved_sms = fused_a2a._buffer, Buffer.num_sms
+    try:
+        # Use the same explicit four-peer config as the direct numerical test.
+        for key in config_keys:
+            os.environ[key] = "64,8,512,16,512"
+        fused_a2a._buffer = buffer
+        for asynchronous, probability_gradient in ((False, 0), (False, 1), (True, 0), (True, 1)):
+            source = x.detach().clone().requires_grad_()
+            probs = weights.detach().clone().requires_grad_()
+            recv, recv_indices, recv_probs, _, handle = fused_a2a.fused_dispatch(
+                source, indices, probs, dist.get_world_size(), dist.group.WORLD,
+                async_finish=asynchronous, allocate_on_comm_stream=asynchronous,
+            )
+            if fused_a2a._buffer is not buffer:
+                raise AssertionError("Fused test must reuse its explicitly owned buffer")
+            combined, _ = fused_a2a.fused_combine(
+                recv * 0.5, dist.group.WORLD, handle,
+                async_finish=asynchronous, allocate_on_comm_stream=asynchronous,
+            )
+            torch.testing.assert_close(combined, source, rtol=0, atol=0)
+            layouts = []
+            def observe(gradient):
+                layouts.append((gradient.stride(), gradient.untyped_storage().nbytes()))
+                return gradient
+            recv_probs.register_hook(observe)
+            routed = recv_probs if probability_gradient == 0 else recv_probs * recv_indices.ne(-1)
+            (combined.float().sum() + routed.sum() * probability_gradient).backward()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(source.grad, torch.ones_like(source), rtol=0, atol=0)
+            torch.testing.assert_close(probs.grad, torch.full_like(probs, probability_gradient), rtol=0, atol=0)
+            if probability_gradient == 0 and layouts != [((0, 0), 4)]:
+                raise AssertionError(f"Expanded-gradient edge case was not exercised: {layouts}")
+            dist.barrier()
+            print(f"fused gradients exact: async={asynchronous}, probability={probability_gradient}, incoming_layout={layouts}", flush=True)
+    finally:
+        fused_a2a._buffer = saved_buffer
+        Buffer.set_num_sms(saved_sms)
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def run(rank, local_rank, world):
     # Import only after each rank has its private cache paths and Slurm identity.
     import torch
@@ -179,6 +230,7 @@ def run(rank, local_rank, world):
         torch.testing.assert_close(combined, x, rtol=0, atol=0)
         torch.testing.assert_close(combined_weights, topk_weights, rtol=0, atol=0)
         torch.cuda.synchronize(device)
+        check_fused_gradients(torch, dist, buffer, x, topk_idx, topk_weights)
         # A rank-local assertion cannot be hidden by success on rank zero.
         passed = torch.ones((), dtype=torch.int32, device=device)
         dist.all_reduce(passed, op=dist.ReduceOp.SUM, group=group)
@@ -204,7 +256,7 @@ def run(rank, local_rank, world):
             f"PASS rank={rank} local_rank={local_rank} host={socket.gethostname()} "
             f"HIP={torch.version.hip} GPU={arch}: RCCL sum=[36,204], "
             f"UCCL HT bf16 dispatch={reference.shape[0]} tokens + identity combine exact; "
-            "recorded tensor release and post-destroy RCCL passed",
+            "fused gradients exact; recorded tensor release and post-destroy RCCL passed",
             flush=True,
         )
     finally:

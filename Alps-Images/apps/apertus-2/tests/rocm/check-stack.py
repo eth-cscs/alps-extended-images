@@ -5,6 +5,7 @@ Run one process per visible GPU; all writable JIT caches are private under /tmp.
 """
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -136,6 +137,19 @@ def check_metadata():
             text=True, timeout=10,
         ).strip()
         require(actual == manifest[name][1], f"Retained {name} checkout changed: {actual}")
+    patch_root = ROOT / "patches/megatron"
+    patch_manifest = (ROOT / "megatron-patches.sha256").read_text().splitlines()
+    require(bool(patch_manifest), "Missing applied Megatron patch manifest")
+    for line in patch_manifest:
+        digest, name = line.split()
+        require(Path(name).name == name and name.endswith(".patch"), "Unsafe patch manifest path")
+        path = patch_root / name
+        require(hashlib.sha256(path.read_bytes()).hexdigest() == digest, f"Changed Megatron patch: {name}")
+        subprocess.run(["git", "-c", "safe.directory=/opt/megatron-lm", "-C", "/opt/megatron-lm",
+                        "apply", "--reverse", "--check", str(path)], check=True, timeout=10)
+    subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("megatron-regressions.py"))],
+                   check=True, timeout=30)
+
     direct_url = metadata.distribution("megatron-core").read_text("direct_url.json")
     require(direct_url is not None, "Missing Megatron editable installation metadata")
     direct_url = json.loads(direct_url)
@@ -246,6 +260,26 @@ def check_te(torch):
                  *[f"bias{i}" for i in range(len(biases))]]
         for name, grad, ref in zip(names, actual_grads, ref_grads, strict=True):
             close(torch, f"{label} d{name}", grad, ref, atol=5e-2, rtol=2e-2)
+
+
+def check_router(torch):
+    from megatron.core.transformer.moe.moe_utils import router_gating_linear
+
+    print("Router backend: " + os.environ.get("APERTUS_ROCM_ROUTER_GEMM_BACKEND", "aten (ROCm default)"), flush=True)
+    for tokens, hidden, experts in ((128, 256, 8), (512, 2560, 256)):
+        x = (torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16) / hidden ** 0.5).requires_grad_()
+        weight = torch.randn(experts, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        actual = router_gating_linear(x, weight, None, torch.float32)
+        actual.square().mean().backward()
+        ref_x = x.detach().float().requires_grad_()
+        ref_weight = weight.detach().float().requires_grad_()
+        expected = ref_x @ ref_weight.t()
+        expected.square().mean().backward()
+        require(actual.dtype == torch.float32, "Router output must remain FP32")
+        label = f"router ({tokens},{hidden},{experts})"
+        close(torch, label + " forward", actual, expected, atol=1e-3, rtol=2e-3)
+        close(torch, label + " dinput", x.grad, ref_x.grad, atol=1e-4, rtol=2e-2)
+        close(torch, label + " dweight", weight.grad, ref_weight.grad, atol=1e-4, rtol=2e-2)
 
 
 def check_kda(torch):
@@ -378,7 +412,7 @@ def check_gpu(cache_root):
     print(f"HIP {torch.version.hip}, {properties.name}, {properties.gcnArchName}", flush=True)
     torch.manual_seed(1234)
     torch.set_float32_matmul_precision("highest")
-    for check in (check_te, check_kda, check_causal_conv, check_muon):
+    for check in (check_te, check_router, check_kda, check_causal_conv, check_muon):
         print(f"Running {check.__name__}", flush=True)
         check(torch)
         torch.cuda.synchronize()

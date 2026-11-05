@@ -227,6 +227,8 @@ The TorchMemorySaver smoke test requires the default preload.
 
 ## Native ROCm image: megatron-rocm
 
+The [ROCm training living plan](ROCM-TRAINING-PLAN.md) tracks the Apertus 2 port, experiment design, evidence and remaining validation.
+
 This target is native ROCm training, **not feature parity with the CUDA Chonk production configuration**.
 It builds against the canonical Alps ROCm 10.0 / Torch 2.13 base on x86_64 and targets MI300 `gfx942`.
 Inherited Torch, TorchVision, TorchAudio, Triton and NumPy distributions are constrained during installation.
@@ -259,7 +261,23 @@ The stack includes:
   Communication uses a PyTorch pool stream so recorded tensors remain safe to release after EP buffer destruction.
   The older runtime-top-k patch is already upstream and is not applied twice.
 - The same Swiss AI FLA per-channel KDA gates and Emerging-Optimizers Muon `moonlight` scaling as the CUDA targets, plus a native causal-conv1d build.
-- Swiss AI Megatron-LM-MoE at `0789b8e429553c2f17c350afa8619c69d01bec25`, installed from `/opt/megatron-lm`, with its CPU dataset helper prebuilt.
+- Swiss AI Megatron-LM-MoE at `0789b8e429553c2f17c350afa8619c69d01bec25`, installed from `/opt/megatron-lm`, with its CPU dataset helpers (including BFD packing) prebuilt.
+
+The ROCm-only Megatron patch set is applied after the pinned editable checkout is installed.
+Patch checksums are retained in `/opt/alps/apertus2-rocm/megatron-patches.sha256` and verified by the metadata check.
+The patches are compatibility/hardening changes motivated by native-image tests, not missing code copied from Imanol’s reference: the corresponding upstream functions are identical in the two audited checkouts.
+
+- ROCm routers default to their existing ATen implementation; other TE operations and Torch’s global BLAS preference are unchanged.
+  `APERTUS_ROCM_ROUTER_GEMM_BACKEND=te` explicitly selects the original TE router for diagnostics; `aten` selects the fallback.
+  An unset variable uses `aten` on HIP and `te` otherwise; invalid values, including an explicitly empty value, are rejected rather than silently replaced.
+  The backend selected during forward is retained for backward.
+  Reduced-depth real-shape two-node training/checkpoint/fresh-process resume passed with this router-only fallback in job `716336`; this does not establish full mid-4b capacity, throughput or convergence.
+- Fused-dispatch backward materializes token/probability gradients before recording its event dependency, preventing a zero-stride expanded gradient from being passed as a dense raw pointer.
+  This fixes the confirmed gradient-layout edge case; it is not a claimed fix for the separate UCCL first-forward-combine HIP launch crash.
+- BFD’s CPU `libbfd_pack.so` is explicitly compiled during the image build, avoiding concurrent import-time compiler/linker activity at rank startup.
+
+The finalizer and Megatron patches are copied immediately before the Megatron installation step, preserving earlier UCCL/TE/training-component cache boundaries.
+These candidate changes require validation in the newly built image; earlier run-local controls are evidence for the design, not acceptance of an unbuilt image.
 
 `/opt/alps/apertus2-rocm/` records base constraints, native source revisions and the installed package inventory.
 Compiler tools and headers remain installed for runtime JIT.
@@ -272,11 +290,11 @@ Do not use CUDA expert-offloading configurations with this image; those paths ar
 
 The ROCm target declares three image-local CI checks:
 
-1. `check-stack.py`: GPU-free metadata/ELF checks during build; on GPU, numerical TE Linear/GroupedLinear forward/backward, KDA gate and recurrent-kernel gradients, causal convolution, and stateful Muon updates.
+1. `check-stack.py`: GPU-free metadata/ELF, patch-contract and CPU BFD checks during build; on GPU, numerical TE Linear/GroupedLinear, smoke/real-shape router forward/backward, KDA gate and recurrent-kernel gradients, causal convolution, and stateful Muon updates.
 2. `train-smoke.sh`: single-GPU TE/CK BF16 GPT training with synthetic data, checkpoint at iteration 2, then a fresh process resuming through iteration 4.
    It checks finite loss and optimizer/scheduler/RNG checkpoint state.
 3. `uccl-smoke.py`: two-node/eight-rank RCCL all-reduce and BF16 **high-throughput** UCCL dispatch/combine with numerical reference values.
-   It also destroys the EP buffer, releases recorded tensor storage, runs fresh GPU/RCCL work, and requires clean process exit.
+   It also checks native fused-autograd expanded-zero and masked-unit probability gradients without a repairing hook, then destroys the EP buffer, releases recorded tensor storage, runs fresh GPU/RCCL work, and requires clean process exit.
    It needs exclusive nodes, block rank order, and all four GPUs visible to each rank (`--gpu-bind=none`).
    Same-user concurrent UCCL jobs cannot share nodes because the upstream POSIX-shm barriers are UID-scoped.
 
@@ -289,13 +307,20 @@ bash /opt/tests/apertus-2/rocm/train-smoke.sh
 
 The distributed check runs directly under Slurm, not via Ray or torchrun.
 Its rendezvous address and port are derived from the Slurm allocation.
-CSCS EDF launches use `srun --environment` with the saved SquashFS as `image`, `/ritom/` mounted, `writable = true`, `entrypoint = true`, and `PMIX_MCA_psec = "native"`.
+CSCS EDF launches use `srun --environment` with a registry image reference (preferably pinned by digest) or a shared SquashFS path as `image`, the required shared paths mounted, `writable = true`, `entrypoint = true`, and `PMIX_MCA_psec = "native"`.
+JFrog images can be referenced directly; only local Podman images need exporting with `enroot import -x mount -o image.sqsh podman://image:tag`.
 Set `com.hooks.cxi.enabled = "false"` under `[annotations]` to retain the image's own CXI stack.
+For Python-direct EDF commands, explicitly source `/opt/alps/env/source-alps-env.sh` in a Bash bootstrap before executing Python; `entrypoint = true` alone does not initialize these ROCm networking defaults.
+Keep JIT caches and compiler scratch on verified writable, executable tmpfs; `/dev/shm` can be mounted noexec, and node-shared `/tmp` still needs deliberate job/rank directory naming.
 
 Manual container launches must expose `/dev/kfd`, `/dev/dri` and the allocated `/dev/cxi*` devices, and forward the allocation's `SLINGSHOT_*`/`FI_CXI_*` environment.
 The base's RCCL transport requires CXI initialization even for the single-rank training smoke.
 
+The UCCL numerical/API checks are not full-model training acceptance.
+The current full hybrid UCCL integration still faults in its first forward combine, including with synchronous execution; ordinary all-to-all remains the established training path.
 These checks do not establish full-size hybrid-model convergence or scaling.
+A separate four-rank synthetic KDA/global-attention + MoE + MuonMD workload passed checkpoint/fresh-process resume on the current-branch JFrog image in job `716187`.
+See the [living ROCm training plan](ROCM-TRAINING-PLAN.md) for the immutable image identity, evidence, limitations and ongoing cross-node/proxy validation; this external workload is not yet an additional image-local CI check.
 
 ## Build
 
@@ -348,3 +373,12 @@ python3 /opt/tests/apertus-2/megatron/check-stack.py
 
 These tests do not cover training convergence, every kernel or an end-to-end Megatron training run.
 Python dependency resolution alone does not establish CUDA or binary compatibility.
+
+## Reference stack comparison
+
+[`STACK-DIFFERENCES.md`](STACK-DIFFERENCES.md) records the pinned Imanol/native comparison, including directly inspected reference package identities, exact source/argument deltas, selected versus merely available optimization paths, and candidate-validation limits.
+The underlying machine-readable evidence and current Primus SquashFS checksum are retained in the benchmark project’s `experiments/apertus2/reference/stack-comparison-2026-11-03/`.
+
+[`MID4B-REPRODUCTION-PLAN.md`](MID4B-REPRODUCTION-PLAN.md) records the next full-recipe/harness step after candidate acceptance, including confirmed defaults, PP2-aware checkpoint requirements and separately gated larger resource requests.
+
+[`COLLEAGUE-UPDATES.md`](COLLEAGUE-UPDATES.md) contains the appendable, Confluence-ready technical update and subsequent experiment results.
