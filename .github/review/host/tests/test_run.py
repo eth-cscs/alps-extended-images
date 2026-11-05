@@ -171,6 +171,7 @@ def test_progress_summarizes_final_errors_without_exposing_unknown_fields(tmp_pa
         os.write(output.fileno(),
                  b'{"type":"error","error":{"message":"private error marker"}}\n'
                  b'{"type":"private event marker"}\n'
+                 b'{"type":"review_phase","phase":"private phase marker"}\n'
                  b'{"type":"step_finish","part":{"reason":"private finish marker"}}')
         stopped = runner.threading.Event()
         stopped.set()
@@ -178,6 +179,7 @@ def test_progress_summarizes_final_errors_without_exposing_unknown_fields(tmp_pa
     progress = capsys.readouterr().out
     assert "error:1" in progress and "unknown:1" in progress
     assert "step_finish:1" in progress and "last_finish=other" in progress
+    assert "phase=other" in progress
     assert "private" not in progress
 
 

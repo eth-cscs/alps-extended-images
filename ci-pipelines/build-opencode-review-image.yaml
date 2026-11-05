@@ -8,7 +8,7 @@ variables:
   # Bootstrap refs are versioned tags; bump the suffix for baked runtime/config changes.
   # Existing versioned tags are reused by if-not-exists. The report job prints
   # a digest pin for .github/workflows/opencode-review-worker.yml.
-  OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review:opencode-2.2.0-amd64-v4
+  OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review:opencode-2.2.0-amd64-v5
   OPENCODE_REVIEW_BASE_IMAGE: docker.io/library/node:24-bookworm-slim
 
 build-opencode-review-image:

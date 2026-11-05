@@ -51,6 +51,7 @@ def _report_progress(output, stopped, started):
     counts = Counter()
     tool_counts = Counter()
     last_finish = "none"
+    phase = "none"
     # A separate descriptor keeps reads from moving the container's stdout write position.
     with open(output.name, "rb") as events:
         while True:
@@ -84,17 +85,20 @@ def _report_progress(output, stopped, started):
                     last_finish = reason if isinstance(reason, str) and reason in _FINISH_REASONS else "other"
                 elif kind == "tool_use":
                     tool_counts[_tool_result(event.get("part"))] += 1
+                elif kind == "review_phase":
+                    value = event.get("phase")
+                    phase = value if isinstance(value, str) and value in ("inspection", "final") else "other"
             # Only fixed labels reach logs, never arguments, errors, output, or model text.
             summary = "; ".join(
                 f"{label}=" + (", ".join(f"{name}:{count}" for name, count in sorted(counter.items())) or "none")
                 for label, counter in (("events", counts), ("tools", tool_counts))
             )
             if finished:
-                print(f"review runner: final {summary}; last_finish={last_finish}", flush=True)
+                print(f"review runner: final {summary}; phase={phase}; last_finish={last_finish}", flush=True)
                 return
             elapsed = int(time.monotonic() - started)
             print(f"review runner: running; elapsed={elapsed}s; stdout={size} bytes (+{size - previous}); "
-                  f"{summary}; last_finish={last_finish}", flush=True)
+                  f"{summary}; phase={phase}; last_finish={last_finish}", flush=True)
             previous = size
 
 
