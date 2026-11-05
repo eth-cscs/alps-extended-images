@@ -61,7 +61,6 @@ This exercises CXI endpoint setup, GPU-memory registration, and the UCCL data pa
 
 The ROCm variant keeps a GPU-less-safe build-time smoke check: `import vllm` runs the platform probe and the module-level GCN-arch query, which initializes CUDA and fails on build containers without a visible GPU.
 The build only imports torch and locates the vLLM package via `importlib.util.find_spec`; the real ROCm `import vllm` coverage lives in the `ray-rccl-uccl-ep` test job.
-
 Older vLLM releases may need fewer changes.
 Releases `0.22` and older are suspected to work without these compatibility patches, but that still needs to be verified against the Alps CUDA/HPC stack.
 

@@ -47,7 +47,7 @@ Separators must occur between lowercase alphanumeric groups: one or two undersco
 In qualified targets, `cuda` and `rocm` are reserved for the final suffix and cannot appear as hyphen- or underscore-delimited variant components.
 The selected `<TARGET>_BASE_IMAGE` determines the family, and a contradictory target suffix is an error.
 Profile-key prefixes uppercase the target and replace `-` with `_`.
-For example, a hypothetical `app example megatron-cuda` selector would use `MEGATRON_CUDA_BASE_IMAGE` and image name `example-megatron-cuda`; this illustrates the convention, not an available image.
+For example, select Apertus with `app apertus-2 megatron-cuda`: its base comes from `MEGATRON_CUDA_BASE_IMAGE` and its image name is `apertus-2-megatron-cuda`.
 Existing `app vllm cuda` / `app vllm rocm` selectors remain unchanged.
 
 CI discovery, manual builds, and ref/hash helpers share `app_variants_from_profile` in `ci-pipelines/helpers/meta.sh`.
