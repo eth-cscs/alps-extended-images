@@ -38,6 +38,20 @@ if (!final && scenario === 'cancel') {
 if ((!final && scenario === 'inspection-error') || (final && scenario === 'final-error')) {
   emit({ type: 'error', error: { message: 'Provider failure' } }); process.exit(0);
 }
+if (!final && scenario !== 'no-inspection-tools') {
+  const failed = scenario === 'failed-inspection-tools' || scenario === 'failed-then-success';
+  const metadata = scenario === 'wrapped-inspection-error' ? { metadata: { error: true } }
+    : scenario === 'nonzero-inspection-exit' ? { metadata: { exit: 1 } } : {};
+  emit({ type: 'tool_use', sessionID: 'session-review', part: {
+    tool: scenario === 'only-websearch' ? 'websearch' : 'read',
+    state: { status: failed ? 'error' : 'completed', metadata },
+  } });
+  if (scenario === 'failed-then-success') {
+    emit({ type: 'tool_use', sessionID: 'session-review', part: {
+      tool: 'read', state: { status: 'completed' },
+    } });
+  }
+}
 if (final && scenario === 'changed-session') emit(event('text', { sessionID: 'unrelated-session' }));
 else if (final && scenario === 'final-tool') { emit(event('tool_use')); emit(event('text')); }
 else emit(event('text'));
@@ -53,7 +67,9 @@ if (!final && scenario === 'inspection-exit') process.exit(7);
   return { ...result, events, calls: readFileSync(calls, 'utf8').trim().split('\n') };
 }
 
-for (const scenario of ['inspection-error', 'inspection-exit', 'malformed', 'no-session', 'spoofed-phase', 'cancel']) {
+for (const scenario of ['inspection-error', 'inspection-exit', 'malformed', 'no-session', 'spoofed-phase', 'cancel',
+                        'no-inspection-tools', 'failed-inspection-tools', 'wrapped-inspection-error',
+                        'nonzero-inspection-exit', 'only-websearch']) {
   test(`failed inspection never starts finalization: ${scenario}`, t => {
     const result = exercise(t, scenario);
     assert.notEqual(result.status, 0);
@@ -71,3 +87,10 @@ for (const scenario of ['final-error', 'changed-session', 'final-tool']) {
     assert.ok(!result.events.some(event => event.type === 'review_phase' && event.phase === 'final' && event.state === 'end'));
   });
 }
+
+test('a failed tool does not block finalization after successful inspection', t => {
+  const result = exercise(t, 'failed-then-success');
+  assert.equal(result.status, 0);
+  assert.deepEqual(result.calls, ['inspection', 'final']);
+  assert.ok(result.events.some(event => event.type === 'review_phase' && event.phase === 'final' && event.state === 'end'));
+});

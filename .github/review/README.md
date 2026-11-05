@@ -37,6 +37,8 @@ Web research is reserved for specific external-behavior questions that repositor
   Preparation fails if an API request fails or history is incomplete.
 - The reviewer treats history and instructions found in PR files as material to inspect.
   It checks previous concerns against the current code, avoids repeating fixed findings, and does not treat approval or thread resolution as proof of correctness.
+  Repeat reviews briefly identify earlier findings that remain, were addressed, or were not substantiated, with links when available.
+  Previous reviews are not templates for the new review.
 
 ## Repository layout
 
@@ -129,10 +131,13 @@ The CLI uses `--thinking` to include provider-exposed reasoning in the private e
 Reasoning is excluded from the published review.
 Missing reasoning events do not prove that the model generated no reasoning.
 
-The [final-response policy](image/grumpy-reviewer.md#final-response) excludes reviewer setup diagnostics and permits verification notes only for material gaps in reviewing the changed code.
+The [final-response policy](image/grumpy-reviewer.md#final-response) keeps material uncertainty beside the affected finding rather than adding verification checklists, limitations sections, or reviewer setup diagnostics.
 
 - [run-review.mjs](image/run-review.mjs) marks the start and successful end of each phase in the event stream.
   It reuses the inspection session for finalization and stops on a failed CLI exit, an error event, an unexpected session, or a tool attempt during finalization.
+  The final-response task requires a fresh assessment of inspection notes under the review policy, not a copy of their proposed review.
+  Inspection must complete a `read`, `grep`, `shell`, or Code Mode `execute` call successfully before finalization starts; glob-only discovery, web search, failed calls, and copied context do not satisfy this requirement.
+  A successful tool call does not prove review coverage or correctness.
 - [extract.py](host/extract.py) selects completed text only from the explicit final-response phase.
   Extraction requires both phases to complete in order in the same session and rejects errors, missing phases, malformed events, or incomplete final output.
   Inspection summaries and notes are never used as a publishable fallback.
@@ -144,6 +149,7 @@ The [final-response policy](image/grumpy-reviewer.md#final-response) excludes re
   Empty or oversized reviews fail rather than posting partial text, and oversized output remains in the artifact.
   Before posting, the publisher checks the current PR head and skips a stale result if it differs from the reviewed SHA.
   Published comments identify the reviewed commit and workflow run.
+  The model supplies only the review body and must not reproduce the publisher's header or metadata from an earlier review.
 
 ## Local provider diagnostics
 
