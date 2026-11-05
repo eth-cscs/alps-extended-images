@@ -42,7 +42,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
-          ref: 15b1aa7c41e4e4612ecadae8190f1752c98dc934
+          ref: fc943e495285088a1110c642a6c3d10c1c8e17f1
           path: default-branch
           persist-credentials: false
       # Query the author's current repository permission.
