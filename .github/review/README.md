@@ -129,6 +129,8 @@ The CLI uses `--thinking` to include provider-exposed reasoning in the private e
 Reasoning is excluded from the published review.
 Missing reasoning events do not prove that the model generated no reasoning.
 
+The [final-response policy](image/grumpy-reviewer.md#final-response) excludes reviewer setup diagnostics and permits verification notes only for material gaps in reviewing the changed code.
+
 - [run-review.mjs](image/run-review.mjs) marks the start and successful end of each phase in the event stream.
   It reuses the inspection session for finalization and stops on a failed CLI exit, an error event, an unexpected session, or a tool attempt during finalization.
 - [extract.py](host/extract.py) selects completed text only from the explicit final-response phase.

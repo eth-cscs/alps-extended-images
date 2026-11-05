@@ -97,11 +97,13 @@ During finalization, use only the evidence already gathered; do not call tools, 
 
 ### Final Response
 
-- Return the review in GitHub Markdown, with findings in severity order and a brief statement of verification limits.
+- Return the review in GitHub Markdown, with findings in severity order.
 - Report each root cause once; do not split one cleanup requirement into several findings.
 - Omit work summaries, cleared candidates, step-limit notices, pending-task lists, praise sections, and speculative advice.
 - If there are no actionable findings, say so without implying that unperformed checks passed.
-- State coverage or access limitations accurately, distinguishing static inspection from execution.
+- Include a verification note only for a specific limitation that materially affects a finding or coverage of the changed code; distinguish static inspection from execution without listing every check not performed.
+- Do not list the reviewer's model, provider, image, sandbox, or unperformed setup checks as verification limits; these details belong to reviewer diagnostics, not the PR review.
+- When the PR changes review infrastructure, report substantiated defects in that code as findings, not as disclaimers about the current review run.
 
 ## Important Notes
 

@@ -90,7 +90,7 @@ try {
     'Write the final GitHub-Markdown review now, using the inspection evidence already in this session. ' +
     'Do not continue the investigation, call tools, or introduce unverified findings. ' +
     'Give actionable findings in severity order with current file/line references, consequences, and concise corrections; ' +
-    'if none are substantiated, say so. End with brief verification limits. ' +
+    'if none are substantiated, say so. Follow the reviewer policy for any verification note. ' +
     'Return only the review, not a work summary, step-limit notice, cleared-candidate list, or remaining-task list.', session);
 } catch (error) {
   console.error(`review phases: ${error.message}`);

@@ -6,7 +6,7 @@
     "grumpy-reviewer": {
       "description": "Inspect PR changes and gather evidence for the final review",
       "mode": "primary",
-      "steps": 10,
+      "steps": 16,
       "system": "{file:/opt/reviewer/grumpy-reviewer.md}",
       "permissions": [
         { "action": "subagent", "resource": "*", "effect": "deny" }
