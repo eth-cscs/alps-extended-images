@@ -6,6 +6,20 @@ Run these commands on a node where rootless `podman` is available and where the 
 The helper uses the same reference and hash logic as CI.
 By default it writes local tags under `localhost/alps-images`; override `IMAGE_PREFIX` if you want registry-style tags.
 
+## List Build Candidates
+
+Print the selectors declared by the current checkout or extracted source snapshot:
+
+```bash
+manual-build/manual-build.sh list
+```
+
+Each line is a selector accepted by the build-script generator, for example `base cuda pytorch 26.06-py3` or `app vllm cuda`.
+Listing reads family-local `ci.yaml` variants and app `profile.env` targets through the same discovery and validation helpers used by CI and manual builds.
+It requires a modern Python 3 with PyYAML, like the pipeline generator; for an isolated environment, use `uv run --no-project --python 3.12 --with pyyaml bash manual-build/manual-build.sh list`.
+It does not query registries, resolve canonical tags, generate a pipeline, or require Podman, build-environment overrides, or Git metadata.
+These are declared build candidates, not a claim that their builds or runtime tests have passed.
+
 ## Generate A Build Script
 
 Generate a base-image build script:
