@@ -2,7 +2,7 @@
 
 These Bash scripts start vLLM on Alps GH200 nodes. Each node has four GPUs.
 You do not need Spellbook, Ray, a source checkout, or extra patches.
-The shared `environment.toml` selects the tested image by digest.
+The shared `environment.toml` selects the CI-validated image by its content-hashed tag.
 
 | Model | Script | Nodes / GPUs | TP / DP / EP | Context limit |
 | --- | --- | --- | --- | --- |
@@ -58,14 +58,13 @@ minutes to become ready. The server URL is in `server-url.txt`.
 Both launchers accept `FP8=1`. Chonk also accepts the independent `EPLB=1` option.
 Both options default to `0`, so the existing BF16 launches are unchanged.
 
-These options require a compatible build of the newer [`apertus2/main` revision](https://github.com/swiss-ai/vllm/tree/200556e646ff4e6c13dc1b443d973830485f3c0f). Select its EDF with `CONTAINER_EDF`; the default EDF still selects the previous tested image. The intended moving tag is `alps7-dev`, but it must be published by CI promotion before use.
+The default EDF selects a compatible build of [`apertus2/main`](https://github.com/swiss-ai/vllm/tree/200556e646ff4e6c13dc1b443d973830485f3c0f) that passed CI GPU import and Vetnode checks. No EDF override is needed for these options. The moving `alps7-dev` tag still requires CI promotion before use.
 
 Source-built Chonk checks passed on one four-GPU GH200 node with an 8,192-token context limit: Triton FP8 for routed experts, routed-expert FP8 with EPLB, and FP8 including shared experts and dense MLPs. All three passed serving and short-context numerical checks against BF16. This does not validate the new container image or the default multi-node layouts.
 
 From the `chonk` directory:
 
 ```bash
-export CONTAINER_EDF=/absolute/path/to/new-vllm.toml
 FP8=1 sbatch serve.sh          # Online MoE FP8 only.
 EPLB=1 sbatch serve.sh         # Expert load balancing only.
 FP8=1 EPLB=1 sbatch serve.sh   # Both.

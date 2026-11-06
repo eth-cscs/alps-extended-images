@@ -1,5 +1,5 @@
 # Container engine EDF for the published Apertus2 vLLM CUDA image.
-image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/vllm-apertus2-cuda@sha256:2daf3b1906ab62291c00b6a78d9eaa8aa85aad792abffb6695dc89ce9dcc9e05"
+image = "jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/vllm-apertus2-cuda:alps7-dev-f3e889ac320cb71645302bd4cb3a503a"
 
 mounts = [
     "/capstor/",

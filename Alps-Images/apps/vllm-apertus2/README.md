@@ -15,8 +15,8 @@ UCCL is pinned to
 [Chonk and Megachonk examples](example/README.md) provide standalone `sbatch`
 Bash launchers using the pinned, tested image and `allgather_reducescatter`.
 They retain BF16 defaults and expose optional online FP8 scopes and Chonk EPLB.
-The example EDF keeps the previous tested digest. Override `CONTAINER_EDF` to select
-a newer compatible image. The moving `alps7-dev` tag requires CI promotion before use.
+The example EDF selects the validated content-hashed image. Override `CONTAINER_EDF`
+to select another image. The moving `alps7-dev` tag requires CI promotion before use.
 
 ## Build and publish
 
