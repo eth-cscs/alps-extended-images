@@ -4,11 +4,13 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
+  manual-build/manual-build.sh list
   manual-build/manual-build.sh base FAMILY NAME VARIANT [OUTPUT]
   manual-build/manual-build.sh app APP_NAME APP_VARIANT [OUTPUT]
 
 Emits a standalone podman build script that uses the same image reference
 derivation as CI. If OUTPUT is omitted, the script is written to stdout.
+Use list to print local build selectors without contacting registries.
 
 Environment overrides:
   IMAGE_PREFIX              default: localhost/alps-images
@@ -195,6 +197,12 @@ main() {
   if [[ $# -lt 1 ]]; then
     usage >&2
     exit 2
+  fi
+
+  # Discovery needs only local declarations, not build/registry environment.
+  if [[ "$1" == list ]]; then
+    [[ $# -eq 1 ]] || { usage >&2; exit 2; }
+    exec python3 "$root/ci-pipelines/helpers/generate-child-pipeline.py" --list
   fi
 
   export IMAGE_PREFIX="${IMAGE_PREFIX:-localhost/alps-images}"
