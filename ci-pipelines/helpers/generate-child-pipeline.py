@@ -19,6 +19,7 @@ reviewed static templates.
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import os
 import re
@@ -263,8 +264,8 @@ def require_list(value: Any, context: str) -> list[Any]:
     return value
 
 
-def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
-    """Validate one family base ci.yaml file."""
+def validate_base_variants(path: Path, cfg: dict[str, Any]) -> None:
+    """Validate local base selectors without requiring CI test metadata."""
     family = cfg.get("family")
     if not isinstance(family, str) or family not in BASE_TEST_TEMPLATES:
         supported = ", ".join(sorted(BASE_TEST_TEMPLATES))
@@ -273,6 +274,12 @@ def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
         item = require_mapping(variant, f"{path}: variants[{idx}]")
         if not item.get("name") or not item.get("variant"):
             raise RuntimeError(f"{path}: variants[{idx}] must define name and variant")
+
+
+def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
+    """Validate one family base ci.yaml file."""
+    validate_base_variants(path, cfg)
+    family = cfg["family"]
     tests = require_list(cfg.get("tests"), f"{path}: tests")
     if not tests:
         raise RuntimeError(f"{path}: tests must not be empty")
@@ -320,15 +327,41 @@ def validate_app_ci(
             require_mapping(variables, f"{path}: tests.{variant}[{idx}].variables")
 
 
-def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
-    """Load base variants/tests from family-local ci.yaml files."""
-    result = []
+def base_definitions() -> list[tuple[Path, dict[str, Any]]]:
+    """Read declared base variants shared by listing and pipeline discovery."""
+    definitions = []
     for path in sorted((ROOT / "Alps-Images").glob("*/ci.yaml")):
         if path.parent.name in {"apps", "common"}:
             continue
         cfg = load_yaml(path)
         if "family" not in cfg:
             continue
+        validate_base_variants(path, cfg)
+        definitions.append((path, cfg))
+    return definitions
+
+
+def app_definitions() -> list[tuple[Path, list[str]]]:
+    """Read declared app variants through the same validator as manual builds."""
+    return [(profile, app_variants_from_profile(profile))
+            for profile in sorted((ROOT / "Alps-Images" / "apps").glob("*/profile.env"))]
+
+
+def build_selectors() -> list[list[str]]:
+    """List local build candidates without resolving refs or querying registries."""
+    selectors = []
+    for _, cfg in base_definitions():
+        for variant in cfg["variants"]:
+            selectors.append(["base", cfg["family"], str(variant["name"]), str(variant["variant"])])
+    for profile, variants in app_definitions():
+        selectors.extend(["app", profile.parent.name, variant] for variant in variants)
+    return selectors
+
+
+def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
+    """Load base variants/tests from family-local ci.yaml files."""
+    result = []
+    for path, cfg in base_definitions():
         validate_base_ci(path, cfg)
         family = str(cfg["family"])
         tests = cfg.get("tests") or []
@@ -341,9 +374,8 @@ def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
 def discover_apps() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
     """Load app variants from profile.env and tests from app-local ci.yaml."""
     apps = []
-    for profile in sorted((ROOT / "Alps-Images" / "apps").glob("*/profile.env")):
+    for profile, variants in app_definitions():
         app = profile.parent.name
-        variants = app_variants_from_profile(profile)
         ci_file = profile.parent / "ci.yaml"
         cfg = load_yaml(ci_file)
         images = {}
@@ -502,4 +534,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--list", action="store_true", help="list local build selectors without generating a pipeline")
+    args = parser.parse_args()
+    if args.list:
+        # Materialize first so invalid metadata cannot produce a partial listing.
+        for selector in build_selectors():
+            print(shlex.join(selector))
+    else:
+        main()

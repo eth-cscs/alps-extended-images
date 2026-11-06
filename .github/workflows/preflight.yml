@@ -55,6 +55,13 @@ jobs:
           python -m py_compile .github/rl-runs-collector/collect_rl_runs.py
           uvx pytest .github/rl-runs-collector/tests
 
+      - name: NeMo-RL blueprints
+        # Checks every blueprint against its schema, profiles and catalogs, and that the committed
+        # index.json is what they produce
+        run: |
+          uv run --with pyyaml --with jsonschema python Alps-Images/apps/nemo-rl/blueprints/tools/build_index.py --check
+          uvx --with pyyaml --with jsonschema pytest Alps-Images/apps/nemo-rl/blueprints/tools/tests
+
       - name: Shell syntax
         # Catch syntax errors in tracked shell scripts, including sourced helpers.
         run: git ls-files '*.sh' | xargs -r -n1 bash -n

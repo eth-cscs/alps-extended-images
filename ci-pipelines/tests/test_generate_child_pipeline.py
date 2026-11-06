@@ -1,5 +1,9 @@
 import importlib.util
+import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -665,6 +669,78 @@ def test_discovery_rejects_target_base_family_mismatch(gen, named_targets):
 
     assert "megatron-rocm" in str(error.value)
     assert wrong_base in str(error.value)
+
+
+def test_build_selectors_use_local_declarations_without_ci_or_registry(monkeypatch, gen, named_targets):
+    app, targets = named_targets
+    # Manual candidates do not require test jobs or registry/ref configuration.
+    (app / "ci.yaml").unlink()
+    for key in ("IMAGE_PREFIX", "GHCR_IMAGE_PREFIX", "ALPS_REV", "CSCS_CI_ORIG_CLONE_URL"):
+        monkeypatch.delenv(key, raising=False)
+    def forbidden(*args, **kwargs):
+        pytest.fail("listing must not resolve refs or query registries")
+    for name in ("base_env", "app_env", "img_digest"):
+        monkeypatch.setattr(gen, name, forbidden)
+
+    selectors = gen.build_selectors()
+    assert [selector for selector in selectors if selector[0] == "app"] == [
+        ["app", "apertus-2", target] for target in targets
+    ]
+    assert ["base", "cuda", "pytorch", "26.06-py3"] in selectors
+    assert ["base", "rocm", "pytorch", "rocm10.0-ubuntu24.04-py3.12-torch2.13"] in selectors
+
+    profile = app / "profile.env"
+    profile.write_text(profile.read_text().replace("MEGATRON_ROCM_BASE_IMAGE=pytorch-rocm:",
+                                                 "MEGATRON_ROCM_BASE_IMAGE=pytorch-cuda:"))
+    with pytest.raises(RuntimeError, match="megatron-rocm"):
+        gen.build_selectors()
+
+
+def test_manual_list_works_from_gitless_snapshot_and_fails_without_partial_output(tmp_path):
+    # Copy only the inputs needed for local discovery: no parent CI settings,
+    # image recipes, registry helper, Git checkout, or container engine.
+    for relative in ("manual-build/manual-build.sh", "ci-pipelines/helpers/meta.sh",
+                     "ci-pipelines/helpers/generate-child-pipeline.py"):
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+    base = tmp_path / "Alps-Images/ROCm/ci.yaml"
+    base.parent.mkdir(parents=True)
+    base.write_text("family: rocm\nvariants:\n  - name: example\n    variant: '1.0'\n")
+    profile = tmp_path / "Alps-Images/apps/example/profile.env"
+    profile.parent.mkdir(parents=True)
+    marker = tmp_path / "executed"
+    profile.write_text(f'APP_VARIANTS="cuda rocm"\nCUDA_BASE_IMAGE=pytorch-cuda:tag\n'
+                       f'ROCM_BASE_IMAGE=pytorch-rocm:tag\ntouch {marker}\n')
+    env = {key: value for key, value in os.environ.items()
+           if key not in {"IMAGE_PREFIX", "ALPS_REV", "CSCS_CI_ORIG_CLONE_URL"}}
+    env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + env["PATH"]
+    command = ["bash", "manual-build/manual-build.sh", "list"]
+    result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["base rocm example 1.0", "app example cuda", "app example rocm"]
+    assert not marker.exists()
+    assert not (tmp_path / "generated-child-pipeline.yaml").exists()
+
+    profile.write_text('APP_VARIANTS="rocm"\nROCM_BASE_IMAGE=pytorch-cuda:tag\n')
+    failed = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert failed.returncode != 0 and not failed.stdout
+    assert "rocm" in failed.stderr
+
+
+@pytest.mark.parametrize("metadata", [
+    {"family": "unsupported", "variants": []},
+    {"family": "cuda", "variants": [{"name": "pytorch"}]},
+    {"family": "cuda", "variants": "not a list"},
+])
+def test_listing_and_ci_share_base_selector_validation(tmp_path, monkeypatch, gen, metadata):
+    path = tmp_path / "Alps-Images/example/ci.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(yaml.safe_dump(metadata))
+    monkeypatch.setattr(gen, "ROOT", tmp_path)
+    for operation in (gen.build_selectors, gen.discover_bases):
+        with pytest.raises(RuntimeError):
+            operation()
 
 
 def test_discovery_rejects_cuda_vetnode_on_named_rocm_target(gen, named_targets):
