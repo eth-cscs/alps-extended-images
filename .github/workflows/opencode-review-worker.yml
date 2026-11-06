@@ -1,0 +1,207 @@
+name: opencode-review-worker
+
+# TEMPORARY: remove test_event_json and restore default-branch helpers and Conversation reactions before merging.
+# Keep later permission and runtime fixes when removing the test wiring.
+
+# opencode-review.yml checks write access before calling this worker.
+# The acknowledge job reacts to the request; review runs OpenCode; publish posts its final text.
+# See .github/review/README.md for setup, security boundaries, and image updates.
+on:
+  workflow_call:
+    inputs:
+      test_event_json:
+        description: Temporary normalized issue_comment event for the inline test
+        required: true
+        type: string
+    secrets:
+      CSCS_INFERENCE_KEY:
+        required: true
+
+# Set token permissions per job rather than granting write access to every job.
+permissions: {}
+
+jobs:
+  # Keep the reaction's write permission separate from the job that runs the reviewer.
+  acknowledge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # TEMPORARY: inline-comment reactions require PR write access, not issue write access.
+      pull-requests: write
+    steps:
+      - name: Acknowledge accepted review request
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.reactions.createForPullRequestReviewComment({
+              ...context.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes',
+            });
+
+  review:
+    needs: acknowledge
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Read PR metadata and source on the host; do not pass the GitHub token to the container.
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      # Built by ci-pipelines/build-opencode-review-image.yaml.
+      # A digest pin prevents later tag updates from changing the downloaded image.
+      OPENCODE_REVIEW_IMAGE: ghcr.io/eth-cscs/alps-extended-images/opencode-review@sha256:3cf79d223a9b7698a4dd7a0eb0352622c19d9dca10a6ebae12ae76130b3520ad
+    outputs:
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+    steps:
+      # TEMPORARY: use the reviewed helper and AGENTS.md snapshot pinned below.
+      - name: Checkout pinned test helpers and instructions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: 87cd8d5420f1159dce83d2a6e6eb882e37c2cb81
+          path: default-branch
+          persist-credentials: false
+
+      # Recheck write access in case it changed after the caller's authorize job.
+      # Resolve the open PR's current head and fetch all review-history pages through the API.
+      # API failures or malformed history stop this step before inference.
+      - name: Prepare validated PR metadata and review history
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TEST_EVENT_JSON: ${{ inputs.test_event_json }}
+        run: |
+          set -euo pipefail
+          # TEMPORARY: use the same normalized event that passed authorization.
+          event_path="$RUNNER_TEMP/opencode-inline-test-event.json"
+          printf '%s\n' "$TEST_EVENT_JSON" > "$event_path"
+          python3 default-branch/.github/review/host/context.py prepare \
+            --event-name issue_comment \
+            --event-path "$event_path" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output "$RUNNER_TEMP/opencode-review/input" \
+            --github-output "$GITHUB_OUTPUT"
+
+      # Check out the API-selected SHA so later branch updates do not change the review input.
+      # Full Git history is needed to compute the PR's merge base.
+      - name: Checkout validated PR head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ steps.prepare.outputs.head_repository }}
+          ref: ${{ steps.prepare.outputs.head_sha }}
+          path: pr-source
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      # Verify checkout HEAD and build context from metadata, review history, and the diff.
+      # Git hooks and executable diff drivers are disabled; PR text is not executed.
+      - name: Render review context without executing PR code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 default-branch/.github/review/host/context.py render \
+            --metadata "$RUNNER_TEMP/opencode-review/input/metadata.json" \
+            --checkout "$GITHUB_WORKSPACE/pr-source" \
+            --output "$RUNNER_TEMP/opencode-review/input/context.md"
+
+      # Pull the pinned image anonymously; no registry token is needed.
+      - name: Pull trusted prebuilt review image
+        run: docker pull "$OPENCODE_REVIEW_IMAGE"
+
+      # run.py mounts the PR checkout, context, and pinned AGENTS.md read-only.
+      # Only CSCS_INFERENCE_API_KEY is forwarded from the host environment; the Docker socket is not mounted.
+      # Runtime files go in /work and /tmp; the image filesystem is read-only.
+      # Failed or interrupted runs attempt container removal before checking HEAD and Git status.
+      - name: Run isolated CSCS reviewer
+        env:
+          CSCS_INFERENCE_API_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 default-branch/.github/review/host/run.py \
+            --engine docker \
+            --image "$OPENCODE_REVIEW_IMAGE" \
+            --instructions "$GITHUB_WORKSPACE/default-branch/AGENTS.md" \
+            --checkout "$GITHUB_WORKSPACE/pr-source" \
+            --context "$RUNNER_TEMP/opencode-review/input/context.md" \
+            --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl"
+
+      # Extract the final completed response, excluding reasoning and tool output.
+      # Extraction failures stop the job before any artifact is uploaded.
+      - name: Extract review text
+        run: |
+          set -euo pipefail
+          python3 default-branch/.github/review/host/extract.py \
+            --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl" \
+            --output "$RUNNER_TEMP/opencode-review/model-output/review.md"
+
+      # Pass only review.md to the publish job, not raw model events or PR context.
+      - name: Retain review text only
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: opencode-review
+          path: ${{ runner.temp }}/opencode-review/model-output/review.md
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publish on a separate runner without executing the reviewer or PR code.
+  publish:
+    needs: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # The comment targets a PR, so grant PR write access rather than issue write access.
+      pull-requests: write
+    steps:
+      # Read review.md without a source checkout, inference key, or model process.
+      - name: Download review text
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: opencode-review
+          path: ${{ runner.temp }}/opencode-review/model-output
+
+      # Read model output from the artifact as text; never insert it into this script's source.
+      # Pass the PR number and reviewed SHA through environment variables and validate them below.
+      - name: Publish only against the reviewed PR head
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          REVIEW_PR_NUMBER: ${{ needs.review.outputs.pr_number }}
+          REVIEW_HEAD_SHA: ${{ needs.review.outputs.head_sha }}
+          REVIEW_PATH: ${{ runner.temp }}/opencode-review/model-output/review.md
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('node:fs');
+            const numberText = process.env.REVIEW_PR_NUMBER;
+            const head = process.env.REVIEW_HEAD_SHA;
+            if (!/^[1-9][0-9]*$/.test(numberText) || !/^[0-9a-f]{40}$/.test(head)) {
+              throw new Error('Invalid trusted prepare outputs');
+            }
+            const pull_number = Number(numberText);
+            if (!Number.isSafeInteger(pull_number)) {
+              throw new Error('PR number is outside the safe integer range');
+            }
+            const review = fs.readFileSync(process.env.REVIEW_PATH, 'utf8');
+            if (!review.trim()) {
+              throw new Error('Review artifact is empty; no comment was posted');
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const header = `## OpenCode review\n\nReviewed commit: \`${head}\` · [Workflow run](${runUrl})\n\n`;
+            const body = header + review;
+            // UTF-16 length is a conservative check against GitHub's 65,536-character limit.
+            if (body.length > 65536) {
+              throw new Error('Review exceeds the GitHub comment limit; the complete review.md remains in the opencode-review artifact');
+            }
+            // Re-read the PR head before posting; skip the comment if it differs from the reviewed SHA.
+            const {data: current} = await github.rest.pulls.get({...context.repo, pull_number});
+            if (current.head.sha !== head) {
+              core.notice(`Skipping stale review of ${head}: PR #${pull_number} now points to ${current.head.sha}. Review retained in artifact.`);
+              await core.summary.addRaw(`Skipped stale review of \`${head}\` for PR #${pull_number}; review.md is retained in the opencode-review artifact.`).write();
+              return;
+            }
+            await github.rest.issues.createComment({...context.repo, issue_number: pull_number, body});

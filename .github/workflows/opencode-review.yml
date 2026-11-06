@@ -1,31 +1,83 @@
 name: opencode-review
 
+# TEMPORARY pre-merge test for the same-repository fix/opencode-review branch.
+# Before merging, restore the Conversation trigger, default-branch helpers, and @main worker.
+# Remove the branch restriction and event adapter; keep later permission and runtime fixes.
+
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  # Inline comments load the PR's workflow; Conversation comments still use the default branch.
+  pull_request_review_comment:
+    types: [created]
+
+# Allow the worker to read PR data, react to requests, and post the final comment.
+# Its acknowledge, review, and publish jobs restrict these permissions separately.
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
 
 jobs:
-  review:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+  authorize:
+    # Test only the prepared branch in the main repository, never a fork PR.
+    # The access-check step still validates the command and the author's write permission.
+    if: >-
+      github.repository == 'eth-cscs/alps-extended-images' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'fix/opencode-review' &&
+      github.event.comment.user.type == 'User' &&
+      github.event.sender.type == 'User' &&
+      github.actor == github.event.comment.user.login &&
+      startsWith(github.event.comment.body, '/oc-review')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    concurrency:
-      group: opencode-review-${{ github.event.issue.number || github.event.pull_request.number }}
-      cancel-in-progress: true
+    timeout-minutes: 5
+    # This job checks access but has no inference key or permission to post comments.
     permissions:
-      id-token: write
       contents: read
-      pull-requests: write
-      issues: write
+    outputs:
+      authorized: ${{ steps.access.outputs.authorized }}
+      test_event_json: ${{ steps.access.outputs.test_event_json }}
     steps:
-      - uses: actions/checkout@v6
+      # TEMPORARY: use the reviewed helper snapshot, not main or the PR head.
+      - name: Checkout pinned authorization helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          repository: ${{ github.repository }}
+          ref: 87cd8d5420f1159dce83d2a6e6eb882e37c2cb81
+          path: default-branch
           persist-credentials: false
-
-      - uses: anomalyco/opencode/github@latest
+      # Query the author's current repository permission.
+      # Write and admin qualify; GitHub reports maintain as write.
+      # Noncommands and users without write access return authorized=false.
+      # A missing collaborator counts as no access; other API errors fail this job.
+      - name: Check repository write access
+        id: access
         env:
-          CSCS_INFERENCE_API_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
-        with:
-          model: cscs/moonshotai/Kimi-K2.7-Code
-          agent: grumpy-reviewer
-          share: false
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # TEMPORARY: adapt the inline event to the production conversation-command schema.
+          event_path="$RUNNER_TEMP/opencode-inline-test-event.json"
+          event_json="$(jq -ca '{repository, sender, action, issue: {number: .pull_request.number, pull_request: {}}, comment}' "$GITHUB_EVENT_PATH")"
+          printf '%s\n' "$event_json" > "$event_path"
+          python3 default-branch/.github/review/host/context.py authorize \
+            --event-name issue_comment \
+            --event-path "$event_path" \
+            --repository "$GITHUB_REPOSITORY" \
+            --github-output "$GITHUB_OUTPUT"
+          printf 'test_event_json=%s\n' "$event_json" >> "$GITHUB_OUTPUT"
+
+  review:
+    needs: authorize
+    if: needs.authorize.outputs.authorized == 'true'
+    # Only an authorized request can cancel an earlier review for the same PR.
+    # Reviews for other PRs use different concurrency groups.
+    concurrency:
+      group: opencode-review-test-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    # TEMPORARY: load the worker from the same commit as this caller.
+    uses: ./.github/workflows/opencode-review-worker.yml
+    with:
+      test_event_json: ${{ needs.authorize.outputs.test_event_json }}
+    # Forward only the inference key; the worker pulls its image without registry credentials.
+    secrets:
+      CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
