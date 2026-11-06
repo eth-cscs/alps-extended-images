@@ -53,6 +53,50 @@ DP from the allocation. Only the node counts in the table above were tested.
 Wait for the server to start. The tested Megachonk run needed about eight
 minutes to become ready. The server URL is in `server-url.txt`.
 
+## Optional online FP8 and EPLB
+
+Both launchers accept `FP8=1`. Chonk also accepts the independent `EPLB=1` option.
+Both options default to `0`, so the existing BF16 launches are unchanged.
+
+These options require a compatible build of the newer [`apertus2/main` revision](https://github.com/swiss-ai/vllm/tree/200556e646ff4e6c13dc1b443d973830485f3c0f). Select its EDF with `CONTAINER_EDF`; the default EDF still selects the previous tested image. The intended moving tag is `alps7-dev`, but it must be published by CI promotion before use.
+
+Source-built Chonk checks passed on one four-GPU GH200 node with an 8,192-token context limit: Triton FP8 for routed experts, routed-expert FP8 with EPLB, and FP8 including shared experts and dense MLPs. All three passed serving and short-context numerical checks against BF16. This does not validate the new container image or the default multi-node layouts.
+
+From the `chonk` directory:
+
+```bash
+export CONTAINER_EDF=/absolute/path/to/new-vllm.toml
+FP8=1 sbatch serve.sh          # Online MoE FP8 only.
+EPLB=1 sbatch serve.sh         # Expert load balancing only.
+FP8=1 EPLB=1 sbatch serve.sh   # Both.
+```
+
+From the `megachonk` directory:
+
+```bash
+FP8=1 sbatch serve.sh
+```
+
+Megachonk FP8 has not been GPU-tested here.
+
+`FP8=1` defaults to `FP8_SCOPE=experts`: only routed-expert weights use online 128×128 block FP8. Triton remains the default MoE backend. No separate FP8 checkpoint is needed. FP8 uses CPU-staged RunAI loading to reduce peak GPU memory during quantization; BF16 keeps its existing distributed loading.
+
+To also quantize shared-expert MLPs and dense MLPs, use either launcher with:
+
+```bash
+FP8=1 FP8_SCOPE=mlp sbatch serve.sh
+```
+
+This broader scope leaves attention/KDA projections, latent projections, embeddings, and the output head in BF16. It can also be combined with Chonk's `EPLB=1`. The default FP8 scope remains routed experts only.
+
+To select DeepGEMM instead of Triton for MoE:
+
+```bash
+FP8=1 MOE_BACKEND=deep_gemm sbatch serve.sh
+```
+
+`EPLB=1` enables synchronous load balancing across the expert-parallel GPUs. It reorders existing experts without adding replicas. The script prints both option values at startup.
+
 ## Send a request
 
 Replace `HEAD_IP` with the address in the server URL.

@@ -11,11 +11,22 @@ assert torch.cuda.is_available(), "no CUDA device visible"
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 
 vllm_version = metadata.version("vllm")
-assert vllm_version.startswith("0.28.0"), vllm_version
+assert vllm_version == "0.28.0+apertus2.200556e64", vllm_version
 assert metadata.version("nixl") == "1.3.2"
 assert metadata.version("runai-model-streamer") == "0.15.7"
 assert metadata.version("transformers") == "5.17.0"
 print("vllm", vllm_version)
+
+from vllm.config.quantization import QuantizationConfigArgs
+
+expert_only = QuantizationConfigArgs(moe={"weight": "fp8_per_block_static"})
+assert expert_only.linear is None
+assert expert_only.moe is not None
+mlp = QuantizationConfigArgs(
+    linear={"weight": "fp8_per_block_static"},
+    moe={"weight": "fp8_per_block_static"},
+)
+assert mlp.linear is not None and mlp.moe is not None
 
 from uccl import ep, p2p
 import deep_ep
