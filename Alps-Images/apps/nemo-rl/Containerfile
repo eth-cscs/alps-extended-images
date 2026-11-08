@@ -115,7 +115,7 @@ ARG UV_BREAK_SYSTEM_PACKAGES=1
 ARG UV_PYTHON_DOWNLOADS=never
 
 ARG VLLM_REPO=https://github.com/swiss-ai/vllm.git
-ARG VLLM_REF=d4d41485a1cc1aee0d906d19f41523d2fdc67463
+ARG VLLM_REF=200556e646ff4e6c13dc1b443d973830485f3c0f
 ARG VLLM_MAX_JOBS=32
 ARG VLLM_NVCC_THREADS=4
 ARG VLLM_CUDA_ARCH_LIST=9.0
@@ -239,7 +239,7 @@ COPY Alps-Images/apps/nemo-rl/sources/package-additions.in /opt/alps/package-add
 # Match app/vllm-apertus2's full CUDA 13 wheel and public P2P library/headers,
 # including the DeepEP wrapper used by Megatron's flex dispatcher.
 ARG UCCL_REPO=https://github.com/uccl-project/uccl.git
-ARG UCCL_REF=18b588a048a3a3fe3d4bd60aa5678c66e284df31
+ARG UCCL_REF=78adb5dce345c1ba5c52c77c6de8e09bcd4fe4cb
 ARG NANOBIND_VERSION=3.0.1
 ARG UCCL_NVL_PEERS=4     # NVLink peers per node (GH200: 4 GPUs/node)
 ARG UCCL_CUDA_ARCH=9.0   # GH200 = Hopper (sm_90)
@@ -288,7 +288,6 @@ RUN set -eux; \
     printf '%s\n' "${libfabric_libdir}" > /etc/ld.so.conf.d/98-alps-libfabric.conf; \
     ldconfig; \
     pushd /io; \
-    sed -i 's|-Wl,-rpath=/usr/lib/x86_64-linux-gnu||g' p2p/Makefile; \
     export PATH="/tmp/gpustub:${PATH}" \
       CUDA_HOME=/usr/local/cuda \
       LIBFABRIC_HOME="${libfabric_prefix}" \
