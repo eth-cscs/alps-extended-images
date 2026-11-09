@@ -114,10 +114,6 @@ PY
 
         cd /io
 
-        sed -i \
-            's|-Wl,-rpath=/usr/lib/x86_64-linux-gnu||g' \
-            p2p/Makefile
-
         host_glibc_ver="$(python3 -c 'import platform; print(platform.libc_ver()[1])')"
 
         export PATH="/tmp/gpustub:${PATH}" \

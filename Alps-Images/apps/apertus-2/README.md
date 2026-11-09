@@ -201,10 +201,13 @@ The image stores inherited package constraints in
 `/opt/alps/megatron/base-pins.txt`. Native Git source pins are stored in
 `/opt/alps/megatron/source-pins.txt`.
 
-UCCL uses upstream commit `18b588a048a3a3fe3d4bd60aa5678c66e284df31`.
+UCCL uses upstream commit `78adb5dce345c1ba5c52c77c6de8e09bcd4fe4cb`.
 This includes [PR #1085](https://github.com/uccl-project/uccl/pull/1085), which keeps
 the EP D2H handle table in device memory. This prevents `combine` faults caused
 by managed-memory eviction under GPU memory pressure.
+It also includes the EP CXI fixes that serialize CXI resource setup across proxy threads
+([PR #1101](https://github.com/uccl-project/uccl/pull/1101), [PR #1109](https://github.com/uccl-project/uccl/pull/1109))
+and retry CXI posts that return `FI_EAGAIN` ([PR #1115](https://github.com/uccl-project/uccl/pull/1115)).
 The build uses `BUILD_TYPE=all`.
 It also installs the public P2P library and headers, and builds the DeepEP wrapper.
 
