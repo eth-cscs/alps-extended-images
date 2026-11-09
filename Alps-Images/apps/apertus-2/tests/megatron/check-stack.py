@@ -26,6 +26,8 @@ NATIVE_VERSIONS = {
     "uccl": "0.1.1",
     "flashinfer-python": "0.6.16.post3",
     "flashinfer-jit-cache": "0.6.16.post3",
+    "nixl": "1.3.2",
+    "nixl-cu13": "1.3.2",
 }
 
 MODULES = (
@@ -55,6 +57,7 @@ MODULES = (
     "uccl.ep",
     "uccl.p2p",
     "deep_ep",
+    "nixl",
     "deep_gemm",
     "grouped_gemm",
     "grouped_gemm_backend",
@@ -118,6 +121,11 @@ def check_metadata():
     assert Path("/usr/local/lib/libuccl_p2p.so").is_file()
     assert Path("/usr/local/include/uccl_engine.h").is_file()
     metadata.distribution("deep-ep")
+    assert Path(os.environ["NIXL_PLUGIN_DIR"], "libplugin_UCCL.so").is_file()
+    assert not any(
+        d.metadata["Name"].lower().replace("_", "-") == "nixl-cu12"
+        for d in metadata.distributions()
+    )
     assert metadata.version("pytest") == "8.3.5"
     assert metadata.version("opentelemetry-api") == "1.43.0"
     assert metadata.version("opentelemetry-sdk") == "1.43.0"
@@ -183,6 +191,7 @@ def check_gpu():
     set_test_caches()
 
     import cupy
+    import nixl
     import torch
     import transformer_engine.pytorch as te
     from emerging_optimizers.orthogonalized_optimizers.muon import get_muon_scale_factor
@@ -208,6 +217,10 @@ def check_gpu():
     layer(x).float().sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
     assert get_muon_scale_factor(64, 64, mode="moonlight") == 1.6
+
+    assert nixl._bindings.__name__ == "nixl_cu13._bindings", nixl._bindings.__name__
+    agent = nixl.nixl_agent("megatron-smoke", nixl.nixl_agent_config(backends=[]))
+    assert "UCCL" in agent.get_plugin_list(), agent.get_plugin_list()
 
     g = torch.randn(1, 8, 2, 64, device="cuda", requires_grad=True)
     a_log = torch.randn(2, 64, device="cuda", requires_grad=True)

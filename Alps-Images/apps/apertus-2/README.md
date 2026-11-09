@@ -94,12 +94,14 @@ It builds native extensions against that stack.
 | FlashAttention 3 | `3.0.0` | Pinned Hopper source build |
 | FlashInfer Python | `0.6.16.post3` | Matched to the JIT cache |
 | FlashInfer JIT cache | `0.6.16.post3` | Built for this CUDA stack |
+| NIXL | `1.3.2` | `nixl-cu13` with the UCCL plugin only |
 
 | Build group | Target | Default maximum jobs |
 | --- | --- | --- |
 | UCCL, TE and other native builds | Includes SM90 | `8` |
 | FA3 | SM90 | `8`, with two NVCC threads |
 | FlashInfer cache | SM90a | `16`, with one NVCC thread |
+| NIXL | SM90 | `16` |
 
 Mamba 2.3.1 avoids the TVM-FFI dependency conflict in 2.3.2.post1.
 Mamba3 is not included. Mamba uses its upstream CUDA architecture list.
@@ -214,6 +216,10 @@ It also installs the public P2P library and headers, and builds the DeepEP wrapp
 The runtime defaults are `UCCL_EP_TRANSPORT=cxi`, `UCCL_P2P_TRANSPORT=cxi`
 and `UCCL_CXI_THREADING=safe`. Runtime settings can override these values.
 
+NIXL uses upstream commit `de8115ca97d3f8fb63a4988e9b4d4a038b2e0f72`, the same pin as the NeMo-RL image.
+It builds only the UCCL plugin against the UCCL P2P library above.
+`NIXL_PLUGIN_DIR` points to `/usr/local/lib/aarch64-linux-gnu/plugins`, which contains `libplugin_UCCL.so`.
+
 The image preloads the CUDA 13 TorchMemorySaver library.
 Set `LD_PRELOAD=` to disable this hook when it is not needed.
 The TorchMemorySaver smoke test requires the default preload.
@@ -259,8 +265,8 @@ Both targets declare separate CI tests and validation markers:
 - UCCL dispatch/combine on two GH200 nodes with eight tasks.
 
 Both images check TE, Muon scaling and per-channel KDA gate gradients.
-The full image adds Hadamard, FA3, FlashInfer, Mamba, CuPy and
-TorchMemorySaver GPU checks. Its FlashInfer check requires the packaged cache
+The full image adds Hadamard, FA3, FlashInfer, Mamba, CuPy,
+TorchMemorySaver and NIXL UCCL plugin checks. Its FlashInfer check requires the packaged cache
 module to be loaded, not a JIT fallback.
 
 Tests are grouped under `tests/megatron-base/` and `tests/megatron/`.

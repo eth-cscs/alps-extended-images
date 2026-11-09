@@ -13,6 +13,7 @@ export UV_PYTHON_DOWNLOADS=never
 : "${FA3_MAX_JOBS:=8}"
 : "${FA3_PTXAS_OPT:=1}"
 : "${FLASHINFER_CACHE_MAX_JOBS:=16}"
+: "${NIXL_MAX_JOBS:=16}"
 
 uv_install() {
     uv pip install \
@@ -368,6 +369,92 @@ PY
 
         cd /
         rm -rf /tmp/megatron-flashinfer /opt/wheels/flashinfer
+        ;;
+
+    nixl)
+        # The UCCL plugin links the libuccl_p2p installed by the uccl group.
+        test -f /usr/local/lib/libuccl_p2p.so
+        test -f /usr/local/include/uccl_engine.h
+
+        uv_install \
+            "meson==$MESON_VERSION" \
+            "meson-python==$MESON_PYTHON_VERSION"
+
+        uv pip uninstall \
+            --system \
+            --break-system-packages \
+            --python python3 \
+            nixl \
+            nixl-cu12 \
+            nixl-cu13
+
+        checkout_source "$NIXL_REPO" "$NIXL_REF" /tmp/megatron-nixl
+
+        cd /tmp/megatron-nixl
+
+        python3 contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml
+
+        mkdir -p /opt/wheels/nixl
+
+        # The nixl meta wheel is built by an isolated uv build inside meson.
+        CUDA_HOME=/usr/local/cuda \
+            LIBRARY_PATH="/usr/local/lib:${LIBRARY_PATH:-}" \
+            LDFLAGS="-L/usr/local/lib -Wl,-rpath,/usr/local/lib ${LDFLAGS:-}" \
+            uv build \
+                --wheel \
+                --no-build-isolation \
+                --no-cache \
+                --python python3 \
+                --out-dir /opt/wheels/nixl \
+                -Cbuild-dir=/tmp/megatron-nixl-build \
+                -Ccompile-args="-j${NIXL_MAX_JOBS}" \
+                -Csetup-args="-Dlibdir=${NIXL_LIBDIR}" \
+                -Csetup-args=-Denable_plugins=UCCL \
+                -Csetup-args=-Dbuild_tests=false \
+                -Csetup-args=-Dbuild_examples=false \
+                -Csetup-args=-Dinstall_headers=false \
+                -Csetup-args=-Dnixl_cuda_arch_list=90 \
+                -Csetup-args=-Dwheel_variant=cu13 \
+                .
+
+        cp /tmp/megatron-nixl-build/src/bindings/python/nixl-meta/nixl-*.whl \
+            /opt/wheels/nixl/
+
+        test "$(find /opt/wheels/nixl -maxdepth 1 -name 'nixl_cu13-*.whl' | wc -l)" -eq 1
+        test "$(find /opt/wheels/nixl -maxdepth 1 -name 'nixl-*.whl' | wc -l)" -eq 1
+
+        uv_install \
+            --no-deps \
+            /opt/wheels/nixl/nixl_cu13-*.whl \
+            /opt/wheels/nixl/nixl-*.whl
+
+        site_dir="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+        torch_lib_dir="$(python3 -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"
+
+        nixl_plugin="$(find "$site_dir" /usr/local -type f -name libplugin_UCCL.so -print -quit 2>/dev/null)"
+        nixl_lib="$(find "$site_dir" /usr/local -type f -name 'libnixl.so*' -print -quit 2>/dev/null)"
+
+        test -n "$nixl_plugin"
+        test -n "$nixl_lib"
+
+        mkdir -p "$NIXL_PLUGIN_DIR"
+
+        if [[ "$nixl_plugin" != "$NIXL_PLUGIN_DIR/libplugin_UCCL.so" ]]; then
+            ln -sfn "$nixl_plugin" "$NIXL_PLUGIN_DIR/libplugin_UCCL.so"
+        fi
+
+        printf '%s\n%s\n%s\n' \
+            "$torch_lib_dir" \
+            "$(dirname "$nixl_lib")" \
+            "$(dirname "$nixl_plugin")" \
+            > /etc/ld.so.conf.d/98-nixl.conf
+
+        ldconfig
+
+        record_source nixl "$NIXL_REPO" "$NIXL_REF"
+
+        cd /
+        rm -rf /tmp/megatron-nixl /tmp/megatron-nixl-build /opt/wheels/nixl
         ;;
 
     *)

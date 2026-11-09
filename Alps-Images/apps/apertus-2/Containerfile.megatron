@@ -66,6 +66,10 @@ RUN bash /opt/alps/megatron/install-kernels.sh hadamard
 RUN bash /opt/alps/megatron/install-kernels.sh flash-attention-3
 RUN bash /opt/alps/megatron/install-kernels.sh flashinfer
 
+ARG NIXL_MAX_JOBS=16
+ENV NIXL_PLUGIN_DIR=/usr/local/lib/aarch64-linux-gnu/plugins
+RUN bash /opt/alps/megatron/install-kernels.sh nixl
+
 COPY Alps-Images/apps/apertus-2/tests/megatron/ /opt/tests/apertus-2/megatron/
 RUN python3 /opt/tests/apertus-2/megatron/check-stack.py --metadata-only
 
