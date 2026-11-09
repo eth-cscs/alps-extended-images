@@ -120,8 +120,18 @@ cleanup_new_apt_build_deps() {
         return 1
     }
 
+    # Normalize both sides conservatively: any inherited architecture preserves
+    # a requested package, while cleanup receives its original spelling.
+    local installed_package
+    local -A installed_packages=()
+    # read returns failure at EOF; still process a final unterminated line.
+    while IFS= read -r installed_package || [[ -n "$installed_package" ]]; do
+        [[ -n "$installed_package" ]] || continue
+        installed_packages["${installed_package%%:*}"]=1
+    done < "${snapshot_file}"
+
     for pkg in "${packages[@]}"; do
-        if ! grep -Fxq "$pkg" "${snapshot_file}"; then
+        if [[ -z "${installed_packages[${pkg%%:*}]+set}" ]]; then
             cleanup_packages+=("$pkg")
         fi
     done

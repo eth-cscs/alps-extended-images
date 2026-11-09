@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,13 +13,13 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def run_bash(script, *, env=None, check=True):
+def run_bash(script, *, env=None, check=True, cwd=ROOT):
     merged_env = os.environ.copy()
     if env:
         merged_env.update(env)
     result = subprocess.run(
         ["bash", "-c", script],
-        cwd=ROOT,
+        cwd=cwd,
         env=merged_env,
         text=True,
         stdout=subprocess.PIPE,
@@ -245,8 +246,11 @@ def test_skopeo_promote_strict_rejects_different_stable(tmp_path):
     assert "refusing to overwrite" in result.stderr
 
 
-def run_meta(command, *, check=True, **extra_env):
-    return run_bash(f"source ci-pipelines/helpers/skopeo.sh; source ci-pipelines/helpers/meta.sh; {command}", env=meta_env(**extra_env), check=check)
+def run_meta(command, *, check=True, cwd=ROOT, **extra_env):
+    return run_bash(
+        f"source ci-pipelines/helpers/skopeo.sh; source ci-pipelines/helpers/meta.sh; {command}",
+        env=meta_env(**extra_env), check=check, cwd=cwd,
+    )
 
 
 def test_meta_base_refs_return_expected_fields():
@@ -256,10 +260,42 @@ def test_meta_base_refs_return_expected_fields():
     assert len(rocm_fields) == 4
 
 
-def test_meta_app_refs_use_canonical_base_ref():
-    fields = run_meta("app_refs vllm cuda").stdout.split()
-    assert len(fields) == 4
-    assert re.match(r"localhost/alps-images/pytorch-cuda:26\.07-py3-alps7-dev-[0-9a-f]{32}$", fields[0])
+@pytest.mark.parametrize("helper", ["rocm_base_refs pytorch", "write_base_build_env"])
+def test_rocm_base_helpers_preserve_optional_library_variable_scope(tmp_path, helper):
+    variant = "rocm7.14-ubuntu24.04-py3.12-torch2.11"
+    output = tmp_path / "base.env"
+    command = (
+        f"rocm_base_refs pytorch {variant}"
+        if helper == "rocm_base_refs pytorch"
+        else f"write_base_build_env {output} rocm pytorch {variant}"
+    )
+    result = run_meta(
+        f'{command} && printf "\\nLIBRARY_SCOPE=%s,%s\\n" "$ROCM_LIBRARIES_REPO" "$ROCM_LIBRARIES_COMMIT"',
+        ROCM_LIBRARIES_REPO="outer-repo",
+        ROCM_LIBRARIES_COMMIT="outer-commit",
+    )
+
+    assert result.stdout.splitlines()[-1] == "LIBRARY_SCOPE=outer-repo,outer-commit"
+    if output.exists():
+        data = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        profile = f"Alps-Images/ROCm/pytorch-{variant}/profile.env"
+        for key in ("ROCM_LIBRARIES_REPO", "ROCM_LIBRARIES_COMMIT"):
+            assert data[key] == run_meta(f"profile_value {profile} {key}").stdout.strip()
+
+
+@pytest.mark.parametrize(
+    "family,helper,canonical_index",
+    [("cuda", "ngc_base_refs", 3), ("rocm", "rocm_base_refs", 2)],
+)
+def test_meta_app_refs_use_canonical_base_ref(family, helper, canonical_index):
+    base = run_meta(f"profile_value Alps-Images/apps/vllm/profile.env {family.upper()}_BASE_IMAGE").stdout.strip()
+    image, variant = base.split(":", 1)
+    name = image.removesuffix(f"-{family}")
+    canonical = run_meta(f"{helper} {name} {variant}").stdout.split()[canonical_index]
+    fields = run_meta(f"app_refs vllm {family}").stdout.split()
+    assert len(fields) == 5
+    assert fields[0] == canonical
+    assert fields[4] == family
 
 
 def test_meta_parse_base_image_rejects_unsupported_format():
@@ -487,12 +523,387 @@ def test_manual_build_generates_valid_cuda_app_script(tmp_path):
     script = generate_manual("app", "vllm", "cuda", output=tmp_path / "app-cuda.sh")
     assert "Alps-Images/apps/vllm/Containerfile" in script
     assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-cuda:.*-[0-9a-f]{32}"', script)
+    assert '-t "localhost/alps-images/vllm-cuda:alps7-dev" \\' in script
 
 
 def test_manual_build_generates_valid_rocm_app_script(tmp_path):
     script = generate_manual("app", "vllm", "rocm", output=tmp_path / "app-rocm.sh")
     assert "Alps-Images/apps/vllm/Containerfile.rocm" in script
     assert re.search(r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-rocm:.*-[0-9a-f]{32}"', script)
+    assert '-t "localhost/alps-images/vllm-rocm:alps7-dev" \\' in script
+
+
+@pytest.fixture()
+def named_app_root(tmp_path):
+    (tmp_path / "ci-pipelines").symlink_to(ROOT / "ci-pipelines", target_is_directory=True)
+    images = tmp_path / "Alps-Images"
+    images.mkdir()
+    for name in ("NGC", "ROCm", "common", "patches"):
+        (images / name).symlink_to(ROOT / "Alps-Images" / name, target_is_directory=True)
+    app = images / "apps" / "apertus-2"
+    app.mkdir(parents=True)
+    targets = {
+        "megatron-base-cuda": ("pytorch-cuda:25.12-py3", "Containerfile.megatron-base", "tests/megatron-base"),
+        "megatron-cuda": ("pytorch-cuda:26.06-py3", "Containerfile.megatron", "tests/megatron"),
+        "megatron-rocm": (
+            "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13",
+            "Containerfile.megatron.rocm",
+            "tests/rocm",
+        ),
+    }
+    profile = [f'APP_VARIANTS="{" ".join(targets)}"']
+    for target, (base, recipe, test_dir) in targets.items():
+        prefix = target.upper().replace("-", "_")
+        profile.extend([
+            f"{prefix}_BASE_IMAGE={base}",
+            f"{prefix}_CONTAINERFILE={recipe}",
+            f"{prefix}_TEST_DIR={test_dir}",
+        ])
+        (app / recipe).write_text("ARG BASE_IMAGE\nFROM ${BASE_IMAGE}\n")
+        tests = app / test_dir
+        tests.mkdir(parents=True)
+        (tests / "check-stack.py").write_text("assert True\n")
+    (app / "profile.env").write_text("\n".join(profile) + "\n")
+    (app / "ci.yaml").write_text("tests: {}\n")
+    return tmp_path
+
+
+def write_named_target_profile(root, targets):
+    profile = root / "Alps-Images/apps/apertus-2/profile.env"
+    lines = [f'APP_VARIANTS="{" ".join(targets)}"']
+    for target, base in targets.items():
+        prefix = target.upper().replace("-", "_")
+        lines.extend([
+            f"{prefix}_BASE_IMAGE={base}",
+            f"{prefix}_CONTAINERFILE=Containerfile.megatron",
+            f"{prefix}_TEST_DIR=tests/megatron",
+        ])
+    profile.write_text("\n".join(lines) + "\n")
+
+
+def test_meta_named_targets_use_the_selected_base(named_app_root):
+    targets = {
+        "megatron-base-cuda": ("cuda", "ngc_base_refs pytorch 25.12-py3", 3, "Containerfile.megatron-base"),
+        "megatron-cuda": ("cuda", "ngc_base_refs pytorch 26.06-py3", 3, "Containerfile.megatron"),
+        "megatron-rocm": (
+            "rocm",
+            "rocm_base_refs pytorch rocm10.0-ubuntu24.04-py3.12-torch2.13",
+            2,
+            "Containerfile.megatron.rocm",
+        ),
+    }
+    for target, (family, command, ref_index, recipe) in targets.items():
+        output = named_app_root / f"{target}.env"
+        run_meta(f"write_app_build_env {output} apertus-2 {target}", cwd=named_app_root)
+        data = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        base_ref = run_meta(command, cwd=named_app_root).stdout.split()[ref_index]
+        fields = run_meta(f"app_refs apertus-2 {target}", cwd=named_app_root).stdout.split()
+        assert fields == [
+            base_ref, f"Alps-Images/apps/apertus-2/{recipe}",
+            data["CANON_IMAGE_REF"], data["STABLE_IMAGE_REF"], family,
+        ]
+
+        assert data["FAMILY"] == family
+        assert data["VARIANT"] == target
+        assert data["BASE_IMAGE"] == base_ref
+        assert data["DOCKERFILE"] == f"Alps-Images/apps/apertus-2/{recipe}"
+        assert f"apertus-2-{target}:" in data["CANON_IMAGE_REF"]
+        assert data["TESTED_IMAGE_REF"] == f'{data["CANON_IMAGE_REF"]}-tested-{data["VALIDATION_HASH"]}'
+
+
+@pytest.mark.parametrize(
+    "variants",
+    ["megatron-base-cuda megatron_base-cuda", "megatron-stage-cuda megatron_stage-cuda", "megatron-cuda megatron-cuda"],
+)
+@pytest.mark.parametrize("helper", ["app_refs", "app_validation_hash"])
+def test_meta_rejects_colliding_target_prefixes(named_app_root, variants, helper):
+    write_named_target_profile(named_app_root, dict.fromkeys(variants.split(), "pytorch-cuda:26.06-py3"))
+    profile = named_app_root / "Alps-Images/apps/apertus-2/profile.env"
+    lines = profile.read_text().splitlines()
+    lines[0] = f'APP_VARIANTS="{variants}"'
+    profile.write_text("\n".join(lines) + "\n")
+
+    result = run_meta(f"{helper} apertus-2 {variants.split()[0]}", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert "share profile prefix" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["megatron", "megatron-base", "megatron-tpu", "cuda-debug", "-cuda", "megatron.rocm"],
+)
+def test_meta_app_refs_reject_invalid_target_names(named_app_root, target):
+    write_named_target_profile(named_app_root, {target: "pytorch-cuda:26.06-py3"})
+
+    result = run_meta(f"app_refs apertus-2 {target}", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert target in result.stderr
+
+
+@pytest.mark.parametrize("target", [
+    "Megatron-cuda", "MEGATRON-cuda", "megatron-CUDA", "CUDA",
+    "_team-stage-cuda", "_team-stage-rocm",
+    "a_-cuda", "a-_stage-cuda", "a___stage-cuda",
+    "a_-stage-rocm", "a--_stage-rocm",
+])
+@pytest.mark.parametrize("helper", ["app_refs", "app_validation_hash"])
+def test_meta_consumers_reject_invalid_target_syntax(named_app_root, target, helper):
+    base = "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13" if target.endswith("-rocm") else "pytorch-cuda:26.06-py3"
+    write_named_target_profile(named_app_root, {target: base})
+
+    result = run_meta(f"{helper} apertus-2 {target}", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert target in result.stderr
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "cuda-rocm", "rocm-cuda", "cuda-cuda", "rocm-rocm",
+        "cuda-stage-rocm", "rocm-stage-cuda",
+        "team-cuda-stage-rocm", "team-rocm-stage-cuda",
+        "team_cuda-rocm", "team_rocm-cuda",
+    ],
+)
+@pytest.mark.parametrize("helper", ["app_refs", "app_validation_hash"])
+def test_meta_consumers_reject_family_tokens_in_unselected_variant_names(named_app_root, target, helper):
+    family = target.rsplit("-", 1)[-1]
+    base = "pytorch-cuda:26.06-py3" if family == "cuda" else "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"
+    write_named_target_profile(
+        named_app_root,
+        {"megatron-cuda": "pytorch-cuda:26.06-py3", target: base},
+    )
+
+    result = run_meta(f"{helper} apertus-2 megatron-cuda", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert target in result.stderr
+    assert "must not contain cuda or rocm variant components" in result.stderr
+
+
+
+@pytest.mark.parametrize("helper", ["app_refs", "app_validation_hash"])
+def test_meta_consumers_reject_undeclared_target(named_app_root, helper):
+    write_named_target_profile(named_app_root, {"megatron-cuda": "pytorch-cuda:26.06-py3"})
+
+    result = run_meta(f"{helper} apertus-2 megatron-rocm", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "megatron-rocm" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "target,family,base",
+    [
+        ("cuda", "cuda", "pytorch-cuda:26.06-py3"),
+        ("rocm", "rocm", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+        ("team-long-stage-cuda", "cuda", "pytorch-cuda:26.06-py3"),
+        ("team-long-stage-rocm", "rocm", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+        ("cudagraph-rocm", "rocm", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+        ("team_rocmish-cuda", "cuda", "pytorch-cuda:26.06-py3"),
+        ("team__stage-cuda", "cuda", "pytorch-cuda:26.06-py3"),
+        ("team--stage-rocm", "rocm", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+    ],
+)
+def test_meta_build_env_accepts_family_only_and_multi_part_targets(named_app_root, target, family, base):
+    write_named_target_profile(named_app_root, {target: base})
+    output = named_app_root / "build.env"
+
+    run_meta(f"write_app_build_env {output} apertus-2 {target}", cwd=named_app_root)
+
+    data = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert data["VARIANT"] == target
+    assert data["FAMILY"] == family
+    assert f"/pytorch-{family}:" in data["BASE_IMAGE"]
+    assert f"/apertus-2-{target}:" in data["CANON_IMAGE_REF"]
+    assert data["VALIDATION_HASH"]
+    assert data["TESTED_IMAGE_REF"] == f'{data["CANON_IMAGE_REF"]}-tested-{data["VALIDATION_HASH"]}'
+
+
+@pytest.mark.parametrize(
+    "helper,target,base",
+    [
+        ("app_refs", "stage-rocm", "pytorch-cuda:26.06-py3"),
+        ("app_refs", "cuda", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+        ("app_validation_hash", "stage-cuda", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"),
+        ("app_validation_hash", "rocm", "pytorch-cuda:26.06-py3"),
+    ],
+)
+def test_meta_consumers_reject_mismatches_in_unselected_targets(named_app_root, helper, target, base):
+    write_named_target_profile(
+        named_app_root,
+        {"megatron-cuda": "pytorch-cuda:26.06-py3", target: base},
+    )
+
+    result = run_meta(f"{helper} apertus-2 megatron-cuda", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert target in result.stderr
+    assert base in result.stderr
+
+
+@pytest.mark.parametrize(
+    "target,base,error",
+    [
+        ("Megatron-rocm", "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13", "must match"),
+        ("megatron-rocm", "", "MEGATRON_ROCM_BASE_IMAGE must be set"),
+        ("megatron-rocm", "pytorch:plain", "expected BASE_IMAGE"),
+    ],
+)
+def test_meta_build_env_rejects_malformed_unselected_declarations(named_app_root, target, base, error):
+    write_named_target_profile(
+        named_app_root,
+        {"megatron-cuda": "pytorch-cuda:26.06-py3", target: base},
+    )
+    output = named_app_root / "build.env"
+
+    result = run_meta(f"write_app_build_env {output} apertus-2 megatron-cuda", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert error in result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("failure", ["base-family-mismatch", "missing-validation-input"])
+def test_meta_write_app_build_env_propagates_failures(named_app_root, failure):
+    if failure == "base-family-mismatch":
+        write_named_target_profile(
+            named_app_root,
+            {"megatron-cuda": "pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13"},
+        )
+    else:
+        (named_app_root / "Alps-Images/apps/apertus-2/ci.yaml").unlink()
+    output = named_app_root / "build.env"
+
+    result = run_meta(f"write_app_build_env {output} apertus-2 megatron-cuda", cwd=named_app_root, check=False)
+
+    assert result.returncode != 0
+    assert result.stderr
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "target,recipe,test_dir",
+    [
+        ("megatron-base-cuda", "Containerfile.megatron-base", "tests/megatron-base"),
+        ("megatron-cuda", "Containerfile.megatron", "tests/megatron"),
+        ("megatron-rocm", "Containerfile.megatron.rocm", "tests/rocm"),
+    ],
+)
+def test_megatron_hashes_use_the_selected_recipe_and_test_group(named_app_root, target, recipe, test_dir):
+    app = named_app_root / "Alps-Images/apps/apertus-2"
+    targets = ("megatron-base-cuda", "megatron-cuda", "megatron-rocm")
+    refs = {name: run_meta(f"app_refs apertus-2 {name}", cwd=named_app_root).stdout for name in targets}
+    validations = {
+        name: run_meta(f"app_validation_hash apertus-2 {name}", cwd=named_app_root).stdout
+        for name in targets
+    }
+    for relative in (recipe, f"{test_dir}/check-stack.py"):
+        path = app / relative
+        original = path.read_text()
+        path.write_text(original + "\n# Changed hash input.\n")
+        for name in targets:
+            current_ref = run_meta(f"app_refs apertus-2 {name}", cwd=named_app_root).stdout
+            current_validation = run_meta(f"app_validation_hash apertus-2 {name}", cwd=named_app_root).stdout
+            assert (current_ref != refs[name]) == (name == target)
+            assert (current_validation != validations[name]) == (name == target and relative.startswith("tests/"))
+        path.write_text(original)
+
+
+@pytest.mark.parametrize(
+    "source,affected",
+    [
+        ("shared.sh", {"megatron-base-cuda", "megatron-cuda", "megatron-rocm"}),
+        ("base.sh", {"megatron-base-cuda"}),
+        ("cuda.sh", {"megatron-cuda"}),
+        ("rocm.sh", {"megatron-rocm"}),
+        ("unused.sh", set()),
+    ],
+)
+def test_named_target_source_lists_hash_only_selected_inputs(named_app_root, source, affected):
+    app = named_app_root / "Alps-Images/apps/apertus-2"
+    sources = app / "sources"
+    sources.mkdir()
+    for name in ("shared.sh", "base.sh", "cuda.sh", "rocm.sh", "unused.sh"):
+        (sources / name).write_text(f"# {name}\n")
+    profile = app / "profile.env"
+    profile.write_text(
+        profile.read_text()
+        + "COMMON_SOURCE_FILES=sources/shared.sh\n"
+        + "MEGATRON_BASE_CUDA_SOURCE_FILES=sources/base.sh\n"
+        + "MEGATRON_CUDA_SOURCE_FILES=sources/cuda.sh\n"
+        + "MEGATRON_ROCM_SOURCE_FILES=sources/rocm.sh\n"
+    )
+    targets = ("megatron-base-cuda", "megatron-cuda", "megatron-rocm")
+    before = {target: run_meta(f"app_refs apertus-2 {target}", cwd=named_app_root).stdout for target in targets}
+    (sources / source).write_text("# changed source\n")
+
+    for target in targets:
+        after = run_meta(f"app_refs apertus-2 {target}", cwd=named_app_root).stdout
+        assert (after != before[target]) == (target in affected)
+
+
+def test_named_target_hashes_use_effective_selected_profile_values(named_app_root):
+    app = named_app_root / "Alps-Images/apps/apertus-2"
+    profile = app / "profile.env"
+    original = profile.read_text()
+    command = "app_refs apertus-2 megatron-cuda"
+    before = run_meta(command, cwd=named_app_root).stdout
+    profile.write_text(
+        original.replace(
+            'APP_VARIANTS="megatron-base-cuda megatron-cuda megatron-rocm"',
+            'APP_VARIANTS="megatron-rocm megatron-cuda"',
+        ).replace(
+            "MEGATRON_CUDA_CONTAINERFILE=Containerfile.megatron",
+            "COMMON_CONTAINERFILE=Containerfile.megatron",
+        ).replace(
+            "MEGATRON_ROCM_BASE_IMAGE=pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13",
+            "MEGATRON_ROCM_BASE_IMAGE=pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11",
+        )
+    )
+
+    assert run_meta(command, cwd=named_app_root).stdout == before
+    profile.write_text(
+        profile.read_text().replace(
+            "MEGATRON_CUDA_BASE_IMAGE=pytorch-cuda:26.06-py3",
+            "MEGATRON_CUDA_BASE_IMAGE=pytorch-cuda:25.12-py3",
+        )
+    )
+    assert run_meta(command, cwd=named_app_root).stdout != before
+
+
+def test_named_target_recursive_sources_exclude_transients_and_cover_dockerignore(named_app_root):
+    app = named_app_root / "Alps-Images/apps/apertus-2"
+    sources = app / "sources"
+    sources.mkdir()
+    nested = sources / "nested"
+    nested.mkdir()
+    source = nested / "install.sh"
+    source.write_text("# source\n")
+    dockerignore = named_app_root / ".dockerignore"
+    dockerignore.write_text(".git\n__pycache__\n")
+    command = "app_refs apertus-2 megatron-cuda"
+    before = run_meta(command, cwd=named_app_root).stdout
+    for directory in (".git", "__pycache__", ".pytest_cache"):
+        transient = sources / directory
+        transient.mkdir()
+        (transient / "generated").write_text("cache\n")
+    for name in ("install.pyc", "install.pyo", "install.sh.swp", "install.sh.swo", "install.sh~"):
+        (nested / name).write_text("transient\n")
+
+    assert run_meta(command, cwd=named_app_root).stdout == before
+    source.write_text("# changed source\n")
+    changed_source = run_meta(command, cwd=named_app_root).stdout
+    assert changed_source != before
+    dockerignore.write_text(dockerignore.read_text() + ".pytest_cache\n")
+    assert run_meta(command, cwd=named_app_root).stdout != changed_source
 
 
 def source_rocm(command):
@@ -618,12 +1029,179 @@ def test_rocm_sdk_source_pins_explicitly_allow_missing_devel(tmp_path):
     assert "devel=no" in result.stdout
 
 
-def test_rocm_build_prefix_order_does_not_change_runtime_order():
-    env = {"ROCM_CORE_PREFIX": "/wheel/core", "ROCM_LIBRARIES_PREFIX": "/wheel/libraries", "ROCM_DEVEL_PREFIX": "/wheel/devel"}
-    runtime = run_bash(source_rocm("rocm_sdk_prefix_candidates"), env=env).stdout.splitlines()
-    build = run_bash(source_rocm("rocm_sdk_prefix_candidates build"), env=env).stdout.splitlines()
-    assert runtime[:3] == ["/wheel/core", "/wheel/libraries", "/opt/rocm"]
-    assert build[:4] == ["/wheel/core", "/wheel/libraries", "/wheel/devel", "/opt/rocm"]
+@pytest.fixture
+def miopen_headers_runtime(tmp_path):
+    compiler = shutil.which("cc")
+    if compiler is None:
+        pytest.skip("C compiler required for the MIOpen runtime ABI fixture")
+    source = tmp_path / "sources"
+    project = source / "projects/miopen"
+    headers = project / "include/miopen"
+    headers.mkdir(parents=True)
+    (project / "CMakeLists.txt").write_text("rocm_setup_version(VERSION 3.6.0)\n")
+    (headers / "miopen.h").write_text("/* public C API */\n")
+    (headers / "config.h.in").write_text("/* upstream build configuration */\n")
+    (headers / "version.h.in").write_text("".join(
+        f"#define MIOPEN_VERSION_{name} @MIOpen_VERSION_{name}@\n"
+        for name in ("MAJOR", "MINOR", "PATCH", "TWEAK")
+    ))
+    sdk = tmp_path / "sdk"
+    (sdk / "lib").mkdir(parents=True)
+    runtime = tmp_path / "miopen.c"
+    runtime.write_text(
+        "#include <stddef.h>\n"
+        "int miopenGetVersion(size_t *major, size_t *minor, size_t *patch) {\n"
+        "    *major = 3; *minor = 6; *patch = 0; return 0;\n"
+        "}\n"
+    )
+    subprocess.run([compiler, "-shared", "-fPIC", str(runtime), "-o", str(sdk / "lib/libMIOpen.so.1")], check=True)
+    env = {"SOURCE": str(source), "SDK": str(sdk), "ROCM_PYTHON": sys.executable,
+           "ROCM_CORE_PREFIX": str(sdk), "ROCM_LIBRARIES_PREFIX": str(sdk)}
+    return project, sdk, env
+
+
+@pytest.mark.parametrize("declaration", [
+    "rocm_setup_version(VERSION 3.6.0)",
+    'rocm_setup_version ( VERSION "3.6.0" )',
+    'ROCM_SETUP_VERSION(\\n\\tVERSION\\t"3.6.0"\\n)',
+])
+def test_miopen_public_headers_accept_cmake_version_layouts(miopen_headers_runtime, declaration):
+    project, sdk, env = miopen_headers_runtime
+    (project / "CMakeLists.txt").write_text(declaration.replace("\\n", "\n").replace("\\t", "\t") + "\n")
+    run_bash(source_rocm('install_rocm_miopen_headers "$SOURCE" "$SDK"'), env=env)
+    headers = sdk / "include/miopen"
+    assert {path.name for path in headers.iterdir()} == {"miopen.h", "config.h", "export.h", "version.h"}
+    version = (headers / "version.h").read_text()
+    assert "#define MIOPEN_VERSION_MAJOR 3\n" in version
+    assert "#define MIOPEN_VERSION_MINOR 6\n" in version
+    assert "@" not in version
+
+
+@pytest.mark.parametrize("failure", ["missing-runtime", "version-mismatch", "private-header", "private-directory"])
+def test_miopen_public_headers_refuse_invalid_payloads(miopen_headers_runtime, failure):
+    project, sdk, env = miopen_headers_runtime
+    if failure == "missing-runtime":
+        (sdk / "lib/libMIOpen.so.1").unlink()
+    elif failure == "version-mismatch":
+        (project / "CMakeLists.txt").write_text('rocm_setup_version ( VERSION "3.7.0" )\n')
+    elif failure == "private-header":
+        (project / "include/miopen/internal.hpp").write_text("/* private */\n")
+    else:
+        (project / "include/miopen/internal").mkdir()
+    result = run_bash(source_rocm('install_rocm_miopen_headers "$SOURCE" "$SDK"'), env=env, check=False)
+    assert result.returncode != 0
+    assert not (sdk / "include/miopen").exists()
+    if failure == "missing-runtime":
+        assert str(sdk / "lib/libMIOpen.so.1") in result.stderr
+        assert "OSError" not in result.stderr
+    elif failure == "version-mismatch":
+        assert "(3, 7, 0)" in result.stderr and "(3, 6, 0)" in result.stderr
+    else:
+        assert ("internal.hpp" if failure == "private-header" else "internal") in result.stderr
+
+
+def test_rocm_build_prefix_uses_development_view_without_reordering_runtime_libraries(tmp_path):
+    core = tmp_path / "core"
+    libraries = tmp_path / "libraries"
+    devel = tmp_path / "devel"
+    # A runtime tree may have enough HIP/HSA files to pass the discovery
+    # probes, but extension builds still need the complete development view.
+    for prefix in (core, devel):
+        for header in (
+            "hip/hip_runtime_api.h", "hip/hip_runtime.h", "hip/hip_version.h",
+            "hsa/hsa.h", "hsa/hsa_ext_amd.h",
+        ):
+            path = prefix / "include" / header
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("/* public header */\n")
+        (prefix / "lib").mkdir()
+        for name in ("libamdhip64.so", "libhsa-runtime64.so", "libhsakmt.so"):
+            (prefix / "lib" / name).write_text("runtime")
+    (libraries / "lib").mkdir(parents=True)
+    (libraries / "lib" / "librccl.so").write_text("runtime")
+    env = {
+        "ROCM_CORE_PREFIX": str(core),
+        "ROCM_LIBRARIES_PREFIX": str(libraries),
+        "ROCM_DEVEL_PREFIX": str(devel),
+        "ROCM_CORE_DIR": str(core),
+        "ROCM_LIBRARIES_DIR": str(libraries),
+        "ROCM_DEVEL_DIR": str(devel),
+        "ROCM_SDK_ROOT": str(devel),
+        "ROCM_SDK_BIN": str(devel / "bin"),
+        "ROCM_SDK_CMAKE": str(devel / "lib/cmake"),
+        "ROCM_PYTHON": sys.executable,
+        "ROCM_SDK": str(devel / "bin/rocm-sdk"),
+    }
+    selected = run_bash(source_rocm("discover_rocm_build_prefix"), env=env)
+    assert Path(selected.stdout.strip()) == devel
+    runtime_dirs = run_bash(source_rocm("rocm_sdk_ldconfig_dirs"), env=env).stdout.splitlines()
+    assert runtime_dirs.index(str(core / "lib")) < runtime_dirs.index(str(devel / "lib"))
+    assert runtime_dirs.index(str(libraries / "lib")) < runtime_dirs.index(str(devel / "lib"))
+    # Simulate bootstrap's selection, persist it, then load it in a fresh shell.
+    alps_env = tmp_path / "env"
+    component = tmp_path / "components.sh"
+    component.write_text(
+        (ROOT / "Alps-Images/ROCm/install-alps-rocm-components.sh").read_text()
+        .replace("/opt/alps/env", str(alps_env))
+    )
+    run_bash(
+        f'set -eu; source "{component}"; '
+        'ROCM_BUILD_PREFIX="$(discover_rocm_build_prefix)"; persist_rocm_sdk_env',
+        env=env,
+    )
+    loaded = run_bash(
+        f'set -eu; source "{component}"; unset ROCM_BUILD_PREFIX; load_rocm_sdk_env; '
+        'printf "%s\\n" "$ROCM_BUILD_PREFIX" "$ROCM_HOME" "$ROCM_PATH" "$HIP_PATH"',
+        env=env,
+    )
+    assert loaded.stdout.splitlines() == [str(devel)] * 4
+
+
+def test_vllm_rocm_build_setup_preserves_runtime_linker_order(tmp_path):
+    core = tmp_path / "z-core"
+    libraries = tmp_path / "zz-libraries"
+    devel = tmp_path / "a-devel"
+    for prefix in (core, libraries, devel):
+        (prefix / "lib").mkdir(parents=True)
+        runtime = "libamdhip64.so.7" if prefix == core else "librccl.so.1"
+        (prefix / "lib" / runtime).write_text("runtime")
+        (prefix / "blas").mkdir()
+        (prefix / "blas" / "librocm-openblas.so.0").write_text("openblas")
+    alps = tmp_path / "alps"
+    (alps / "env").mkdir(parents=True)
+    (alps / "env" / "alps-rocm-build.env").write_text(
+        f"export ROCM_CORE_PREFIX={core}\n"
+        f"export ROCM_LIBRARIES_PREFIX={libraries}\n"
+        f"export ROCM_DEVEL_PREFIX={devel}\n"
+        f"export ROCM_BUILD_PREFIX={devel}\n"
+    )
+    (alps / "package-helpers.sh").write_text(
+        'snapshot_apt_packages() { printf "inherited:amd64\\n" > "$1"; }\n'
+        "apt_get() { :; }\n"
+    )
+    (alps / "install-alps-hpc-stack.sh").write_text("")
+    (alps / "install-alps-rocm-components.sh").write_text(
+        (ROOT / "Alps-Images/ROCm/install-alps-rocm-components.sh").read_text()
+        .replace("/opt/rocm", str(tmp_path / "compat"))
+    )
+    ldconfig = tmp_path / "ldconfig"
+    ldconfig.mkdir()
+    # Relocate container filesystem paths only; execute the real setup and SDK
+    # discovery functions, with package installation isolated from the host.
+    helper = tmp_path / "build-rocm-env.sh"
+    helper.write_text(
+        (ROOT / "Alps-Images/apps/vllm/sources/build-rocm-env.sh").read_text()
+        .replace("/opt/alps", str(alps))
+        .replace("/etc/ld.so.conf.d", str(ldconfig))
+        .replace("/tmp/vllm-apt-before.txt", str(tmp_path / "apt-before.txt"))
+        .replace("/var/lib/apt/lists", str(tmp_path / "apt-lists"))
+    )
+    run_bash(f'set -euo pipefail; source "{helper}"; vllm_build_begin')
+    runtime_dirs = (ldconfig / "99-alps-vllm-rocm-sdk.conf").read_text().splitlines()
+    assert runtime_dirs == [
+        str(core / "lib"), str(libraries / "lib"), str(devel / "lib"),
+        str(core / "blas"), str(libraries / "blas"), str(devel / "blas"),
+    ]
 
 
 def test_rocm_714_rccl_test_sources_remain_unchanged(tmp_path):
@@ -721,6 +1299,199 @@ def test_rocm_sdk_refuses_mismatched_preinstalled_wheels(tmp_path, mismatch):
     result = run_bash(source_rocm("install_rocm_sdk_wheels"), env=env, check=False)
     assert result.returncode != 0
     assert f"Incompatible {mismatch}: installed 7.13.0, expected ROCm 7.14.0" in result.stderr
+
+
+def fake_apt_cleanup_env(tmp_path):
+    status = tmp_path / "status"
+    status.write_text(
+        "\n".join(
+            f"Package: {name}\nStatus: install ok installed\n"
+            f"Architecture: {architecture}\nVersion: 1.0\n"
+            f"{dependencies}Description: isolated cleanup regression fixture\n"
+            for name, architecture, dependencies in (
+                ("libnuma-dev", "amd64", ""),
+                ("libnuma-dev", "arm64", ""),
+                ("cmake", "amd64", ""),
+                ("ninja-build", "amd64", "Depends: build-support\n"),
+                ("build-support", "amd64", ""),
+                ("libtool", "amd64", ""),
+                ("libtool", "arm64", ""),
+                ("libibverbs1", "amd64", ""),
+            )
+        )
+    )
+    apt_lists = tmp_path / "apt-lists"
+    apt_lists.mkdir()
+    (apt_lists / "packages").write_text("isolated APT cache")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    command = bin_dir / "fake-apt"
+    command.write_text(
+        f"#!{sys.executable}\n"
+        r"""
+import os
+import sys
+from pathlib import Path
+
+status = Path(os.environ["FAKE_DPKG_STATUS"])
+packages = [
+    dict(line.split(": ", 1) for line in stanza.splitlines())
+    for stanza in status.read_text().strip().split("\n\n")
+    if stanza
+]
+args = sys.argv[1:]
+command = Path(sys.argv[0]).name
+
+def key(package):
+    return package["Package"] + ":" + package["Architecture"]
+
+def matches(package, requested):
+    return key(package) == requested if ":" in requested else package["Package"] == requested
+
+def save():
+    status.write_text("".join(
+        "".join(f"{field}: {value}\n" for field, value in package.items()) + "\n"
+        for package in packages
+    ))
+
+if command == "dpkg-query":
+    assert args[:2] == ["-W", "-f=${db:Status-Abbrev}\\n"], args
+    found = [package for package in packages if matches(package, args[2])]
+    for package in found:
+        print("hi " if package["Status"].startswith("hold ") else "ii ")
+    raise SystemExit(0 if found else 1)
+elif command == "apt-mark":
+    assert args[0] in ("hold", "unhold"), args
+    for requested in args[1:]:
+        found = [package for package in packages if matches(package, requested)]
+        assert found, requested
+        for package in found:
+            package["Status"] = ("hold" if args[0] == "hold" else "install") + " ok installed"
+    save()
+elif command == "apt-get":
+    if args[:3] == ["remove", "--purge", "-y"]:
+        removed = [package for package in packages if any(matches(package, requested) for requested in args[3:])]
+        assert not any(package["Status"].startswith("hold ") for package in removed)
+        packages = [package for package in packages if package not in removed]
+    elif args == ["autoremove", "-y"]:
+        needed = {
+            dependency.strip()
+            for package in packages
+            for dependency in package.get("Depends", "").split(",")
+            if dependency.strip()
+        }
+        automatic = set(os.environ["FAKE_APT_AUTOMATIC"].split())
+        packages = [
+            package for package in packages
+            if key(package) not in automatic
+            or package["Package"] in needed
+            or package["Status"].startswith("hold ")
+        ]
+    else:
+        raise AssertionError(args)
+    save()
+elif command == "rm":
+    # Redirect the real helper's absolute APT-cache cleanup to the fixture.
+    assert args[0] == "-rf" and all(path.startswith("/var/lib/apt/lists/") for path in args[1:]), args
+    for entry in Path(os.environ["FAKE_APT_LISTS"]).iterdir():
+        entry.unlink()
+else:
+    raise AssertionError(command)
+"""
+    )
+    command.chmod(0o755)
+    for name in ("dpkg-query", "apt-get", "apt-mark", "rm"):
+        (bin_dir / name).symlink_to(command.name)
+    return {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_DPKG_STATUS": str(status),
+        "FAKE_APT_LISTS": str(apt_lists),
+        "FAKE_APT_AUTOMATIC": "build-support:amd64 libibverbs1:amd64",
+        "APT_CLEANUP_HOLD_PACKAGES": "libibverbs1",
+    }, status, apt_lists
+
+
+def read_fake_apt_status(status):
+    packages = [
+        dict(line.split(": ", 1) for line in stanza.splitlines())
+        for stanza in status.read_text().strip().split("\n\n")
+        if stanza
+    ]
+    return {
+        f"{package['Package']}:{package['Architecture']}": package["Status"]
+        for package in packages
+    }
+
+
+@pytest.mark.parametrize("snapshot_package", ["libnuma-dev", "libnuma-dev:amd64", "libnuma-dev:arm64"])
+@pytest.mark.parametrize("requested_package", ["libnuma-dev", "libnuma-dev:amd64", "libnuma-dev:arm64"])
+@pytest.mark.parametrize("final_newline", [True, False])
+def test_new_build_dependency_cleanup_preserves_inherited_multiarch_packages(
+    tmp_path, snapshot_package, requested_package, final_newline
+):
+    env, status, apt_lists = fake_apt_cleanup_env(tmp_path)
+    snapshot = tmp_path / "packages-before.txt"
+    snapshot.write_text(f"cmake\n\n{snapshot_package}" + ("\n" if final_newline else ""))
+    env.update({"SNAPSHOT_FILE": str(snapshot), "REQUESTED_PACKAGE": requested_package})
+
+    run_bash(
+        """
+source Alps-Images/common/package-helpers.sh
+cleanup_new_apt_build_deps "$SNAPSHOT_FILE" "$REQUESTED_PACKAGE" cmake ninja-build libtool:amd64
+""",
+        env=env,
+    )
+
+    assert read_fake_apt_status(status) == {
+        "libnuma-dev:amd64": "install ok installed",
+        "libnuma-dev:arm64": "install ok installed",
+        "cmake:amd64": "install ok installed",
+        # Keeping the other architecture proves qualified cleanup was not broadened.
+        "libtool:arm64": "install ok installed",
+        # Autoremove must respect the temporary hold, which cleanup then releases.
+        "libibverbs1:amd64": "install ok installed",
+    }
+    assert not list(apt_lists.iterdir())
+
+
+def test_new_build_dependency_cleanup_does_nothing_when_all_requests_are_inherited(tmp_path):
+    env, status, apt_lists = fake_apt_cleanup_env(tmp_path)
+    snapshot = tmp_path / "packages-before.txt"
+    snapshot.write_text("cmake\nlibnuma-dev")
+    env["SNAPSHOT_FILE"] = str(snapshot)
+    before = status.read_text()
+
+    run_bash(
+        """
+source Alps-Images/common/package-helpers.sh
+cleanup_new_apt_build_deps "$SNAPSHOT_FILE" libnuma-dev:amd64 cmake
+""",
+        env=env,
+    )
+
+    assert status.read_text() == before
+    assert (apt_lists / "packages").read_text() == "isolated APT cache"
+
+
+def test_new_build_dependency_cleanup_refuses_missing_snapshot_without_mutating_packages(tmp_path):
+    env, status, apt_lists = fake_apt_cleanup_env(tmp_path)
+    snapshot = tmp_path / "missing-snapshot.txt"
+    env["SNAPSHOT_FILE"] = str(snapshot)
+    before = status.read_text()
+
+    result = run_bash(
+        """
+source Alps-Images/common/package-helpers.sh
+cleanup_new_apt_build_deps "$SNAPSHOT_FILE" libnuma-dev:amd64 ninja-build
+""",
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert f"ERROR: missing apt package snapshot: {snapshot}" in result.stderr
+    assert status.read_text() == before
+    assert (apt_lists / "packages").read_text() == "isolated APT cache"
 
 
 def test_exact_build_package_purge_refuses_reverse_dependency_removal(tmp_path):
