@@ -137,11 +137,19 @@ The report distinguishes bookkeeping events such as `step_start` from `tool_use`
 Tool-result counts use fixed tool names and status labels, with unknown values reported as `other`.
 Code Mode errors and nonzero shell exits count as errors even when OpenCode marks the call `completed`.
 A final event summary is printed when the process exits, including failed or interrupted runs.
+After an OpenCode error, summaries also include its HTTP status and timeout classification; the error message stays in the diagnostic artifact.
 Reports continue when no output arrives, but do not prove that an inference request is making progress.
-CI diagnostics use fixed labels, counts, and statuses; raw source, model content, credentials, tool arguments, tool errors, and tool output are not printed.
+CI log summaries use fixed labels, counts, and statuses; error messages, raw source, model content, credentials, tool arguments, and tool output are not printed.
 Raw events and stderr stay in private runner files (`events.jsonl` and `events.stderr.log`), not CI logs or artifacts.
 The host writes sanitized counters, phase labels, elapsed time, exit status, and cleanup outcomes to `events.diagnostics.json`.
+The diagnostic file also retains the eight most recent OpenCode error details: phase, error type, HTTP status, timeout classification, and a message excerpt of at most 1,024 characters.
+Timeout classifications reflect explicit error details or HTTP 408/504, not elapsed time or silence.
+Known host credentials, their JSON-escaped and URL-encoded forms, and common credential assignments are redacted before excerpts are truncated.
+Error excerpts contain provider or CLI text; credential masking is not a guarantee that arbitrary sensitive content is removed.
+Structured response bodies, headers, stack traces, and raw stderr are not included.
+The `message_truncated` flag identifies shortened excerpts, and the total error count remains available when older details have been discarded.
 The workflow adds review and extraction outcomes and uploads a separate `opencode-review-diagnostics` artifact, including when extraction fails.
+When a run fails, inspect the `errors` array in that artifact before changing token, iteration, or time budgets.
 The CLI uses `--thinking` to include provider-exposed reasoning in the private event stream.
 Reasoning is excluded from the published review.
 Missing reasoning events do not prove that the model generated no reasoning.

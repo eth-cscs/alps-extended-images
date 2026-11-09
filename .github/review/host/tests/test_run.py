@@ -190,6 +190,97 @@ def test_progress_summarizes_final_errors_without_exposing_unknown_fields(tmp_pa
     assert "private" not in progress
 
 
+@pytest.mark.parametrize(("error", "status", "timeout"), [
+    ({"type": "provider.transport", "status": 200,
+      "message": "Timed out waiting for the response to complete"}, 200, "response_complete"),
+    ({"type": "provider.transport",
+      "message": "Timed out waiting for response headers"}, None, "response_headers"),
+    ({"type": "provider.transport", "message": "Response chunk timeout"}, None, "response_chunk"),
+    ({"type": "TimeoutError", "message": "Request failed"}, None, "unspecified"),
+    ({"type": "provider.api", "status": 504}, 504, "http_status"),
+    ({"type": "provider.api", "status": 413, "message": "Request too large"}, 413, "not_reported"),
+    ({"type": "provider.api", "status": 503, "message": "Unavailable"}, 503, "not_reported"),
+    ({"type": [], "status": True, "message": {}}, None, "not_reported"),
+    (None, None, "not_reported"),
+])
+def test_error_diagnostics_distinguish_timeouts_and_http_failures(
+        tmp_path, runner, capsys, error, status, timeout):
+    diagnostic = {}
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        for event in [
+            {"type": "review_phase", "phase": "inspection", "state": "start"},
+            {"type": "error", "error": error},
+        ]:
+            os.write(output.fileno(), json.dumps(event).encode() + b"\n")
+        stopped = runner.threading.Event()
+        stopped.set()
+        runner._report_progress(output, stopped, runner.time.monotonic(), diagnostic)
+    detail, = diagnostic["errors"]
+    assert detail["phase"] == "inspection"
+    assert detail["http_status"] == status
+    assert detail["timeout"] == timeout
+    assert diagnostic["events"]["error"] == 1
+    progress = capsys.readouterr().out
+    assert "provider.transport" not in progress
+    assert f"last_error_http_status={status or 'unknown'}" in progress
+    assert f"last_error_timeout={timeout}" in progress
+
+
+def test_error_artifact_redacts_credentials_before_truncation(
+        tmp_path, runner, monkeypatch, capsys):
+    secret = 'inference-key/"with spaces'
+    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", secret)
+    marker = "UNRETAINED_RESPONSE_PAYLOAD"
+    message = (
+        f"{secret} {json.dumps(secret)[1:-1]} {runner.quote(secret, safe='')} "
+        f"{runner.quote_plus(secret, safe='')} "
+        'Authorization: Bearer unknown-bearer-value; {"apiKey": "unknown-api-value"} '
+        "password='unknown password value'; https://user:unknown-url-value@example.invalid "
+        "Bearer standalone-value\n"
+    )
+    diagnostic = {}
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        # A separate message places a secret across the output boundary.
+        for text in (message, "x" * 1020 + secret + " trailing detail"):
+            event = {"type": "error", "error": {
+                "type": f"provider.{secret}", "message": text, "status": 500,
+                "responseBody": marker, "headers": {"Authorization": marker},
+            }}
+            os.write(output.fileno(), json.dumps(event).encode() + b"\n")
+        stopped = runner.threading.Event()
+        stopped.set()
+        runner._report_progress(output, stopped, runner.time.monotonic(), diagnostic)
+    path = tmp_path / "events.diagnostics.json"
+    runner._write_diagnostic(path, diagnostic)
+    raw = path.read_text()
+    detail, boundary = json.loads(raw)["errors"]
+    assert detail["type"] == "provider.[REDACTED]"
+    assert detail["message_truncated"] is False
+    assert boundary["message_truncated"] is True
+    assert len(boundary["message"]) == 1024
+    assert "[REDACTED]" in detail["message"]
+    for forbidden in (secret, "inference-key", "unknown-bearer-value", "unknown-api-value",
+                      "unknown password value", "unknown-url-value", "standalone-value", marker):
+        assert forbidden not in raw
+    assert path.stat().st_mode & 0o777 == 0o600
+    progress = capsys.readouterr().out
+    assert "provider." not in progress and "REDACTED" not in progress
+
+
+def test_error_diagnostics_keep_recent_failures_with_bounded_storage(tmp_path, runner):
+    diagnostic = {}
+    with (tmp_path / "events.jsonl").open("w+b") as output:
+        for status in range(500, 510):
+            event = {"type": "error", "error": {"type": "provider.api", "status": status}}
+            os.write(output.fileno(), json.dumps(event).encode() + b"\n")
+        stopped = runner.threading.Event()
+        stopped.set()
+        runner._report_progress(output, stopped, runner.time.monotonic(), diagnostic)
+    assert diagnostic["events"]["error"] == 10
+    assert [detail["http_status"] for detail in diagnostic["errors"]] == list(range(502, 510))
+
+
+
 @pytest.mark.parametrize(("tool", "state", "result"), [
     ("read", {"status": "completed"}, "read/completed"),
     ("read", {"status": "error"}, "read/error"),
