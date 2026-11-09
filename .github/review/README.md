@@ -31,6 +31,10 @@ These instructions guide the review but do not guarantee coverage or finding qua
 - The `acknowledge` job adds a 👀 reaction to an accepted request before review preparation starts.
   The reaction confirms acceptance, not successful completion.
   A reaction API error stops the review before inference.
+- The `report-status` job adds a 😕 (`confused`) reaction to the request if acknowledgement, review, or publication fails, including a review timeout.
+  A successful retry removes only the workflow's failure reaction; other users' reactions and the acceptance reaction are preserved.
+  Cancellation, including replacement by a newer request, does not add a failure reaction.
+  Reaction updates depend on GitHub API access and may themselves fail.
 - Each request selects the current head of an open PR through the GitHub API.
   Context includes PR metadata, the full merge-base diff, prior bot and human reviews, conversation comments, and inline threads with all replies.
   The diff starts at the merge base of the PR head and its target branch.
@@ -101,9 +105,9 @@ That path marks inspection incomplete; other inspection failures and any finaliz
 - The [review workflow](../workflows/opencode-review.yml) runs an `authorize` job to validate the command and check the requester's repository write access.
   Conversation-comment events load this workflow from the repository's default branch, currently `main`.
 - Authorized requests call the [reusable worker](../workflows/opencode-review-worker.yml) from `main`.
-  Its `acknowledge` job adds the reaction, `review` prepares context and runs the reviewer, and `publish` posts the findings.
-  The reaction job has `issues: write` permission, and the publisher has `pull-requests: write` permission.
-  Neither job runs the model or receives the inference key.
+  Its `acknowledge` job accepts the request, `review` prepares context and runs the reviewer, `publish` posts the findings, and `report-status` updates the failure reaction.
+  The reaction and publication jobs have `pull-requests: write` permission.
+  These write-enabled jobs neither run the model nor receive the inference key.
 - The `authorize` and `review` jobs each check out the default branch into `default-branch/` and execute helpers from its `.github/review/host/` directory.
   The validated PR-head checkout is separate, in `pr-source/`.
 - The [image definition](image/Containerfile) pins the reviewer software and installs it with its configuration, agent definition, and entrypoint under `/opt/reviewer/`.
@@ -271,6 +275,8 @@ Post a new top-level comment in the PR's Conversation tab:
 The command is case-insensitive, and request text is optional.
 A space, tab, CR, or LF separates request text from the command.
 After changing the PR, post another request when the updated code is ready for review.
+If a run fails, open it in the Actions tab and select **Re-run failed jobs**, or post a new `/oc-review` comment.
+Reactions report status; clicking a reaction does not restart the workflow.
 
 ## Configure inference access
 

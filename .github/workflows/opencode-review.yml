@@ -10,7 +10,7 @@ on:
     types: [created]
 
 # Allow the worker to read PR data, react to requests, and post the final comment.
-# Its acknowledge, review, and publish jobs restrict these permissions separately.
+# Worker jobs restrict these permissions separately; only reaction and publish jobs can write.
 permissions:
   contents: read
   pull-requests: write

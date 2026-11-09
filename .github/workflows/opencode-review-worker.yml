@@ -4,7 +4,7 @@ name: opencode-review-worker
 # Keep later permission and runtime fixes when removing the test wiring.
 
 # opencode-review.yml checks write access before calling this worker.
-# The acknowledge job reacts to the request; review runs OpenCode; publish posts its final text.
+# Separate jobs acknowledge the request, generate and publish the review, and report failures.
 # See .github/review/README.md for setup, security boundaries, and image updates.
 on:
   workflow_call:
@@ -28,17 +28,22 @@ jobs:
     permissions:
       # TEMPORARY: inline-comment reactions require PR write access, not issue write access.
       pull-requests: write
+    outputs:
+      reaction_user_id: ${{ steps.reaction.outputs.user_id }}
     steps:
       - name: Acknowledge accepted review request
+        id: reaction
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           github-token: ${{ github.token }}
           script: |
-            await github.rest.reactions.createForPullRequestReviewComment({
+            const {data: reaction} = await github.rest.reactions.createForPullRequestReviewComment({
               ...context.repo,
               comment_id: context.payload.comment.id,
               content: 'eyes',
             });
+            // Reuse the token's actual identity when removing our failure reaction after a retry.
+            core.setOutput('user_id', reaction.user.id);
 
   review:
     needs: acknowledge
@@ -239,3 +244,47 @@ jobs:
               return;
             }
             await github.rest.issues.createComment({...context.repo, issue_number: pull_number, body});
+
+  # Run after failed dependencies too; the reviewer itself still has no write permission.
+  # Ignore cancellation, including reviews superseded by a newer request.
+  report-status:
+    needs: [acknowledge, review, publish]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # TEMPORARY: restore issue-comment reaction endpoints with the Conversation trigger.
+      pull-requests: write
+    steps:
+      - name: Update request failure reaction
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          JOB_RESULTS: ${{ toJSON(needs.*.result) }}
+          REACTION_USER_ID: ${{ needs.acknowledge.outputs.reaction_user_id }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const results = JSON.parse(process.env.JOB_RESULTS);
+            const request = {...context.repo, comment_id: context.payload.comment.id};
+            if (results.includes('failure')) {
+              // GitHub returns the existing reaction on retries rather than adding a duplicate.
+              await github.rest.reactions.createForPullRequestReviewComment({
+                ...request, content: 'confused',
+              });
+              return;
+            }
+            if (!results.every(result => result === 'success')) return;
+            // Re-run failed jobs can skip acknowledge, so clear a prior failure here.
+            // Preserve reactions from people and other bots.
+            const reactions = await github.paginate(
+              github.rest.reactions.listForPullRequestReviewComment,
+              {...request, content: 'confused', per_page: 100},
+            );
+            for (const reaction of reactions) {
+              if (String(reaction.user?.id) === process.env.REACTION_USER_ID) {
+                await github.request(
+                  'DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions/{reaction_id}',
+                  {...request, reaction_id: reaction.id},
+                );
+              }
+            }
