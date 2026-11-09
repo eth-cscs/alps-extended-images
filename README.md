@@ -61,13 +61,14 @@ The base installers use shared defaults from `common/alps-stack-versions.env`, s
 | NVSHMEM | 3.6.5-0 | GPU symmetric heap memory for peer-to-peer transfers |
 | UCX | 1.20.1 | Unified Communication X transport layer |
 | UCC | 1.8.0 | Unified Collective Communications abstraction |
-| OpenMPI | 5.0.10 | MPI implementation linked against OFI and UCX |
+| OpenMPI (CUDA images) | 5.0.10 | MPI implementation linked against OFI and UCX |
+| cray-mpich (ROCm images) | 9.2.1 | HPE Cray MPICH with the HSA GTL for GPU buffers; launch with `srun --mpi=cray_shasta` |
 | GDRCopy | 2.5.1 | GPU Direct RDMA copy utilities |
 | XPMEM | — | Cross-process memory regions for intra-node GPU sharing |
 | NCCL Tests | 2.18.2 | Collective benchmark suite |
 | OSU Micro-benchmarks | 7.5.2 | Point-to-point latency and bandwidth measurements |
 
-CUDA components are compiled with CUDA support and architecture-specific flags for NVIDIA Hopper (SM90/SM90a). ROCm components keep the bundled RCCL by default, build aws-ofi-rccl against the Alps libfabric stack, and build rccl-tests for MI250/MI300 targets (`gfx90a`, `gfx942`) using the ROCm SDK from the image profile. RCCL rebuilds are opt-in with `ROCM_REBUILD_RCCL=1`.
+CUDA components are compiled with CUDA support and architecture-specific flags for NVIDIA Hopper (SM90/SM90a). ROCm components keep the bundled RCCL by default, build aws-ofi-rccl against the Alps libfabric stack, and build rccl-tests for MI250/MI300 targets (`gfx90a`, `gfx942`) using the ROCm SDK from the image profile. RCCL rebuilds are opt-in with `ROCM_REBUILD_RCCL=1`. ROCm images ship cray-mpich (with cray-pmi, cray-pals and cray-gtl) in place of Open MPI, installed from the CSCS JFrog mirror the same way as the `cray-mpich` Spack package in [alps-cluster-config](https://github.com/eth-cscs/alps-cluster-config); MPI jobs need `srun --mpi=cray_shasta`.
 
 Patches for upstream issues in libfabric, NCCL, and aws-ofi-nccl are maintained under `Alps-Images/patches/` and are included in base image hashes. Application-specific patches are kept under `Alps-Images/apps/<app>/patches/` and are included in app image hashes.
 
