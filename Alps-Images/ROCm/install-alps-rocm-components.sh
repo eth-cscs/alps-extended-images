@@ -738,225 +738,11 @@ build_ucc() {
         --with-rccl="${RCCL_PREFIX}"
 }
 
-# cray-mpich replaces Open MPI in ROCm images. It is installed from the binary
-# tarballs CSCS mirrors for its Spack stacks, following the cray-mpich,
-# cray-gtl, cray-pmi and cray-pals packages in eth-cscs/alps-cluster-config.
-# cray-mpich gets PMI from cray-pmi, so jobs launch with srun --mpi=cray_shasta.
-init_cray_mpich_prefixes() {
-    : "${CRAY_MPICH_VERSION:=9.2.1}"
-    : "${CRAY_PMI_VERSION:=6.1.18}"
-    : "${CRAY_PALS_VERSION:=1.3.2}"
-    : "${CRAY_PE_URL_BASE:=https://jfrog.svc.cscs.ch/artifactory/cray-mpich}"
-    : "${CRAY_PE_PREFIX:=/opt/alps/cray}"
-    CRAY_MPICH_PREFIX="${CRAY_PE_PREFIX}/mpich"
-    CRAY_GTL_PREFIX="${CRAY_PE_PREFIX}/gtl"
-    CRAY_PMI_PREFIX="${CRAY_PE_PREFIX}/pmi"
-    CRAY_PALS_PREFIX="${CRAY_PE_PREFIX}/pals"
-    export CRAY_MPICH_VERSION CRAY_PMI_VERSION CRAY_PALS_VERSION CRAY_PE_URL_BASE CRAY_PE_PREFIX
-    export CRAY_MPICH_PREFIX CRAY_GTL_PREFIX CRAY_PMI_PREFIX CRAY_PALS_PREFIX
-}
-
-# Checksums from the alps-cluster-config Spack packages. cray-gtl shares the
-# cray-mpich version.
-cray_pe_sha256() {
-    local tarball="${1:?tarball name required}"
-
-    case "${tarball}" in
-        cray-mpich-9.2.1.x86_64) echo f3f805c81e9455249a0cd6ffb10e42f76a4d075f1e851b5fc18a06532b910410 ;;
-        cray-gtl-9.2.1.x86_64)   echo 31c81c5516bde19e5e67ac3a7a3e1539f10e2cf51fadd7c91005880b0f724ffd ;;
-        cray-pmi-6.1.18.x86_64)  echo 97f3bbf264aea86275609c4f35b60156f345fd1dfeea4461f3f74fc16a0debb0 ;;
-        cray-pals-1.3.2.x86_64)  echo 5eb6c1d4b92a61dc2f0a7fc67fe2733316969902eb005651fc2b215d1d870752 ;;
-        *) die "No sha256 recorded for ${tarball}; add it from alps-cluster-config" ;;
-    esac
-}
-
-# Downloads, verifies and unpacks one tarball under STAGE_DIR. Prints the
-# source root: like Spack's stage, a single top-level directory is stripped.
-fetch_cray_pe_tarball() {
-    local name="${1:?name required}"
-    local version="${2:?version required}"
-    local stage_dir="${3:?stage dir required}"
-    local tarball="${name}-${version}.$(uname -m)"
-    local archive="${stage_dir}/${tarball}.tar.gz"
-    local workdir="${stage_dir}/${name}"
-    local entries
-
-    curl -fsSL "${CRAY_PE_URL_BASE}/${tarball}.tar.gz" -o "${archive}"
-    echo "$(cray_pe_sha256 "${tarball}")  ${archive}" | sha256sum -c - >&2
-    mkdir -p "${workdir}"
-    tar --no-same-owner -C "${workdir}" -xzf "${archive}"
-    rm -f "${archive}"
-
-    entries=("${workdir}"/*)
-    if [[ "${#entries[@]}" -eq 1 && -d "${entries[0]}" ]]; then
-        printf '%s\n' "${entries[0]}"
-    else
-        printf '%s\n' "${workdir}"
-    fi
-}
-
-cray_pe_libdir() {
-    local prefix="${1:?prefix required}"
-
-    if compgen -G "${prefix}/lib64/*.so*" >/dev/null; then
-        printf '%s\n' "${prefix}/lib64"
-    else
-        printf '%s\n' "${prefix}/lib"
-    fi
-}
-
-# Prints the SONAME of the first shared library matching NAME under DIR.
-cray_pe_soname() {
-    local dir="${1:?dir required}"
-    local name="${2:?library name required}"
-    local lib soname
-
-    lib="$(find "${dir}" -maxdepth 1 -type f -name "${name}.so*" | sort -V | head -n1)"
-    [[ -n "${lib}" ]] || die "${name} not found in ${dir}"
-    soname="$(patchelf --print-soname "${lib}")"
-    printf '%s\n' "${soname:-${lib##*/}}"
-}
-
-# Mirrors fixup_binaries in the Spack packages: set the RPATH on every ELF file
-# and add the extra NEEDED entries.
-patch_cray_pe_elfs() {
-    local prefix="${1:?prefix required}"
-    local rpath="${2:?rpath required}"
-    shift 2
-    local f needed
-
-    while IFS= read -r -d '' f; do
-        [[ "$(od -An -N4 -tx1 "${f}" | tr -d ' \n')" == 7f454c46 ]] || continue
-        patchelf --force-rpath --set-rpath "${rpath}" "${f}" || true
-        for needed in "$@"; do
-            patchelf --add-needed "${needed}" "${f}" || true
-        done
-    done < <(find "${prefix}" -type f -print0)
-}
-
-# cray-gtl may be linked against an older libamdhip64 SONAME than the ROCm SDK
-# in the image ships (the Spack package does the same for hip@7).
-fix_cray_gtl_hip_soname() {
-    local libdir="${1:?libdir required}"
-    local hip f needed
-
-    hip="$(ldconfig -p | awk '$1 ~ /^libamdhip64\.so\.[0-9]+$/ { print $1; exit }')"
-    [[ -n "${hip}" ]] || die "libamdhip64 is not in the ldconfig cache"
-
-    while IFS= read -r -d '' f; do
-        while IFS= read -r needed; do
-            [[ "${needed}" == "${hip}" ]] && continue
-            echo "cray-gtl: ${f##*/}: ${needed} -> ${hip}"
-            patchelf --replace-needed "${needed}" "${hip}" "${f}"
-        done < <(patchelf --print-needed "${f}" | grep '^libamdhip64\.so\.' || true)
-    done < <(find "${libdir}" -maxdepth 1 -type f -name '*.so*' -print0)
-}
-
-# Mirrors fixup_compiler_paths and fixup_pkgconfig: the wrappers and .pc files
-# ship with @@...@@ placeholders.
-fix_cray_mpich_placeholders() {
-    local gtl_libdir="${1:?gtl libdir required}"
-    local gtl_flags="-L${gtl_libdir} -Wl,-rpath,${gtl_libdir} -lmpi_gtl_hsa"
-    local f
-
-    while IFS= read -r f; do
-        sed -i \
-            -e "s|@@CC@@|$(command -v gcc)|g" \
-            -e "s|@@CXX@@|$(command -v g++)|g" \
-            -e "s|@@FC@@|$(command -v gfortran)|g" \
-            -e "s|@@PREFIX@@|${CRAY_MPICH_PREFIX}|g" \
-            -e "s|@@GTL_LIBRARY@@|${gtl_flags}|g" \
-            "${f}"
-    done < <(grep -rlI '@@[A-Z_]*@@' "${CRAY_MPICH_PREFIX}" || true)
-
-    for f in "${CRAY_PMI_PREFIX}" "${CRAY_PALS_PREFIX}" "${CRAY_GTL_PREFIX}"; do
-        find "${f}" -type f -name '*.pc' -exec sed -i "s|@@PREFIX@@|${f}|g" {} +
-    done
-
-    if grep -rlI '@@[A-Z_]*@@' "${CRAY_MPICH_PREFIX}/bin"; then
-        die "unresolved placeholders left in cray-mpich wrappers"
-    fi
-}
-
-check_cray_mpich_links() {
-    local prefix f missing=0
-
-    for prefix in "${CRAY_MPICH_PREFIX}" "${CRAY_GTL_PREFIX}" "${CRAY_PMI_PREFIX}" "${CRAY_PALS_PREFIX}"; do
-        while IFS= read -r -d '' f; do
-            if ldd "${f}" | grep 'not found'; then
-                echo "ERROR: unresolved libraries in ${f}" >&2
-                missing=1
-            fi
-        done < <(find "$(cray_pe_libdir "${prefix}")" -maxdepth 1 -type f -name '*.so*' -print0)
-    done
-    [[ "${missing}" -eq 0 ]] || die "cray-mpich install has unresolved shared libraries"
-
-    cat > /tmp/mpi-hello.c <<'EOT'
-#include <mpi.h>
-int main(int argc, char **argv) { MPI_Init(&argc, &argv); MPI_Finalize(); return 0; }
-EOT
-    "${CRAY_MPICH_PREFIX}/bin/mpicc" /tmp/mpi-hello.c -o /tmp/mpi-hello
-    rm -f /tmp/mpi-hello.c /tmp/mpi-hello
-}
-
-build_cray_mpich() {
-    init_cray_mpich_prefixes
-
-    local stage_dir src pals_lib pmi_lib gtl_lib mpich_lib rpath
-
-    apt_get update
-    # patchelf for the fixups; cray-pals needs libjansson, cray-pmi needs OpenSSL 3.
-    apt_get install -y --no-install-recommends patchelf libjansson4 libssl3t64
-    rm -rf /var/lib/apt/lists/*
-
-    rm -rf "${CRAY_PE_PREFIX}"
-    mkdir -p "${CRAY_MPICH_PREFIX}" "${CRAY_GTL_PREFIX}" "${CRAY_PMI_PREFIX}" "${CRAY_PALS_PREFIX}"
-
-    stage_dir="$(mktemp -d /tmp/cray-pe.XXXXXX)"
-    src="$(fetch_cray_pe_tarball cray-pals "${CRAY_PALS_VERSION}" "${stage_dir}")"
-    cp -a "${src}/." "${CRAY_PALS_PREFIX}/"
-    src="$(fetch_cray_pe_tarball cray-pmi "${CRAY_PMI_VERSION}" "${stage_dir}")"
-    cp -a "${src}/." "${CRAY_PMI_PREFIX}/"
-    src="$(fetch_cray_pe_tarball cray-gtl "${CRAY_MPICH_VERSION}" "${stage_dir}")"
-    cp -a "${src}/." "${CRAY_GTL_PREFIX}/"
-    # The tarball ships the CUDA GTL too; it needs libcudart/libcuda and is unused here.
-    find "${CRAY_GTL_PREFIX}" -name '*gtl_cuda*' -print -delete
-    src="$(fetch_cray_pe_tarball cray-mpich "${CRAY_MPICH_VERSION}" "${stage_dir}")"
-    [[ -d "${src}/mpich-gcc" ]] || die "cray-mpich tarball has no mpich-gcc directory"
-    cp -a "${src}/mpich-gcc/." "${CRAY_MPICH_PREFIX}/"
-    rm -rf "${stage_dir}"
-
-    pals_lib="$(cray_pe_libdir "${CRAY_PALS_PREFIX}")"
-    pmi_lib="$(cray_pe_libdir "${CRAY_PMI_PREFIX}")"
-    gtl_lib="$(cray_pe_libdir "${CRAY_GTL_PREFIX}")"
-    mpich_lib="$(cray_pe_libdir "${CRAY_MPICH_PREFIX}")"
-    printf '%s\n' "${mpich_lib}" "${gtl_lib}" "${pmi_lib}" "${pals_lib}" > /etc/ld.so.conf.d/99-alps-cray-mpich.conf
-    ldconfig
-
-    rpath="${mpich_lib}:${gtl_lib}:${pmi_lib}:${pals_lib}:${LIBFABRIC_PREFIX}/lib:/usr/lib"
-    patch_cray_pe_elfs "${CRAY_PALS_PREFIX}" "${rpath}"
-    patch_cray_pe_elfs "${CRAY_PMI_PREFIX}" "${rpath}"
-    patch_cray_pe_elfs "${CRAY_GTL_PREFIX}" "${rpath}"
-    fix_cray_gtl_hip_soname "${gtl_lib}"
-    patch_cray_pe_elfs "${CRAY_MPICH_PREFIX}" "${rpath}" \
-        "$(cray_pe_soname /usr/lib libxpmem)" \
-        "$(cray_pe_soname "${pmi_lib}" libpmi_cray)" \
-        "$(cray_pe_soname "${gtl_lib}" libmpi_gtl_hsa)"
-    fix_cray_mpich_placeholders "${gtl_lib}"
-    ldconfig
-
-    check_cray_mpich_links
-
-    rm -rf /usr/local/mpi
-    ln -s "${CRAY_MPICH_PREFIX}" /usr/local/mpi
-    record_alps_version_var CRAY_MPICH_VERSION "${CRAY_MPICH_VERSION}"
-    record_alps_version_var CRAY_PMI_VERSION "${CRAY_PMI_VERSION}"
-    record_alps_version_var CRAY_PALS_VERSION "${CRAY_PALS_VERSION}"
+build_ompi5() {
+    build_ompi5_common --with-rocm="${ROCM_BUILD_PREFIX}"
 }
 
 build_aws_ofi_rccl() {
-    init_cray_mpich_prefixes
-
     local cppflags="${CPPFLAGS:-}"
     local ldflags="${LDFLAGS:-}"
     local prefix libdir rocm_configure_prefix="" test_obj
@@ -1002,30 +788,17 @@ build_aws_ofi_rccl() {
     [[ -n "${rocm_configure_prefix}" ]] || die "Could not compile-test hip/hip_runtime_api.h from ROCm SDK prefixes"
     echo "Using ROCm prefix for aws-ofi: ${rocm_configure_prefix}"
 
-    # Open MPI used to provide hwloc; without it, use the distro package.
-    # Name libhwloc15 explicitly so it is marked manual: clean_up's autoremove
-    # otherwise drops it and librccl-net.so fails to load (libhwloc.so.15).
-    apt_get update
-    apt_get install -y --no-install-recommends libhwloc-dev libhwloc15
-    rm -rf /var/lib/apt/lists/*
-
     # aws-ofi's configure probe does not reliably find HIP headers in ROCm
     # wheel SDK prefixes, so compile-test the header above and seed the cache.
-    # The --with-mpi/--with-hwloc below override the Open MPI defaults set by
-    # build_aws_ofi_nccl_common. hwloc comes from /usr, so use "yes": a path
-    # makes configure add "-isystem /usr/include", which breaks <cstdlib>.
     CPPFLAGS="${cppflags}" \
     LDFLAGS="${ldflags}" \
     ac_cv_header_hip_hip_runtime_api_h=yes \
     build_aws_ofi_nccl_common \
         --with-rocm="${rocm_configure_prefix}" \
-        --with-mpi="${CRAY_MPICH_PREFIX}" \
-        --with-hwloc=yes \
         "$@"
 }
 
 build_rccl_tests() {
-    init_cray_mpich_prefixes
     : "${RCCL_TESTS_GPU_TARGETS:?RCCL_TESTS_GPU_TARGETS must be set}"
     : "${RCCL_TESTS_BUILDDIR:=/tmp/rccl-tests-build}"
 
@@ -1033,9 +806,8 @@ build_rccl_tests() {
     rm -rf "${RCCL_TESTS_BUILDDIR}"
     cmake -S "${ROCM_SYSTEMS_SRC_DIR}/projects/rccl-tests" -B "${RCCL_TESTS_BUILDDIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_PREFIX_PATH="${CRAY_MPICH_PREFIX};${RCCL_PREFIX};${RCCL_LIB_DIR:-};${RCCL_INCLUDE_DIR:-};${CMAKE_PREFIX_PATH}" \
+        -DCMAKE_PREFIX_PATH="${OMPI_PREFIX};${RCCL_PREFIX};${RCCL_LIB_DIR:-};${RCCL_INCLUDE_DIR:-};${CMAKE_PREFIX_PATH}" \
         -DUSE_MPI=ON \
-        -DMPI_HOME="${CRAY_MPICH_PREFIX}" \
         -DGPU_TARGETS="${RCCL_TESTS_GPU_TARGETS}"
     cmake --build "${RCCL_TESTS_BUILDDIR}" -j"$(cmake_build_jobs)"
 
@@ -1046,13 +818,12 @@ build_rccl_tests() {
 
 build_osu() {
     init_hpc_stack_prefixes
-    init_cray_mpich_prefixes
 
     curl -fsSL "http://mvapich.cse.ohio-state.edu/download/mvapich/osu-micro-benchmarks-${OSU_VERSION}.tar.gz" -o /tmp/osu.tar.gz
     tar --no-same-owner --no-same-permissions -C /tmp -xzf /tmp/osu.tar.gz
     pushd "/tmp/osu-micro-benchmarks-${OSU_VERSION}"
-    CC="${CRAY_MPICH_PREFIX}/bin/mpicc" \
-    CXX="${CRAY_MPICH_PREFIX}/bin/mpicxx" \
+    CC="${OMPI_PREFIX}/bin/mpicc" \
+    CXX="${OMPI_PREFIX}/bin/mpicxx" \
     CFLAGS="-O3" \
     ./configure \
         --prefix=/usr/local \

@@ -20,7 +20,7 @@ ROCM_STACK_STEPS=(
     rccl
     ucx
     ucc
-    cray-mpich
+    ompi
     aws-ofi
     tests
     cleanup
@@ -28,7 +28,7 @@ ROCM_STACK_STEPS=(
 
 step_needs_rocm_env() {
     case "${1:?step required}" in
-        cxi-bits|libfabric|rccl|ucx|ucc|cray-mpich|aws-ofi|tests)
+        cxi-bits|libfabric|rccl|ucx|ucc|ompi|aws-ofi|tests)
             return 0
             ;;
         *)
@@ -72,8 +72,8 @@ run_rocm_stack_step() {
         ucc)
             build_ucc
             ;;
-        cray-mpich)
-            build_cray_mpich
+        ompi)
+            build_ompi5
             ;;
         aws-ofi)
             build_aws_ofi_rccl

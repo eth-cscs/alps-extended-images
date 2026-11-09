@@ -135,9 +135,7 @@ include:
       "LIBFABRIC_PATCH",
       "UCX_VERSION",
       "UCC_VERSION",
-      "CRAY_MPICH_VERSION",
-      "CRAY_PMI_VERSION",
-      "CRAY_PALS_VERSION",
+      "OMPI_VER",
       "AWS_OFI_NCCL_REPO",
       "AWS_OFI_NCCL_COMMIT",
       "AWS_OFI_NCCL_PATCH",
@@ -310,8 +308,6 @@ include:
   variables:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
-    # ROCm images use cray-mpich, which gets PMI from Slurm's cray_shasta plugin.
-    SLURM_MPI_TYPE: cray_shasta
 
 # CUDA app test template; generated jobs provide the script.
 .child-cuda-custom-test-template:
