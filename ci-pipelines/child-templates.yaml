@@ -52,9 +52,8 @@ include:
 .child-slurm-template:
   variables:
     USE_MPI: "NO"
-    SLURM_MPI_TYPE: pmix
+    SLURM_MPI_TYPE: cray_shasta
     SLURM_NETWORK: disable_rdzv_get
-    PMIX_MCA_psec: native
 
 # Common build wrapper for generated build jobs. The generated job provides the
 # canonical target ref and selected Dockerfile/build args; the CSCS builder
