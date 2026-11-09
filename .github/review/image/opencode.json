@@ -6,7 +6,7 @@
     "grumpy-reviewer": {
       "description": "Inspect PR changes and gather evidence for the final review",
       "mode": "primary",
-      "steps": 16,
+      "steps": 24,
       "system": "{file:/opt/reviewer/grumpy-reviewer.md}",
       "permissions": [
         { "action": "subagent", "resource": "*", "effect": "deny" }
@@ -38,7 +38,8 @@
       "settings": {
         "baseURL": "https://api.inference.cscs.ch/v1",
         "apiKey": "{env:CSCS_INFERENCE_API_KEY}",
-        "systemMessageMode": "system"
+        "systemMessageMode": "system",
+        "timeout": 180000
       },
       "models": {
         "zai-org/GLM-5.3": {

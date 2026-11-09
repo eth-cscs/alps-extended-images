@@ -117,8 +117,10 @@ jobs:
       # run.py mounts the PR checkout, context, and pinned AGENTS.md read-only.
       # Only CSCS_INFERENCE_API_KEY is forwarded from the host environment; the Docker socket is not mounted.
       # Runtime files go in /work and /tmp; the image filesystem is read-only.
-      # Failed or interrupted runs attempt container removal before checking HEAD and Git status.
+      # The host enforces a 17-minute backstop, 5-second kill grace, and bounded container cleanup.
+      # Failures still check HEAD/Git status and retain only fixed-label diagnostics for CI upload.
       - name: Run isolated CSCS reviewer
+        id: reviewer
         env:
           CSCS_INFERENCE_API_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}
         run: |
@@ -132,8 +134,9 @@ jobs:
             --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl"
 
       # Extract the final completed response, excluding reasoning and tool output.
-      # Extraction failures stop the job before any artifact is uploaded.
+      # Extraction failure prevents publication, but sanitized diagnostics are always retained.
       - name: Extract review text
+        id: extract
         run: |
           set -euo pipefail
           python3 default-branch/.github/review/host/extract.py \
@@ -146,6 +149,37 @@ jobs:
         with:
           name: opencode-review
           path: ${{ runner.temp }}/opencode-review/model-output/review.md
+          if-no-files-found: error
+          retention-days: 7
+
+      # Record step outcomes even when setup, review, or extraction failed. Never upload raw events/context.
+      - name: Record sanitized diagnostic outcomes
+        if: ${{ always() }}
+        env:
+          REVIEW_OUTCOME: ${{ steps.reviewer.outcome }}
+          EXTRACT_OUTCOME: ${{ steps.extract.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RUNNER_TEMP"]) / "opencode-review/model-output/events.diagnostics.json"
+          diagnostic = json.loads(path.read_text()) if path.exists() else {}
+          outcomes = {"success", "failure", "cancelled", "skipped"}
+          for key, variable in (("review_step", "REVIEW_OUTCOME"), ("extraction_step", "EXTRACT_OUTCOME")):
+              outcome = os.environ.get(variable)
+              diagnostic[key] = outcome if outcome in outcomes else "not_started"
+          path.parent.mkdir(parents=True, exist_ok=True)
+          path.write_text(json.dumps(diagnostic, sort_keys=True) + "\n")
+          PY
+
+      - name: Retain sanitized review diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: opencode-review-diagnostics
+          path: ${{ runner.temp }}/opencode-review/model-output/events.diagnostics.json
           if-no-files-found: error
           retention-days: 7
 

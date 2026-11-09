@@ -20,6 +20,9 @@ from extract import EVENT_TYPES
 
 
 _PROGRESS_INTERVAL = 30
+_REVIEW_TIMEOUT = 17 * 60
+_KILL_GRACE = 5
+_CLEANUP_TIMEOUT = 30
 _FINISH_REASONS = {"stop", "end_turn", "length", "tool-calls", "content-filter", "error", "unknown"}
 _TOOL_NAMES = {"execute", "glob", "grep", "question", "read", "shell",
                "skill", "subagent", "webfetch", "websearch"}
@@ -46,7 +49,7 @@ def _tool_result(part):
     return f"{name}/{status}"
 
 
-def _report_progress(output, stopped, started):
+def _report_progress(output, stopped, started, diagnostic=None):
     previous = 0
     counts = Counter()
     tool_counts = Counter()
@@ -57,7 +60,7 @@ def _report_progress(output, stopped, started):
         while True:
             finished = stopped.wait(_PROGRESS_INTERVAL)
             # Bound each scan so a busy producer cannot delay cancellation.
-            size = os.fstat(output.fileno()).st_size
+            size = os.stat(output.name).st_size
             while events.tell() < size:
                 position = events.tell()
                 line = events.readline(size - position)
@@ -93,6 +96,10 @@ def _report_progress(output, stopped, started):
                 f"{label}=" + (", ".join(f"{name}:{count}" for name, count in sorted(counter.items())) or "none")
                 for label, counter in (("events", counts), ("tools", tool_counts))
             )
+            if diagnostic is not None:
+                diagnostic.update(events=dict(counts), tools=dict(tool_counts), phase=phase,
+                                  last_finish=last_finish, stdout_bytes=size,
+                                  summary_complete=finished)
             if finished:
                 print(f"review runner: final {summary}; phase={phase}; last_finish={last_finish}", flush=True)
                 return
@@ -100,6 +107,35 @@ def _report_progress(output, stopped, started):
             print(f"review runner: running; elapsed={elapsed}s; stdout={size} bytes (+{size - previous}); "
                   f"{summary}; phase={phase}; last_finish={last_finish}", flush=True)
             previous = size
+
+def _stop_process(process):
+    """Bound termination of the engine client and any local descendants."""
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "completed"
+    try:
+        process.wait(timeout=_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        pass
+    # Kill surviving descendants even if their process-group leader exited.
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=_KILL_GRACE)
+    except subprocess.TimeoutExpired:
+        return "failed"
+    return "completed"
+
+
+def _write_diagnostic(path, diagnostic):
+    with path.open("w", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
+        json.dump(diagnostic, output, sort_keys=True)
+        output.write("\n")
+
 
 
 def checkout_state(checkout):
@@ -121,6 +157,14 @@ def run_review(engine, image, checkout, context, events, instructions):
         raise ValueError("context must be a file")
     if events == checkout or checkout in events.parents or events in (context, instructions):
         raise ValueError("events output must be outside the checkout, context and instructions files")
+    diagnostics = events.with_suffix(".diagnostics.json").resolve()
+    if (diagnostics == events or diagnostics == checkout or checkout in diagnostics.parents
+            or diagnostics in (context, instructions)):
+        raise ValueError("diagnostics output must not overwrite review inputs or events")
+    stderr = events.with_suffix(".stderr.log").resolve()
+    if (stderr == checkout or checkout in stderr.parents
+            or stderr in (events, diagnostics, context, instructions)):
+        raise ValueError("stderr output must not overwrite review inputs, events or diagnostics")
     if not os.environ.get("CSCS_INFERENCE_API_KEY"):
         raise ValueError("CSCS_INFERENCE_API_KEY is required")
     executable = shutil.which(engine)
@@ -150,40 +194,78 @@ def run_review(engine, image, checkout, context, events, instructions):
             # Docker sockets, host HOME, or any other environment variable.
             "--env", "CSCS_INFERENCE_API_KEY", image,
         ]
+        started = time.monotonic()
+        diagnostic = {
+            "status": "running", "failure": "none", "exit_code": None,
+            "cleanup": "not_needed", "process_cleanup": "not_needed",
+            "events": {}, "tools": {}, "phase": "none", "last_finish": "none",
+            "stdout_bytes": 0, "summary_complete": False, "elapsed_seconds": 0,
+        }
+        _write_diagnostic(diagnostics, diagnostic)
         try:
-            with events.open("w", encoding="utf-8") as output:
+            with events.open("w", encoding="utf-8") as output, stderr.open("w", encoding="utf-8") as errors:
                 os.fchmod(output.fileno(), 0o600)
-                started = time.monotonic()
-                print(f"review runner: starting isolated reviewer; progress every {_PROGRESS_INTERVAL}s "
+                os.fchmod(errors.fileno(), 0o600)
+                print(f"review runner: starting isolated reviewer; deadline={_REVIEW_TIMEOUT}s; "
+                      f"progress every {_PROGRESS_INTERVAL}s "
                       "(byte counts and fixed event/tool summaries only)", flush=True)
                 stopped = threading.Event()
                 reporter = threading.Thread(target=_report_progress,
-                                            args=(output, stopped, started), daemon=True)
+                                            args=(output, stopped, started, diagnostic), daemon=True)
                 reporter.start()
+                process = None
                 try:
-                    result = subprocess.run(command, stdout=output, check=False)
+                    # Raw stderr may contain source, model text, or credentials; never log it.
+                    process = subprocess.Popen(command, stdout=output, stderr=errors,
+                                               start_new_session=True)
+                    diagnostic["exit_code"] = process.wait(timeout=_REVIEW_TIMEOUT)
+                except BaseException as error:
+                    diagnostic["failure"] = (
+                        "timeout" if isinstance(error, subprocess.TimeoutExpired)
+                        else "interrupted" if isinstance(error, KeyboardInterrupt) else "runner_error")
+                    if process is not None:
+                        diagnostic["process_cleanup"] = _stop_process(process)
+                        diagnostic["exit_code"] = process.returncode
+                    if isinstance(error, subprocess.TimeoutExpired):
+                        raise ValueError("isolated reviewer exceeded the 17-minute hard deadline") from error
+                    raise
                 finally:
-                    # Stop and join before closing the event file or removing the container.
                     stopped.set()
-                    reporter.join()
-                elapsed = int(time.monotonic() - started)
-                size = os.fstat(output.fileno()).st_size
-                print(f"review runner: exited; status={result.returncode}; elapsed={elapsed}s; "
-                      f"stdout={size} bytes", flush=True)
-            if result.returncode:
-                raise ValueError(f"isolated reviewer failed (exit {result.returncode})")
+                    reporter.join(timeout=_KILL_GRACE)
+                print(f"review runner: exited; status={diagnostic['exit_code']}; "
+                      f"elapsed={int(time.monotonic() - started)}s; "
+                      f"stdout={os.fstat(output.fileno()).st_size} bytes", flush=True)
+            if diagnostic["exit_code"]:
+                diagnostic["failure"] = "reviewer_exit"
+                raise ValueError(f"isolated reviewer failed (exit {diagnostic['exit_code']})")
+            diagnostic["status"] = "success"
         except BaseException:
-            # Cancellation also needs cleanup; re-raise the original failure afterward.
+            diagnostic["status"] = "failed"
+            if diagnostic["failure"] == "none":
+                diagnostic["failure"] = "runner_error"
+            # Cancellation also needs bounded container cleanup, independent of the engine client.
             try:
                 subprocess.run([executable, "rm", "--force", name], check=True,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
-            except (OSError, subprocess.SubprocessError) as error:
-                print(f"review runner: container cleanup failed: {error}", file=sys.stderr)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=_CLEANUP_TIMEOUT)
+                diagnostic["cleanup"] = "completed"
+            except (OSError, subprocess.SubprocessError):
+                diagnostic["cleanup"] = "failed"
+                print("review runner: container cleanup failed", file=sys.stderr)
             raise
         finally:
-            # Cleanup errors must not skip the source-state check.
-            if checkout_state(checkout) != before:
-                raise ValueError("review changed the source checkout or HEAD")
+            # Cleanup errors must not skip the source-state check or diagnostic persistence.
+            try:
+                if checkout_state(checkout) != before:
+                    diagnostic.update(status="failed", failure="checkout_changed")
+                    raise ValueError("review changed the source checkout or HEAD")
+            except BaseException:
+                if diagnostic["failure"] != "checkout_changed":
+                    diagnostic.update(status="failed", failure="checkout_check_error")
+                raise
+            finally:
+                diagnostic["elapsed_seconds"] = int(time.monotonic() - started)
+                _write_diagnostic(diagnostics, diagnostic)
 
 
 def main(argv=None):

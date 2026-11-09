@@ -121,3 +121,67 @@ def test_cli_cannot_overwrite_event_stream(tmp_path):
         extract.main(["--events", str(events), "--output", str(alias)])
     assert error.value.code == 1
     assert events.read_text() == original
+
+
+def incomplete_review(final):
+    lines = review(final)
+    marker = json.loads(lines[3])
+    marker["incomplete"] = True
+    lines[3] = json.dumps(marker)
+    return lines
+
+
+def test_interrupted_inspection_qualifies_completed_final_review():
+    result = extract.extract_review(incomplete_review([text("## Findings\n\n- Boundary bug.")]))
+    assert result == (
+        "> Inspection was interrupted. Findings cover only the code inspected; "
+        "this is not a clean bill of health for the remaining changes.\n\n"
+        "## Findings\n\n- Boundary bug.\n"
+    )
+    assert "Private inspection notes" not in result
+
+
+@pytest.mark.parametrize("final", [
+    [text("Truncated"), event("step_finish", reason="length")],
+    [text("Truncated"), event("step_finish", reason="length"), text("Later text", message="later")],
+    [text("Failure"), event("step_finish", reason="error"), text("Later text", message="later")],
+    [text("Review"), event("tool_use", session="child-session")],
+    [text("Review"), json.dumps({"type": "error", "error": {"message": "private failure"}})],
+    [event("text", id="text", text="Partial", time={"start": 1})],
+    [],
+])
+def test_incomplete_inspection_never_relaxes_final_validation(final):
+    with pytest.raises(ValueError):
+        extract.extract_review(incomplete_review(final))
+
+
+def test_interrupted_inspection_with_unfinished_final_is_not_publishable():
+    with pytest.raises(ValueError):
+        extract.extract_review(incomplete_review([text("Looks finished")])[:-1])
+
+
+@pytest.mark.parametrize(("marker_index", "value"), [
+    (0, True), (3, "true"), (3, 1), (3, None), (4, True), (6, True),
+])
+def test_incomplete_marker_is_only_boolean_inspection_end(marker_index, value):
+    lines = review([text("A review")])
+    marker = json.loads(lines[marker_index])
+    marker["incomplete"] = value
+    lines[marker_index] = json.dumps(marker)
+    with pytest.raises(ValueError, match="incomplete"):
+        extract.extract_review(lines)
+
+
+def test_false_incomplete_marker_does_not_qualify_complete_inspection():
+    lines = incomplete_review([text("A review")])
+    marker = json.loads(lines[3])
+    marker["incomplete"] = False
+    lines[3] = json.dumps(marker)
+    assert extract.extract_review(lines) == "A review\n"
+
+
+def test_incomplete_marker_cannot_hide_inspection_error():
+    lines = incomplete_review([text("A review")])
+    lines.insert(3, json.dumps({"type": "error"}))
+    with pytest.raises(ValueError, match="reported an error"):
+        extract.extract_review(lines)

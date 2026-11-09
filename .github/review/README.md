@@ -8,9 +8,11 @@ Inspection gathers evidence from the supplied context and checkout.
 A separate final-response phase writes the review from that evidence with provider tool selection disabled.
 PR content is untrusted input, so model execution is separated from GitHub authorization and publication.
 The reviewer inspects code but must not execute PR code or tests, install packages, change the checkout, or publish anything itself.
-The review reports static findings and states any verification limits.
+The review reports supported static findings and material gaps in inspected coverage, not a generic list of unperformed checks.
 The grumpy reviewer checks correctness, security, performance, duplication, readability, and complexity, requiring concrete impact rather than personal preferences.
+Claims about external API or platform behavior need authoritative evidence; unverified claims are dropped.
 Web research is reserved for specific external-behavior questions that repository evidence cannot answer.
+These instructions guide the review but do not guarantee coverage or finding quality.
 
 ## Review behavior
 
@@ -36,8 +38,9 @@ Web research is reserved for specific external-behavior questions that repositor
   REST and GraphQL pagination preserve authors, timestamps, commit links, review states, and resolved or outdated thread status.
   Preparation fails if an API request fails or history is incomplete.
 - The reviewer treats history and instructions found in PR files as material to inspect.
-  It checks previous concerns against the current code, avoids repeating fixed findings, and does not treat approval or thread resolution as proof of correctness.
-  Repeat reviews briefly identify earlier findings that remain, were addressed, or were not substantiated, with links when available.
+  It checks previous concerns against the current source, avoids repeating fixed findings, and does not treat approval or thread resolution as proof of correctness.
+  Earlier reviews can be wrong and do not replace inspection of other changed logical areas.
+  Repeat reviews use brief linked status bullets for earlier findings, separate from the current findings and without duplicating them.
   Previous reviews are not templates for the new review.
 
 ## Repository layout
@@ -68,11 +71,13 @@ The reviewer combines three trusted instruction sources:
 The inspection agent cannot launch subagents.
 The finalizer denies all tool permissions and selects the `review-final` model variant, which sets `tool_choice: none`.
 The variant is needed because deny-all permissions alone still leave skill discovery advertised by the CLI.
+Phase-specific evidence gathering and final-response policy live in [grumpy-reviewer.md](image/grumpy-reviewer.md#review-phases); the runner supplies the phase tasks.
+The runner also includes that same policy file in the final task so earlier reviews and inspection summaries do not displace it in a long session.
 [entrypoint.sh](image/entrypoint.sh) sets private runtime paths and starts the phase runner.
 
 ## Review limits
 
-The agents' `steps` settings in [opencode.json](image/opencode.json) cap model iterations separately for inspection and finalization, not individual tool calls.
+The agents' `steps` settings in [opencode.json](image/opencode.json) cap model iterations at 24 for inspection and 2 for finalization, not individual tool calls.
 Each phase can finish before reaching its cap.
 The finalizer reserves more than one iteration so its first response does not receive OpenCode's generic last-step summary prompt.
 A tools-disabled response normally ends finalization on that first iteration.
@@ -80,9 +85,16 @@ New user input resets OpenCode's allowance, so the two configured caps must be c
 Recovery from empty, token-truncated responses can add provider requests beyond this step count.
 The setting is therefore not a hard HTTP request-count quota.
 The model and selected variant's `body.max_tokens` in [opencode.json](image/opencode.json) limit generation per request without changing the model's advertised capabilities.
-The final-response variant has its own allowance rather than inheriting the inspection allowance.
+The per-request output allowance is 16,384 tokens for inspection and 32,768 for finalization.
 This is not a review-wide quota for input and output tokens.
-The workflow's job timeout is a separate hard stop and does not guarantee a publishable final response.
+Inspection has a 10-minute wall deadline, and finalization has a separate 5-minute wall deadline.
+Each provider request has a 180-second wall deadline, including response-body consumption rather than only waiting for headers.
+OpenCode may retry timed-out requests, but retries do not extend the phase deadlines.
+A stopped phase has a 5-second termination grace before forced termination.
+The host enforces a 17-minute container deadline as a backstop.
+The workflow's job timeout remains a separate hard stop and does not guarantee a publishable final response.
+An inspection deadline, exhausted iteration allowance, or token-truncated last inspection response can lead to finalization only when the session exists and a qualifying inspection tool has succeeded.
+That path marks inspection incomplete; other inspection failures and any finalization failure do not produce a publishable fallback.
 
 ## Security and runtime layout
 
@@ -119,27 +131,42 @@ Cleanup failures are logged without hiding the original failure, and checkout ve
 
 ## Review output
 
-The `Run isolated CSCS reviewer` step logs the container launch, exit status, and elapsed time.
+The `Run isolated CSCS reviewer` step logs fixed launch and exit-status labels and elapsed time, not the container command or captured stderr.
 While waiting, it reports the current phase, captured-output byte counts, counts of known JSON event types, and the last known step-finish reason every 30 seconds.
 The report distinguishes bookkeeping events such as `step_start` from `tool_use`, `text`, or `error` events.
 Tool-result counts use fixed tool names and status labels, with unknown values reported as `other`.
 Code Mode errors and nonzero shell exits count as errors even when OpenCode marks the call `completed`.
 A final event summary is printed when the process exits, including failed or interrupted runs.
 Reports continue when no output arrives, but do not prove that an inference request is making progress.
-Model text, reasoning content, tool arguments, tool errors, and tool output are not printed in these reports.
+CI diagnostics use fixed labels, counts, and statuses; raw source, model content, credentials, tool arguments, tool errors, and tool output are not printed.
+Raw events and stderr stay in private runner files (`events.jsonl` and `events.stderr.log`), not CI logs or artifacts.
+The host writes sanitized counters, phase labels, elapsed time, exit status, and cleanup outcomes to `events.diagnostics.json`.
+The workflow adds review and extraction outcomes and uploads a separate `opencode-review-diagnostics` artifact, including when extraction fails.
 The CLI uses `--thinking` to include provider-exposed reasoning in the private event stream.
 Reasoning is excluded from the published review.
 Missing reasoning events do not prove that the model generated no reasoning.
 
-The [final-response policy](image/grumpy-reviewer.md#final-response) keeps material uncertainty beside the affected finding rather than adding verification checklists, limitations sections, or reviewer setup diagnostics.
+The [final-response policy](image/grumpy-reviewer.md#final-response) uses short finding headings with separate location/evidence, consequence, and correction bullets.
+Grumpy commentary stays brief, and each root cause is reported once.
+Material uninspected areas get a short coverage notice; uncertainty about a finding stays beside it.
+The review avoids setup diagnostics, generic verification checklists, and claims that uninspected code is clean.
+Intentional temporary testing arrangements are not standalone defects without an unintended current consequence.
 
-- [run-review.mjs](image/run-review.mjs) marks the start and successful end of each phase in the event stream.
-  It reuses the inspection session for finalization and stops on a failed CLI exit, an error event, an unexpected session, or a tool attempt during finalization.
+- [run-review.mjs](image/run-review.mjs) marks each phase's start and accepted end in the event stream.
+  An inspection deadline, exhausted iteration allowance, or token-truncated last inspection response marks the accepted inspection end with `incomplete: true` only when there is a session and a successful qualifying tool call.
+  Finalization reuses that session and remains tool-free.
+  Other failed CLI exits, error events, unexpected sessions, and finalization tool attempts stop the review.
   The final-response task requires a fresh assessment of inspection notes under the review policy, not a copy of their proposed review.
   Inspection must complete a `read`, `grep`, `shell`, or Code Mode `execute` call successfully before finalization starts; glob-only discovery, web search, failed calls, and copied context do not satisfy this requirement.
   A successful tool call does not prove review coverage or correctness.
 - [extract.py](host/extract.py) selects completed text only from the explicit final-response phase.
-  Extraction requires both phases to complete in order in the same session and rejects errors, missing phases, malformed events, or incomplete final output.
+  Extraction requires ordered phase markers in the same session and rejects errors, missing phases, malformed events, or incomplete final output.
+  An accepted incomplete-inspection marker prepends this fixed notice:
+
+  > Inspection was interrupted.
+  > Findings cover only the code inspected; this is not a clean bill of health for the remaining changes.
+
+  This exception still requires a completed final response; it never publishes inspection notes.
   Inspection summaries and notes are never used as a publishable fallback.
   Only `review.md` is uploaded to the `opencode-review` artifact, with seven-day retention.
   Raw events and prepared context are not uploaded as artifacts.
@@ -151,35 +178,74 @@ The [final-response policy](image/grumpy-reviewer.md#final-response) keeps mater
   Published comments identify the reviewed commit and workflow run.
   The model supplies only the review body and must not reproduce the publisher's header or metadata from an earlier review.
 
-## Local provider diagnostics
+## Local diagnostics
 
-[provider-trace.mjs](diagnostics/provider-trace.mjs) records provider response bodies when OpenCode events and usage counters are insufficient for diagnosis.
-It runs inside the local review container and launches the image entrypoint as its child.
-It does not require host networking, a published proxy port, or writable host mounts.
-GitHub reviews do not launch this recorder or upload its files.
+Use the local launcher when a review stalls or the normal progress counters do not explain what it is doing.
+It prints OpenCode events, all-level CLI/server logs, complete provider requests, decoded response chunks, and request lifecycle timings as they arrive.
+It retains the working state and captures on the host instead of losing them when the container exits.
+GitHub reviews do not enable this mode or upload these files.
 
-To use it in a local test harness:
+Export `CSCS_INFERENCE_API_KEY` and run with Python 3.12:
 
-1. Read the original HTTPS provider `baseURL` from `image/opencode.json` into `upstream`.
-   Stage a private configuration copy that changes only that URL to `http://127.0.0.1:18080/v1`.
-   Do not change the committed provider URL.
-2. Mount that configuration copy and the reviewed `diagnostics/` directory read-only, retaining the normal sandbox restrictions.
-   Mount the directory at `/trace-code`.
-3. Launch the recorder inside the container instead of invoking the image entrypoint directly:
+```sh
+uv run --no-project --python 3.12 python .github/review/diagnostics/run-local.py \
+  --engine podman \
+  --image "$OPENCODE_REVIEW_IMAGE_PIN" \
+  --checkout /path/to/pr-checkout \
+  --context /path/to/prepared/context.md \
+  --instructions /path/to/trusted/AGENTS.md \
+  --output "$HOME/opencode-debug/run-1"
+```
 
-   ```sh
-   node /trace-code/provider-trace.mjs --upstream "$upstream" -- /opt/reviewer/entrypoint.sh
-   ```
+Use a new or empty output directory outside the source checkout for each run.
+The context is the prepared PR input, not a prompt to fetch the PR or execute its code.
+The instructions file is chosen explicitly by the local caller.
+Pull a published image with your container engine before launching it; the diagnostic launcher does not refresh local images.
+The launcher uses the selected image's configuration and changes only the provider URL to route requests through the recorder.
+Models, agents, token allowances, and step caps are unchanged.
+The source checkout remains read-only, while `/work` and the recording directory are writable host mounts.
+Interrupting a run stops its container and retains captures already written.
 
-4. Capture `/work/provider-trace/` before removing the container.
-   That directory is temporary and is not preserved by the normal review workflow.
+The image must match the local machine's architecture.
+On an ARM node, build a native image and pass `localhost/opencode-review:local-debug` to `--image`:
 
-Each request produces numbered `.json` metadata and `.response` files.
-Metadata includes the requested model, generation limit, tool choice, HTTP status, and response timing, but omits authentication headers, prompts, and messages.
-`first_body_ms` measures the first response-body bytes, not necessarily the first generated token.
-The recorder forwards the provider response to OpenCode and saves a separately decoded copy with the known inference key redacted, including matches split across chunks.
-Other sensitive content can remain, so keep the files private rather than uploading them as public artifacts.
-HTTP errors and partial responses are retained for diagnosis.
+```sh
+podman build --format docker \
+  -f .github/review/image/Containerfile \
+  -t localhost/opencode-review:local-debug .
+```
+
+| Path under the output directory | Contents |
+| --- | --- |
+| `recording/trace.log` | Provider request bodies, decoded response data, headers, and lifecycle timings |
+| `recording/opencode.events.jsonl` | OpenCode JSON events, including exposed reasoning, tool inputs/results, model text, and phase markers |
+| `recording/opencode.stderr.log` | CLI/server logs from `--log-level all --print-logs` |
+| `recording/NNNN.request`, `NNNN.response`, `NNNN.json` | Per-request body, decoded response, and metadata |
+| `work/` | Persistent OpenCode database, cache, state, and native log files |
+| `staging/` | Context, instructions, original image configuration, recorder configuration, and launch wrappers |
+| `image.json`, `invocation.json` | Image identity and the commands used |
+| `engine.stdout.log`, `engine.stderr.log` | Container-engine output and the complete live terminal streams |
+| `review.md` | Extracted final review, written only after successful completion |
+
+The recorder masks authentication headers and the known inference key.
+The private runtime configuration and native state are retained as-is.
+Prompts, source code, tool payloads, and response content are not omitted.
+Keep this directory local rather than publishing it as a GitHub artifact.
+The logger cannot expose reasoning that the provider does not return.
+
+Use the lifecycle messages to locate a delay:
+
+- No provider request has started: inspect the CLI/server logs for startup or local tool activity.
+- A request was uploaded but response headers have not arrived: the gateway or provider has not started its HTTP response.
+  This can include queuing, prompt processing, or generation before the first response bytes.
+- Raw response data arrives but OpenCode emits no events: inspect the CLI's handling or buffering of that response.
+- A response ends with `max_tokens` and another request follows: the model exhausted that request's allowance and OpenCode continued.
+
+`first_body_ms` measures response bytes, not necessarily the first generated token.
+A `message_start` or keepalive frame does not mean model content has arrived.
+A silent provider stream cannot distinguish queuing, prompt processing, or unexposed generation.
+Errors and partial responses are retained.
+The recorder's default mode still captures only response bodies and limited metadata without printing full prompts.
 
 Run the recorder's isolated tests with `node --test .github/review/diagnostics/test-provider-trace.mjs`.
 They use local HTTPS fixtures and do not call an inference service.

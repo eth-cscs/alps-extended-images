@@ -2,8 +2,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -121,6 +123,11 @@ def test_cleanup_timeout_preserves_failure_and_checks_source(
         runner.run_review("/bin/false", "unused", checkout, context,
                           tmp_path / "events.jsonl", instructions)
     assert "container cleanup failed" in capsys.readouterr().err
+    diagnostic = json.loads((tmp_path / "events.diagnostics.json").read_text())
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["failure"] == ("checkout_changed" if changed_source else "reviewer_exit")
+    assert diagnostic["cleanup"] == "failed"
+    assert diagnostic["exit_code"] == 1
 
 
 def test_progress_reports_silence_without_exposing_event_text(tmp_path, runner, capsys):
@@ -204,3 +211,103 @@ def test_progress_classifies_tool_results_without_exposing_payload(
     progress = capsys.readouterr().out
     assert f"tools={result}:1" in progress
     assert "private" not in progress
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_runner_retains_private_events_and_sanitized_diagnostics(
+        tmp_path, trusted_runner, checkout, runner, monkeypatch, capfd, exit_code):
+    _, instructions = trusted_runner
+    context = tmp_path / "context.md"
+    context.write_text("private context marker\n")
+    engine = tmp_path / "engine"
+    cleanup = tmp_path / "cleanup"
+    engine.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys\n"
+        "if sys.argv[1] == 'rm':\n"
+        f"    pathlib.Path({str(cleanup)!r}).touch()\n"
+        "    sys.exit(0)\n"
+        "print(json.dumps({'type': 'reasoning', 'text': 'private model marker'}))\n"
+        "print(json.dumps({'type': 'private event marker'}))\n"
+        "print('private stderr credential marker', file=sys.stderr)\n"
+        f"sys.exit({exit_code})\n"
+    )
+    engine.chmod(0o700)
+    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "private credential marker")
+    events = tmp_path / "events.jsonl"
+    if exit_code:
+        with pytest.raises(ValueError, match=f"exit {exit_code}"):
+            runner.run_review(str(engine), "unused", checkout, context, events, instructions)
+    else:
+        runner.run_review(str(engine), "unused", checkout, context, events, instructions)
+    diagnostic_path = tmp_path / "events.diagnostics.json"
+    raw = diagnostic_path.read_text()
+    diagnostic = json.loads(raw)
+    assert diagnostic["status"] == ("failed" if exit_code else "success")
+    assert diagnostic["failure"] == ("reviewer_exit" if exit_code else "none")
+    assert diagnostic["exit_code"] == exit_code
+    assert diagnostic["events"] == {"reasoning": 1, "unknown": 1}
+    assert diagnostic["summary_complete"] is True
+    assert diagnostic["elapsed_seconds"] >= 0
+    assert diagnostic["cleanup"] == ("completed" if exit_code else "not_needed")
+    assert cleanup.exists() == bool(exit_code)
+    assert diagnostic_path.stat().st_mode & 0o777 == 0o600
+    assert "private model marker" in events.read_text()
+    stderr_path = tmp_path / "events.stderr.log"
+    assert "private stderr credential marker" in stderr_path.read_text()
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
+    captured = capfd.readouterr()
+    assert "private" not in raw + captured.out + captured.err
+
+
+def test_hanging_reviewer_is_killed_and_container_cleanup_is_bounded(
+        tmp_path, trusted_runner, checkout, runner, monkeypatch):
+    _, instructions = trusted_runner
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    engine = tmp_path / "engine"
+    cleanup = tmp_path / "cleanup"
+    engine.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, signal, sys, time\n"
+        "if sys.argv[1] == 'rm':\n"
+        f"    pathlib.Path({str(cleanup)!r}).touch()\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "while True:\n"
+        "    time.sleep(60)\n"
+    )
+    engine.chmod(0o700)
+    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-deadline-test")
+    monkeypatch.setattr(runner, "_REVIEW_TIMEOUT", 0.5)
+    monkeypatch.setattr(runner, "_KILL_GRACE", 0.1)
+    monkeypatch.setattr(runner, "_CLEANUP_TIMEOUT", 0.5)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="hard deadline"):
+        runner.run_review(str(engine), "unused", checkout, context,
+                          tmp_path / "events.jsonl", instructions)
+    assert time.monotonic() - started < 5
+    diagnostic = json.loads((tmp_path / "events.diagnostics.json").read_text())
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["failure"] == "timeout"
+    assert diagnostic["exit_code"] == -signal.SIGKILL
+    assert diagnostic["process_cleanup"] == "completed"
+    assert diagnostic["cleanup"] == "failed"
+    assert cleanup.exists()
+    assert (checkout / "app.py").read_text() == "important source\n"
+
+
+@pytest.mark.parametrize("suffix", ["diagnostics.json", "stderr.log"])
+def test_private_outputs_cannot_overwrite_inputs(
+        tmp_path, trusted_runner, checkout, runner, monkeypatch, suffix):
+    _, instructions = trusted_runner
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    (tmp_path / f"events.{suffix}").symlink_to(context)
+    monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-path-safety-test")
+    with pytest.raises(ValueError, match=suffix.split(".")[0]):
+        runner.run_review("/bin/true", "unused", checkout, context,
+                          tmp_path / "events.jsonl", instructions)
+    assert context.read_text() == "review input\n"
+    assert not (tmp_path / "events.jsonl").exists()
+
+

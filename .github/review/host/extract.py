@@ -7,6 +7,10 @@ from pathlib import Path
 
 
 EVENT_TYPES = {"review_phase", "step_start", "step_finish", "tool_use", "text", "reasoning", "error"}
+_INCOMPLETE_NOTICE = (
+    "> Inspection was interrupted. Findings cover only the code inspected; "
+    "this is not a clean bill of health for the remaining changes."
+)
 
 
 def extract_review(lines):
@@ -15,6 +19,7 @@ def extract_review(lines):
     message = None
     parts = {}
     finish_reason = None
+    incomplete = False
     transitions = {
         ("initial", "inspection", "start"): "inspection",
         ("inspection", "inspection", "end"): "inspected",
@@ -40,6 +45,10 @@ def extract_review(lines):
                 raise ValueError("invalid review phase transition")
             if phase != "initial" and (session is None or event.get("sessionID") != session):
                 raise ValueError("review phase changed the inspection session")
+            if "incomplete" in event:
+                if transition != ("inspection", "inspection", "end") or type(event["incomplete"]) is not bool:
+                    raise ValueError("invalid incomplete inspection marker")
+                incomplete = event["incomplete"]
             phase = transitions[transition]
             continue
         if phase not in ("inspection", "final"):
@@ -52,6 +61,10 @@ def extract_review(lines):
             raise ValueError("missing OpenCode session ID")
         if session is None:
             session = event_session
+        if phase == "final" and kind == "tool_use":
+            raise ValueError("final review phase attempted to use a tool")
+        if phase == "final" and kind == "step_finish" and part.get("reason") not in ("stop", "end_turn"):
+            raise ValueError("OpenCode stopped before completing the final review phase")
         if event_session != session:
             # Child-agent results must not replace the parent review.
             continue
@@ -68,9 +81,7 @@ def extract_review(lines):
             finish_reason = None
         if kind == "step_start":
             continue
-        if kind == "tool_use":
-            raise ValueError("final review phase attempted to use a tool")
-        elif kind == "step_finish":
+        if kind == "step_finish":
             finish_reason = part.get("reason")
         elif kind == "text":
             part_id = part.get("id")
@@ -87,6 +98,8 @@ def extract_review(lines):
     review = "\n\n".join(parts.values()).strip()
     if not review:
         raise ValueError("OpenCode produced no final review text")
+    if incomplete:
+        review = _INCOMPLETE_NOTICE + "\n\n" + review
     return review + "\n"
 
 
