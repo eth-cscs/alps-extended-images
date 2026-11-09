@@ -140,7 +140,7 @@ When adding a build-affecting profile key, update its reader, hash inputs, this 
 
 - The OpenCode workflow reviews same-repository and fork PRs and posts findings as a GitHub comment.
 - Reviews run only after a user with repository write access posts a new `/oc-review` comment in the PR's Conversation tab.
-- The reviewer inspects changes, then writes a tools-disabled final response in the same read-only container; a separate job publishes the review.
+- The reviewer inspects changes, then writes a tools-disabled final response in the same read-only container; a separate job publishes the review and reports failures through request reactions.
 - See the [review documentation](.github/review/README.md) for trigger rules, trusted code, review history, sandbox permissions, credentials, and image publication.
 
 ## Manual Builds

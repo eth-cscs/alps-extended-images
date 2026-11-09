@@ -58,8 +58,8 @@ jobs:
           uvx pytest .github/review/host/tests
 
       - name: Review runtime checks
-        # Child-process and local HTTPS fixtures only; no inference credentials or external requests.
-        run: node --test .github/review/image/test-run-review.mjs .github/review/diagnostics/test-provider-trace.mjs
+        # Child-process fixtures only; no inference credentials or external requests.
+        run: node --test .github/review/image/test-run-review.mjs
 
       - name: Shell syntax
         # Catch syntax errors in tracked shell scripts, including sourced helpers.

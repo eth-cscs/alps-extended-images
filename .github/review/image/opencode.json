@@ -49,12 +49,7 @@
           "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
           "variants": [
             { "id": "review-final", "body": { "max_tokens": 32768, "tool_choice": { "type": "none" } } }
-          ],
-          "cost": {
-            "input": 0.1811,
-            "output": 6.642,
-            "cache": { "read": 0, "write": 0 }
-          }
+          ]
         }
       }
     }

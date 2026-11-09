@@ -66,8 +66,7 @@ def extract_review(lines):
         if phase == "final" and kind == "step_finish" and part.get("reason") not in ("stop", "end_turn"):
             raise ValueError("OpenCode stopped before completing the final review phase")
         if event_session != session:
-            # Child-agent results must not replace the parent review.
-            continue
+            raise ValueError("OpenCode event changed the inspection session")
         # Inspection text is private evidence, never a publishable fallback.
         if phase == "inspection":
             continue

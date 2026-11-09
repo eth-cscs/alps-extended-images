@@ -35,12 +35,19 @@ def review(final):
 def test_only_explicit_final_parent_response_is_published():
     lines = review([
         event("step_start"),
-        text("Child opinion", "child", "child-session"),
         event("reasoning", text="Private reasoning"),
         text("## Findings", part_id="heading"),
         text("- P1: incorrect boundary."),
     ])
     assert extract.extract_review(lines) == "## Findings\n\n- P1: incorrect boundary.\n"
+
+
+@pytest.mark.parametrize("position", [2, 5])
+def test_foreign_session_in_either_phase_is_rejected(position):
+    lines = review([text("Otherwise complete review")])
+    lines.insert(position, text("Unexpected session", session="other"))
+    with pytest.raises(ValueError, match="session"):
+        extract.extract_review(lines)
 
 
 def test_native_final_response_without_step_events_is_accepted():

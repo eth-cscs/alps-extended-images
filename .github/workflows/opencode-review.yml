@@ -1,29 +1,23 @@
 name: opencode-review
 
-# TEMPORARY pre-merge test for the same-repository fix/opencode-review branch.
-# Before merging, restore the Conversation trigger, default-branch helpers, and @main worker.
-# Remove the branch restriction and event adapter; keep later permission and runtime fixes.
-
 on:
-  # Inline comments load the PR's workflow; Conversation comments still use the default branch.
-  pull_request_review_comment:
+  # Conversation comments use the default branch's workflow, including for fork PRs.
+  issue_comment:
     types: [created]
 
 # Allow the worker to read PR data, react to requests, and post the final comment.
-# Worker jobs restrict these permissions separately; only reaction and publish jobs can write.
+# Worker jobs restrict these permissions separately; only reaction and finishing jobs can write.
 permissions:
   contents: read
   pull-requests: write
-  issues: write
 
 jobs:
   authorize:
-    # Test only the prepared branch in the main repository, never a fork PR.
-    # The access-check step still validates the command and the author's write permission.
+    # Reject non-PR comments and bot requests before starting a runner.
+    # The helper validates the full command and checks the author's current write access.
     if: >-
       github.repository == 'eth-cscs/alps-extended-images' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.ref == 'fix/opencode-review' &&
+      github.event.issue.pull_request &&
       github.event.comment.user.type == 'User' &&
       github.event.sender.type == 'User' &&
       github.actor == github.event.comment.user.login &&
@@ -35,14 +29,13 @@ jobs:
       contents: read
     outputs:
       authorized: ${{ steps.access.outputs.authorized }}
-      test_event_json: ${{ steps.access.outputs.test_event_json }}
     steps:
-      # TEMPORARY: use the reviewed helper snapshot, not main or the PR head.
-      - name: Checkout pinned authorization helper
+      # Never execute an authorization helper supplied by the PR.
+      - name: Checkout default-branch authorization helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
-          ref: b21cba435551836cd1cdcbe47551e191b742836d
+          ref: ${{ github.event.repository.default_branch }}
           path: default-branch
           persist-credentials: false
       # Query the author's current repository permission.
@@ -55,16 +48,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # TEMPORARY: adapt the inline event to the production conversation-command schema.
-          event_path="$RUNNER_TEMP/opencode-inline-test-event.json"
-          event_json="$(jq -ca '{repository, sender, action, issue: {number: .pull_request.number, pull_request: {}}, comment}' "$GITHUB_EVENT_PATH")"
-          printf '%s\n' "$event_json" > "$event_path"
           python3 default-branch/.github/review/host/context.py authorize \
-            --event-name issue_comment \
-            --event-path "$event_path" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
             --github-output "$GITHUB_OUTPUT"
-          printf 'test_event_json=%s\n' "$event_json" >> "$GITHUB_OUTPUT"
 
   review:
     needs: authorize
@@ -72,12 +60,10 @@ jobs:
     # Only an authorized request can cancel an earlier review for the same PR.
     # Reviews for other PRs use different concurrency groups.
     concurrency:
-      group: opencode-review-test-${{ github.event.pull_request.number }}
+      group: opencode-review-${{ github.event.issue.number }}
       cancel-in-progress: true
-    # TEMPORARY: load the worker from the same commit as this caller.
-    uses: ./.github/workflows/opencode-review-worker.yml
-    with:
-      test_event_json: ${{ needs.authorize.outputs.test_event_json }}
+    # Load trusted worker code from main, not the PR's head or target branch.
+    uses: eth-cscs/alps-extended-images/.github/workflows/opencode-review-worker.yml@main
     # Forward only the inference key; the worker pulls its image without registry credentials.
     secrets:
       CSCS_INFERENCE_KEY: ${{ secrets.CSCS_INFERENCE_KEY }}

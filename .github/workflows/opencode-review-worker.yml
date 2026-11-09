@@ -1,18 +1,10 @@
 name: opencode-review-worker
 
-# TEMPORARY: remove test_event_json and restore default-branch helpers and Conversation reactions before merging.
-# Keep later permission and runtime fixes when removing the test wiring.
-
 # opencode-review.yml checks write access before calling this worker.
-# Separate jobs acknowledge the request, generate and publish the review, and report failures.
+# Separate jobs acknowledge the request, generate the review, and publish or report failure.
 # See .github/review/README.md for setup, security boundaries, and image updates.
 on:
   workflow_call:
-    inputs:
-      test_event_json:
-        description: Temporary normalized issue_comment event for the inline test
-        required: true
-        type: string
     secrets:
       CSCS_INFERENCE_KEY:
         required: true
@@ -26,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      # TEMPORARY: inline-comment reactions require PR write access, not issue write access.
+      # Conversation comments on PRs use the issue-comment reaction API.
       pull-requests: write
     outputs:
       reaction_user_id: ${{ steps.reaction.outputs.user_id }}
@@ -37,7 +29,7 @@ jobs:
         with:
           github-token: ${{ github.token }}
           script: |
-            const {data: reaction} = await github.rest.reactions.createForPullRequestReviewComment({
+            const {data: reaction} = await github.rest.reactions.createForIssueComment({
               ...context.repo,
               comment_id: context.payload.comment.id,
               content: 'eyes',
@@ -61,12 +53,12 @@ jobs:
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
-      # TEMPORARY: use the reviewed helper and AGENTS.md snapshot pinned below.
-      - name: Checkout pinned test helpers and instructions
+      # PR changes cannot replace the helpers or repository instructions used by this run.
+      - name: Checkout default-branch helpers and instructions
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
-          ref: b21cba435551836cd1cdcbe47551e191b742836d
+          ref: ${{ github.event.repository.default_branch }}
           path: default-branch
           persist-credentials: false
 
@@ -77,15 +69,11 @@ jobs:
         id: prepare
         env:
           GH_TOKEN: ${{ github.token }}
-          TEST_EVENT_JSON: ${{ inputs.test_event_json }}
         run: |
           set -euo pipefail
-          # TEMPORARY: use the same normalized event that passed authorization.
-          event_path="$RUNNER_TEMP/opencode-inline-test-event.json"
-          printf '%s\n' "$TEST_EVENT_JSON" > "$event_path"
           python3 default-branch/.github/review/host/context.py prepare \
-            --event-name issue_comment \
-            --event-path "$event_path" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \
             --output "$RUNNER_TEMP/opencode-review/input" \
             --github-output "$GITHUB_OUTPUT"
@@ -119,11 +107,11 @@ jobs:
       - name: Pull trusted prebuilt review image
         run: docker pull "$OPENCODE_REVIEW_IMAGE"
 
-      # run.py mounts the PR checkout, context, and pinned AGENTS.md read-only.
+      # run.py mounts the PR checkout, context, and default-branch AGENTS.md read-only.
       # Only CSCS_INFERENCE_API_KEY is forwarded from the host environment; the Docker socket is not mounted.
       # Runtime files go in /work and /tmp; the image filesystem is read-only.
-      # The host enforces a 17-minute backstop, 5-second kill grace, and bounded container cleanup.
-      # Failures still check HEAD/Git status and retain only fixed-label diagnostics for CI upload.
+      # The host enforces a hard deadline and bounded process/container cleanup.
+      # Failures still check HEAD/Git status and retain sanitized diagnostics, including error excerpts.
       - name: Run isolated CSCS reviewer
         id: reviewer
         env:
@@ -148,7 +136,7 @@ jobs:
             --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl" \
             --output "$RUNNER_TEMP/opencode-review/model-output/review.md"
 
-      # Pass only review.md to the publish job, not raw model events or PR context.
+      # Pass only review.md to the finishing job, not raw model events or PR context.
       - name: Retain review text only
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -188,9 +176,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Publish on a separate runner without executing the reviewer or PR code.
-  publish:
-    needs: review
+  # Publish and report failures on one runner without a source checkout or inference key.
+  # Run after failed dependencies too, but ignore requests cancelled or superseded by newer ones.
+  finish:
+    needs: [acknowledge, review]
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -199,6 +189,8 @@ jobs:
     steps:
       # Read review.md without a source checkout, inference key, or model process.
       - name: Download review text
+        id: download
+        if: needs.review.result == 'success'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: opencode-review
@@ -207,6 +199,8 @@ jobs:
       # Read model output from the artifact as text; never insert it into this script's source.
       # Pass the PR number and reviewed SHA through environment variables and validate them below.
       - name: Publish only against the reviewed PR head
+        id: publish
+        if: needs.review.result == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           REVIEW_PR_NUMBER: ${{ needs.review.outputs.pr_number }}
@@ -245,30 +239,24 @@ jobs:
             }
             await github.rest.issues.createComment({...context.repo, issue_number: pull_number, body});
 
-  # Run after failed dependencies too; the reviewer itself still has no write permission.
-  # Ignore cancellation, including reviews superseded by a newer request.
-  report-status:
-    needs: [acknowledge, review, publish]
-    if: ${{ always() && !cancelled() }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      # TEMPORARY: restore issue-comment reaction endpoints with the Conversation trigger.
-      pull-requests: write
-    steps:
       - name: Update request failure reaction
+        if: ${{ always() && !cancelled() }}
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           JOB_RESULTS: ${{ toJSON(needs.*.result) }}
+          STEP_RESULTS: ${{ toJSON(steps.*.outcome) }}
           REACTION_USER_ID: ${{ needs.acknowledge.outputs.reaction_user_id }}
         with:
           github-token: ${{ github.token }}
           script: |
-            const results = JSON.parse(process.env.JOB_RESULTS);
+            const results = [
+              ...JSON.parse(process.env.JOB_RESULTS),
+              ...JSON.parse(process.env.STEP_RESULTS),
+            ];
             const request = {...context.repo, comment_id: context.payload.comment.id};
             if (results.includes('failure')) {
               // GitHub returns the existing reaction on retries rather than adding a duplicate.
-              await github.rest.reactions.createForPullRequestReviewComment({
+              await github.rest.reactions.createForIssueComment({
                 ...request, content: 'confused',
               });
               return;
@@ -277,14 +265,13 @@ jobs:
             // Re-run failed jobs can skip acknowledge, so clear a prior failure here.
             // Preserve reactions from people and other bots.
             const reactions = await github.paginate(
-              github.rest.reactions.listForPullRequestReviewComment,
+              github.rest.reactions.listForIssueComment,
               {...request, content: 'confused', per_page: 100},
             );
             for (const reaction of reactions) {
               if (String(reaction.user?.id) === process.env.REACTION_USER_ID) {
-                await github.request(
-                  'DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}/reactions/{reaction_id}',
-                  {...request, reaction_id: reaction.id},
-                );
+                await github.rest.reactions.deleteForIssueComment({
+                  ...request, reaction_id: reaction.id,
+                });
               }
             }
