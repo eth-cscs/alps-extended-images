@@ -33,8 +33,8 @@
 # verl V1 separate_async notes (vs the fully-async recipe this descends from):
 #   * data.train_batch_size == parameter_sync_step * ppo_mini_batch_size (asserted by verl).
 #   * old_log_probs come from rollout.calculate_log_probs + algorithm.rollout_correction.bypass_mode.
-#   * PPOTrainer._setup() also builds HYBRID rollout replicas on the training GPUs (not
-#     configurable) -- v1-separate-async-fixes.patch below no-ops them; without it init OOMs.
+#   * actor_rollout_ref.hybrid_engine: False keeps HYBRID rollout replicas off the training GPUs
+#     (verl 0.9.1); without it init OOMs.
 # ─────────────────────────────────────────────────────────────────────────────
 
 export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev-621fa40275c4f036" #alps7-dev-a9f9e56471c0574e image with update dependencies #alps7-dev-0f334b540ccc7034 image with megatron
@@ -77,6 +77,8 @@ workdir = "/workspace/verl"
 writable = true
 entrypoint = true
 [env]
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -108,6 +110,7 @@ data:
   max_response_length: 256  # GSM8K answers fit; 1024 made generation the bottleneck at TP=32
 
 actor_rollout_ref:
+  hybrid_engine: False  # no colocated rollout replicas on the trainer GPUs
   model:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
     # THD packed sequences: required by R3 router replay and by use_fused_kernels. Works with DSA
@@ -135,7 +138,6 @@ actor_rollout_ref:
       # Params stay on GPU (bf16, ~17 GB/rank): offloading them tipped trainer-node host RAM over
       # 450 GB together with the CPU-offloaded optimizer state and the delta-sync snapshot.
       param_offload: False
-      grad_offload: True
       optimizer_offload: True
       vanilla_mbridge: False  # GLM-5.1 (glm_moe_dsa) needs megatron-bridge
       # R3 (Rollout Router Replay): replays the rollout's expert routing in the trainer -- verl's
@@ -393,506 +395,6 @@ sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.p
 # script runs from Slurm's spool copy, so script-relative paths do not resolve on the nodes. Each
 # heredoc must stay byte-identical to its checked-in file. Staged on the batch host, sbcast to
 # every node, applied in the srun (apply-or-fail, so no node can silently run unpatched code).
-#   v1-separate-async-fixes.patch ....... no-op the hybrid rollout replicas + the stale hybrid
-#                                          weight-sync call; nested-tensor fix in TensorDict assembly
-#   r3-sglang-routed-experts-import-fix .. R3 rollout capture vs sglang 0.5.16 (moved module,
-#                                          base64 routed_experts)
-#   wsync-debug-progress-log.patch ....... per-tensor weight-sync progress log + the seed-sync
-#                                          WORLD barrier (megatron-bridge collective desync)
-#   delta-sharded-localserializedtensor-import-fix .. sglang 0.5.16 import path for the delta path
-#   step1-oom-memdump.patch .............. unconditional empty_cache() before optimizer.step()
-#                                          (+ a one-shot [MEMDUMP] memory report per rank)
-cat > "${TRAINING_CONFIG}/v1-separate-async-fixes.patch" <<- 'EOF'
-# Local fixes for verl v0.9.0's V1 separate-async trainer, discovered debugging
-# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh (see Known hazards and the
-# Run log in CLAUDE.md for the full incident history). Re-diff against a newer verl
-# ref if this stops applying.
-#
-# 1. LLMServerManager._initialize_llm_servers (verl/workers/rollout/llm_server.py):
-#    PPOTrainer._setup() always builds hybrid rollout replicas on top of the
-#    training worker group (trainer_world_size / rollout_world_size replicas) *in
-#    addition to* the standalone rollout -- actor_rollout_ref.hybrid_engine is not
-#    consulted anywhere in the V1 path, so this could not be disabled from config.
-#    Those replicas are instantiated at gpu_memory_utilization=0.75 on the training
-#    GPUs during trainer.init(), before the first on_sample_end() ever runs, and
-#    free_cache_engine=false (required for TP=32 SGLang stability) makes their
-#    sleep() a no-op -- so they held ~71 GiB per training GPU for the life of the
-#    run. trainer.init() then needs ~15 GiB back on those same GPUs to stage
-#    Megatron params for the NCCL export to the standalone rollout, and OOMed
-#    (runs 3121001, 3125195, 3129805). separate-async never actually needs the
-#    hybrid engine: get_llm_client() is overridden in PPOTrainerSeparateAsync to
-#    always route through the standalone rollout, so the hybrid replicas existed
-#    only to be immediately put to sleep. Fixed by no-oping hybrid-mode calls
-#    (worker_group is not None); standalone-mode calls (worker_group is None) are
-#    unaffected. Confirmed fixed in run 3134772 (no OOM, training reached step 0).
-#
-# 2. PPOTrainerSeparateAsync.on_init_end (verl/trainer/ppo/v1/trainer_separate_async.py):
-#    drops the self.checkpoint_manager.update_weights(...) call. That manager's
-#    backend is forced to "naive" (trainer_base.py), which pushes weights into
-#    each worker's colocated hybrid engine directly rather than going through a
-#    replica list -- with hybrid replicas disabled by fix 1 above, that colocated
-#    engine is never created, so the call would push into nothing.
-#    self.standalone_checkpoint_manager.update_weights(...), the actual sync to
-#    the standalone rollout, is left untouched. Paired with fix 1; same runs.
-#
-# 3. list_of_dict_to_tensordict (verl/utils/tensordict_utils.py): decided
-#    nested-vs-stacked per field by checking `all(item.shape == val_list[0].shape
-#    for item in val_list)` -- trivially true for a length-1 list (this function
-#    is called once per rollout output, so len(list_of_dicts) is often 1) and also
-#    true whenever several ragged items (e.g. GRPO rollout-group responses)
-#    coincidentally share a length, most commonly by all saturating
-#    max_response_length. Silently produced a dense Tensor for fields callers
-#    assume are nested (input_ids, prompts, responses, position_ids), and any
-#    downstream .offsets() call then raised
-#    AttributeError: 'Tensor' object has no attribute 'offsets' (runs 3134772,
-#    3136766, 3137775). Fixed by delegating non-scalar tensor fields
-#    unconditionally to this same file's own nested_tensor_from_tensor_list (used
-#    elsewhere in the file for chunking/dispatch, and already correct there) --
-#    no more shape-equality guessing. This was a real, independent bug, but ended
-#    up never being the sole cause of the offsets crashes in this chain: see
-#    CLAUDE.md's run 3144665/3149736 entries for the actual root cause, a
-#    same-shaped bug in the separately pip-installed TransferQueue==0.1.6 (fixed
-#    upstream in 0.1.7; the training script upgrades the wheel at runtime rather
-#    than patching it here, since it isn't part of this checkout). Confirmed fixed
-#    end-to-end for the whole recipe in run 3149736 (14/231 training steps
-#    completed, sane metrics, zero offsets crashes).
-#
-# Originally shipped as sitecustomize.py runtime monkeypatches (fast to iterate on
-# mid-debugging -- no hand-crafted diff needed while the exact fix was still
-# changing), converted to this source patch once run 3149736 confirmed all three
-# were correct and stable: same reasoning as the Apertus benchmark's equivalent
-# conversion (apertus-benchmarks/patches/sglang-apertus1p5-local-fixes.patch) --
-# a runtime monkeypatch is great for fast iteration but not the form a stable fix
-# should end up in. A plain source patch is one less moving part (no
-# sys.meta_path machinery, no PYTHONPATH staging, no import-timing dependency)
-# and the actual behavior is just readable in the file.
-diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
-index 18a06ee2..4c1815a5 100644
---- a/verl/trainer/ppo/v1/trainer_separate_async.py
-+++ b/verl/trainer/ppo/v1/trainer_separate_async.py
-@@ -133,7 +133,13 @@ class PPOTrainerSeparateAsync(PPOTrainer):
-     def on_init_end(self):
-         # update weights after loading checkpoint
-         self.standalone_checkpoint_manager.update_weights(self.global_steps)
--        self.checkpoint_manager.update_weights(self.global_steps)
-+        # self.checkpoint_manager (the hybrid-replica sync path) is skipped: its
-+        # backend is forced to "naive", which pushes weights into each worker's
-+        # colocated hybrid engine directly rather than through a replica list --
-+        # with LLMServerManager._initialize_llm_servers disabling hybrid replicas
-+        # (see llm_server.py), that colocated engine is never created, so this call
-+        # would push into nothing. self.standalone_checkpoint_manager.update_weights
-+        # above, the actual sync to the standalone rollout, is unaffected.
-
-     def on_train_begin(self):
-         if self.config.skip.rollout_tq.enable:
-diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
-index 91d82b15..810ccbee 100644
---- a/verl/utils/tensordict_utils.py
-+++ b/verl/utils/tensordict_utils.py
-@@ -930,20 +930,21 @@ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDic
-     dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
-     batch_size = len(list_of_dicts)
-
--    final_data = {
--        key: (
--            torch.stack(val_list)
--            if val_list
--            and all(isinstance(item, torch.Tensor) for item in val_list)
--            and all(item.shape == val_list[0].shape for item in val_list)
--            else (
--                torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
--                if val_list and all(isinstance(item, torch.Tensor) for item in val_list)
--                else NonTensorStack(*val_list)
--            )
--        )
--        for key, val_list in dict_of_lists.items()
--    }
-+    def _pack(val_list):
-+        if not val_list or not all(isinstance(item, torch.Tensor) for item in val_list):
-+            return NonTensorStack(*val_list)
-+        # Scalar tensors have no dimension to make ragged along.
-+        if all(item.dim() == 0 for item in val_list):
-+            return torch.stack(val_list)
-+        # Always nested -- never guess dense-vs-ragged from shape equality: that
-+        # heuristic is trivially wrong for a length-1 list (every item "matches"
-+        # its own shape) and misfires whenever several ragged items coincidentally
-+        # share a length (e.g. multiple GRPO rollout responses that all saturate
-+        # max_response_length), silently producing a dense Tensor for fields
-+        # callers assume are nested and crashing their .offsets() calls downstream.
-+        return nested_tensor_from_tensor_list(val_list)
-+
-+    final_data = {key: _pack(val_list) for key, val_list in dict_of_lists.items()}
-
-     td = TensorDict(final_data, batch_size=[batch_size])
-
-diff --git a/verl/workers/rollout/llm_server.py b/verl/workers/rollout/llm_server.py
-index d9beede7..4e2d767e 100644
---- a/verl/workers/rollout/llm_server.py
-+++ b/verl/workers/rollout/llm_server.py
-@@ -523,6 +523,18 @@ class LLMServerManager:
-                 so standalone replicas can avoid Ray named-actor collisions with hybrid
-                 replicas (which start at 0) when both coexist (e.g. separate async).
-         """
-+        # separate-async's standalone rollout makes the hybrid replicas this method
-+        # would otherwise build on top of the training worker group pure overhead:
-+        # get_llm_client() is overridden elsewhere to always route through the
-+        # standalone rollout, so hybrid replicas exist only to be put to sleep. Building
-+        # them anyway costs ~gpu_memory_utilization worth of every training GPU during
-+        # init, which the trainer's own weight-sync needs back (OOM without this).
-+        if self.worker_group is not None:
-+            self.rollout_replicas = []
-+            self.server_handles = []
-+            self.server_addresses = []
-+            print("LLMServerManager: hybrid replicas disabled (worker_group is set) — skipping init_hybrid()")
-+            return
-         if start_rank is None:
-             start_rank = self.start_rank
-         rollout_world_size = (
-EOF
-sbcast -f ${TRAINING_CONFIG}/v1-separate-async-fixes.patch ${TRAINING_CONFIG}/v1-separate-async-fixes.patch
-
-cat > "${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch" <<- 'EOF'
-# Fixes R3 (Rollout Router Replay)'s rollout-side routed-experts capture for this image's
-# actual SGLang version (0.5.16). Discovered debugging
-# train-gsm8k-glm5.1-700B-v1-separate-async-megatron.sh -- see CLAUDE.md's Configuration audit
-# and the Run log entries for runs 3199623 / 3207151 and probe job 3199799.
-#
-# Two separate defects in verl v0.9.0's async_sglang_server.py, both fixed here (this patch
-# supersedes the earlier import-path-only version):
-#
-#  1. The `skip_tokenizer_init: True` branch did `captured.numpy()` on
-#     meta_info["routed_experts"], assuming a raw torch tensor. Current sglang stores that
-#     field as a base64-encoded int32 buffer regardless of skip_tokenizer_init (the encode
-#     happens in DetokenizerManager._b64_encode_per_request, which runs even with no
-#     tokenizer) -- so the branch raised `AttributeError: 'str' object has no attribute
-#     'numpy'` on every rollout call, cluster-wide, in run 3207151. This recipe's TP=32
-#     standalone rollout runs with skip_tokenizer_init=True, so it always hit this branch.
-#     Fix: drop the dead tensor branch; always decode via
-#     extract_routed_experts_from_meta_info + reshape (what the other branch already did).
-#
-#  2. The surviving branch imported extract_routed_experts_from_meta_info from
-#     sglang.srt.layers.moe.routed_experts_capturer, a path that does not exist in sglang
-#     0.5.16 -- the module was relocated/renamed to sglang.srt.state_capturer.routed_experts
-#     (confirmed by fetching the real sglang v0.5.16 tag: same function name, same
-#     single-arg signature). Fix: import from the new path, fall back to the old one so the
-#     patch is also correct against an older sglang / usable as an upstream PR.
-#
-# The reshape target -- [num_tokens, num_hidden_layers, num_experts_per_tok] -- matches
-# sglang 0.5.16's own RoutedExpertsCapturer buffer, which is allocated
-# num_layers=hf_text_config.num_hidden_layers wide (dense-layer slots stay zero); confirmed
-# by reading sglang/srt/state_capturer/routed_experts.py at the v0.5.16 tag. GLM-5.1
-# (glm_moe_dsa) exposes num_hidden_layers and num_experts_per_tok as flat top-level config
-# fields (same layout as transformers' glm4_moe), so the hasattr guard passes; if a future
-# checkpoint nests them, the guard raises a clear AttributeError rather than mis-shaping.
-#
-# Generated from a real edited git worktree at the verl v0.9.0 tag (not hand-written),
-# verified against a fresh checkout: applies cleanly (git apply --check), the patched file
-# compiles (python3 -m py_compile), and git apply --reverse --check correctly detects
-# "already applied" -- same verification discipline as this script's other patches.
-#
-# This only fixes the rollout (SGLang) side of R3. The actor-side fused DSA-THD kernel that
-# R3 also needs is covered by this script's megatron-core 0.19.0 + megatron-bridge 0.6.1
-# runtime upgrade block.
-diff --git a/verl/workers/rollout/sglang_rollout/async_sglang_server.py b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
-index b3329a8..fe20e55 100644
---- a/verl/workers/rollout/sglang_rollout/async_sglang_server.py
-+++ b/verl/workers/rollout/sglang_rollout/async_sglang_server.py
-@@ -658,12 +658,24 @@ class SGLangHttpServer:
- 
-         routed_experts = None
-         if self.config.enable_rollout_routing_replay:
--            if self.config.skip_tokenizer_init:
--                # convert to numpy
--                captured = output.get("meta_info", {}).get("routed_experts", None)
--                routed_experts = captured.numpy() if captured is not None else None
--            else:
--                from sglang.srt.layers.moe.routed_experts_capturer import extract_routed_experts_from_meta_info
-+            # sglang stores meta_info["routed_experts"] as a base64-encoded int32
-+            # buffer (this is true regardless of skip_tokenizer_init -- the encode
-+            # happens in DetokenizerManager._b64_encode_per_request, which runs even
-+            # with no tokenizer). Decode + reshape to
-+            # [num_tokens, num_hidden_layers, num_experts_per_tok]. The former
-+            # skip_tokenizer_init branch assumed a raw tensor exposing .numpy(),
-+            # which no current sglang provides -- it raised
-+            # AttributeError: 'str' object has no attribute 'numpy'.
-+            captured = output.get("meta_info", {}).get("routed_experts", None)
-+            if captured is not None:
-+                try:
-+                    from sglang.srt.state_capturer.routed_experts import (
-+                        extract_routed_experts_from_meta_info,
-+                    )
-+                except ImportError:
-+                    from sglang.srt.layers.moe.routed_experts_capturer import (
-+                        extract_routed_experts_from_meta_info,
-+                    )
- 
-                 hf_config = self.model_config.hf_config
-                 if not hasattr(hf_config, "num_hidden_layers") or not hasattr(hf_config, "num_experts_per_tok"):
-EOF
-sbcast -f ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch
-
-cat > "${TRAINING_CONFIG}/wsync-debug-progress-log.patch" <<- 'EOF'
-# [CSCS, 2026-09-02] Weight-sync per-tensor progress logging + seed AND steady-sync lockstep
-# barrier.
-#
-# (1) DIAGNOSTIC: wraps the two Megatron weight-export generators (get_per_tensor_param = the
-#     full seed export; get_per_tensor_param_delta_shard = the delta_sharded steady export) so a
-#     collective hang shows, per rank, how far streaming got ("[WSYNC-DBG] rank=N ... tensor#K",
-#     every 1000 tensors + on exit). Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE / _DUMP_ON_TIMEOUT
-#     (set in the srun env).
-#
-# (2) FIX: a collective desync during weight sync (CLAUDE.md "Gloo all_gather_object" /
-#     gather_from_ep_ranks NCCL ALLGATHER 30-min timeout in stream_weights_megatron_to_hf, hit on
-#     the SEED path in runs 3141801/3207923/3219811/3240762 -- ~1 run in 2, the single biggest
-#     blocker to a full run for a long stretch). The seed sync (_send_full_seed) streams the full
-#     get_per_tensor_param() HF export, running a chain of PP/EP/TP assembly collectives per HF
-#     tensor; _send_full_seed drives that generator ASYMMETRICALLY -- rank 0 buckets + broadcasts
-#     each flush to the rollout CE group between pulls, every non-master rank just discards its
-#     tensor and pulls the next -- so non-master ranks race ahead in the per-tensor collective
-#     chain until a later cross-group collective deadlocks. Fix: for the seed export,
-#     torch.distributed.barrier() on the trainer WORLD group every VERL_WSYNC_SEED_BARRIER_EVERY
-#     (default 1) HF tensors, AFTER the consumer processed each -- no rank can start tensor K+1's
-#     assembly collectives until every rank finished K, so drift is bounded to
-#     VERL_WSYNC_SEED_BARRIER_EVERY. Validated across 10+ runs with zero recurrence.
-#
-#     Run 3263683 (the first run to ever reach a real, full-scale delta_sharded STEADY sync --
-#     every prior run died earlier, on the seed hang or a step-1 GPU/host-RAM OOM) hit the SAME
-#     desync class there: an NCCL ALLGATHER hang on the steady sync's very first flush. The
-#     steady path's _GatherQueue was assumed "count-lockstepped by design" (CLAUDE.md run
-#     3219811's investigation) and deliberately left unbarriered -- that assumption is now
-#     disproven by direct evidence. Fix: extend the identical barrier to the "delta-steady" tag
-#     too. Steady syncs are far smaller than the seed (only changed values), so per-item
-#     barriering there is cheap.
-#
-# Generated from a real edited git worktree at the verl v0.9.0 tag; verified against a fresh
-# checkout: git apply --check clean, py_compile clean, git apply --reverse --check detects
-# "already applied".
-diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index e8a6c56..259cdd7 100644
---- a/verl/workers/engine/megatron/transformer_impl.py
-+++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -87,6 +87,53 @@ logger = logging.getLogger(__file__)
- logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
- 
- 
-+
-+def _wsync_progress_log(gen, tag):
-+    """[weight-sync debug + seed/steady-sync lockstep fix, CSCS] Wrap a per-tensor weight-export
-+    generator.
-+
-+    (1) Diagnostic: on a collective hang during weight sync, print per rank how far the
-+        streaming got (which tensor / how long). Pairs with TORCH_NCCL_TRACE_BUFFER_SIZE.
-+    (2) Fix for megatron-bridge / delta-engine collective desyncs during weight sync (CLAUDE.md:
-+        gather_from_ep_ranks / broadcast_obj_from_pp_rank timeout on the seed path, runs
-+        3141801 / 3207923 / 3219811 / 3240762; and an NCCL ALLGATHER hang on the delta-STEADY
-+        path's very first flush, run 3263683 -- the first run to ever reach that path at real
-+        scale). For BOTH the "seed/full" and "delta-steady" exports, torch.distributed.barrier()
-+        on the trainer WORLD group every VERL_WSYNC_SEED_BARRIER_EVERY (default 1) items, AFTER
-+        the consumer has processed each -- no rank can start the next item's assembly/gather
-+        collectives until every rank finished the current one, so drift is bounded to
-+        VERL_WSYNC_SEED_BARRIER_EVERY. The seed export drives its generator asymmetrically (rank
-+        0 buckets + broadcasts each flush to the rollout CE group between pulls, non-master ranks
-+        discard and pull the next) -- the delta-steady _GatherQueue path was assumed
-+        "count-lockstepped by design" and left unbarriered, but run 3263683 showed that
-+        assumption does not hold at real scale. Steady syncs are far smaller than the seed
-+        (only changed values), so per-item barriering there is cheap."""
-+    import time as _t
-+
-+    _rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "?"
-+    _barrier_tag = tag in ("seed/full", "delta-steady")
-+    try:
-+        _every = max(1, int(os.environ.get("VERL_WSYNC_SEED_BARRIER_EVERY", "1")))
-+    except ValueError:
-+        _every = 1
-+    _t0 = _t.time()
-+    _n = 0
-+    try:
-+        for _item in gen:
-+            _n += 1
-+            if _n % 1000 == 1:
-+                try:
-+                    _name = getattr(_item, "name", None) or (_item[0] if isinstance(_item, (tuple, list)) else "?")
-+                except Exception:
-+                    _name = "?"
-+                print(f"[WSYNC-DBG] rank={_rank} {tag} tensor#{_n} name={_name} t+{_t.time() - _t0:.0f}s", flush=True)
-+            yield _item
-+            if _barrier_tag and (_n % _every == 0) and torch.distributed.is_initialized():
-+                torch.distributed.barrier()
-+    finally:
-+        print(f"[WSYNC-DBG] rank={_rank} {tag} generator exited after {_n} tensors, {_t.time() - _t0:.0f}s", flush=True)
-+
-+
- def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
-     """Return the scalar temperature required by fused linear cross entropy."""
-     values = torch.as_tensor(temperature).detach().flatten()
-@@ -1042,7 +1089,7 @@ class MegatronEngine(BaseEngine):
- 
-             per_tensor_param = export_qat_weights(per_tensor_param, self.module, self._qat_config.mode, self.bridge)
- 
--        return per_tensor_param, peft_config
-+        return _wsync_progress_log(per_tensor_param, "seed/full"), peft_config
- 
-     def _mcore_export_index(self):
-         """Build (once) the per-parameter delta export index: geometry specs and
-@@ -1104,7 +1151,9 @@ class MegatronEngine(BaseEngine):
- 
-         self._delta_shard_snap = getattr(self, "_delta_shard_snap", {})
-         gen, _ = self.get_per_tensor_param_shard()
--        return hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), None
-+        return _wsync_progress_log(
-+            hf_delta_export(gen, self._delta_shard_snap, self._hf_delta_entry), "delta-steady"
-+        ), None
- 
-     def disable_adapter(self) -> ContextManager:
-         return self.peft_cls.disable_adapter(self.module)
-EOF
-sbcast -f ${TRAINING_CONFIG}/wsync-debug-progress-log.patch ${TRAINING_CONFIG}/wsync-debug-progress-log.patch
-
-cat > "${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch" <<- 'EOF'
-# [CSCS, 2026-08-30] verl v0.9.0's delta_sharded weight-sync path
-# (_update_weights_delta_flush in sglang_rollout.py) hardcodes
-#   from sglang.srt.model_executor.model_runner import LocalSerializedTensor
-# but this image's sglang (0.5.16, the GLM-5.1 DSA build) moved that class to
-#   sglang.srt.model_executor.model_runner_components.weight_updater
-# -- confirmed by reading sglang v0.5.16's own weight_sync/utils.py, which imports it from the
-# new path (line 10-12), and the class definition at model_runner_components/weight_updater.py:370.
-# Same class of verl-vs-sglang import drift as r3-sglang-routed-experts-import-fix.patch. Found by
-# run 3223205: delta_sharded's trainer-side export worked cleanly (no gather_from_ep_ranks hang!)
-# but the first delta flush died on the rollout side with
-#   ImportError: cannot import name 'LocalSerializedTensor' from 'sglang.srt.model_executor.model_runner'
-#
-# Fix: try the new path, fall back to the old (so it also works against an older sglang / as an
-# upstream PR). Only the import moves; the LocalSerializedTensor(values=[...]) construction a few
-# lines below is unchanged. The other three sglang imports in the same function
-# (UpdateWeightsFromTensorReqInput, MultiprocessingSerializer, monkey_patch_torch_reductions) were
-# checked against sglang v0.5.16 and are still at their hardcoded paths.
-#
-# Generated from a real edited git worktree at the verl v0.9.0 tag; verified against a fresh
-# checkout: git apply --check clean, py_compile clean, git apply --reverse --check detects
-# "already applied".
-diff --git a/verl/workers/rollout/sglang_rollout/sglang_rollout.py b/verl/workers/rollout/sglang_rollout/sglang_rollout.py
-index 07e30d0..bf05f07 100644
---- a/verl/workers/rollout/sglang_rollout/sglang_rollout.py
-+++ b/verl/workers/rollout/sglang_rollout/sglang_rollout.py
-@@ -401,7 +401,12 @@ class ServerAdapter(BaseRollout):
-         """
-         import torch.distributed as dist
-         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
--        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
-+
-+        try:
-+            # sglang >= ~0.5.16 (the version this image ships): LocalSerializedTensor moved here
-+            from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor
-+        except ImportError:
-+            from sglang.srt.model_executor.model_runner import LocalSerializedTensor
-         from sglang.srt.utils import MultiprocessingSerializer
-         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
- 
-EOF
-sbcast -f ${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch ${TRAINING_CONFIG}/delta-sharded-localserializedtensor-import-fix.patch
-
-cat > "${TRAINING_CONFIG}/step1-oom-memdump.patch" <<- 'EOF'
-# [CSCS diagnostic, 2026-09-01/02] step-1 GPU memory instrumentation + the empty_cache() fix.
-#
-# _step1_oom_memdump() fires ONCE per rank, right before the first optimizer.step(): prints this
-# process's torch CUDA accounting (every rank) plus a full nvidia-smi -- all GPUs, all compute
-# processes, per-process used_memory (local rank 0 only, i.e. the GPU that used to OOM). The
-# [MEMDUMP] lines land in the main slurm log. This diagnostic block (run 3246683) proved the
-# step-1 GPU OOM (runs 3241496-3246683) was a genuine hairline miss, not a phantom co-resident
-# process -- nvidia-smi always showed exactly one WorkerDict per GPU.
-#
-# Also makes optimizer_step()'s empty_cache() call UNCONDITIONAL (was gated on the unused
-# _distillation_use_topk_active path): returns PyTorch's reserved-but-unallocated cache to the
-# driver right before the optimizer's large contiguous allocations, closing the hairline miss.
-#
-# MUST be applied AFTER wsync-debug-progress-log.patch -- both touch transformer_impl.py and this
-# diff's context lines assume _wsync_progress_log is already present.
-#
-# DIAGNOSTIC (memdump) kept indefinitely for now -- cheap, and useful signal on any future
-# step-1 memory question. Generated from a real edited git worktree at the verl v0.9.0 tag
-# (+ wsync-debug-progress-log.patch applied); git apply --check clean, py_compile clean,
-# git apply --reverse --check detects "already applied".
-diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 259cdd7..fa9d585 100644
---- a/verl/workers/engine/megatron/transformer_impl.py
-+++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -134,6 +134,57 @@ def _wsync_progress_log(gen, tag):
-         print(f"[WSYNC-DBG] rank={_rank} {tag} generator exited after {_n} tensors, {_t.time() - _t0:.0f}s", flush=True)
- 
- 
-+
-+def _step1_oom_memdump(engine):
-+    """[CSCS step-1 OOM diagnostic] Fire once, on this rank's FIRST optimizer.step(), right
-+    before it runs. Dumps this process's torch CUDA accounting + a full nvidia-smi (all GPUs,
-+    all compute processes, per-process used memory) so GPU memory pressure at the optimizer step
-+    can be attributed to a concrete pid/process. Every rank dumps its own torch numbers; only
-+    local rank 0 (the GPU that OOMs) also shells out to nvidia-smi. Remove once no longer needed
-+    for diagnosis."""
-+    if getattr(engine, "_step1_oom_memdump_done", False):
-+        return
-+    engine._step1_oom_memdump_done = True
-+    import subprocess
-+
-+    _rank = os.environ.get("RANK") or os.environ.get("SLURM_PROCID") or "?"
-+    _lrank = os.environ.get("LOCAL_RANK", "0")
-+    _cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
-+    try:
-+        _dev = torch.cuda.current_device()
-+        _free, _total = torch.cuda.mem_get_info(_dev)
-+        _alloc = torch.cuda.memory_allocated(_dev)
-+        _resv = torch.cuda.memory_reserved(_dev)
-+        print(
-+            f"[MEMDUMP] rank={_rank} lrank={_lrank} pid={os.getpid()} CUDA_VISIBLE_DEVICES={_cvd} "
-+            f"cur_dev={_dev} free={_free / 2**30:.2f}G total={_total / 2**30:.2f}G "
-+            f"gpu_used={(_total - _free) / 2**30:.2f}G torch_alloc={_alloc / 2**30:.2f}G "
-+            f"torch_reserved={_resv / 2**30:.2f}G "
-+            f"non_torch_this_proc={((_total - _free) - _resv) / 2**30:.2f}G(incl other procs)",
-+            flush=True,
-+        )
-+    except Exception as _e:
-+        print(f"[MEMDUMP] rank={_rank} torch mem read failed: {_e}", flush=True)
-+
-+    if str(_lrank) != "0":
-+        return
-+    for _args, _tag in (
-+        (["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-+          "--format=csv,noheader"], "compute-apps"),
-+        (["nvidia-smi", "--query-gpu=index,uuid,memory.used,memory.total",
-+          "--format=csv,noheader"], "gpu-mem"),
-+    ):
-+        try:
-+            _out = subprocess.run(_args, capture_output=True, text=True, timeout=25).stdout.strip()
-+            print(f"[MEMDUMP] rank={_rank} nvidia-smi {_tag}:\n{_out}", flush=True)
-+        except Exception as _e:
-+            print(f"[MEMDUMP] rank={_rank} nvidia-smi {_tag} failed: {_e}", flush=True)
-+    try:
-+        print(f"[MEMDUMP] rank={_rank} torch.cuda.memory_summary():\n{torch.cuda.memory_summary()}", flush=True)
-+    except Exception as _e:
-+        print(f"[MEMDUMP] rank={_rank} memory_summary failed: {_e}", flush=True)
-+
-+
- def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
-     """Return the scalar temperature required by fused linear cross entropy."""
-     values = torch.as_tensor(temperature).detach().flatten()
-@@ -733,8 +784,13 @@ class MegatronEngine(BaseEngine):
-         """
-         # forward_kl_topk leaves large fp32 vocab tensors until backward ends;
-         # free cached blocks before grad-norm all_reduce to reduce OOM on tight VRAM.
--        if getattr(self, "_distillation_use_topk_active", False):
--            get_torch_device().empty_cache()
-+        # [CSCS] made unconditional (was gated on _distillation_use_topk_active): the
-+        # Megatron distributed-optimizer state init allocates large contiguous blocks on GPU 0
-+        # during the FIRST optimizer.step() and used to OOM a few MiB short against PyTorch's
-+        # reserved-but-unallocated cache (runs 3241496-3246683). Returning that cache to the
-+        # driver first hands the optimizer a clean arena.
-+        get_torch_device().empty_cache()
-+        _step1_oom_memdump(self)
-         update_successful, grad_norm, num_zeros_in_grad = self.optimizer.step()
- 
-         if update_successful:
-EOF
-sbcast -f ${TRAINING_CONFIG}/step1-oom-memdump.patch ${TRAINING_CONFIG}/step1-oom-memdump.patch
-
 
 # SGLang scheduler-watchdog diagnostic hook: on a TP=32 rollout watchdog timeout (3 distinct call
 # sites so far, see the "TP=32 SGLang" hazard in CLAUDE.md) also print nvidia-smi + local CUDA
@@ -939,16 +441,30 @@ PYEOF
 sbcast -f ${TRAINING_CONFIG}/cscs_watchdog_diag.py ${TRAINING_CONFIG}/cscs_watchdog_diag.py
 
 
-# Upstream verl PRs applied at runtime (v0.9.0 does not have them). Fetched ONCE here and sbcast:
+# Upstream verl PRs applied at runtime (v0.9.1 does not have them). Fetched ONCE here and sbcast:
 # per-node downloads inside the srun left half the cluster unpatched (run 3124273). -f turns an
 # HTTP error page into a hard failure. What each one is: see the apply loop in the srun.
-for pr in 7421 7422 7423 7777 7778; do
+for pr in 7421 7661 7777 7778 8493; do
     curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
         || { echo "FATAL: could not download PR #${pr}"; exit 1; }
     [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
         || { echo "FATAL: PR #${pr} patch is empty"; exit 1; }
     sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
 done
+
+# R3 fix: only upstream commit 8f016846 (verl #8287) has it, and the rest of that 60-file refactor
+# does not apply to 0.9.1, so keep just its routed_experts hunk. Drop this once a tag contains it.
+export VERL_R3_COMMIT="8f016846e3010e225072a947270dc0c1b98c1cd0"
+curl -sfL "https://github.com/verl-project/verl/commit/${VERL_R3_COMMIT}.patch" -o "${TRAINING_CONFIG}/verl-r3-commit.patch" \
+    || { echo "FATAL: could not download verl commit ${VERL_R3_COMMIT}"; exit 1; }
+awk '
+/^diff --git /{file=index($0,"rollout/sglang_rollout/async_sglang_server.py")>0; hunk=0; seen=0}
+file && /^@@ /{seen=1; hunk=index($0,"@@ -662,22 ")==1}
+file && (!seen || hunk)
+' "${TRAINING_CONFIG}/verl-r3-commit.patch" > "${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch"
+grep -q "sglang.srt.state_capturer.routed_experts" "${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch" \
+    || { echo "FATAL: routed_experts hunk not found in verl commit ${VERL_R3_COMMIT}"; exit 1; }
+sbcast -f ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch
 
 # sglang PR #38298 (found on the DeepSeek-V3 recipe, 2026-09-07): the sglang DeepSeek-family loader
 # fused q_a_proj / kv_a_proj_with_mqa only when both halves arrived in the same load_weights call;
@@ -964,7 +480,9 @@ sbcast -f "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" "${TRAINING_CONFIG}/sgla
 
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -1006,7 +524,7 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --container-writable bash -c '
 
 
-# verl is baked into the image at v0.9.0 (editable install at /workspace/verl); the patches below go on top.
+# verl is baked into the image at v0.9.1 (editable install at /workspace/verl); the patches below go on top.
 git -C /workspace/verl --no-pager log --oneline -1 || true
 
 
@@ -1039,7 +557,7 @@ try:
     from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor  # noqa: F401
     print(\"  sglang LocalSerializedTensor: OK at model_runner_components.weight_updater\")
 except ImportError as _e:
-    print(f\"  WARNING sglang LocalSerializedTensor NOT at the patched path ({_e}) — delta-sharded-localserializedtensor-import-fix.patch needs re-pointing\")
+    print(f\"  WARNING sglang LocalSerializedTensor NOT at the patched path ({_e}) — verl 0.9.1 expects it there\")
 "
 
 
@@ -1126,12 +644,15 @@ fi
 # Upstream verl PRs (fetched on the batch host). apply-or-already-present-or-FATAL: a cluster where
 # only some ranks carry a patch is worse than one that carries none (run 3124273).
 #   #7421 DSA attention compat with mcore >= 0.16.2 (load-bearing: GLM-5.1 uses DSA)
-#   #7422 keep load_format=dummy for the standalone rollout (else it loads the full model from Lustre)
-#   #7423 lock + barriers around the async weight sync (NCCL deadlock)
+#   #7661 list_of_dict_to_tensordict: always build nested tensors
 #   #7777 delta_sharded steady sync: targeted P2P instead of the padded 480-way gather-to-rank-0
 #         (found on the DeepSeek-V3 recipe; run 3263683 here hung on the same collective).
 #   #7778 gather_round_megabytes kwarg (same origin) -- applied separately below with fuzz.
-for pr in 7421 7422 7423 7777; do
+#   #8493 lockstep barrier on the Megatron HF export (the seed-sync collective desync).
+# The patches below target verl 0.9.1: fail now rather than deep into an allocation on an older image.
+VERL_INSTALLED=$(python3 -c "import importlib.metadata as m; print(m.version(\"verl\"))")
+[ "$VERL_INSTALLED" = "0.9.1" ] || { echo "FATAL: this recipe needs verl 0.9.1, image has $VERL_INSTALLED (update VERL_IMAGE)"; exit 1; }
+for pr in 7421 7661 7777 8493; do
     p="${TRAINING_CONFIG}/${pr}.patch"
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied PR #${pr} on $(hostname)"
@@ -1156,11 +677,16 @@ else
     echo "FATAL: PR #7778 did not apply on $(hostname)"
     exit 1
 fi
+# verl v0.9.1 passes print-style flush=True to logging.Logger.info on the hybrid_engine=False
+# path, a TypeError at trainer init (PR 8493 validation jobs 3842126/3842147). Main rewrote it.
+sed -i -E "/^[[:space:]]+flush=True,[[:space:]]*$/d" /workspace/verl/verl/trainer/ppo/v1/trainer_separate_async.py
+sed -i -E "s/, flush=True\)$/)/" /workspace/verl/verl/workers/rollout/sglang_rollout/http_server_engine.py
+grep -q "flush=True" /workspace/verl/verl/trainer/ppo/v1/trainer_separate_async.py \
+    && { echo "FATAL: logger flush=True fix did not apply on $(hostname)"; exit 1; }
 
 # Local patches (staged on the batch host, see there for what each does). Same apply-or-fail
-# discipline. Order matters: step1-oom-memdump.patch is diffed on top of wsync-debug-progress-log.patch.
-for lp in v1-separate-async-fixes r3-sglang-routed-experts-import-fix wsync-debug-progress-log \
-          delta-sharded-localserializedtensor-import-fix step1-oom-memdump; do
+# discipline.
+for lp in r3-sglang-routed-experts-import-fix; do
     p="${TRAINING_CONFIG}/${lp}.patch"
     if git -C /workspace/verl apply --check "$p" 2>/dev/null; then
         git -C /workspace/verl apply "$p" && echo "Applied ${lp}.patch on $(hostname)"

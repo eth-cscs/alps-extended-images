@@ -34,6 +34,8 @@ workdir = "/workspace/verl"
 writable = true
 entrypoint = true
 [env]
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -254,7 +256,9 @@ sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.p
 
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \

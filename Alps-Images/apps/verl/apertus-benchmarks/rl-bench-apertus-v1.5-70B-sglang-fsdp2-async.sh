@@ -34,6 +34,8 @@ workdir = "/workspace/verl"
 writable = true
 entrypoint = true
 [env]
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
 HF_TOKEN = "$(cat ~/HF_TOKEN)"
 [annotations]
@@ -397,6 +399,10 @@ awk '
     /^diff --git a\/test\// { keep = 0 }
     /^diff --git a\/docs\// { keep = 0 }
     /^diff --git a\/docs_new\// { keep = 0 }
+    # detokenizer_manager.py: since the PR grew a get_serving() call, its hunks apply
+    # with fuzz but leave a NameError against the image SGLang (run 5315875). Only
+    # used by the apertus2509 tool-call parser, which this benchmark never sets.
+    /^diff --git a\/python\/sglang\/srt\/managers\/detokenizer_manager\.py/ { keep = 0 }
     keep { print }
 ' ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff > ${TRAINING_CONFIG}/sglang-apertus1p5-best-effort.diff
 sbcast -f ${TRAINING_CONFIG}/sglang-apertus1p5-best-effort.diff ${TRAINING_CONFIG}/sglang-apertus1p5-best-effort.diff
@@ -470,8 +476,7 @@ sbcast -f ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff ${TRAINING_CONFI
 # heredoc here (not read from a script-relative path) for the same reason as the other
 # checked-in patches in this repo -- see CLAUDE.md run 3129805: sbatch stages the
 # submitted script elsewhere, so BASH_SOURCE-relative paths don't resolve on the batch
-# host. Content of apertus-benchmarks/patches/fsdp2-rank0-load-fix.patch, embedded here;
-# the two copies must be kept in sync by hand.
+# host, so the patch is embedded here.
 cat > "${TRAINING_CONFIG}/fsdp2-rank0-load-fix.patch" <<- 'EOF'
 # FSDP2 rank-0-load fix for verl v0.9.0's actor engine
 # (verl/workers/engine/fsdp/transformer_impl.py), ported from
@@ -638,10 +643,8 @@ sbcast -f ${TRAINING_CONFIG}/fsdp2-rank0-load-fix.patch ${TRAINING_CONFIG}/fsdp2
 # prints both hashes. This is the direct test for the leading hypothesis behind the
 # reward-collapse comparison in CLAUDE.md's "Megatron vs FSDP2" section: that the
 # rank-0-loads-then-broadcasts path is silently corrupting/mismatching weights on some
-# ranks. Remove once the mechanism is confirmed one way or the other -- content of
-# apertus-benchmarks/patches/fsdp2-broadcast-diagnostic.patch, embedded here for the
-# same script-relative-path reason as the patch above; the two copies must be kept in
-# sync by hand.
+# ranks. Remove once the mechanism is confirmed one way or the other. Embedded here for
+# the same script-relative-path reason as the patch above.
 cat > "${TRAINING_CONFIG}/fsdp2-broadcast-diagnostic.patch" <<- 'EOF'
 # One-off diagnostic, NOT a fix. Applies on top of fsdp2-rank0-load-fix.patch
 # against verl v0.9.0's verl/workers/engine/fsdp/transformer_impl.py.
@@ -727,7 +730,9 @@ sbcast -f ${TRAINING_CONFIG}/fsdp2-broadcast-diagnostic.patch ${TRAINING_CONFIG}
 
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -812,6 +817,14 @@ patch -p2 -d /usr/local/lib/python3.12/dist-packages < ${TRAINING_CONFIG}/sglang
     || echo "WARNING: one or more best-effort sglang PR #32979 hunks did not apply (context-sensitive against the image SGLang version, or a feature this benchmark never enables, e.g. base_processor.py audio-input path or detokenizer_manager.py apertus2509 tool-call-parser trim) — continuing"
 patch -p2 -d /usr/local/lib/python3.12/dist-packages < ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff \
     || { echo "FATAL: local apertus_mm.py fixes failed to apply"; exit 1; }
+# PR #32979 no longer carries its qwen3_asr.py exist_ok fix, and the swiss-ai
+# transformers fork already registers qwen3_asr: patch the image copy directly.
+QWEN3_ASR_CFG=/usr/local/lib/python3.12/dist-packages/sglang/srt/configs/qwen3_asr.py
+[ -f "${QWEN3_ASR_CFG}" ] || { echo "FATAL: ${QWEN3_ASR_CFG} not found"; exit 1; }
+sed -i -E "s/^(AutoConfig\.register\([^)]*Config)\)$/\1, exist_ok=True)/" "${QWEN3_ASR_CFG}"
+if grep -E "^AutoConfig\.register\(" "${QWEN3_ASR_CFG}" | grep -qv exist_ok; then
+    echo "FATAL: sglang qwen3_asr AutoConfig.register exist_ok patch did not apply"; exit 1
+fi
 
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking

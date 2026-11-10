@@ -40,6 +40,8 @@ workdir = "/workspace/verl"
 writable = true
 entrypoint = true
 [env]
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -295,7 +297,9 @@ sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.p
 
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -455,13 +459,6 @@ export SGLANG_DISABLE_CUDA_GRAPH=1
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
 
 export VERL_LOGGING_LEVEL=INFO
-
-# Inject debug instrumentation patches via sitecustomize.py.
-# patches/ lives next to this script on /users (mounted in the container).
-# sitecustomize.py is executed at Python startup for every process including
-# Ray workers, so the patches apply cluster-wide without modifying verl source.
-# Remove this line to disable all instrumentation.
-export PYTHONPATH="${SCRIPT_DIR}/patches:${PYTHONPATH:-}"
 
 # Required for Megatron communication/computation overlapping
 export CUDA_DEVICE_MAX_CONNECTIONS=1

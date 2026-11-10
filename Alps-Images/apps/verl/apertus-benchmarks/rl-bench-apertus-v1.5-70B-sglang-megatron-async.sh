@@ -35,6 +35,8 @@ writable = true
 entrypoint = true
 [env]
 PMIX_MCA_psec = "native"
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 HF_TOKEN = "$(cat ~/HF_TOKEN)"
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -463,6 +465,10 @@ awk '
     /^diff --git a\/test\// { keep = 0 }
     /^diff --git a\/docs\// { keep = 0 }
     /^diff --git a\/docs_new\// { keep = 0 }
+    # detokenizer_manager.py: since the PR grew a get_serving() call, its hunks apply
+    # with fuzz but leave a NameError against the image SGLang (run 5315875). Only
+    # used by the apertus2509 tool-call parser, which this benchmark never sets.
+    /^diff --git a\/python\/sglang\/srt\/managers\/detokenizer_manager\.py/ { keep = 0 }
     keep { print }
 ' ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff > ${TRAINING_CONFIG}/sglang-apertus1p5-best-effort.diff
 sbcast -f ${TRAINING_CONFIG}/sglang-apertus1p5-best-effort.diff ${TRAINING_CONFIG}/sglang-apertus1p5-best-effort.diff
@@ -534,7 +540,11 @@ sbcast -f ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff ${TRAINING_CONFI
 # CLAUDE.md).
 export MEGATRON_LM_DIR=${TRAINING_HOME}/Megatron-LM
 export MEGATRON_BRIDGE_DIR=${MEGATRON_LM_DIR}/Megatron-Bridge
-if [ ! -d "${MEGATRON_LM_DIR}/.git" ]; then
+# Re-clone unless both checkouts are intact on the apertus branch: the scratch purge
+# deletes files from a stale checkout (.git/HEAD, models/apertus) but keeps the dirs.
+if ! git -C "${MEGATRON_LM_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1 \
+    || ! git -C "${MEGATRON_BRIDGE_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1 \
+    || [ ! -d "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus" ]; then
     echo "Cloning wqwqazwsxedc/Megatron-LM + Megatron-Bridge (apertus branches)..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -603,10 +613,7 @@ echo "Patched (or confirmed already-patched) qwen3_asr AutoConfig/AutoModel/Auto
 # 'Apertus1p5ForConditionalGeneration' is not yet supported" (run 3149776)
 # without this. New bridge module, adapted from apertus/apertus_bridge.py --
 # see the file's own docstring below for the full architectural comparison and
-# the vision/audio-weights and pruned-LM-head caveats. Checked-in copy:
-# apertus-benchmarks/patches/apertus1p5_bridge.py -- the two must be kept in
-# sync by hand (same convention as sitecustomize-verl-v0.9.0.py in the GLM
-# script; diff them before trusting either). Written once on the batch host,
+# the vision/audio-weights and pruned-LM-head caveats. Written once on the batch host,
 # before the wheel-build step, so the new file is what gets packaged.
 mkdir -p "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus1p5"
 touch "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus1p5/__init__.py"
@@ -654,8 +661,8 @@ cat > "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus1p5/apertus1p5_b
 # conversation, not multimodal fidelity), which has no parameter slots for them
 # anyway, and this benchmark (text-only GSM8K GRPO) never calls
 # get_image_feature/get_audio_feature -- same reasoning already established for
-# the SGLang side of this script (see apertus-benchmarks/patches/
-# sglang-apertus1p5-local-fixes.patch point 6 in CLAUDE.md: those weights never
+# the SGLang side of this script (see the sglang-apertus1p5-local-fixes diff,
+# point 6 in CLAUDE.md: those weights never
 # need to be numerically correct for this benchmark, only absent-is-fine). No
 # strict/leftover-key check was found anywhere in model_bridge.py's weight-load
 # path, so simply omitting these mappings is sufficient -- there is nothing to
@@ -1023,7 +1030,9 @@ fi
 
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -1236,6 +1245,14 @@ patch -p2 -d /usr/local/lib/python3.12/dist-packages < ${TRAINING_CONFIG}/sglang
     || echo "WARNING: one or more best-effort sglang PR #32979 hunks did not apply (context-sensitive against the image SGLang version, or a feature this benchmark never enables, e.g. base_processor.py audio-input path or detokenizer_manager.py apertus2509 tool-call-parser trim) — continuing"
 patch -p2 -d /usr/local/lib/python3.12/dist-packages < ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff \
     || { echo "FATAL: local apertus_mm.py fixes failed to apply"; exit 1; }
+# PR #32979 no longer carries its qwen3_asr.py exist_ok fix, and the swiss-ai
+# transformers fork already registers qwen3_asr: patch the image copy directly.
+QWEN3_ASR_CFG=/usr/local/lib/python3.12/dist-packages/sglang/srt/configs/qwen3_asr.py
+[ -f "${QWEN3_ASR_CFG}" ] || { echo "FATAL: ${QWEN3_ASR_CFG} not found"; exit 1; }
+sed -i -E "s/^(AutoConfig\.register\([^)]*Config)\)$/\1, exist_ok=True)/" "${QWEN3_ASR_CFG}"
+if grep -E "^AutoConfig\.register\(" "${QWEN3_ASR_CFG}" | grep -qv exist_ok; then
+    echo "FATAL: sglang qwen3_asr AutoConfig.register exist_ok patch did not apply"; exit 1
+fi
 
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking

@@ -8,9 +8,6 @@ FROM ${BASE_IMAGE}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 
-# v0.9.0: adds verl/trainer/ppo/v1 (the V1 separate-async trainer) + TransferQueue integration
-ARG VERL_REF="v0.9.0"
-
 # 0.5.16: the only recent sglang whose own flashinfer requirement
 # (flashinfer_python[cu13]==0.6.14) matches this image's flashinfer pin below -- see the
 # reasoning at its install site. Bump this + the flashinfer pin together, deliberately, tested.
@@ -40,8 +37,8 @@ COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 # (flashinfer_python[cu13]==0.6.14) matches the flashinfer pin below -- 0.5.17 wants
 # 0.6.15.post1, 0.5.18 wants 0.6.17, so leaving sglang unpinned reintroduces the exact
 # python-vs-required flashinfer skew that caused run 3209484's TP=32 MLA plan() hang. The
-# verl-vs-sglang import-drift source patches (r3-sglang-routed-experts-import-fix,
-# delta-sharded-localserializedtensor-import-fix) also target 0.5.16's module layout. Bump
+# verl-vs-sglang import-drift source patch (r3-sglang-routed-experts-import-fix) also
+# targets 0.5.16's module layout. Bump
 # this + the flashinfer pin together, deliberately, tested.
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
@@ -74,7 +71,8 @@ WORKDIR /workspace
 
 RUN rm -rf ${SRC_DIR}
 
-ARG VERL_REF="v0.8.0"
+# v0.9.1: V1 separate-async trainer, delta_sharded sglang imports, hybrid_engine=False
+ARG VERL_REF="v0.9.1"
 
 RUN git clone --branch ${VERL_REF} --depth 1 https://github.com/verl-project/verl
 RUN set -eux; \
