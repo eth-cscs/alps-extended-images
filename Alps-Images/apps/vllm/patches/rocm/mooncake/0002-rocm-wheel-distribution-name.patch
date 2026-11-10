@@ -1,0 +1,9 @@
+diff --git a/mooncake-wheel/pyproject.toml b/mooncake-wheel/pyproject.toml
+--- a/mooncake-wheel/pyproject.toml
++++ b/mooncake-wheel/pyproject.toml
+@@ -24,4 +24,4 @@
+ [project]
+-name = "mooncake-transfer-engine"
++name = "mooncake-transfer-engine-rocm"
+ version = "0.3.13.post1"
+ description = "A KVCache-centric Disaggregated Architecture for large-scale LLM inference and training."

@@ -374,6 +374,7 @@ def isolated_meta_repo(tmp_path):
         ("patches/rocm/aiter/0001-mi300a-xcd-count.patch", {"rocm"}),
         ("patches/rocm/uccl/0001-rocm-use-rocr-libfabric-hmem.patch", {"rocm"}),
         ("patches/rocm/vllm/0001-rocm10-include-cstdint.patch", {"rocm"}),
+        ("patches/rocm/mooncake/0002-rocm-wheel-distribution-name.patch", {"rocm"}),
         ("patches/cuda/uccl/0001-cuda-allow-explicit-grace-hopper-target.patch", {"cuda"}),
         ("sources/install-aiter.sh", {"rocm"}),
         ("sources/build-rocm-env.sh", {"rocm"}),

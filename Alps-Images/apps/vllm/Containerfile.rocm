@@ -192,6 +192,8 @@ RUN set -eux; \
 # Mooncake transfer engine (CXI)
 COPY Alps-Images/apps/vllm/sources/install-mooncake.sh /opt/alps/install-mooncake.sh
 COPY Alps-Images/apps/vllm/patches/common/mooncake /opt/alps/mooncake-patches
+# Match vLLM's distribution name so pip removes the upstream wheel's stale files.
+COPY Alps-Images/apps/vllm/patches/rocm/mooncake /opt/alps/mooncake-patches
 
 RUN set -eux; \
     chmod u+x /opt/alps/install-mooncake.sh; \

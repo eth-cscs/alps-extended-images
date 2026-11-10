@@ -88,7 +88,9 @@ The patches in `patches/rocm/aiter/` are applied to the pinned AITER sources at 
 ## Mooncake (CXI KV transfer)
 
 Both variants additionally install the [Mooncake](https://github.com/kvcache-ai/Mooncake) transfer engine with the HPE Slingshot (CXI) backend (`USE_CXI`, [kvcache-ai/Mooncake#2535](https://github.com/kvcache-ai/Mooncake/pull/2535)).
-It is built from a pinned tag by `sources/install-mooncake.sh` (which is part of the app content hash) and installed as the `mooncake-transfer-engine` wheel, providing the `mooncake.engine` and `mooncake.store` modules used by vLLM's `MooncakeConnector` and `MooncakeStoreConnector` KV connectors.
+It is built from a pinned tag by `sources/install-mooncake.sh` (which is part of the app content hash), providing the `mooncake.engine` and `mooncake.store` modules used by vLLM's `MooncakeConnector` and `MooncakeStoreConnector` KV connectors.
+The wheel is named `mooncake-transfer-engine` on CUDA and `mooncake-transfer-engine-rocm` on ROCm, matching vLLM's dependency so pip replaces the upstream distribution and removes obsolete module files.
+The ROCm-only packaging patch in `patches/rocm/mooncake/` prevents overlapping distributions from mixing newer store modules with the pinned CXI build's libraries.
 
 Mooncake is compiled against the libfabric installed by the Alps base image (`/usr`), so it always matches the stack's libfabric version and shares a single in-process libfabric instance with the aws-ofi-nccl NCCL plugin.
 This is deliberate: a second, bundled libfabric would race for the CXI devices and leave one consumer with an empty provider list.
