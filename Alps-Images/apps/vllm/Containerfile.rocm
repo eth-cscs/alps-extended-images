@@ -127,7 +127,14 @@ RUN set -eux; \
       git apply --check "${patch_file}"; \
       git apply "${patch_file}"; \
     done; \
-    pip_install python --no-cache-dir -r requirements/rocm.txt; \
+    # Pin the PyPI Mooncake wheels to the release built from source later
+    # (install-mooncake.sh, MOONCAKE_REF).
+    printf '%s\n' \
+      'mooncake-transfer-engine-rocm==0.3.13.post1' \
+      'mooncake-transfer-engine-non-cuda==0.3.13.post1' \
+      > /tmp/vllm-mooncake-constraints.txt; \
+    pip_install python --no-cache-dir -r requirements/rocm.txt \
+      -c /tmp/vllm-mooncake-constraints.txt; \
     # The wheel compiler needs these unset; ROCM_HOME still supplies CMake's SDK root.
     rm -rf /tmp/vllm-dist; \
     mkdir -p /tmp/vllm-dist; \
@@ -149,7 +156,7 @@ RUN set -eux; \
     printf '%s\n' "${torch_lib_dir}" > /etc/ld.so.conf.d/99-alps-vllm-torch.conf; \
     ldconfig; \
     vllm_build_end; \
-    rm -rf /opt/vllm /tmp/vllm-dist
+    rm -rf /opt/vllm /tmp/vllm-dist /tmp/vllm-mooncake-constraints.txt
 
 RUN set -eux; \
     while IFS= read -r pin; do \
