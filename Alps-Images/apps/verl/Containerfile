@@ -8,17 +8,14 @@ FROM ${BASE_IMAGE}
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 
-# 0.5.16: the only recent sglang whose own flashinfer requirement
-# (flashinfer_python[cu13]==0.6.14) matches this image's flashinfer pin below -- see the
-# reasoning at its install site. Bump this + the flashinfer pin together, deliberately, tested.
+# sglang pin. It must be a release that pins torch==2.11.0 (the NGC 26.02 base wheel): newer
+# releases pull a newer PyPI torch (0.5.19 -> torch==2.13.0) and break the NGC flash_attn_2_cuda
+# binary (undefined symbol c10::impl::cow::materialize_cow_storage). Of those, 0.5.16 is the only
+# one whose own flashinfer requirement (flashinfer_python[cu13]==0.6.14) matches the flashinfer
+# pin below (0.5.17 wants 0.6.15.post1), and the version the validated recipe runs used.
+# Bump it together with the flashinfer pin.
 
-# 0.5.17: sglang to a release that pins torch==2.11.0, matching the NGC 26.02 base
-# wheel. Unpinned resolution drifts to newer sglang releases that require newer
-# pypi torch (e.g. 0.5.19 -> torch==2.13.0), replacing the NGC torch and breaking
-# the NGC flash_attn_2_cuda binary shipped in the base (undefined symbol
-# c10::impl::cow::materialize_cow_storage at transformers' flash-attn import).
-
-ARG SGLANG_VERSION="0.5.17"
+ARG SGLANG_VERSION="0.5.16"
 
 # Must match ${SGLANG_VERSION}'s own exact pin (its pyproject.toml declares
 # transformers==<this>, not a floor) -- see the reasoning at its install site.
@@ -110,6 +107,8 @@ RUN set -eux; \
 RUN mkdir -p /tmp/fht && \
     printf '[project]\nname = "fast-hadamard-transform"\nversion = "1.1.0"\n' > /tmp/fht/pyproject.toml
 
+# megatron-bridge 0.6.1 is yanked on PyPI ("wrong version"); an exact pin still installs it, and it
+# is the version the validated recipe runs used.
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python -c /tmp/torch_constraints.txt \
