@@ -147,13 +147,27 @@ case "${accel}" in
         export PATH="${ROCM_BUILD_PREFIX}/bin:${ROCM_BUILD_PREFIX}/llvm/bin:${PATH}"
         rocm_libdir="${ROCM_BUILD_PREFIX}/lib64"
         [[ -d "${rocm_libdir}" ]] || rocm_libdir="${ROCM_BUILD_PREFIX}/lib"
-        export LD_LIBRARY_PATH="${rocm_libdir}:${LD_LIBRARY_PATH:-}"
+        export LD_LIBRARY_PATH="${rocm_libdir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
         cmake_args+=(
             -DUSE_HIP=ON
             -DUSE_CUDA=OFF
         )
         ;;
 esac
+
+ibverbs_apt_build_deps=(
+    libibverbs-dev
+    libnl-3-dev
+    libnl-route-3-dev
+)
+
+# Mooncake links ibverbs but does not require RDMA CM development headers.
+# The CUDA base also carries librdmacm-dev, which depends on libibverbs-dev;
+# remove it when present without installing it unnecessarily on ROCm.
+rdma_apt_purge_deps=(
+    "${ibverbs_apt_build_deps[@]}"
+    librdmacm-dev
+)
 
 mooncake_apt_build_deps=(
     cmake
@@ -174,10 +188,26 @@ mooncake_apt_build_deps=(
     pkg-config
     python3-dev
 )
+# The CUDA base supplies an RDMA development package set at version 63
+# alongside its DOCA/rdma-core runtime, while the configured Ubuntu
+# repositories offer version 50. Keep the matching base packages until Mooncake
+# finishes building, then remove the development packages from the final image.
+if [[ "${accel}" == "cuda" ]]; then
+    for pkg in "${ibverbs_apt_build_deps[@]}"; do
+        dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null \
+            | grep -q '^ii ' \
+            || die "matching CUDA base package ${pkg} is not installed"
+    done
+fi
+
 snapshot_apt_packages /tmp/mooncake-apt-before.txt
+# Match the unqualified dependency names even when dpkg adds a Multi-Arch suffix.
+mapfile -t apt_packages_before < /tmp/mooncake-apt-before.txt
+printf '%s\n' "${apt_packages_before[@]%%:*}" > /tmp/mooncake-apt-before.txt
+unset apt_packages_before
 apt_get update
 apt_get install -y --no-install-recommends \
-    ca-certificates libibverbs-dev "${mooncake_apt_build_deps[@]}"
+    ca-certificates "${ibverbs_apt_build_deps[@]}" "${mooncake_apt_build_deps[@]}"
 rm -rf /var/lib/apt/lists/*
 
 # The NGC base images carry an NVIDIA/DOCA libibverbs-dev whose unversioned
@@ -299,9 +329,9 @@ libfabric_needed="$({ ldd "${mooncake_pkg_dir}/engine.so" 2>/dev/null || true; }
     || die "mooncake engine.so does not link libfabric; USE_CXI build is broken"
 echo "INFO: mooncake engine links ${libfabric_needed}"
 
-# Mark dpkg-owned runtime libraries of the installed modules as manual so the
-# autoremove below keeps them. Resolve owners by soname, not by ldd's
-# resolved path (/lib vs /usr/lib trips dpkg -S on merged-/usr systems).
+# Mark dpkg-owned runtime libraries of the installed modules as manual so
+# subsequent package operations retain them. Resolve owners by soname, not by
+# ldd's resolved path (/lib vs /usr/lib trips dpkg -S on merged-/usr systems).
 mapfile -t mooncake_elf_files < <(
     find "${mooncake_pkg_dir}" -type f \
         \( -name '*.so' -o -name 'mooncake_master' -o -name 'mooncake_client' \
@@ -324,7 +354,28 @@ echo "INFO: keeping mooncake runtime library packages: ${runtime_pkg_list[*]}"
 apt_mark manual "${runtime_pkg_list[@]}"
 rm -f "${runtime_packages}"
 
-cleanup_new_apt_build_deps /tmp/mooncake-apt-before.txt "${mooncake_apt_build_deps[@]}"
+# Remove newly installed build tools plus the RDMA development packages even
+# when inherited from the base. Refuse collateral removals and avoid autoremove;
+# the runtime packages marked above must remain in the final image.
+mooncake_cleanup_packages=()
+for pkg in "${rdma_apt_purge_deps[@]}"; do
+    if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null \
+        | grep -q '^ii '; then
+        mooncake_cleanup_packages+=("${pkg}")
+    fi
+done
+for pkg in "${mooncake_apt_build_deps[@]}"; do
+    if ! grep -Fxq "${pkg}" /tmp/mooncake-apt-before.txt; then
+        mooncake_cleanup_packages+=("${pkg}")
+    fi
+done
+purge_apt_build_deps_exact "${mooncake_cleanup_packages[@]}"
+for pkg in "${rdma_apt_purge_deps[@]}"; do
+    if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null \
+        | grep -q '^ii '; then
+        die "${pkg} remains installed after Mooncake build"
+    fi
+done
 ldconfig
 
 # Final verification against the post-cleanup image content.

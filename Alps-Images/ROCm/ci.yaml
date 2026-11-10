@@ -1,6 +1,8 @@
 family: rocm
 variants:
   - name: pytorch
+    variant: rocm10.0-ubuntu24.04-py3.12-torch2.13
+  - name: pytorch
     variant: rocm7.14-ubuntu24.04-py3.12-torch2.11
 tests:
   - name: env

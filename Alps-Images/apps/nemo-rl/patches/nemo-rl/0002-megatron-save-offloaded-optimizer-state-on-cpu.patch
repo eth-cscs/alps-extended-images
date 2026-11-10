@@ -1,0 +1,22 @@
+From: davmels <davmelous@gmail.com>
+Subject: [PATCH] Save logprob-offloaded optimizer state from CPU
+
+Adapt RL-infra's NeMo-RL patch 0007 without its referrer diagnostics or
+checkpoint-GC dependency. When optimizer state is saved and normally offloaded
+for logprobs, keep it on CPU during the save. prepare_for_training restores it
+to CUDA before the next update. Hybrid CPU-offloaded optimizers are unchanged.
+
+--- a/nemo_rl/models/policy/workers/megatron_policy_worker.py
++++ b/nemo_rl/models/policy/workers/megatron_policy_worker.py
+@@ -4616,7 +4616,10 @@
+                 and self.optimizer is not None
+                 and not self.optimizer_cpu_offload
+             ):
+-                self.move_optimizer("cuda")
++                # Avoid retaining GPU optimizer-state copies across checkpoint saves.
++                self.move_optimizer(
++                    "cpu" if self.offload_optimizer_for_logprob else "cuda"
++                )
+             torch.cuda.synchronize()
+ 
+             self.mcore_state.cfg.checkpoint.save = weights_path

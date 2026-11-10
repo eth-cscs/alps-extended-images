@@ -24,7 +24,10 @@ hash_paths_stream() {
   # sort -u ensures stable uniqueness if two roots overlap.
   for path in "$@"; do
     if [[ -d "$path" ]]; then
-      find "$path" -type f -print0
+      # Keep cache/editor artifacts out of both hashes and the build context.
+      find "$path" \
+        -type d \( -name .git -o -name __pycache__ -o -name .pytest_cache \) -prune -o \
+        -type f ! -name '*.pyc' ! -name '*.pyo' ! -name '*.swp' ! -name '*.swo' ! -name '*~' -print0
     else
       printf '%s\0' "$path"
     fi
@@ -160,25 +163,17 @@ app_validation_hash() {
   local -a paths=("$ci_file" "${helper_paths[@]}")
 
   [[ -f "$ci_file" ]] || { echo "ERROR: missing $ci_file" >&2; return 1; }
-  [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
+  app_variants_from_profile "$profile_file" "$app_variant" >/dev/null || return 1
 
-  local variant_upper="${app_variant^^}"
+  local variant_upper
+  variant_upper="$(app_variant_prefix "$app_variant")"
   local test_dir_var="${variant_upper}_TEST_DIR"
   local patch_dir_var="${variant_upper}_PATCH_DIR"
-  local app_variants common_test_dir common_patch_dir test_dir_rel patch_dir_rel declared_variant
-  app_variants="$(profile_value "$profile_file" APP_VARIANTS)"
+  local common_test_dir common_patch_dir test_dir_rel patch_dir_rel
   common_test_dir="$(profile_value "$profile_file" COMMON_TEST_DIR)"
   common_patch_dir="$(profile_value "$profile_file" COMMON_PATCH_DIR)"
   test_dir_rel="$(profile_value "$profile_file" "$test_dir_var")"
   patch_dir_rel="$(profile_value "$profile_file" "$patch_dir_var")"
-
-  for declared_variant in $app_variants; do
-    validate_app_variant_name "$declared_variant" "declared app variant in ${profile_file}"
-  done
-  case " ${app_variants} " in
-    *" ${app_variant} "*) ;;
-    *) echo "ERROR: app variant ${app_variant} is not declared in ${profile_file}" >&2; return 1;;
-  esac
 
   if [[ -n "$common_test_dir" ]]; then
     paths+=("${app_dir}/${common_test_dir}")
@@ -306,6 +301,9 @@ validate_rocm_profile() {
   [[ "${ROCM_REBUILD_RCCL:-0}" == "0" || "${ROCM_REBUILD_RCCL:-0}" == "1" ]] || { echo "ERROR: ROCM_REBUILD_RCCL must be 0 or 1 in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_REPO:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_REPO must be set in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_COMMIT:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_COMMIT must be set in $profile_file" >&2; return 1; }
+  if [[ -n "${ROCM_LIBRARIES_REPO:-}" || -n "${ROCM_LIBRARIES_COMMIT:-}" ]]; then
+    [[ -n "${ROCM_LIBRARIES_REPO:-}" && -n "${ROCM_LIBRARIES_COMMIT:-}" ]] || { echo "ERROR: ROCM_LIBRARIES_REPO and ROCM_LIBRARIES_COMMIT must be set together in $profile_file" >&2; return 1; }
+  fi
   [[ -n "${RCCL_GPU_TARGETS:-}" ]] || { echo "ERROR: RCCL_GPU_TARGETS must be set in $profile_file" >&2; return 1; }
   [[ -n "${RCCL_TESTS_GPU_TARGETS:-}" ]] || { echo "ERROR: RCCL_TESTS_GPU_TARGETS must be set in $profile_file" >&2; return 1; }
 }
@@ -317,6 +315,8 @@ load_rocm_profile() {
   ROCM_REBUILD_RCCL="0"
   ROCM_SYSTEMS_REPO=""
   ROCM_SYSTEMS_COMMIT=""
+  ROCM_LIBRARIES_REPO=""
+  ROCM_LIBRARIES_COMMIT=""
   RCCL_GPU_TARGETS=""
   RCCL_TESTS_GPU_TARGETS=""
   # shellcheck disable=SC1090
@@ -333,6 +333,8 @@ rocm_base_build_args() {
   --build-arg ROCM_REBUILD_RCCL="$ROCM_REBUILD_RCCL" \\
   --build-arg ROCM_SYSTEMS_REPO="$ROCM_SYSTEMS_REPO" \\
   --build-arg ROCM_SYSTEMS_COMMIT="$ROCM_SYSTEMS_COMMIT" \\
+  --build-arg ROCM_LIBRARIES_REPO="$ROCM_LIBRARIES_REPO" \\
+  --build-arg ROCM_LIBRARIES_COMMIT="$ROCM_LIBRARIES_COMMIT" \\
   --build-arg RCCL_GPU_TARGETS="$RCCL_GPU_TARGETS" \\
   --build-arg RCCL_TESTS_GPU_TARGETS="$RCCL_TESTS_GPU_TARGETS" \\
   --build-arg ROCM_PYPI_INDEX_URL="$ROCM_PYPI_INDEX_URL" \\
@@ -348,6 +350,8 @@ ROCM_VERSION=$ROCM_VERSION
 ROCM_REBUILD_RCCL=$ROCM_REBUILD_RCCL
 ROCM_SYSTEMS_REPO=$ROCM_SYSTEMS_REPO
 ROCM_SYSTEMS_COMMIT=$ROCM_SYSTEMS_COMMIT
+ROCM_LIBRARIES_REPO=$ROCM_LIBRARIES_REPO
+ROCM_LIBRARIES_COMMIT=$ROCM_LIBRARIES_COMMIT
 RCCL_GPU_TARGETS=$RCCL_GPU_TARGETS
 RCCL_TESTS_GPU_TARGETS=$RCCL_TESTS_GPU_TARGETS
 ROCM_PYPI_INDEX_URL=$ROCM_PYPI_INDEX_URL
@@ -384,16 +388,18 @@ rocm_base_refs() {
 
   local ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
   local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
+  local ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT
   load_rocm_profile "$profile_file"
   ROCM_VERSION="$(rocm_version_from_variant "$rocm_variant")"
   local base_image_ref
   base_image_ref="$(rocm_base_image_ref "$rocm_name" "$rocm_variant")"
 
   local -a hash_paths=("$dockerfile" "$rocm_installer" "$rocm_components" "$rocm_runtime_env" "$common_dir" "$patches_dir" "$image_dir")
+  [[ ! -f .dockerignore ]] || hash_paths+=(.dockerignore)
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
   local h
-  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
@@ -447,6 +453,7 @@ ngc_base_refs() {
 
   # Compute canonical tag from hashed content
   local -a hash_paths=("$dockerfile" "$ngc_installer" "$ngc_components" "$ngc_runtime_env" "$common_dir" "$patches_dir" "$image_dir")
+  [[ ! -f .dockerignore ]] || hash_paths+=(.dockerignore)
   local name="${ngc_name}-cuda"
   local tag="${ngc_tag}-${ALPS_REV}"
   local h
@@ -458,14 +465,88 @@ ngc_base_refs() {
     "$base_image_ref" "$REMOVE_HPCX_DIRS_B64" "$dockerfile" "$canon_ref" "$stable_ref"
 }
 
-validate_app_variant_name() {
+app_variant_prefix() {
   local app_variant="${1:?app variant required}"
-  local context="${2:-app variant}"
+  app_variant="${app_variant^^}"
+  printf '%s\n' "${app_variant//-/_}"
+}
 
-  [[ "$app_variant" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
-    echo "ERROR: ${context} '${app_variant}' must match [A-Za-z_][A-Za-z0-9_]* because app metadata uses shell variable names" >&2
+# Derive the accelerator family from the selected logical base image.
+app_base_family() {
+  local base_image="${1:?base image required}"
+  local parsed_base base_family family
+  parsed_base="$(parse_base_image "$base_image")" || return 1
+  base_family="${parsed_base%% *}"
+  case "$base_family" in
+    ngc) family=cuda ;;
+    rocm) family=rocm ;;
+    *)
+      echo "ERROR: unsupported app base family: $base_family" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$family"
+}
+
+# Read and validate all targets without executing the profile. Optionally require
+# one requested target to be declared before callers normalize its name.
+# Validation is profile-wide: malformed unselected targets or base declarations
+# also block builds and ref/hash queries for an otherwise valid selected target.
+app_variants_from_profile() {
+  local profile_file="${1:?profile file required}"
+  local requested_variant="${2:-}"
+  local app_variants declared_variant prefix base_image family variant_name
+  [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
+  app_variants="$(profile_value "$profile_file" APP_VARIANTS)" || return 1
+  [[ -n "${app_variants//[[:space:]]/}" ]] || {
+    echo "ERROR: APP_VARIANTS must be set and not empty in $profile_file" >&2
     return 1
   }
+  local -A prefixes=()
+
+  for declared_variant in $app_variants; do
+    [[ "$declared_variant" =~ ^[a-z][a-z0-9]*((_|__|-+)[a-z0-9]+)*$ ]] || {
+      echo "ERROR: app target '${declared_variant}' in ${profile_file} must match ^[a-z][a-z0-9]*((_|__|-+)[a-z0-9]+)*$" >&2
+      return 1
+    }
+    case "$declared_variant" in
+      cuda|rocm|?*-cuda|?*-rocm) ;;
+      *)
+        echo "ERROR: app target '${declared_variant}' in ${profile_file} must be cuda, rocm, or end in -cuda/-rocm with a non-empty variant name" >&2
+        return 1
+        ;;
+    esac
+    variant_name="${declared_variant%-*}"
+    if [[ "$declared_variant" != cuda && "$declared_variant" != rocm &&
+          "$variant_name" =~ (^|[-_])(cuda|rocm)([-_]|$) ]]; then
+      echo "ERROR: app target '${declared_variant}' in ${profile_file} must not contain cuda or rocm variant components before its family suffix" >&2
+      return 1
+    fi
+    prefix="$(app_variant_prefix "$declared_variant")" || return 1
+    if [[ -n "${prefixes[$prefix]+set}" ]]; then
+      echo "ERROR: app variants '${prefixes[$prefix]}' and '${declared_variant}' share profile prefix ${prefix} in ${profile_file}" >&2
+      return 1
+    fi
+    prefixes[$prefix]="$declared_variant"
+    base_image="$(profile_value "$profile_file" "${prefix}_BASE_IMAGE")" || return 1
+    [[ -n "$base_image" ]] || {
+      echo "ERROR: ${prefix}_BASE_IMAGE must be set in ${profile_file}" >&2
+      return 1
+    }
+    family="$(app_base_family "$base_image")" || return 1
+    if [[ "$declared_variant" != "$family" && "$declared_variant" != *-"$family" ]]; then
+      echo "ERROR: app target '${declared_variant}' does not match family '${family}' derived from base '${base_image}'" >&2
+      return 1
+    fi
+  done
+
+  if [[ -n "$requested_variant" ]]; then
+    case " ${app_variants} " in
+      *" ${requested_variant} "*) ;;
+      *) echo "ERROR: app variant ${requested_variant} is not declared in ${profile_file}" >&2; return 1;;
+    esac
+  fi
+  printf '%s\n' "$app_variants"
 }
 
 write_base_build_env() {
@@ -497,6 +578,7 @@ write_base_build_env() {
       read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(rocm_base_refs "$name" "$variant")
       local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
+      local ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT
       profile_file="$(rocm_profile_file "$name" "$variant")"
       load_rocm_profile "$profile_file"
       ROCM_VERSION="$(rocm_version_from_variant "$variant")"
@@ -525,9 +607,13 @@ write_base_build_env() {
       "STABLE_IMAGE_REF=$stable_image_ref" \
       "TESTED_IMAGE_REF=$tested_image_ref" \
       "VALIDATION_HASH=$validation_hash_value" \
-      "BASE_IMAGE=$base_image_ref" \
-      "$family_variant_dir"
-    printf '%s\n' "$family_dotenv"
+      "BASE_IMAGE=$base_image_ref"
+    if [[ -n "$family_variant_dir" ]]; then
+      printf '%s\n' "$family_variant_dir"
+    fi
+    if [[ -n "$family_dotenv" ]]; then
+      printf '%s\n' "$family_dotenv"
+    fi
     # shellcheck source=Alps-Images/common/alps-stack-versions.env
     source Alps-Images/common/alps-stack-versions.env
     vars_blob "BOOST_VER BOOST_BUILD_JOBS ALPS_BUILD_JOBS ALPS_CMAKE_BUILD_JOBS XPMEM_REF CASSINI_HEADERS_VERSION CXI_DRIVER_VERSION LIBCXI_VERSION LIBFABRIC_COMMIT LIBFABRIC_PATCH UCX_VERSION UCC_VERSION OMPI_VER AWS_OFI_NCCL_REPO AWS_OFI_NCCL_COMMIT AWS_OFI_NCCL_PATCH OSU_VERSION"
@@ -537,7 +623,7 @@ write_base_build_env() {
       "OCI_DESCRIPTION=$image_description" \
       "CSCS_ALPS_GIT_COMMIT_SHORT=${CI_COMMIT_SHORT_SHA}" \
       "GHCR_STABLE_IMAGE_REF=${GHCR_IMAGE_PREFIX}${stable_image_ref#"$IMAGE_PREFIX"}"
-  } | sed '/^$/d' > "$output_file"
+  } > "$output_file"
 }
 
 write_app_build_env() {
@@ -545,18 +631,22 @@ write_app_build_env() {
   local app_name="${2:?app name required}"
   local app_variant="${3:?app variant required}"
   local base_image_ref dockerfile canon_image_ref stable_image_ref tested_image_ref image_description validation_hash_value
+  local family
 
   : "${GHCR_IMAGE_PREFIX:?GHCR_IMAGE_PREFIX must be set}"
   : "${CI_COMMIT_SHORT_SHA:?CI_COMMIT_SHORT_SHA must be set}"
 
   # App canonical hashes include the canonical base ref, so app images rebuild
   # automatically when their selected base content changes.
-  read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(app_refs "$app_name" "$app_variant")
-  validation_hash_value="$(app_validation_hash "$app_name" "$app_variant")"
+  read -r base_image_ref dockerfile canon_image_ref stable_image_ref family < <(app_refs "$app_name" "$app_variant") || return 1
+
+  validation_hash_value="$(app_validation_hash "$app_name" "$app_variant")" || return 1
   tested_image_ref="$(tested_ref_for "$canon_image_ref" "$validation_hash_value")"
   image_description="This image extends ${base_image_ref} with application software for Alps."
 
   cat > "${output_file}" <<EOF
+FAMILY=$family
+VARIANT=$app_variant
 DOCKERFILE=$dockerfile
 CANON_IMAGE_REF=$canon_image_ref
 STABLE_IMAGE_REF=$stable_image_ref
@@ -573,9 +663,10 @@ EOF
 
 # Usage: app_refs APP_NAME APP_VARIANT
 # Returns a space-separated record:
-#   BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF
+#   BASE_IMAGE_REF DOCKERFILE CANON_REF STABLE_REF FAMILY
+# FAMILY is the selected base's accelerator family: cuda (NGC) or rocm.
 app_refs() {
-  local app_name="${1:?name required}"       # e.g. apertus-2
+  local app_name="${1:?name required}"       # e.g. vllm
   local app_variant="${2:?app variant required}" # e.g. cuda
 
   : "${ALPS_REV:?ALPS_REV must be set}"
@@ -585,30 +676,19 @@ app_refs() {
   local profile_file="${app_dir}/profile.env"
   local package_helpers="Alps-Images/common/package-helpers.sh"
   local sources_dir="${app_dir}/sources"
-  validate_app_variant_name "$app_variant" "requested app variant"
-  local variant_upper="${app_variant^^}"
+  [[ -d "$app_dir" ]] || { echo "ERROR: missing $app_dir" >&2; return 1; }
+  app_variants_from_profile "$profile_file" "$app_variant" >/dev/null || return 1
+  local variant_upper
+  variant_upper="$(app_variant_prefix "$app_variant")"
   local base_image_var="${variant_upper}_BASE_IMAGE"
   local dockerfile_var="${variant_upper}_CONTAINERFILE"
   local test_dir_var="${variant_upper}_TEST_DIR"
   local patch_dir_var="${variant_upper}_PATCH_DIR"
 
-  [[ -d "$app_dir" ]]      || { echo "ERROR: missing $app_dir" >&2; return 1; }
-  [[ -f "$profile_file" ]] || { echo "ERROR: missing $profile_file" >&2; return 1; }
-
-  local app_variants common_containerfile common_test_dir common_patch_dir declared_variant
-  app_variants="$(profile_value "$profile_file" APP_VARIANTS)"
+  local common_containerfile common_test_dir common_patch_dir
   common_containerfile="$(profile_value "$profile_file" COMMON_CONTAINERFILE)"
   common_test_dir="$(profile_value "$profile_file" COMMON_TEST_DIR)"
   common_patch_dir="$(profile_value "$profile_file" COMMON_PATCH_DIR)"
-
-  for declared_variant in $app_variants; do
-    validate_app_variant_name "$declared_variant" "declared app variant in ${profile_file}"
-  done
-
-  case " ${app_variants} " in
-    *" ${app_variant} "*) ;;
-    *) echo "ERROR: app variant ${app_variant} is not declared in ${profile_file}" >&2; return 1;;
-  esac
 
   local base_image
   local dockerfile_rel
@@ -622,7 +702,6 @@ app_refs() {
   local dockerfile
   local -a test_dirs=() patch_dirs=()
 
-  [[ -n "$base_image" ]] || { echo "ERROR: ${base_image_var} must be set in ${profile_file}" >&2; return 1; }
   dockerfile="${app_dir}/${dockerfile_rel}"
   [[ -f "$dockerfile" ]] || { echo "ERROR: missing $dockerfile" >&2; return 1; }
 
@@ -650,14 +729,29 @@ app_refs() {
   # Compute canonical ref of base
   local base_family base_name base_variant
   read -r base_family base_name base_variant < <(parse_base_image "$base_image")
+  local family
+  family="$(app_base_family "$base_image")" || return 1
   local base_canon_ref
   base_canon_ref="$(base_canonical_ref "$base_family" "$base_name" "$base_variant")"
 
-  # Compute canonical tag from hashed content
-  local -a hash_paths=("$dockerfile" "$profile_file" "${patch_dirs[@]}" "${test_dirs[@]}")
-  if [[ -d "$sources_dir" ]]; then
+  # Hash the selected profile values, not unrelated build-target settings.
+  local -a hash_paths=("$dockerfile" "${patch_dirs[@]}" "${test_dirs[@]}")
+  # Explicit file lists narrow target-specific helper inputs. Apps without
+  # lists retain automatic coverage of their complete sources directory.
+  local common_sources variant_sources source_rel
+  common_sources="$(profile_value "$profile_file" COMMON_SOURCE_FILES)"
+  variant_sources="$(profile_value "$profile_file" "${variant_upper}_SOURCE_FILES")"
+  if [[ -n "${common_sources}${variant_sources}" ]]; then
+    local -a source_files=()
+    read -r -a source_files <<< "${common_sources} ${variant_sources}"
+    for source_rel in "${source_files[@]}"; do
+      [[ -f "${app_dir}/${source_rel}" ]] || { echo "ERROR: missing declared source file ${app_dir}/${source_rel}" >&2; return 1; }
+      hash_paths+=("${app_dir}/${source_rel}")
+    done
+  elif [[ -d "$sources_dir" ]]; then
     hash_paths+=("$sources_dir")
   fi
+  [[ ! -f .dockerignore ]] || hash_paths+=(.dockerignore)
   if grep -Fq "$package_helpers" "$dockerfile"; then
     [[ -f "$package_helpers" ]] || { echo "ERROR: missing $package_helpers" >&2; return 1; }
     hash_paths+=("$package_helpers")
@@ -665,9 +759,11 @@ app_refs() {
   local image_name="${app_name}-${app_variant}"
   local tag="${ALPS_REV}"
   local h
-  h="$(content_hash "app_name app_variant image_name tag base_canon_ref CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  # Profile-key coverage and effective/defaulted values are documented in README.md.
+  # Hash the resolved base ref only; base_image is just its profile selector.
+  h="$(content_hash "app_name app_variant image_name tag base_canon_ref dockerfile_rel common_test_dir test_dir_rel common_patch_dir patch_dir_rel common_sources variant_sources CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$image_name" "$tag" "$h")
 
-  printf '%s %s %s %s\n' "$base_canon_ref" "$dockerfile" "$canon_ref" "$stable_ref"
+  printf '%s %s %s %s %s\n' "$base_canon_ref" "$dockerfile" "$canon_ref" "$stable_ref" "$family"
 }

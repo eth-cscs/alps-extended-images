@@ -1,0 +1,104 @@
+From 654d0f6060c0d81e882ceb1f6bae51b4baab3d33 Mon Sep 17 00:00:00 2001
+From: davmels <davmelous@gmail.com>
+Date: Sat, 17 Oct 2026 15:32:23 +0200
+Subject: [PATCH 4/5] megatron generation: cap new tokens to the context left
+ after the prompt
+
+The Megatron engine fails every request whose prompt plus num_tokens_to_generate
+exceeds its max sequence length (MaxSequenceLengthOverflowError), and the failed
+request comes back without generated log-probs. NeMo-RL passed max_new_tokens
+unchanged, so with max_new_tokens equal to max_model_len every request failed.
+Cap it per request to max_model_len minus the prompt length, as the vLLM worker
+does.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+ous, the
+CUDA cache is emptied once before the state comes back, and each step prints how
+long the moves and the step took (rank 0, and any rank over 10 s).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../generation/megatron/megatron_worker.py     | 18 ++++++++++++++++--
+ nemo_rl/models/generation/megatron/utils.py    | 13 +++++++++++++
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/nemo_rl/models/generation/megatron/megatron_worker.py b/nemo_rl/models/generation/megatron/megatron_worker.py
+index b55954a6e..5439491f0 100644
+--- a/nemo_rl/models/generation/megatron/megatron_worker.py
++++ b/nemo_rl/models/generation/megatron/megatron_worker.py
+@@ -91,6 +91,7 @@ from nemo_rl.models.generation.megatron.utils import (
+     build_image_preprocessing_config,
+     build_prompt_and_multimodal_data,
+     build_video_preprocessing_config,
++    context_capped_max_new_tokens,
+     log_gpu_memory,
+     resolve_torch_dtype,
+     sample_vision_tensors,
+@@ -976,10 +977,16 @@ class MegatronGenerationMixin:
+         self,
+         greedy: bool,
+         stop_words: Optional[list[str]],
++        prompt_length: int,
+         *,
+         return_prompt_tokens: bool = False,
+     ) -> SamplingParams:
+-        """Build mcore SamplingParams for a single request."""
++        """Build mcore SamplingParams for a single request.
++
++        The engine fails any request whose prompt plus ``num_tokens_to_generate``
++        exceeds its max sequence length, so the generation budget is capped to
++        the context left after the prompt, as the vLLM worker does.
++        """
+         top_k_cfg = self.cfg["generation"]["top_k"]
+         top_k_val = 1 if greedy else (int(top_k_cfg) if top_k_cfg is not None else 0)
+ 
+@@ -994,7 +1001,13 @@ class MegatronGenerationMixin:
+             top_p=top_p_val,
+             skip_prompt_log_probs=True,
+             return_log_probs=True,
+-            num_tokens_to_generate=self.cfg["generation"]["max_new_tokens"],
++            num_tokens_to_generate=context_capped_max_new_tokens(
++                configured_max_new_tokens=self.cfg["generation"]["max_new_tokens"],
++                input_length=prompt_length,
++                max_model_len=self.cfg["generation"]["mcore_generation_config"][
++                    "max_model_len"
++                ],
++            ),
+             termination_id=self.megatron_tokenizer.eod,
+             stop_words=stop_words,
+             return_prompt_tokens=return_prompt_tokens,
+@@ -1064,6 +1077,7 @@ class MegatronGenerationMixin:
+                 self._build_sampling_params(
+                     greedy,
+                     stop_words,
++                    len(prompt),
+                     return_prompt_tokens=multi_modal_data is not None,
+                 )
+             )
+diff --git a/nemo_rl/models/generation/megatron/utils.py b/nemo_rl/models/generation/megatron/utils.py
+index ba5edf531..d1c35c278 100644
+--- a/nemo_rl/models/generation/megatron/utils.py
++++ b/nemo_rl/models/generation/megatron/utils.py
+@@ -20,6 +20,19 @@ from megatron.core.inference.config import ImageProcessingConfig, VideoProcessin
+ from megatron.core.inference.utils import device_memory_summary
+ 
+ 
++def context_capped_max_new_tokens(
++    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
++) -> int:
++    """Cap generation so the prompt and response fit the engine's max sequence length."""
++    remaining_context = max_model_len - input_length
++    if remaining_context <= 0:
++        raise ValueError(
++            "Cannot generate from an input whose length exhausts the model context: "
++            f"input_length={input_length}, max_model_len={max_model_len}."
++        )
++    return min(configured_max_new_tokens, remaining_context)
++
++
+ def sample_vision_tensors(data, index: int):
+     """Return one sample's vision tensors from RL PackedTensors."""
+     from nemo_rl.data.multimodal_utils import PackedTensor
+-- 
+2.43.0
+

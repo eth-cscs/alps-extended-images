@@ -1,6 +1,8 @@
 family: cuda
 variants:
   - name: pytorch
+    variant: 26.07-py3
+  - name: pytorch
     variant: 26.06-py3
   - name: pytorch
     variant: 26.02-py3

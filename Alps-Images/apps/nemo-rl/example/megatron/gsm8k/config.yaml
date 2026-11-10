@@ -1,0 +1,26 @@
+# Native generation from swiss-ai/rl-infra@8ff6156fd2bf324f409c3cb8f33c00ea26cd9990.
+defaults: ../../common/gsm8k.yaml
+
+policy:
+  megatron_cfg:
+    env_vars:
+      NRL_XFERDTENSOR_PYTHON: "1"
+  generation:
+    backend: megatron
+    refit_transport: nccl_reshard
+    mcore_generation_config:
+      tensor_model_parallel_size: 1
+      pipeline_model_parallel_size: 1
+      expert_model_parallel_size: ${oc.decode:${oc.env:GENERATION_EXPERT_PARALLEL_SIZE}}
+      expert_tensor_parallel_size: 1
+      moe_token_dispatcher_type: alltoall
+      moe_enable_deepep: false
+      cuda_graph_impl: local
+      inference_cuda_graph_scope: layer
+      num_cuda_graphs: -1
+      moe_pad_experts_for_cuda_graph_inference: true
+      use_cuda_graphs_for_non_decode_steps: true
+      async_sched_mode: legacy
+      buffer_size_gb: 32
+      max_requests: ${oc.decode:${oc.env:INFERENCE_REQUESTS}}
+      logprobs_mode: raw_logprobs

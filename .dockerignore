@@ -1,0 +1,10 @@
+# Exclude transient files from the repository-root build context.
+# Keep these patterns aligned with meta.sh's recursive hashing exclusions.
+**/.git
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+**/*.pyo
+**/*.swp
+**/*.swo
+**/*~

@@ -2,7 +2,12 @@ tests:
   cuda:
     - name: vetnode
       kind: cuda-vetnode
-    - name: ray-nccl
+    - name: model-imports
+      runner: cuda
+      timeout: 10m
+      script:
+        - /opt/tests/vllm/model_import_smoke.sh
+    - name: ray-nccl-uccl-ep
       runner: cuda
       timeout: 30m
       script:
@@ -11,6 +16,7 @@ tests:
         SLURM_JOB_NUM_NODES: "2"
         SLURM_NTASKS: "2"
         VLLM_RAY_NCCL_WORLD_SIZE: "8"
+        FI_CXI_ENABLE_WRITEDATA: "1"
     - name: mooncake-cxi
       runner: cuda
       timeout: 15m
@@ -20,7 +26,12 @@ tests:
         SLURM_JOB_NUM_NODES: "1"
         SLURM_NTASKS: "1"
   rocm:
-    - name: ray-rccl
+    - name: model-imports
+      runner: rocm
+      timeout: 10m
+      script:
+        - /opt/tests/vllm/model_import_smoke.sh
+    - name: ray-rccl-uccl-ep
       runner: rocm
       timeout: 30m
       script:
@@ -29,6 +40,7 @@ tests:
         SLURM_JOB_NUM_NODES: "2"
         SLURM_NTASKS: "2"
         VLLM_RAY_NCCL_WORLD_SIZE: "8"
+        FI_CXI_ENABLE_WRITEDATA: "1"
     - name: mooncake-cxi
       runner: rocm
       timeout: 15m

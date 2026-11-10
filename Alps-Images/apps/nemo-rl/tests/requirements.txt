@@ -1,0 +1,21 @@
+# Libraries to install at runtime for upstream unit tests and code-quality checks
+coverage==7.16.2
+flake8==7.4.1
+hatchling==1.32.4
+mock==5.2.0
+mypy==2.4.0
+pre-commit==4.6.2
+PyGithub==2.10.0
+pylint==4.1.2
+pyrefly==1.3.2
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+pytest-mock==3.16.0
+pytest-random-order==1.2.0
+pytest-runner==6.0.1
+pytest-shard==0.1.2
+pytest-testmon==2.2.0
+pytest-timeout==2.4.0
+ruff==0.16.10
+ty==0.0.85
+types-requests==2.31.0.6
