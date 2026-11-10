@@ -928,6 +928,184 @@ def source_rocm(command):
     )
 
 
+@pytest.mark.parametrize("python_fails", [False, True])
+def test_bundled_rccl_discovers_roots_and_propagates_failure(tmp_path, python_fails):
+    env = {name: str(tmp_path / name) for name in (
+        "ROCM_SDK_ROOT", "ROCM_LIBRARIES_DIR", "ROCM_CORE_PREFIX",
+        "ROCM_LIBRARIES_PREFIX", "ROCM_DEVEL_PREFIX", "ROCM_BUILD_PREFIX",
+        "PURELIB", "PLATLIB",
+    )}
+    for path in env.values():
+        Path(path).mkdir()
+    expected_roots = set(env.values())
+    env.update(RCCL_LIB_DIR=str(tmp_path / "built/lib"), ROCM_PYTHON="sdk_python")
+    python_body = 'return 17' if python_fails else 'printf "%s\\n" "$PURELIB" "$PLATLIB"'
+    # Stop at the replacement boundary, before any host files or ldconfig writes.
+    command = source_rocm(
+        f'sdk_python() {{ {python_body}; }}; '
+        'replace_rccl_libraries() { printf "%s\\n" "$@"; return 19; }; '
+        'replace_bundled_rccl'
+    )
+    result = run_bash(command, env=env, check=False)
+    assert result.returncode != 0
+    if python_fails:
+        assert not result.stdout
+    else:
+        arguments = result.stdout.splitlines()
+        assert arguments[0] == env["RCCL_LIB_DIR"]
+        assert expected_roots <= set(arguments[1:])
+        for path in ("/opt/rocm", "/usr/local/lib", "/usr/local/lib64", "/usr/lib", "/usr/lib64", "/lib", "/lib64"):
+            if Path(path).is_dir():
+                assert path in arguments[1:]
+
+
+def test_system_rccl_replacement_forwards_cmake_after_libraries(tmp_path):
+    command = source_rocm(
+        'sdk_python() { :; }; '
+        'replace_rccl_libraries() { echo libraries; }; '
+        'forward_rccl_configs() { printf "%s\\n" "$@"; return 19; }; '
+        'replace_bundled_rccl'
+    )
+    result = run_bash(command, env={
+        "ROCM_PYTHON": "sdk_python", "ROCM_SDK_LAYOUT": "system",
+        "ROCM_SDK_ROOT": str(tmp_path), "ROCM_LIBRARIES_DIR": str(tmp_path),
+        "ROCM_BUILD_PREFIX": str(tmp_path / "vendor"), "RCCL_LIB_DIR": str(tmp_path / "alps/lib64"),
+    }, check=False)
+    assert result.returncode != 0
+    assert result.stdout.splitlines() == [
+        "libraries", str(tmp_path / "alps/lib64/cmake/rccl"), str(tmp_path / "vendor/lib/cmake/rccl"),
+    ]
+
+
+def test_rccl_cmake_forwarding_uses_built_target_not_deleted_vendor(tmp_path):
+    if not shutil.which("cmake"):
+        pytest.skip("CMake is needed")
+    built = tmp_path / "alps/lib/cmake/rccl"
+    vendor = tmp_path / "vendor/lib/cmake/rccl"
+    built.mkdir(parents=True)
+    vendor.mkdir(parents=True)
+    (built / "rccl-config.cmake").write_text(
+        'include("${CMAKE_CURRENT_LIST_DIR}/rccl-targets.cmake")\n'
+        'set(RCCL_FOUND TRUE)\nset(RCCL_VERSION 2.30.4)\n'
+    )
+    (built / "rccl-targets.cmake").write_text(
+        'get_filename_component(prefix "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)\n'
+        'add_library(roc::rccl SHARED IMPORTED)\n'
+        'set_target_properties(roc::rccl PROPERTIES IMPORTED_LOCATION "${prefix}/lib/librccl.so.1.0")\n'
+    )
+    (built / "rccl-config-version.cmake").write_text(
+        'set(PACKAGE_VERSION 2.30.4)\nset(PACKAGE_VERSION_COMPATIBLE TRUE)\n'
+    )
+    (vendor / "rccl-config.cmake").write_text('message(FATAL_ERROR "Deleted vendor library")\n')
+    run_bash(source_rocm('forward_rccl_configs "$BUILT_CONFIG" "$VENDOR_CONFIG"'),
+             env={"BUILT_CONFIG": str(built), "VENDOR_CONFIG": str(vendor)})
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "CMakeLists.txt").write_text(
+        'cmake_minimum_required(VERSION 3.16)\nproject(rccl_forwarding NONE)\n'
+        f'find_package(RCCL 2.30.4 CONFIG REQUIRED PATHS "{tmp_path}/vendor" NO_DEFAULT_PATH)\n'
+        'get_target_property(actual roc::rccl IMPORTED_LOCATION)\n'
+        f'if(NOT actual STREQUAL "{tmp_path}/alps/lib/librccl.so.1.0")\nmessage(FATAL_ERROR "wrong target")\nendif()\n'
+        'if(NOT RCCL_VERSION STREQUAL "2.30.4")\nmessage(FATAL_ERROR "wrong version")\nendif()\n'
+    )
+    subprocess.run(["cmake", "-S", str(project), "-B", str(tmp_path / "build")],
+                   check=True, capture_output=True, text=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(built, target_is_directory=True)
+    result = run_bash(source_rocm('forward_rccl_configs "$BUILT_CONFIG" "$VENDOR_CONFIG"'),
+                      env={"BUILT_CONFIG": str(built), "VENDOR_CONFIG": str(alias)}, check=False)
+    assert result.returncode != 0
+    assert "would overwrite" in result.stderr
+    assert 'include("${CMAKE_CURRENT_LIST_DIR}/rccl-targets.cmake")' in (built / "rccl-config.cmake").read_text()
+
+
+def built_rccl(directory):
+    directory.mkdir(parents=True)
+    (directory / "librccl.so.1.0").write_text("Alps RCCL")
+    (directory / "librccl.so.1").symlink_to("librccl.so.1.0")
+    (directory / "librccl.so").symlink_to("librccl.so.1")
+    return directory
+
+
+@pytest.mark.parametrize("libdir", ["lib", "lib64"])
+def test_rccl_replacement_covers_nested_roots_and_preserves_canonical_build(tmp_path, libdir):
+    root = tmp_path / "image with spaces"
+    source = built_rccl(root / "alps/rccl" / libdir)
+    destinations = [root / relative for relative in (
+        "sdk/lib", "site-packages/_rocm_sdk_libraries/lib",
+        "site-packages/_rocm_sdk_libraries/lib/rccl/lib", "site-packages/torch/lib",
+        "usr/lib/x86_64-linux-gnu", "usr/local/lib",
+    )]
+    for directory in destinations:
+        directory.mkdir(parents=True)
+        (directory / "librccl.so.1").write_text("vendor RCCL")
+        (directory / "librccl.so").symlink_to("librccl.so.1")
+        (directory / "librccl.so.obsolete").symlink_to("missing-vendor-library")
+        (directory / "libcompute.so").write_text("vendor compute")
+    alias = tmp_path / "SDK alias"
+    alias.symlink_to(root / "sdk", target_is_directory=True)
+    # SDK compatibility trees can contain cycles; scanning must not follow them.
+    (root / "sdk/loop").symlink_to(root, target_is_directory=True)
+    env = {"BUILT_RCCL": str(source), "IMAGE_ROOT": str(root), "SDK_ALIAS": str(alias)}
+    command = source_rocm('replace_rccl_libraries "$BUILT_RCCL" "$IMAGE_ROOT" "$SDK_ALIAS" "$BUILT_RCCL"')
+    for _ in range(2):
+        run_bash(command, env=env)
+        assert not (source / "librccl.so.1.0").is_symlink()
+        assert (source / "librccl.so.1.0").read_text() == "Alps RCCL"
+        assert (source / "librccl.so.1").readlink() == Path("librccl.so.1.0")
+        for directory in destinations:
+            assert {path.name for path in directory.glob("librccl.so*")} == {
+                "librccl.so", "librccl.so.1", "librccl.so.1.0",
+            }
+            for path in directory.glob("librccl.so*"):
+                assert path.is_symlink() and path.resolve() == source / "librccl.so.1.0"
+            assert (directory / "libcompute.so").read_text() == "vendor compute"
+
+
+@pytest.mark.parametrize("broken", ["missing-library", "dangling-link", "external-target", "missing-root", "failed-find"])
+def test_rccl_replacement_rejects_invalid_inputs_before_deleting_vendor_files(tmp_path, broken):
+    source = built_rccl(tmp_path / "alps/lib")
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    original = vendor / "librccl.so.1"
+    original.write_text("vendor RCCL")
+    roots = vendor
+    prefix = ""
+    if broken == "missing-library":
+        (source / "librccl.so.1.0").unlink()
+    elif broken == "dangling-link":
+        (source / "librccl.so.broken").symlink_to("missing")
+    elif broken == "external-target":
+        (source / "librccl.so").unlink()
+        (source / "librccl.so").symlink_to(original)
+    elif broken == "missing-root":
+        roots = tmp_path / "missing"
+    else:
+        # Even a partial discovery followed by failure must not trigger deletion.
+        prefix = 'find() { command find "$@"; return 17; }; '
+    result = run_bash(source_rocm(prefix + 'replace_rccl_libraries "$BUILT_RCCL" "$SEARCH_ROOT"'),
+                      env={"BUILT_RCCL": str(source), "SEARCH_ROOT": str(roots)}, check=False)
+    assert result.returncode != 0
+    assert not original.is_symlink() and original.read_text() == "vendor RCCL"
+
+
+def test_rccl_replacement_verifies_link_targets(tmp_path):
+    source = built_rccl(tmp_path / "alps/lib")
+    vendor = tmp_path / "vendor"
+    vendor.mkdir()
+    (vendor / "librccl.so.1").write_text("vendor RCCL")
+    wrong = tmp_path / "wrong-library"
+    wrong.write_text("wrong RCCL")
+    command = source_rocm(
+        'ln() { command ln -s "$WRONG_LIBRARY" "$3"; }; '
+        'replace_rccl_libraries "$BUILT_RCCL" "$SEARCH_ROOT"'
+    )
+    result = run_bash(command, env={"BUILT_RCCL": str(source), "SEARCH_ROOT": str(vendor),
+                                    "WRONG_LIBRARY": str(wrong)}, check=False)
+    assert result.returncode != 0
+    assert "does not resolve to the Alps build" in result.stderr
+
+
 @pytest.mark.parametrize("kind", ["directory", "symlink", "dangling-symlink", "marker-symlink"])
 def test_rocm_compat_root_refuses_unmanaged_layout(tmp_path, kind):
     root = tmp_path / "rocm"

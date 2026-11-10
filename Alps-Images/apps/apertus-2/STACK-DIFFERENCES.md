@@ -1,5 +1,115 @@
 # Imanol reference versus the native Apertus 2 ROCm stack
 
+## Primus image progress: 2026-11-06
+
+### Current blocking findings
+
+The source-corrected Primus 26.3 base passed GPU/library checks, strict Enroot export, and fresh two-node/eight-rank validation 724239: MIOpen passed, RCCL completed 18/18 sizes with zero wrong values, and GPU-OSU completed 18/18 sizes without a preload shim.
+Its exact-config Docker backup preserves image ID `5e4d3a6a1b0411c0d862fa4b463173f5845d7d7a24c38405378c6e78adbb5adf`.
+The checker-corrected 26.3 app compiled as `483272f80fd87d6a2ae70319dd6edaad3c683f256601bf24e1b8e704718bd0b6`, preserving 11 vendor packages / 4293 files, but its strict AITER backward comparison failed on 3/32768 elements; no accepted app export followed.
+Recovery 724549 found the old node-local store absent and is restoring the exact parent before rebuilding the same frozen app content in `26.3/app-attempt-005`.
+The rebuilt app will be archived before an explicitly external attention diagnostic adds FP64-reference and BF16-math-control measurements while retaining the original strict rejection.
+No 26.3 attention tolerance or release policy has been changed.
+
+The same-content Primus 26.8 parent rebuilt as `c7dc20175cdbab02421542630103e88973fbfc9649e7d1e70cf041c1dfd647c8`, preserving 14 vendor packages / 5164 files and MPI5.
+It passed GPU/library checks and strict Enroot export with SHA-256 `d29af3ac02584a65a1b62477146f16cd93b48ccb0e95b004f09e2a09f36fecf8`; its exact-config Docker backup is preserved.
+Fresh validation 724548 passed runtime tests but its reviewer lacked INFO-level transport evidence; that result and the reviewer failure are retained in `26.8/validation-002`.
+Repeat 724551 passed MIOpen, RCCL 18/18 with zero wrong values and AWS Libfabric logging, and GPU-OSU 18/18, establishing the rebuilt image's fresh base gate.
+Recovery 724550 found the old node-local store absent, restored the exact parent ID, verified frozen inputs and the full base gate, and received the corrected child handoff.
+Both recovery builders archive compiled children before GPU checks, so a numerical rejection will not prevent exact-config preservation.
+The corrected 26.8 child has now compiled as `7ec22d34344ec3001cfd5d4b6ac3485eae6e86d6cfbadc5d698a3afa8b8230ec`, passed the packaged GPU stack check, and passed strict export with SHA-256 `faa88a6ed8848f86374302cdb78f0583f0e1d88929dafd09c1d617005ccf7726`.
+Its exact-config Docker archive is preserved; independent cold-stack validation is queued for admission after the active numerical diagnostic.
+
+The checker now reads native reload evidence from rank 0 independently of rank 7 metrics and retains all checkpoint ownership, optimizer/RNG ancestry, source identity and finite-update guards.
+Its tests passed 67 focused cases and 333 total cases with one skipped.
+Frozen `app-inputs-011` identifies canonical app suffixes `c736a041810bb7fe7dbcd420f0794861` (26.3) and `a00cdf813c7373a5f69792117ce4c3e4` (26.8); previous frozen snapshots and failed evidence remain intact.
+
+26.8 full-path diagnostic 724245 reproduced the first post-reload NaN and preserved eight checksummed raw gradient snapshots.
+Only rank 2 had nonfinite local inputs: two FP32 128×128 matrices contained 2304 and 256 NaNs, with remaining finite magnitudes around 10³⁴.
+Their full layout matches expert FC2 weight gradients for decoder layers 2/3 in a prior named healthy capture; those names remain inferred rather than directly recorded in the failed call.
+This establishes corrupted gradient inputs in that run, not their producer or root cause.
+Read-only source analysis shows selective `moe_act` recomputation sets FC2 `_o1_nodefer`, so the deferred FC2 queue is not the expected path for this configuration; immediate side-stream work and recomputed storage lifetime need investigation.
+Standalone GPU probe 724554 reproduced a storage-lifetime defect: all four custom-alias-only `record_stream` cases reused storage before the side-stream read, corrupting every output element.
+All twelve native-storage, true-owner-recording and retained-owner controls passed.
+The exact Torch commit's allocator skips stream recording for custom-deleter DataPtrs, matching the reference storage-sharing extension's pointer type.
+Full-path diagnostic pair 724559 completed finite updates 1–4 and strict external save2/load2/save4 checks in both the baseline and retained-FC2-input trials.
+Each trial produced 16 lifetime reports and exercised 144 immediate FC2 calls; peak held inputs were zero and three respectively.
+The intended control executed, but the healthy baseline means this pair does not establish a causal training fix.
+Actual-kernel probe 724576 then reproduced corruption in all four custom-alias-only cases using the image’s unchanged `vk_accum` FC2 wgrad kernel with controlled delayed execution and storage reuse.
+All 262144 output elements per failing case matched the replacement-input arithmetic, while all twelve native-storage, true-owner-recording and retained-owner controls were exact.
+This confirms the lifetime defect can corrupt the actual wgrad kernel; it does not establish that the original training failure used this schedule.
+Bounded full-training pair 724579 applied the same explicit side-stream delay in both trials and retains FC2 inputs only in the second, using natural training allocator activity without injected replacement allocations.
+Its perturbed schedule is diagnostic and cannot establish unmodified training reliability.
+Its baseline rejected a NaN at update 1; eight raw snapshots are checksummed, with nonfinite FP32 128×128 gradient inputs on six ranks.
+The retained-input trial completed finite updates 1–4 and strict external save2/load2/save4 checks on all eight ranks, with 16 reports, 144 immediate FC2 calls and peak retention of three inputs.
+All eight baseline lifetime hooks were installed, but process termination prevented its exit-time call reports; summary zero call counts are unavailable evidence, not proof of zero calls.
+This supports lifetime causality under the deliberately delayed schedule; original-run causality and a production fix remain unaccepted.
+Reverse-order repeat 724599 reproduced the split: retained inputs passed finite updates 1–4 and strict eight-rank restart; the delayed baseline failed at update 1 with eight preserved raw snapshots.
+The improved failure capture retained eight baseline lifetime reports covering 48 immediate FC2 calls with peak retention zero; the successful trial recorded 16 reports, 144 calls and peak retention three.
+Both trial orders now support the lifetime mechanism in the perturbed training schedule.
+No production source fix has been demonstrated.
+Earlier uninstrumented failures 723856/723879, native local-bucket NaN 724075 and the separate cold-start 1000-second compilation-budget failure remain blocking.
+Healthy observed or reload-only runs do not waive these failures.
+Neither app has accepted training/restart or four-node validation, and full-depth, performance and publication gates remain closed.
+All changes remain uncommitted and unpublished, with P2P-off and Alps networking defaults retained.
+
+### Earlier build and diagnostic evidence (preserved)
+
+Both original bases compiled, preserved their tracked vendor compute bytes, pass single-GPU numerical and actual RCCL/MPI loader audits, and have Enroot exports with exit zero plus independent full-data reads and checksums.
+Primus26.8 retains MPI5.0.10 and passed two-node/eight-rank MIOpen, RCCL all-reduce and GPU-aware OSU all-to-all validation in job723432.
+Primus26.3 uses the approved private MPI4.1.6 compatibility build; its unchanged Torch loads only Alps MPI4 core libraries, while26.8 and existing images retain the shared MPI5 implementation.
+The26.3 private fixes include an OFI `offsetof` macro replacement, an explicit RCCL-to-retained-ROCm-SMI final relink without recompiling device objects, and forwarding stale system RCCL CMake metadata to the Alps build.
+Its two-node RCCL all-reduce completed32B through4MiB with zero errors in job723802 after excluding the vendor hwloc OpenGL discovery component with per-launch `HWLOC_COMPONENTS=-gl`.
+Stack traces established that merely clearing `DISPLAY`/`XAUTHORITY` did not prevent `hwloc_gl` from blocking in `XOpenDisplay` before aws-ofi network initialization.
+The current MPI4 launcher selects per-launch `PMIX_MCA_gds=hash` to avoid unsupported host-Slurm `shmem2` component selection; these launcher/discovery controls do not alter image network defaults.
+Separate Slurm steps resolved the second-MPI startup failure, but full26.3 validation723823 remains failed: GPU-aware OSU reaches MPI_Alltoall and reports CXI memory-mapping write errors on every rank, while RCCL again completes with zero wrong values.
+The pinned MPI4 OFI component lacks MPI5-style FI_HMEM negotiation and accelerator registration support.
+Capability queries confirmed CXI supports HMEM with mr_mode0, requiring no explicit application-side registration in this configuration.
+A bounded preload diagnostic723839 enabled API1.18/HMEM negotiation and completed all18 GPU OSU sizes across eight ranks on two nodes in18seconds, with the unchanged base image and cm/ofi/cxi transport.
+The corresponding private source patch now requests FI_HMEM/API1.18 without advertising FI_MR_HMEM callbacks that MPI4 does not implement; it still requires a rebuilt image and full base validation, and no transport defaults have changed.
+The26.8 Apertus2 app compiled and passed package/source metadata, the preserved14-package/5164-file compute fingerprint and pointer-GEMM GPU checks, but its original fixed attention-gradient threshold failed.
+An independent three-seed FP64 audit reproduced sparse failures with AITER relative L2 error below0.37%, versus approximately0.17% for BF16 PyTorch math; changing AITER conversion mode did not fix them.
+A GPU diagnostic using mounted revised tests passed the exact amd-aiter0.1.22.post1 upstream BF16-control-relative gradient criterion plus added finite/nonnegative and one-BF16-epsilon relative-L2 guards; original mismatch counts remain visible.
+That policy is pinned to upstream commit b4d9154d125e09efbe098d986e40fea3549c1244 and applies only to that AITER version;26.3 retains the original strict check.
+The frozen app-inputs009 canonical26.8 app c2133f5e0d077b44045690eced172115 rebuilt as image8fd11f0b179dd84d7b1fee8bcc4a5c030e7f954169bef37e6b44d5261c1670ec and passed the revised in-image GPU stack check with unchanged compute fingerprint.
+Its Enroot export exited0, passed a full filesystem read and SHA-2569e0301cc7e6265f89fe69703cbab35682547550a56653c58cf199ed54c5b8970.
+Independent fresh-cache exported-image stack test723840 passed.
+Two-node restart test723844 failed before model construction because vendor NVTE_FLASH_ATTN=0 conflicts with the reference auto backend; the CI launcher now clears the three NVTE attention selectors exactly as the reference launcher does, without changing image defaults.
+Image references remain unchanged and validation hashes change; local checks pass315 with one skipped and49 focused tests.
+Corrected cold restart test723851 reached the reference AITER path but hit the unchanged1000-second stage limit while compiling351 kernel objects per rank, before completing an update or checkpoint.
+Warm-cache functional restart test723856 is separate: it imports three checksummed AITER modules from executable node-local tmpfs through an explicit PYTHONPATH allowlist and verifies the unchanged packaged tests and per-node compute fingerprint.
+Warm functional723856 saved iteration2 but failed the strict finite-update guard: iteration1 reported grad norm inf and iteration2 reported2.106, despite finite reported losses.
+The failed checkpoint and all logs are preserved; no restart/pipeline gate opens from this run.
+Post-native-norm audit723866 captured finite inputs on all eight ranks and native norms1.602435/2.089203 matching aggregated FP64 references, so it did not reproduce the original failure.
+That diagnostic perturbs timing and is not a fix or acceptance; an uninstrumented repeat is required to assess the unresolved behavior.
+A CPU audit found no nonfinite tensor values in the16 saved model/optimizer files, which does not retroactively validate the prior nonfinite gradient norm.
+No cold-start training, completed restart, full-depth or performance acceptance is claimed.
+The26.3 app remains blocked on its full base gate.
+Successor723842 is rebuilding the private HMEM-corrected canonical base9ebd8bb0806680810baec2ef43cfb120 from frozenbase-inputs009 after a strict exact-ID Docker restore; its prior node-local build cache did not survive allocation expiry.
+Its bootstrap/SDK-cleanup compute fingerprint remains unchanged at11 packages and4293 files, which is not full base or app acceptance.
+Its saved OCI archive is checksummed, but restore723813 correctly failed the exact-ID guard because OCI config conversion changed the image ID.
+A Docker-format archive subsequently preserved the original config ID and loaded with the exact original image ID into a fresh separate Podman store on the existing builder node; identity guards were not waived.
+The rebuilt26.8 app also has a checksummed, config-ID-preserving Docker archive; that separate archive has not yet been restored.
+All prior failures, snapshots and the older native candidate are preserved; no commits, pushes, stable tags or registry promotions have been made.
+The private HMEM source correction passed48 focused and314 full tests with one skipped; the subsequent CI attention-launcher correction passes49 focused and315 full tests with one skipped.
+The user-requested delegated P2P omission probe723803 completed: both controls passed all18 sizes with zero wrong values, while omission passed1/3 on26.3 and0/3 on26.8, with four HIP invalid-device-pointer failures and one timeout.
+INFO logs confirm actual local P2P/IPC with the flag absent versus SHM/direct/direct in controls; AWS Libfabric/CXI networking remained selected.
+Failed launches have no correctness result; omission is unreliable on both bases, and the image P2P-off default remains unchanged.
+
+
+## Primus rebuild checkpoint: 2026-11-05
+
+The active objective is independent Primus26.3/reference-generation and Primus26.8/newer-stack bases and Apertus2 children, not another P2P study or full-depth run on the frozen native candidate.
+Neither new base has completed compilation, export or validation; upstream-only pointer-GEMM forward/dgrad/fused-wgrad numerics passed on both stacks with `DEBUG_CLR_AQL_DEV_QUEUE=0`, which is not image/training acceptance.
+Job722906 (26.3) exited after SDK cleanup removed Torch's MPI4 dependencies; job722902 (26.8) compiled RCCL and the network stack, then failed compiling rccl-tests because CMake de-duplicated split `-x hip` flags.
+The reviewed fixes preserve the system SDK, use joined `-xhip` test options, and confine checksum-pinned OpenMPI4.1.6 to `primus-rocm:26.3` and its child.
+This MPI exception is user-approved because the unchanged26.3 Torch requires `libmpi_cxx.so.40`;26.8 and existing images retain MPI5 and all Alps network defaults, including P2P off.
+Both new Primus bases select Alps-rebuilt upstream RCCL2.30.4 (`rocm-systems@6b0e43f341195e203754e08f850e437ff2fc09f9`), not a CSCS RCCL fork.
+All changes remain uncommitted and unpublished; frozen prior inputs/logs and the earlier native candidate are preserved.
+Next gates are compilation, compute-byte preservation and actual library loading, full export integrity and GPU smoke, two-node base validation, then each app's stack and save2/load2/save4 acceptance before any full-depth/performance claim.
+Orchestration and append-only evidence remain in benchmark `experiments/apertus2/runs/image-build-primus-bases-001/`.
+
+
 ## Scope and evidence
 
 This comparison is pinned on 2026-11-03 and separates Imanol’s executed reference job `708188`, the older native image actually exercised in job `716336`, and the new native candidate being built.
@@ -288,3 +398,123 @@ These startup observations do not yet accept the traced training/restart protoco
 The offline analyzer now also aligns native submitted operations by recorded group membership/name and native collective sequence ID, checking operation identity and all-reduce shape/dtype metadata independently of host API returns.
 Ambiguous coalesced/concurrent sequence observations and missing rotated/truncated rows are not treated as proof of divergence.
 Native snapshot collection itself can contend for the GIL or block in driver/event queries even though the Python instrumentation adds no explicit synchronization; stale/missing snapshots do not establish GPU progress or the absence of progress.
+
+
+## Follow-up, 2026-11-05 — flag ablation completed: SENDRECV was already selected; P2P remains unreliable
+
+The delegated native flag study completed in job `722504` after17minutes1second, releasing its two nodes from the single30-minute allocation.
+It ran42 sequential fresh eight-rank Slurm/PMIx launches of the exact baked-in CI all-reduce command on `nid002478` / `nid002514`, both with kernel `6.4.0-150600.23.125-default`.
+The main agent verified the frozen launcher hashes,42 distinct MPI namespaces, all42 matrix entries and all10 complete zero-error/eight-rank numerical passes.
+The parent allocation's `COMPLETED` state means the study finished, not that every case passed.
+
+| Native configuration | Numerical passes / fresh launches | P2P/IPC selected |
+| --- | --- | --- |
+| Complete colleague bundle, P2P disabled | 3 / 3 | 0 / 3 |
+| Complete colleague bundle, P2P enabled | 2 / 5 | 5 / 5 |
+| Only `NCCL_P2P_DISABLE=0` relative to image defaults | 1 / 10 | 10 / 10 |
+
+Every tested unset-protocol launch selected SENDRECV, including successful minimum and leave-one-out cases.
+Explicit `OFI_NCCL_PROTOCOL=SENDRECV` was therefore not a transport switch in these controlled tests on this node pair.
+This strengthens the earlier caution against attributing the initial successful smoke tests to SENDRECV alone.
+Mechanically, `NCCL_P2P_DISABLE=0` alone is sufficient to select P2P/IPC, and one such minimum launch completed the full numerical sweep with every other investigated optional override absent or restored to image defaults.
+It is NOT sufficient evidence of reliable communication: the minimum failed9/10 launches, and the complete bundle failed3/5.
+Across all32 failed launches,29 logged invalid-device-pointer errors and five reached the native deadline, with two launches in both categories.
+Representative full-bundle failure: `cases/003-full-r2/ranks/0001/native.log:432–441` reports `[FATAL ERROR]: HIP failure: 'invalid device pointer'`, followed by RCCL `transport/p2p_tmp.cc:450` / `:625` during communicator setup.
+The error occurred on both tested hosts; the experiment does not establish the exact kernel/RCCL/IPC defect or universal behavior on every node.
+
+Leave-one-out tests removing explicit SENDRECV, threshold192 or forced flush each retained a1/2 numerical pass.
+Removing CROSS_NIC, PXN_DISABLE, GDR_LEVEL or P2P_LEVEL each gave0/2, but these samples cannot establish necessity amid intermittent failures, especially when the all-default minimum itself passed once.
+Five tested small-addition combinations were also unreliable; no robust minimal P2P-on combination was found.
+Single-pair sampling, only two trials for most variants, and potentially non-IID initialization failures prevent reliable causal ranking or strong statistical sufficiency claims.
+The study distinguishes IPC activation from correct operation and does not prove that an untested combination cannot work.
+The image's existing P2P-disabled default should not be removed on the strength of the earlier individual successes.
+The complete new bundle with P2P disabled is the better-supported fallback among these small controls, not a guarantee of full-scale training reliability.
+
+Main full-depth training `722506` was still `PENDING(Resources)` at the latest scheduler check; no training allocation was consuming those sixteen nodes yet.
+Its user-requested P2P-enabled configuration remains unchanged; no job was cancelled, silently switched to P2P-off, or replaced after the ablation findings.
+Interactive721530 and unrelated CI722408 remain preserved, and no new ablation allocation was submitted.
+The successful small training/restart and transport gates remain valid individual observations, but do not establish startup reliability across repeated launches.
+
+All agent artifacts are retained under benchmark `experiments/apertus2/ablations/p2p-flags-2026-11-05/`: `REPORT.md`, `matrix.json` / `matrix.csv`, `findings.json`, `verification.json`, pinned source audit and every case's logs/provenance.
+Main integration evidence is `results/p2p-flag-ablation-722504-integration.json`, with artifact hashes and independently checked matrix totals.
+The main178-test CPU suite and image/defaults remain unchanged.
+
+
+## Follow-up, 2026-11-05 — legacy IPC follow-up finished without a reliable P2P fix
+
+The delegated legacy-IPC study has finished and released reservation nodes `nid002456` / `nid002458`; no replacement allocation was requested.
+Job `722681` ended `FAILED` after16minutes21seconds because the controller encountered empty per-rank exit metadata after the final failed native step.
+The agent preserved the original21-case controller matrix and transparently reconstructed the final failed case from raw native/exit/accounting evidence in `matrix-recovered.json`, yielding22 launches rather than excluding the interrupted failure.
+The main agent verified frozen source hashes, the22-case total and all four complete eight-rank/18-size zero-error numerical passes.
+
+| Configuration | Legacy `1` passes | Legacy explicitly unset passes |
+| --- | --- | --- |
+| Full P2P-on bundle | 1 / 5 | 0 / 5 |
+| Minimal P2P-on | 0 / 5 | 1 / 5 |
+| P2P-off safety control | 1 / 1 | 1 / 1 |
+
+All nine failing legacy-on launches reached the native timeout without logged invalid-device-pointer errors; absence of that error is not success when the operation hangs.
+The added flag therefore did not establish repeated numerical sufficiency or a reliable P2P-on combination.
+The loaded ROCr library contains the flag name, and a supporting public-source audit plus live process-owned IPC export-socket differences support actual runtime path selection rather than merely exporting an ignored variable.
+The public source revision was not established as the exact bundled source; socket observations are not a function-level trace or proof of the exact IPC defect.
+Complete child environment captures matched the designated flag value or absence; some immediate captures were empty during startup and are explicitly marked unavailable, not treated as unset.
+On the subset with all eight child environments directly confirmed, repeated failing legacy-on launches remain, so incomplete startup captures do not explain away the result.
+The P2P-off controls passed; samples are small and failures may be non-IID, so neither a robust production failure rate nor a universal root cause is claimed.
+
+No main training job was altered by this flag study; cancelled `722605` had already been stopped separately at the user's request.
+No training or native ablation GPU job is now active; the latest scheduler view contains only the preserved interactive allocation.
+Keep the image's P2P-disabled default, and do not repeat the unchanged full model on the basis of the single legacy-on success.
+The next recommended technical gate remains a lightweight32-rank FP32/61440-element plain-versus-coalesced reduction reproducer with a P2P-disabled control, before returning to model checkpoint/restart and learned-routing issues.
+No such new allocation has been launched automatically by this report integration.
+Evidence: benchmark `experiments/apertus2/ablations/p2p-flags-2026-11-05/legacy-ipc-001/REPORT.md`, `matrix-recovered.json`, `findings.json`, raw case logs, and main `results/p2p-legacy-ipc-722681-integration.json`.
+
+
+## Outcome, 2026-11-05 — no-overlap full-depth trial timed out after post-step scalar-reduction stall
+
+Full-depth P2P-off/no-gradient-overlap **722718** ended `FAILED`, exit1:0, after25m23s at the configured1500-second supervisor cutoff.
+No complete logged update or checkpoint was produced, and strict global acceptance rejects the run.
+All64 supervisor states are failed;13 explicitly retain the1500-second cutoff, while other peer/shutdown errors are termination effects rather than proven initiating causes.
+No explicit OOM, invalid-device-pointer or CXI exception was observed before shutdown.
+The GPU allocation is released; only preserved interactive721530 remained in the latest scheduler view, and no replacement allocation was submitted.
+
+The supported small no-overlap path is accepted by722711, but disabling overlap is not a sufficient full-scale fix.
+Native dense gradient reductions, including FP32 `[61440]`, and global BF16 router-metric `[15,256]` / `[16,256]` reductions completed on all64 ranks in722718.
+All4464 first-forward dispatch groups were complete, with no volume mismatch and1.0125885009765625 peak-to-balanced ratio.
+The run instead waits on the later optimizer-success/gradnorm scalar-reduction frontier in model-parallel group81/ranks8,40: both enter Int32 `[1]` MIN with matching metadata, rank8 completes and enters the FP32 `[1]` MAX, while rank40's first reduction remains started.
+At24m29s, sampled native completions were778–779seconds old; the remaining ranks were blocked behind default-world LR logging or second-stage loss reduction/device scalar access.
+Different current sequence numbers do not establish a mismatched first collective, and zero retained signature-mismatch candidates do not prove stream/progress/order correctness.
+Final training-child source/module/runtime provenance was not published on any rank after termination, so frozen inputs/actual DDP markers are not treated as final all-rank source acceptance.
+
+Keep P2P disabled and stop full-model flag tuning.
+The recommended next gate is a bounded communication-only reproduction of pairwise Int32 MIN →FP32 MAX with immediate scalar reads, first isolated and then interleaved with the observed DP-loss/default-world logging groups and preceding GPU/collective work.
+A serialized-progress control is a diagnostic contrast, not authorization to insert arbitrary barriers into training or an established fix.
+No new allocation/image rebuild/source patch/commit/push/promotion was performed during this result integration.
+Full-model checkpoint/restart/cache handling and26-update baseline remain blocked.
+Evidence: benchmark `ablations/gradient-overlap-off-2026-11-05/REPORT.md`, `outcome.json`, timestamped observations, and `results/train-mid4b-no-grad-overlap-p2poff-722718-{timeout,collectives,forward-loads,precutoff-frontier,model-pair81-live}.json`.
+
+## Primus reference-derived image work: 2026-11-05
+
+The user authorized independent Primus26.3 and26.8 base/app builds, retaining our RCCL, Alps network stack and unchanged network defaults including P2P off.
+This supersedes the earlier native-only direction for this new work, not the frozen native experiments or existing PyTorch-based variants.
+The registered selectors are `primus-rocm:26.3` / `primus-rocm:26.8` and Apertus2 `megatron-primus263-rocm` / `megatron-primus268-rocm`.
+The digest-pinned upstream audits passed and preserve each release's compute generation;26.3 matches the captured reference Torch/Triton/TE versions, while26.8 is a separate newer-stack comparison.
+The app recipe vendors the exact reference Megatron source archive, pins the reference optimizer and FLA gate, rebuilds ABI-specific CPU extensions, and contains portable compute-only defaults.
+Private reference Turbo APIs on26.8 remain a compatibility gate, not an assumed success.
+The first build array722833 failed before executing its first RUN body because chroot isolation could not set supplemental groups.
+OCI retries722859 and722860 are running on two reserved nodes with owned `/dev/shm/podman-22404-primus-*` storage; interactive721530 is untouched.
+All image implementation remains uncommitted in this repository; orchestration, frozen contexts, manifests and logs are under benchmark `experiments/apertus2/runs/image-build-primus-bases-001/`.
+No base/app build, multi-node validation, full-depth restart or performance acceptance is claimed, and no registry promotion has occurred.
+
+The OCI26.8 retry then reached package installation but failed because the wrapper's single-UID namespace cannot assign `man-db` ownership;26.3's matching wrapper build was agent-stopped before repeating this blocker.
+Native rootless Podman preflight confirmed full subordinate UID/GID mappings on the Slurm host.
+Replacement build jobs722886 and722887 use native host Podman with OCI isolation, explicit layer caching, exactly one canonical output tag, and owned node-local storage; the frozen image recipes/hashes are unchanged.
+An upstream26.8 GPU import probe confirmed a missing private Turbo offset symbol; the app now has a version-gated three-file import adapter without vendor-library changes or disabling optimized paths.
+Adapter/source provenance is tested on CPU, while GPU numerical checks, image compilation and training gates are still pending.
+
+Native build-RUN preflight passed with explicit cgroupfs/host cgroup namespace; current build jobs are722906 for26.3 and722902 for26.8, still using unchanged frozen base recipes.
+The latest repository suite passed288 tests with1 skip, and reviewed app inputs/scripts are frozen as `app-inputs-001` without releasing app-ready markers.
+The unmodified26.3 reference pointer-GEMM forward/dgrad/fused-wgrad standalone GPU probe passed; this is upstream compute evidence, not new-base/network/training acceptance.
+The26.8 source adapter passes reference API imports, but a traced numerical probe fails before any reference kernel: vendor Torch2.14 segfaults on its first GPU `fill_()`.
+Both allocator modes and seccomp-unconfined fail; the preserved Torch2.13 candidate passes fill/normal/divide on the same node under Enroot.
+Native GDB reproduces the crash after bootstrap inside `libamdhip64`'s `hipLaunchKernel`, with rocprofiler-SDK interposition visible; a targeted control of the vendor-enabled device-memory AQL ring is pending, not yet an established cause or fix.
+Our RCCL/network settings and P2P-off policy remain unchanged.

@@ -227,8 +227,6 @@ The TorchMemorySaver smoke test requires the default preload.
 
 ## Native ROCm image: megatron-rocm
 
-The [ROCm training living plan](ROCM-TRAINING-PLAN.md) tracks the Apertus 2 port, experiment design, evidence and remaining validation.
-
 This target is native ROCm training, **not feature parity with the CUDA Chonk production configuration**.
 It builds against the canonical Alps ROCm 10.0 / Torch 2.13 base on x86_64 and targets MI300 `gfx942`.
 Inherited Torch, TorchVision, TorchAudio, Triton and NumPy distributions are constrained during installation.
@@ -320,7 +318,7 @@ The UCCL numerical/API checks are not full-model training acceptance.
 The current full hybrid UCCL integration still faults in its first forward combine, including with synchronous execution; ordinary all-to-all remains the established training path.
 These checks do not establish full-size hybrid-model convergence or scaling.
 A separate four-rank synthetic KDA/global-attention + MoE + MuonMD workload passed checkpoint/fresh-process resume on the current-branch JFrog image in job `716187`.
-See the [living ROCm training plan](ROCM-TRAINING-PLAN.md) for the immutable image identity, evidence, limitations and ongoing cross-node/proxy validation; this external workload is not yet an additional image-local CI check.
+This external workload is not an additional image-local CI check.
 
 ## Build
 
@@ -378,7 +376,3 @@ Python dependency resolution alone does not establish CUDA or binary compatibili
 
 [`STACK-DIFFERENCES.md`](STACK-DIFFERENCES.md) records the pinned Imanol/native comparison, including directly inspected reference package identities, exact source/argument deltas, selected versus merely available optimization paths, and candidate-validation limits.
 The underlying machine-readable evidence and current Primus SquashFS checksum are retained in the benchmark project’s `experiments/apertus2/reference/stack-comparison-2026-11-03/`.
-
-[`MID4B-REPRODUCTION-PLAN.md`](MID4B-REPRODUCTION-PLAN.md) records the next full-recipe/harness step after candidate acceptance, including confirmed defaults, PP2-aware checkpoint requirements and separately gated larger resource requests.
-
-[`COLLEAGUE-UPDATES.md`](COLLEAGUE-UPDATES.md) contains the appendable, Confluence-ready technical update and subsequent experiment results.

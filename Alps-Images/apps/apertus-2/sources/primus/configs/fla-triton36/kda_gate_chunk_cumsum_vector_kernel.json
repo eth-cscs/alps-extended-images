@@ -1,0 +1,28 @@
+{
+ "kernel_name": "kda_gate_chunk_cumsum_vector_kernel",
+ "triton_version": "3.6.0",
+ "autotune_entries": {
+  "e52ae9d850006bbe764dc15317eca57e": {
+   "autotune_key": [
+    20,
+    128,
+    64,
+    false,
+    false,
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   "config": {
+    "kwargs": {
+     "BS": 64
+    },
+    "num_warps": 1,
+    "num_stages": 1,
+    "num_ctas": 1,
+    "maxnreg": null
+   }
+  }
+ }
+}

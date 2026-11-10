@@ -127,6 +127,9 @@ include:
       "BASE_IMAGE",
       "ROCM_VARIANT_DIR",
       "ROCM_VERSION",
+      "ALPS_ROCM_VERSION",
+      "ROCM_SDK_LAYOUT",
+      "ROCM_PRESERVE_COMPUTE",
       "ROCM_REBUILD_RCCL",
       "ROCM_SYSTEMS_REPO",
       "ROCM_SYSTEMS_COMMIT",
@@ -276,6 +279,10 @@ include:
       test "${NCCL_PROTO:-}" = "^LL128"
       test -n "${ROCM_VERSION:-}"
       test -n "${RCCL_VERSION:-}"
+      if [[ -f /opt/alps/primus-compute-before.json ]]; then
+        test "${DEBUG_CLR_AQL_DEV_QUEUE:-}" = "0"
+        test "${NCCL_P2P_DISABLE:-}" = "1"
+      fi
       /opt/venv/bin/python - <<'PY'
       import os
       import sys
@@ -358,7 +365,10 @@ include:
                       major, minor, patch);
       }
       CPP
-      env -u ROCM_PATH -u HIP_PATH "${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++" \
+      hip_cxx="${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++"
+      [[ -x "$hip_cxx" ]] || hip_cxx="${ROCM_BUILD_PREFIX}/llvm/bin/clang++"
+      test -x "$hip_cxx"
+      env -u ROCM_PATH -u HIP_PATH "$hip_cxx" \
         -std=c++17 -D__HIP_PLATFORM_AMD__ -I"${ROCM_BUILD_PREFIX}/include" "$work/miopen.cpp" \
         -L"${ROCM_BUILD_PREFIX}/lib" -Wl,-rpath,"${ROCM_BUILD_PREFIX}/lib" \
         -lMIOpen -o "$work/miopen"

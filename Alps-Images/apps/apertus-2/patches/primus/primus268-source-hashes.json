@@ -1,0 +1,5 @@
+{
+  "megatron/core/transformer/moe/beverin_turbo.py": "2c92f2698bbe02e3564d4dd46c5ea3684130bea5cc7853a8f2181fbe3f9d50f9",
+  "megatron/core/transformer/moe/beverin_gg.py": "2b14b0882c0d7bea52d1596c94c835fef25a2812d7bd92b058d5c443242eea14",
+  "megatron/core/transformer/moe/beverin_vk.py": "bfc562fdc1004e0edcaae6791d071fd2ae1d078bf9ba854cf2041801a47be7be"
+}

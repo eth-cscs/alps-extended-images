@@ -777,3 +777,28 @@ def test_schema_current_repo_metadata_is_valid(gen, monkeypatch):
         variants = gen.app_variants_from_profile(path.parent / "profile.env")
         families = {variant: gen.app_env(path.parent.name, variant)["FAMILY"] for variant in variants}
         gen.validate_app_ci(path, variants, gen.load_yaml(path), families)
+
+
+@pytest.mark.parametrize('version,suffix', [('26.3','263'),('26.8','268')])
+def test_primus_app_waits_for_both_base_validations(monkeypatch, gen, version, suffix):
+    for key, value in {
+        'IMAGE_PREFIX': 'registry/alps', 'GHCR_IMAGE_PREFIX': 'ghcr/alps',
+        'ALPS_REV': 'alps7-dev', 'CI_COMMIT_SHORT_SHA': 'abc123',
+        'CSCS_CI_ORIG_CLONE_URL': 'https://example.invalid/repo.git',
+    }.items():
+        monkeypatch.setenv(key, value)
+    fake_registry(monkeypatch, gen, {})
+    base = gen.base_env('rocm', 'primus', version)
+    app = gen.app_env('apertus-2', f'megatron-primus{suffix}-rocm')
+    assert app['BASE_IMAGE'] == base['CANON_IMAGE_REF']
+    child = gen.Child()
+    mark = gen.add_base(child, base, [{'name':'env'}, {'name':'collectives'}], valid=False)
+    tests = gen.load_yaml(ROOT/'Alps-Images/apps/apertus-2/ci.yaml')['tests'][app['VARIANT']]
+    gen.add_app(child, app, tests, {base['CANON_IMAGE_REF']:mark}, {base['CANON_IMAGE_REF']:False})
+    prefix = f'app-apertus-2-megatron-primus{suffix}-rocm'
+    assert child.data[f'build-{prefix}']['needs'] == [mark]
+    assert child.data[mark]['needs'] == [f'test-base-primus-rocm-{version.replace(".","-")}-env',
+                                         f'test-base-primus-rocm-{version.replace(".","-")}-collectives']
+    assert child.data[f'build-{prefix}']['variables']['BASE_IMAGE'] == base['CANON_IMAGE_REF']
+    for test in tests:
+        assert child.data[f'test-{prefix}-{test["name"]}']['image'] == app['CANON_IMAGE_REF']

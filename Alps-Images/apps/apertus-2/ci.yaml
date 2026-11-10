@@ -88,3 +88,56 @@ tests:
         SLURM_KILL_BAD_EXIT: "1"
         UCCL_EP_TRANSPORT: "cxi"
         FI_CXI_ENABLE_WRITEDATA: "1"
+
+  megatron-primus263-rocm: &primus-tests
+    - name: stack-smoke
+      runner: rocm
+      timeout: 45m
+      script:
+        - bash /opt/tests/apertus-2/primus/with-reference-env.sh python3 /opt/tests/apertus-2/primus/check-stack.py
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+        SLURM_TIMELIMIT: "00:45:00"
+
+    - name: train-resume
+      runner: rocm
+      timeout: 45m
+      script:
+        - bash /opt/tests/apertus-2/primus/with-reference-env.sh env -u NVTE_FLASH_ATTN -u NVTE_FUSED_ATTN -u NVTE_UNFUSED_ATTN bash /opt/tests/apertus-2/primus/train-resume.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "8"
+        SLURM_NTASKS_PER_NODE: "4"
+        SLURM_CPUS_PER_TASK: "8"
+        SLURM_CPU_BIND: "none"
+        SLURM_GPU_BIND: "none"
+        SLURM_DISTRIBUTION: "block:block"
+        SLURM_EXCLUSIVE: "exclusive"
+        SLURM_KILL_BAD_EXIT: "1"
+        SLURM_TIMELIMIT: "00:45:00"
+        GIT_STRATEGY: fetch
+        APERTUS_TEST_PP: "1"
+        APERTUS_TEST_EP: "8"
+
+    - name: pipeline-resume
+      runner: rocm
+      timeout: 45m
+      script:
+        - bash /opt/tests/apertus-2/primus/with-reference-env.sh env -u NVTE_FLASH_ATTN -u NVTE_FUSED_ATTN -u NVTE_UNFUSED_ATTN bash /opt/tests/apertus-2/primus/train-resume.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "4"
+        SLURM_NTASKS: "16"
+        SLURM_NTASKS_PER_NODE: "4"
+        SLURM_CPUS_PER_TASK: "8"
+        SLURM_CPU_BIND: "none"
+        SLURM_GPU_BIND: "none"
+        SLURM_DISTRIBUTION: "block:block"
+        SLURM_EXCLUSIVE: "exclusive"
+        SLURM_KILL_BAD_EXIT: "1"
+        SLURM_TIMELIMIT: "00:45:00"
+        GIT_STRATEGY: fetch
+        APERTUS_TEST_PP: "2"
+        APERTUS_TEST_EP: "4"
+
+  megatron-primus268-rocm: *primus-tests

@@ -1,0 +1,28 @@
+--- a/ompi/mca/mtl/ofi/mtl_ofi_component.c
++++ b/ompi/mca/mtl/ofi/mtl_ofi_component.c
+@@ -609,7 +609,13 @@
+        interface and local communication and remote communication. */
+     hints->mode               = FI_CONTEXT | FI_CONTEXT2;
+     hints->ep_attr->type      = FI_EP_RDM;
+-    hints->caps               = FI_TAGGED | FI_LOCAL_COMM | FI_REMOTE_COMM | FI_DIRECTED_RECV;
++    /* Alps CXI can handle ROCm device buffers without application-side
++     * registration. Require that capability instead of treating HIP pointers
++     * as host memory. MPI4 has no accelerator MR machinery, so do not advertise
++     * FI_MR_HMEM support: providers requiring explicit device registration
++     * must be excluded by fi_getinfo rather than used unsafely. */
++    hints->caps               = FI_TAGGED | FI_LOCAL_COMM | FI_REMOTE_COMM | FI_DIRECTED_RECV | FI_HMEM;
++    hints->domain_attr->mr_mode = FI_MR_ALLOCATED;
+     hints->tx_attr->msg_order = FI_ORDER_SAS;
+     hints->rx_attr->msg_order = FI_ORDER_SAS;
+     hints->rx_attr->op_flags = FI_COMPLETION;
+@@ -667,7 +673,9 @@
+      * that checking -- e.g., some providers are suitable for RXD or
+      * RXM, but can't provide local communication).
+      */
+-    fi_version = FI_VERSION(1, 5);
++    /* This private build uses the pinned Alps libfabric (API >= 1.18).
++     * API 1.18 explicitly permits provider accelerator-runtime calls. */
++    fi_version = FI_VERSION(1, 18);
+ 
+     /**
+      * The EFA provider in Libfabric versions prior to 1.10 contains a bug

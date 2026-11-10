@@ -1,0 +1,42 @@
+{
+ "kernel_name": "chunk_kda_bwd_kernel_wy_dqkg_fused",
+ "triton_version": "3.6.0",
+ "autotune_entries": {
+  "94ff86c753cddf2208435dab5c177dec": {
+   "autotune_key": [
+    64,
+    20,
+    false,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.float32"
+   ],
+   "config": {
+    "kwargs": {
+     "BK": 32,
+     "BV": 64,
+     "matrix_instr_nonkdim": 16,
+     "kpack": 2
+    },
+    "num_warps": 2,
+    "num_stages": 2,
+    "num_ctas": 1,
+    "maxnreg": null
+   }
+  }
+ }
+}
