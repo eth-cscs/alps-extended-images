@@ -167,6 +167,7 @@ NGC images assemble `common/alps-runtime.common.env`, `common/alps-runtime.nccl-
 - **NVSHMEM**: libfabric remote transport over the Cassini provider, CUDA VMM disabled
 - **OpenMPI / PMIX**: security modules, byte transfer layer restricted to supported backends
 - **CUDA**: JIT cache disabled for shared-filesystem compatibility
+- **ROCm hwloc**: OpenGL display discovery disabled (`HWLOC_COMPONENTS=-gl`) to avoid blocking OFI initialization on headless compute nodes
 
 Both shipped ROCm profiles default `NCCL_P2P_DISABLE=1` in Podman and Sarus/Enroot; the earlier runtime-specific exception was removed because the Sarus results were inconclusive.
 Explicit user values, including an empty value, remain unchanged.
