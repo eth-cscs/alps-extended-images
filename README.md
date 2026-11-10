@@ -197,6 +197,13 @@ Valid unselected target settings do not invalidate the selected image's content 
 App tests declared with `kind: cuda-vetnode` always use the fixed CUDA runner and accept only `name` and `kind`; they cannot set `runner` or run on ROCm bases.
 Custom app tests may still select a `runner`, defaulting to the selected base's family.
 
+### PR reviews
+
+- The OpenCode workflow reviews same-repository and fork PRs and posts findings as a GitHub comment.
+- Reviews run only after a user with repository write access posts a new `/oc-review` comment in the PR's Conversation tab.
+- The reviewer inspects changes, then writes a tools-disabled final response in the same read-only container; a separate job publishes the review and reports failures through request reactions.
+- See the [review documentation](.github/review/README.md) for trigger rules, trusted code, review history, sandbox permissions, credentials, and image publication.
+
 ## Manual Builds
 
 Images can be built manually on Alps with `podman` using generated build scripts that reuse the CI image-reference logic.
