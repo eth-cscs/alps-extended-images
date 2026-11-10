@@ -29,7 +29,11 @@ cd $TRAINING_HOME
 
 
 # Rollout needs exactly 8 nodes for TP=32 (8 nodes × 4 GPUs = 32 GPUs, 1 replica).
-# Training gets the remaining 48 nodes (192 GPUs) for TP=4, PP=3, EP=8, DP=2.
+# Training gets the remaining 72 nodes (288 GPUs) for TP=4, PP=3, EP=8, DP=3; ppo_mini_batch_size
+# below is sized for exactly that DP, so any other node count fails at init.
+if [ "${SLURM_JOB_NUM_NODES}" -ne 80 ]; then
+    echo "FATAL: this layout needs exactly 80 nodes (got ${SLURM_JOB_NUM_NODES})"; exit 1
+fi
 export ROLLOUT_NNODES=8
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
@@ -330,12 +334,30 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
+[ -r /users/${USER}/.wandb_api_key ] \
+    || { echo "FATAL: /users/${USER}/.wandb_api_key not found (wandb logging needs the API key)"; exit 1; }
 export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
 export RAY_memory_usage_threshold=0.99
 
 
+
+# Upstream verl PRs: fetched ONCE here and sbcast. Per-node downloads inside the srun left half
+# the cluster unpatched (run 3124273); -f turns an HTTP error page into a failure, and the sha256
+# stops the job if an open PR changed upstream. On a mismatch, review the new patch and update it.
+declare -A VERL_PR_SHA256=(
+    [7421]=25c803f00a8912da87bb07d5dab1980d294ec5b38fdd2dbde32372c2476cf9fc
+    [7422]=fa4b54ea72c53f19242dec2db94a712b21d9cfabef77a3c928084dace09798e3
+    [7423]=d5012d6052c77c8c1a7d02839de510e1e8b85d1d2de839b4eb75cd16c1490cbe
+)
+for pr in 7421 7422 7423; do
+    curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
+        || { echo "FATAL: could not download PR #${pr}"; exit 1; }
+    echo "${VERL_PR_SHA256[$pr]}  ${TRAINING_CONFIG}/${pr}.patch" | sha256sum -c --quiet - \
+        || { echo "FATAL: PR #${pr} patch changed upstream (sha256 mismatch); review it and update VERL_PR_SHA256"; exit 1; }
+    sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
+done
 
 srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-per-node=1 -u \
     --environment="${TRAINING_CONFIG}/env.toml" \
@@ -385,35 +407,20 @@ else:
         print(f\"WARNING: no filelock sites found in {p} — patch may already be applied or code changed\")
 "
 
-# PR #7421: DSA (experimental_attention_variant=dsa) compatibility with mcore >= 0.16.2.
-# Upstream _run_core_attention no longer forwards the x/qr kwargs DSA requires; route
-# DSA instances through the verl patch_forward. Also injects a pure-PyTorch
-# Walsh-Hadamard fallback when fast_hadamard_transform is not installed.
-tmp=$(mktemp)
-curl -sL "https://github.com/verl-project/verl/pull/7421.patch" -o "$tmp"
-git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7421" \
-    || echo "PR #7421 already applied or not applicable, skipping"
-rm -f "$tmp"
-
-# PR #7422: Preserve load_format=dummy in disaggregated SGLang rollout.
-# A guard was silently overriding dummy to auto in non-hybrid rollout mode, causing
-# rollout workers to load weights from disk instead of receiving them via broadcast.
-tmp=$(mktemp)
-curl -sL "https://github.com/verl-project/verl/pull/7422.patch" -o "$tmp"
-git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7422" \
-    || echo "PR #7422 already applied or not applicable, skipping"
-rm -f "$tmp"
-
-# PR #7423: Fix NCCL deadlock in async disaggregated weight sync.
-# update_actor (thread-pool) and update_weights (event loop) both submit ops to the
-# same PP/EP NCCL communicators. A threading.Lock serialises them; entry and exit
-# barriers ensure all actors complete the weight-sync collective before any resumes
-# training, preventing seq-number mismatches across EP ranks.
-tmp=$(mktemp)
-curl -sL "https://github.com/verl-project/verl/pull/7423.patch" -o "$tmp"
-git apply --check "$tmp" 2>/dev/null && git apply "$tmp" && echo "Applied PR #7423" \
-    || echo "PR #7423 already applied or not applicable, skipping"
-rm -f "$tmp"
+# Upstream verl PRs, fetched once on the batch host (see above) and applied from the local copy:
+#   #7421 DSA (experimental_attention_variant=dsa) compatibility with mcore >= 0.16.2; also a
+#         pure-PyTorch Walsh-Hadamard fallback when fast_hadamard_transform is not installed.
+#   #7422 keep load_format=dummy in the disaggregated SGLang rollout (a guard flipped it to auto,
+#         so rollout workers loaded weights from disk instead of receiving the broadcast).
+#   #7423 serialise update_actor / update_weights on the shared PP/EP NCCL communicators.
+# Skips a patch that does not apply, as before: the image verl may already contain it.
+for pr in 7421 7422 7423; do
+    if git -C /workspace/verl apply --check ${TRAINING_CONFIG}/${pr}.patch 2>/dev/null; then
+        git -C /workspace/verl apply ${TRAINING_CONFIG}/${pr}.patch && echo "Applied PR #${pr}"
+    else
+        echo "WARNING: PR #${pr} already applied or not applicable, skipping"
+    fi
+done
 
 
 # Mirror model config files to local tmpfs to avoid Lustre metadata contention.
@@ -424,14 +431,15 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     mkdir -p $MODEL_LOCAL
     # Copy small config/tokenizer files locally
     find ${TRAINING_HOME}/models/${MODEL_NAME} -maxdepth 1 -not -name "*.safetensors" -type f \
-        -exec cp {} $MODEL_LOCAL/ \; 2>/dev/null || true
+        -exec cp {} $MODEL_LOCAL/ \; || { echo "FATAL: could not mirror model config to $MODEL_LOCAL"; exit 1; }
     # Symlink safetensors back to Lustre so megatron-bridge can still load weights
     for f in ${TRAINING_HOME}/models/${MODEL_NAME}/*.safetensors; do
         ln -sf "$f" "$MODEL_LOCAL/$(basename "$f")"
-    done 2>/dev/null || true
+    done || { echo "FATAL: could not symlink safetensors into $MODEL_LOCAL"; exit 1; }
     touch $MODEL_LOCAL/.ready
 fi
-until [ -f $MODEL_LOCAL/.ready ]; do sleep 1; done
+for _ in $(seq 600); do [ -f $MODEL_LOCAL/.ready ] && break; sleep 1; done
+[ -f $MODEL_LOCAL/.ready ] || { echo "FATAL: local rank 0 did not stage $MODEL_LOCAL within 600s"; exit 1; }
 
 # Patch the YAML on the head node to point at the local model dir
 if [ $SLURM_PROCID -eq 0 ]; then
@@ -473,6 +481,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-gpus=4 \
         --disable-usage-stats || true
 
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -480,6 +491,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5

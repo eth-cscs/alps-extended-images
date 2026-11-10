@@ -81,11 +81,10 @@ actor_rollout_ref:
     path: ${TRAINING_HOME}/models/${MODEL_NAME}
     use_remove_padding: True  # Megatron THD layout requires sequence packing
     use_shm: false
-    trust_remote_code: True  # GLM-5.2 uses a custom TokenizersBackend tokenizer
+    trust_remote_code: True
 
   actor:
-    # 8 training nodes × 4 GPUs = 32 GPUs; TP=4, PP=2, EP=4 → 4×2×4=32
-    # 2 training nodes × 4 GPUs = 8 GPUs;  TP=2, PP=2, EP=4 → 2×2×2=8
+    # 6 training nodes x 4 GPUs = 24 GPUs (8 nodes, 2 for rollout); TP=2 x PP=2 -> DP=6
     optim:
       lr_decay_steps: 22419  # must be positive at init; set_total_train_steps is called too late (after init_workers)
     ppo_mini_batch_size: 48
@@ -96,7 +95,7 @@ actor_rollout_ref:
     megatron:
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 2
-      expert_model_parallel_size: 1  # Apertus-8B is dense (no MoE); EP must be 1
+      expert_model_parallel_size: 1  # Qwen2.5-3B is dense (no MoE); EP must be 1
       param_offload: True
       grad_offload: True
       optimizer_offload: True
@@ -306,6 +305,8 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
+[ -r /users/${USER}/.wandb_api_key ] \
+    || { echo "FATAL: /users/${USER}/.wandb_api_key not found (wandb logging needs the API key)"; exit 1; }
 export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
@@ -323,8 +324,9 @@ export PIP_CACHE_DIR=/tmp/pip_cache_${SLURM_JOB_ID}
 export TMPDIR=/tmp
 mkdir -p $PIP_CACHE_DIR
 
-# Cluster proxy intercepts PyPI HTTPS; --trusted-host bypasses the Content-Type check.
-PIP_TRUSTED="--trusted-host pypi.org --trusted-host files.pythonhosted.org"
+# Some proxies intercept PyPI HTTPS; set PIP_TRUSTED="--trusted-host pypi.org --trusted-host
+# files.pythonhosted.org" at submit time (or in pip.conf) if yours does.
+PIP_TRUSTED="${PIP_TRUSTED:-}"
 
 pip install "PyYAML>=6.0.2" --ignore-installed ${PIP_TRUSTED} --quiet
 
@@ -383,6 +385,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-gpus=4 \
         --disable-usage-stats || true
 
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -390,6 +395,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5

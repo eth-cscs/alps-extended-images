@@ -500,8 +500,11 @@ sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.p
 # before the job starts or these curls 404 (loud FATAL, not a silent stale copy). The two files
 # are coupled on the \boxed{} SYSTEM_PROMPT -- keep them in sync.
 if [ "${BENCHMARK}" = "dapo-math" ]; then
-    export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
-    export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
+    # Pinned to a commit so a later push to the branch cannot change the reward of a queued job.
+    # Bump ALPS_REPO_REF after editing reward.py / dataset_prepare.py (or override it at submit).
+    export ALPS_REPO_REF="${ALPS_REPO_REF:-8c68c1e9de2de8d89fe97e73e3820c5ca8828d57}"
+    export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/${ALPS_REPO_REF}/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
+    export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/${ALPS_REPO_REF}/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
     curl -sfL "${REWARD_FN_URL}" -o "${TRAINING_CONFIG}/reward.py" \
         || { echo "FATAL: could not download reward.py from ${REWARD_FN_URL}"; exit 1; }
     grep -q "def compute_reward" "${TRAINING_CONFIG}/reward.py" \
@@ -568,11 +571,23 @@ sbcast -f ${TRAINING_CONFIG}/cscs_watchdog_diag.py ${TRAINING_CONFIG}/cscs_watch
 # Upstream verl PRs applied at runtime (v0.9.1 does not have them). Fetched ONCE here and sbcast:
 # per-node downloads inside the srun left half the cluster unpatched (run 3124273). -f turns an
 # HTTP error page into a hard failure. What each one is: see the apply loop in the srun.
+# sha256 of each fetched patch: an upstream push to an open PR changes the content, and the job
+# must stop rather than silently run different code. On a mismatch, review the new patch and
+# update the hash here.
+declare -A VERL_PR_SHA256=(
+    [7421]=25c803f00a8912da87bb07d5dab1980d294ec5b38fdd2dbde32372c2476cf9fc
+    [7661]=b22025a6f5387f0ef4abd24fcce330debc6eb40eb4c539a2b179454ccbc5bbc9
+    [7777]=2fdc8dee0253e21cb215cbb82f8b67bd5c3ca541597d46e781c2f86d96737db4
+    [7778]=ffd083e076f0105ff0f9ecd9c9ffd0734cb3b6c146e6e087bb152ddb0e94fb82
+    [8493]=e6697106260c095a17d3c0a5263fd755c544ef04aa72f471c15c4bf55ae5cb25
+)
 for pr in 7421 7661 7777 7778 8493; do
     curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
         || { echo "FATAL: could not download PR #${pr}"; exit 1; }
     [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
         || { echo "FATAL: PR #${pr} patch is empty"; exit 1; }
+    echo "${VERL_PR_SHA256[$pr]}  ${TRAINING_CONFIG}/${pr}.patch" | sha256sum -c --quiet - \
+        || { echo "FATAL: PR #${pr} patch changed upstream (sha256 mismatch); review it and update VERL_PR_SHA256"; exit 1; }
     sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
 done
 
@@ -581,6 +596,8 @@ done
 export VERL_R3_COMMIT="8f016846e3010e225072a947270dc0c1b98c1cd0"
 curl -sfL "https://github.com/verl-project/verl/commit/${VERL_R3_COMMIT}.patch" -o "${TRAINING_CONFIG}/verl-r3-commit.patch" \
     || { echo "FATAL: could not download verl commit ${VERL_R3_COMMIT}"; exit 1; }
+echo "6ea519373703cb3f7e6baf3e44292324ee7739ad97ff719cbf8b8a862b3eb448  ${TRAINING_CONFIG}/verl-r3-commit.patch" | sha256sum -c --quiet - \
+    || { echo "FATAL: verl commit ${VERL_R3_COMMIT} patch sha256 mismatch"; exit 1; }
 awk '
 /^diff --git /{file=index($0,"rollout/sglang_rollout/async_sglang_server.py")>0; hunk=0; seen=0}
 file && /^@@ /{seen=1; hunk=index($0,"@@ -662,22 ")==1}
@@ -597,6 +614,8 @@ sbcast -f ${TRAINING_CONFIG}/r3-sglang-routed-experts-import-fix.patch ${TRAININ
 export SGLANG_FIX_QKV_A_CACHE="38298"
 curl -sfL "https://github.com/sgl-project/sglang/pull/${SGLANG_FIX_QKV_A_CACHE}.patch" -o "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" \
     || { echo "FATAL: could not download sglang PR #${SGLANG_FIX_QKV_A_CACHE}"; exit 1; }
+echo "1248c6f47a08e0b930ae4b0053948ee5592bc4f81f8bb42a96df14ac5e34c76e  ${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" | sha256sum -c --quiet - \
+    || { echo "FATAL: sglang PR #${SGLANG_FIX_QKV_A_CACHE} patch changed upstream (sha256 mismatch)"; exit 1; }
 grep -q "^diff --git a/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py" "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" \
     || { echo "FATAL: sglang qkv_a cache patch has no loader diff (bad SHA or GitHub error page)"; exit 1; }
 sbcast -f "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch" "${TRAINING_CONFIG}/sglang-qkv-a-cache.patch"
@@ -646,6 +665,8 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
+[ -r /users/${USER}/.wandb_api_key ] \
+    || { echo "FATAL: /users/${USER}/.wandb_api_key not found (wandb logging needs the API key)"; exit 1; }
 export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
@@ -851,11 +872,11 @@ if [ $SLURM_LOCALID -eq 0 ]; then
     mkdir -p $MODEL_LOCAL
     # Copy small config/tokenizer files locally
     find ${TRAINING_HOME}/models/${MODEL_NAME} -maxdepth 1 -not -name "*.safetensors" -type f \
-        -exec cp {} $MODEL_LOCAL/ \; 2>/dev/null || true
+        -exec cp {} $MODEL_LOCAL/ \; || { echo "FATAL: could not mirror model config to $MODEL_LOCAL"; exit 1; }
     # Symlink safetensors back to Lustre so megatron-bridge can still load weights
     for f in ${TRAINING_HOME}/models/${MODEL_NAME}/*.safetensors; do
         ln -sf "$f" "$MODEL_LOCAL/$(basename "$f")"
-    done 2>/dev/null || true
+    done || { echo "FATAL: could not symlink safetensors into $MODEL_LOCAL"; exit 1; }
     # DeepSeek-V3: sanitize the MIRRORED config.json only (see the header): drop quantization_config
     # (SGLang must build bf16, not FP8) and auto_map (no remote code), set num_nextn_predict_layers=0
     # (MTP off). Fatal on failure. Double quotes only -- this lives inside the single-quoted srun body.
@@ -880,7 +901,8 @@ print(\"Sanitized %s for bf16 / no-MTP serving: %s (num_hidden_layers=%s, n_rout
 " || { echo "FATAL: could not sanitize ${MODEL_LOCAL}/config.json on $(hostname)"; exit 1; }
     touch $MODEL_LOCAL/.ready
 fi
-until [ -f $MODEL_LOCAL/.ready ]; do sleep 1; done
+for _ in $(seq 600); do [ -f $MODEL_LOCAL/.ready ] && break; sleep 1; done
+[ -f $MODEL_LOCAL/.ready ] || { echo "FATAL: local rank 0 did not stage $MODEL_LOCAL within 600s"; exit 1; }
 
 # Patch the YAML on the head node to point at the local model dir
 if [ $SLURM_PROCID -eq 0 ]; then
@@ -936,6 +958,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-gpus=4 \
         --disable-usage-stats || true
 
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -943,6 +968,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5

@@ -48,12 +48,8 @@ RUN set -eux; \
 # sglang pins its own deps, so this pair is guaranteed ABI-compatible.
 # All subsequent pip installs will be constrained to these versions so no
 # step can silently swap the C extension out from under us.
-RUN pip freeze | grep -E "^torch(vision)?==" | tee /tmp/torch_constraints.txt && \
+RUN pip freeze | grep -E "^torch(vision|audio)?==" | tee /tmp/torch_constraints.txt && \
     python -c "import torchvision, torch; print('After sglang — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
-
-RUN set -eux; \
-    source /opt/alps/package-helpers.sh; \
-    pip_install python flash-attn --no-build-isolation
 
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
@@ -98,28 +94,41 @@ RUN set -eux; \
 
 # Add Megatron
 
-RUN pip install "PyYAML>=6.0.2" --ignore-installed
+# --ignore-installed: a plain upgrade tries to uninstall the base image's PyYAML first, which pip
+# refuses for a distutils/apt-installed package (no RECORD file). The newer copy is laid over it.
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python "PyYAML>=6.0.2" --ignore-installed
 
 # megatron-core[dev,mlm] (pulled by megatron-bridge) requires fast-hadamard-transform,
 # a CUDA extension with no aarch64 wheel and a broken source tarball (missing csrc/*.cpp).
 # Pin it to a local no-op stub via PEP 508 direct reference so pip's resolver satisfies
 # the transitive dependency without ever attempting to download or compile it.
+# Metadata only: there is no importable module. megatron-core uses it only in the DSA indexer,
+# and the GLM recipes apply verl PR #7421, which falls back to a pure-PyTorch Walsh-Hadamard
+# transform when the import fails. Drop the stub once an aarch64 wheel or a working sdist exists.
 RUN mkdir -p /tmp/fht && \
     printf '[project]\nname = "fast-hadamard-transform"\nversion = "1.1.0"\n' > /tmp/fht/pyproject.toml
 
-RUN pip install -c /tmp/torch_constraints.txt \
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -c /tmp/torch_constraints.txt \
         "megatron-bridge==0.6.1" "megatron-core==0.19.0" "nvidia-resiliency-ext>=0.6.0" \
         "fast-hadamard-transform @ file:///tmp/fht"
 RUN python -c "import torchvision, torch; print('After megatron-bridge — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
-RUN pip install -c /tmp/torch_constraints.txt nvidia-modelopt[hf]
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -c /tmp/torch_constraints.txt nvidia-modelopt[hf]
 RUN python -c "import torchvision, torch; print('After nvidia-modelopt — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
 # megatron-bridges mlflow/comet-ml deps upgrade opentelemetry-exporter-prometheus
 # to 0.64b0 which requires opentelemetry-sdk~=1.43.0, but the SDK stays at 1.33.1
 # → Ray dashboard crashes with AttributeError → GCS never starts → all workers fail.
 # Fix: upgrade the SDK to match the already-upgraded exporters.
-RUN pip install -c /tmp/torch_constraints.txt "opentelemetry-sdk>=1.43.0"
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -c /tmp/torch_constraints.txt "opentelemetry-sdk>=1.43.0"
 
 # Restore sglang-compatible versions that megatron-bridge overwrites.
 # The constraints file prevents megatron-bridge/timm/transformers from
@@ -128,7 +137,9 @@ RUN pip install -c /tmp/torch_constraints.txt "opentelemetry-sdk>=1.43.0"
 # pyproject.toml on the v0.5.16 tag directly: "transformers==5.12.1") -- was 5.8.1, which was
 # never sglang's own requirement, just whatever unpinned sglang[all] happened to resolve to in
 # July 2026 before this pin existed. Unverified end-to-end by a cluster run yet -- needs one.
-RUN pip install -c /tmp/torch_constraints.txt "transformers==${TRANSFORMERS_VERSION}" "timm==1.0.16"
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -c /tmp/torch_constraints.txt "transformers==${TRANSFORMERS_VERSION}" "timm==1.0.16"
 RUN python -c "import torchvision, torch; print('After transformers/timm — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
 # flashinfer 0.6.12 -> 0.6.14: sglang 0.5.16 pins flashinfer_python[cu13]==0.6.14; the stale
@@ -138,7 +149,9 @@ RUN python -c "import torchvision, torch; print('After transformers/timm — tor
 # PyPI (PyPI stops at cubin 0.6.13) -- the real distribution channel is https://flashinfer.ai/whl
 # (GitHub release assets), per flashinfer's install docs; flashinfer_cubin-0.6.14 lives there.
 # Install the matched 0.6.14 pair from that index -> clean AOT, no version-check bypass.
-RUN pip install -c /tmp/torch_constraints.txt --extra-index-url https://flashinfer.ai/whl \
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -c /tmp/torch_constraints.txt --extra-index-url https://flashinfer.ai/whl \
         "flashinfer_cubin==0.6.14" "flashinfer_python[cu13]==0.6.14"
 
 # transformer-engine rebuild — MUST be last (after every step that can move torch).
@@ -163,7 +176,9 @@ RUN pip install -c /tmp/torch_constraints.txt --extra-index-url https://flashinf
 # the base image has them); only transformer_engine_torch (sdist) rebuilds against the final torch,
 # and transformer_engine_cu13 (prebuilt wheel) is re-laid at the same 2.12.0.
 # `cu13` matches this image's CUDA 13 stack and megatron-core 0.19's own `te` extra spec.
-RUN pip install -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall --no-deps \
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    pip_install python -c /tmp/torch_constraints.txt --no-cache-dir --no-build-isolation --force-reinstall --no-deps \
         "transformer-engine==2.12.0" "transformer_engine_cu13==2.12.0" "transformer_engine_torch==2.12.0"
 # Build-time gate: import torch (build-safe) and assert the TE core package and its torch-bindings
 # package are installed at the SAME version (the thing --force-reinstall can get wrong). We do NOT

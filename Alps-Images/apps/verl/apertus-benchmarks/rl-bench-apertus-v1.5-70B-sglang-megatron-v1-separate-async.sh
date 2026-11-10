@@ -548,8 +548,11 @@ EOF
 # \boxed{N} convention for every split (2026-09-09: simplified from a per-split bracket/boxed
 # switch); keep them in sync, and bump DATASET_PROMPT_VERSION on any prompt change so the
 # cached parquet is rebuilt.
-export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
-export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/refs/heads/Add-megatron-rl-recipes/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
+# Pinned to a commit so a later push to the branch cannot change the reward of a queued job.
+# Bump ALPS_REPO_REF after editing reward.py / dataset_prepare.py (or override it at submit).
+export ALPS_REPO_REF="${ALPS_REPO_REF:-8c68c1e9de2de8d89fe97e73e3820c5ca8828d57}"
+export REWARD_FN_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/${ALPS_REPO_REF}/Alps-Images/apps/verl/apertus-benchmarks/reward.py"
+export DATASET_PREPARE_URL="https://raw.githubusercontent.com/eth-cscs/alps-extended-images/${ALPS_REPO_REF}/Alps-Images/apps/verl/apertus-benchmarks/dataset_prepare.py"
 curl -sfL "${REWARD_FN_URL}" -o "${TRAINING_CONFIG}/reward.py" \
     || { echo "FATAL: could not download reward.py from ${REWARD_FN_URL}"; exit 1; }
 grep -q "def compute_reward" "${TRAINING_CONFIG}/reward.py" \
@@ -922,6 +925,8 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
+[ -r /users/${USER}/.wandb_api_key ] \
+    || { echo "FATAL: /users/${USER}/.wandb_api_key not found (wandb logging needs the API key)"; exit 1; }
 export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
@@ -945,11 +950,21 @@ export RAY_memory_usage_threshold=0.99
 #             upstream (a hot-path library function should not print on every
 #             call); all pre-commit hooks (ruff, mypy, license, naming, etc.)
 #             pass on the upstream branch.
+# sha256 of each fetched patch: an upstream push to an open PR changes the content, and the job
+# must stop rather than silently run different code. On a mismatch, review the new patch and
+# update the hash here.
+declare -A VERL_PR_SHA256=(
+    [7421]=25c803f00a8912da87bb07d5dab1980d294ec5b38fdd2dbde32372c2476cf9fc
+    [7661]=b22025a6f5387f0ef4abd24fcce330debc6eb40eb4c539a2b179454ccbc5bbc9
+    [7881]=67728e03333e713473887005854dd23a3be2918b84d3aeae3cc09028d77018bf
+)
 for pr in 7421 7661 7881; do
     curl -sfL "https://github.com/verl-project/verl/pull/${pr}.patch" -o "${TRAINING_CONFIG}/${pr}.patch" \
         || { echo "FATAL: could not download PR #${pr}"; exit 1; }
     [ -s "${TRAINING_CONFIG}/${pr}.patch" ] \
         || { echo "FATAL: PR #${pr} patch is empty"; exit 1; }
+    echo "${VERL_PR_SHA256[$pr]}  ${TRAINING_CONFIG}/${pr}.patch" | sha256sum -c --quiet - \
+        || { echo "FATAL: PR #${pr} patch changed upstream (sha256 mismatch); review it and update VERL_PR_SHA256"; exit 1; }
     sbcast -f "${TRAINING_CONFIG}/${pr}.patch" "${TRAINING_CONFIG}/${pr}.patch"
 done
 
@@ -1165,6 +1180,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-gpus=4 \
         --disable-usage-stats || true
 
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -1172,6 +1190,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5

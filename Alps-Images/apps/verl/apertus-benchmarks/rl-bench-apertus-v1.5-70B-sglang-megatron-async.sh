@@ -1064,6 +1064,8 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
+[ -r /users/${USER}/.wandb_api_key ] \
+    || { echo "FATAL: /users/${USER}/.wandb_api_key not found (wandb logging needs the API key)"; exit 1; }
 export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
@@ -1085,8 +1087,10 @@ git -C /workspace/verl --no-pager log --oneline -1
 
 # Apply Verl fixes
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Fix-fsdp-model-loading-on-async
-git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+# Pinned commit (branch tip of theely/verl Fix-fsdp-model-loading-on-async as of 2026-11-10).
+git fetch pr_origin 9708019aba71867b506578fb5c3b35868cc01efa \
+    || { echo "FATAL: could not fetch theely/verl 9708019a"; exit 1; }
+git reset --hard 9708019aba71867b506578fb5c3b35868cc01efa
 
 # Fix: Apertus1p5 text-only forward corruption (root cause of the
 # split_with_sizes crash chased through runs 3174079/3183472; see CLAUDE.md).
@@ -1284,6 +1288,9 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --num-gpus=4 \
         --disable-usage-stats || true
 
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -1291,6 +1298,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5
