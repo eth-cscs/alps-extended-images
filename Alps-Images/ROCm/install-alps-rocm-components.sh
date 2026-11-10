@@ -825,39 +825,25 @@ link_hsa_runtime_to_core() {
     # unversioned name in the devel tree, which loads a second HSA runtime from
     # a different inode. Its hsa_init() fails with OUT_OF_RESOURCES, libfabric
     # disables ROCr hmem, and GPU buffers get pinned as host memory
-    # ("cxil_map ... Bad address"). Point every other copy, in any installed
-    # Python package or ROCm prefix, at the core one so any load path maps the
-    # same file, including auditwheel-renamed copies (libhsa-runtime64-<hash>.so*).
-    # Idempotent; rerun after installing packages that bundle HSA.
+    # ("cxil_map ... Bad address"). Point every other copy at the core one so
+    # any load path maps the same file.
     local core_lib="${ROCM_CORE_PREFIX}/lib/libhsa-runtime64.so.1"
-    local root lib
-    local -a roots=()
+    local prefix lib
 
     [[ -e "${core_lib}" ]] || die "ROCm core HSA runtime not found: ${core_lib}"
     core_lib="$(readlink -f "${core_lib}")"
-    mapfile -t roots < <("${ROCM_PYTHON}" - <<'PY'
-import site
-import sysconfig
-
-paths = list(site.getsitepackages())
-paths += [sysconfig.get_paths()[key] for key in ("purelib", "platlib")]
-for path in dict.fromkeys(paths):
-    print(path)
-PY
-)
-    roots+=(
-        "${ROCM_DEVEL_PREFIX:-}"
-        "${ROCM_LIBRARIES_PREFIX:-}"
-        "${ROCM_BUILD_PREFIX:-}"
-        "${ROCM_SDK_ROOT:-}"
-    )
-    for root in "${roots[@]}"; do
-        [[ -n "${root}" && -d "${root}" ]] || continue
-        while IFS= read -r -d '' lib; do
+    for prefix in \
+        "${ROCM_DEVEL_PREFIX:-}" \
+        "${ROCM_LIBRARIES_PREFIX:-}" \
+        "${ROCM_BUILD_PREFIX:-}" \
+        "${ROCM_SDK_ROOT:-}"; do
+        [[ -n "${prefix}" ]] || continue
+        for lib in "${prefix}"/lib/libhsa-runtime64.so* "${prefix}"/lib64/libhsa-runtime64.so*; do
+            [[ -e "${lib}" || -L "${lib}" ]] || continue
             [[ "$(readlink -f "${lib}")" == "${core_lib}" ]] && continue
             ln -sfn "${core_lib}" "${lib}"
             echo "Linked ${lib} -> ${core_lib}"
-        done < <(find "${root}" \( -type f -o -type l \) -name 'libhsa-runtime64*.so*' -print0)
+        done
     done
     # The core tree itself has no unversioned name; add it so dlopen() of
     # libhsa-runtime64.so through ldconfig also lands on the core copy.
