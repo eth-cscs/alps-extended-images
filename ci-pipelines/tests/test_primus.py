@@ -132,6 +132,44 @@ def test_reference_environment_preserves_empty_and_explicit_overrides():
     assert not re.search(r'^defvar (?:NCCL_|FI_|HSA_)', text, flags=re.M)
 
 
+@pytest.mark.parametrize('inherited', [False, True])
+@pytest.mark.parametrize('exit_code', [0, 23])
+def test_reference_wrapper_in_child_shell(tmp_path, inherited, exit_code):
+    common = ROOT / 'Alps-Images/common'
+    app = ROOT / 'Alps-Images/apps/apertus-2'
+    runtime = tmp_path / 'env'
+    runtime.mkdir()
+    # Use the installed runtime layout without touching host /opt or requiring GPUs.
+    fragments = [common / 'alps-runtime.common.env', common / 'alps-runtime.nccl-like.env',
+                 ROOT / 'Alps-Images/ROCm/alps-runtime.rocm.env']
+    (runtime / 'alps-runtime.env').write_text(''.join(path.read_text() for path in fragments))
+    hook = runtime / 'source-alps-env.sh'
+    hook.write_text((common / hook.name).read_text().replace('/opt/alps/env', str(runtime)))
+    reference = tmp_path / 'reference.env'
+    shutil.copyfile(app / 'sources/primus/reference.env', reference)
+    wrapper = tmp_path / 'with-reference-env.sh'
+    wrapper.write_text((app / 'tests/primus' / wrapper.name).read_text()
+                       .replace('/opt/alps/env', str(runtime))
+                       .replace('/opt/alps/apertus2-primus/reference.env', str(reference)))
+    probe = tmp_path / 'probe.sh'
+    probe.write_text('set -euo pipefail\n'
+                     '[[ "$BEVERIN_T6_EP" == "" && "$BEVERIN_TURBO_GG" == custom ]]\n'
+                     '[[ "$BEVERIN_AITER_ATTN" == 1 && "$FI_PROVIDER" == cxi ]]\n'
+                     '[[ "$NCCL_NET" == "AWS Libfabric" && "$NCCL_P2P_DISABLE" == 1 ]]\n'
+                     '[[ "$#" == 1 && "$1" == "argument with spaces" ]]\n'
+                     'echo probe-reached\n'
+                     f'exit {exit_code}\n')
+    # BASH_ENV runs before the wrapper, just as it does in the container.
+    # Only the exported marker and defaults survive exec into a fresh bash.
+    setup = f'source "{hook}"; declare -F defvar >/dev/null; ' if inherited else ''
+    value = bash('unset ALPS_EXTENDED_IMAGES_ENV_SOURCED; unset -f defvar; '
+                 'export BEVERIN_T6_EP= BEVERIN_TURBO_GG=custom NCCL_P2P_DISABLE=1; '
+                 + setup + f'BASH_ENV="{hook}" bash "{wrapper}" bash "{probe}" "argument with spaces"',
+                 check=False)
+    assert value.returncode == exit_code, value.stdout + value.stderr
+    assert value.stdout.strip() == 'probe-reached'
+
+
 @pytest.mark.parametrize('historical', [False, True])
 def test_reference_configuration_installs_no_automatic_hooks(tmp_path, monkeypatch, historical):
     from importlib import metadata
