@@ -50,7 +50,9 @@ jobs:
           # Generator/schema tests use mocked digest lookups; shell-helper tests
           # use a fake skopeo executable, so no credentials or CSCS runners are needed.
           python -m py_compile ci-pipelines/helpers/generate-child-pipeline.py
-          uvx --with pyyaml pytest ci-pipelines/tests
+          # Mooncake packaging tests build/install local wheel fixtures offline.
+          # uvx environments do not include pip or build backends by default.
+          uvx --with pyyaml --with pip --with setuptools --with wheel pytest ci-pipelines/tests
           # The RL run collector is standard library only
           python -m py_compile .github/rl-runs-collector/collect_rl_runs.py
           uvx pytest .github/rl-runs-collector/tests
