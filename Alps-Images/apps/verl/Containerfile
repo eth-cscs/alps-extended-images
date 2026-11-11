@@ -109,11 +109,17 @@ RUN mkdir -p /tmp/fht && \
 
 # megatron-bridge 0.6.1 is yanked on PyPI ("wrong version"); an exact pin still installs it, and it
 # is the version the validated recipe runs used.
+# fastapi/opentelemetry bounds: megatron-core[dev] 0.19.0 needs opentelemetry-api<1.34, but the
+# fastapi that sglang installs (>=0.142) requires opentelemetry-api>=1.44. The resolver has to fall
+# back to fastapi 0.141.x, and pip 25.3/26.0 search for that until "resolution-too-deep" (pip 26.1
+# finds it). Naming the bounds makes it resolve in seconds. The opentelemetry-sdk step below
+# upgrades the SDK again.
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     pip_install python -c /tmp/torch_constraints.txt \
         "megatron-bridge==0.6.1" "megatron-core==0.19.0" "nvidia-resiliency-ext>=0.6.0" \
-        "fast-hadamard-transform @ file:///tmp/fht"
+        "fast-hadamard-transform @ file:///tmp/fht" \
+        "fastapi<0.142" "opentelemetry-api<1.34" "opentelemetry-sdk<1.34"
 RUN python -c "import torchvision, torch; print('After megatron-bridge — torch:', torch.__version__, '/ torchvision:', torchvision.__version__)"
 
 RUN set -eux; \
