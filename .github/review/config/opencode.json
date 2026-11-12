@@ -39,7 +39,7 @@
         "baseURL": "https://api.inference.cscs.ch/v1",
         "apiKey": "{env:CSCS_INFERENCE_API_KEY}",
         "systemMessageMode": "system",
-        "timeout": 180000
+        "timeout": 240000
       },
       "models": {
         "zai-org/GLM-5.3": {
