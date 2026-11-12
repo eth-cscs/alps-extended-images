@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 13 Oct 2026 00:00:00 +0000
+Subject: [PATCH] ep: serialize CXI provider initialization
+
+Each UCCL proxy thread constructs its own CXI transport. Concurrent calls into
+CXI provider discovery can corrupt allocator metadata inside fi_getinfo,
+terminating a worker with "malloc(): unaligned tcache chunk detected".
+
+Serialize transport initialization within each process. This only affects
+one-time endpoint setup; established transports continue to run concurrently.
+---
+ ep/src/cxi_transport.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
+index 0995edb3..0c766c2d 100644
+--- a/ep/src/cxi_transport.cpp
++++ b/ep/src/cxi_transport.cpp
+@@ -8,6 +8,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <string>
+ #include <sys/uio.h>
+ 
+@@ -145,6 +146,11 @@ fi_info* select_cxi_info(fi_info* infos, int local_rank) {
+ void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
+ 
+ void CxiTransport::init(ProxyCtx& ctx, int cxi_local_rank) {
++  // CXI provider discovery is not safe when proxy threads initialize it
++  // concurrently within one process.
++  static std::mutex cxi_init_mutex;
++  std::lock_guard<std::mutex> lock(cxi_init_mutex);
++
+   ctx_ = &ctx;
+ 
+   fi_info* hints = fi_allocinfo();
+-- 
+2.51.0

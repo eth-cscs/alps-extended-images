@@ -1,0 +1,98 @@
+name: collect-rl-runs
+
+# Collects the files that RL training jobs launched from the FirecREST UI AI Training page leave
+# in the run tracker directory on the cluster (<job id>-run.json, <job id>-result.json) into run
+# records on the rl-runs branch: one record per run (<recipe id>/<run id>.json) and an index.json
+# per recipe. Tracker files are deleted once the records are pushed. See
+# .github/rl-runs-collector/collect_rl_runs.py.
+#
+# Records contain nothing that identifies a person (no user, account, path, job id or exact
+# time), so they can be public. They live on their own branch so that the collector's commits
+# never touch the image sources or their CI. Nothing runs until FIRECREST_URL is set.
+#
+# Setup:
+# - Create the records branch once:
+#     git switch --orphan rl-runs && git commit --allow-empty -m 'Start RL run records'
+#     git push origin rl-runs
+# - Environment `rl-runs-collector` in this repository's settings, restricted to the main branch
+#   (where scheduled runs come from), with:
+#   - secret FIRECREST_CLIENT_SECRET: FirecREST client secret. Its client must be bound to the
+#     owner of the tracker directory, the only user who can delete everyone's files there
+#   - secret RUN_ID_KEY: random key run ids are derived from, e.g. `openssl rand -hex 32`.
+#     Keep it: a new key gives every run a new id
+#   - variables FIRECREST_URL (FirecREST v2 base URL), FIRECREST_TOKEN_URL (OIDC token endpoint
+#     of the client), FIRECREST_CLIENT_ID, FIRECREST_SYSTEM (system the tracker directory is read
+#     through, e.g. clariden) and RUN_TRACKER_DIR (e.g. /capstor/scratch/cscs/palmee/rl-runs-tracker)
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One pass at a time, so that two passes never push or delete concurrently
+concurrency:
+  group: collect-rl-runs
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: github.repository == 'eth-cscs/alps-extended-images' && vars.FIRECREST_URL != ''
+    runs-on: ubuntu-latest
+    environment: rl-runs-collector
+    timeout-minutes: 20
+    permissions:
+      # Pushing to the rl-runs branch
+      contents: write
+    env:
+      FIRECREST_URL: ${{ vars.FIRECREST_URL }}
+      FIRECREST_TOKEN_URL: ${{ vars.FIRECREST_TOKEN_URL }}
+      FIRECREST_CLIENT_ID: ${{ vars.FIRECREST_CLIENT_ID }}
+      FIRECREST_CLIENT_SECRET: ${{ secrets.FIRECREST_CLIENT_SECRET }}
+      FIRECREST_SYSTEM: ${{ vars.FIRECREST_SYSTEM }}
+      RUN_TRACKER_DIR: ${{ vars.RUN_TRACKER_DIR }}
+      RUN_ID_KEY: ${{ secrets.RUN_ID_KEY }}
+      MANIFEST: ${{ runner.temp }}/rl-runs-processed.json
+    steps:
+      - name: Checkout the collector
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/rl-runs-collector
+          persist-credentials: false
+
+      - name: Checkout the records
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: rl-runs
+          path: runs
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Collect tracker files
+        run: python .github/rl-runs-collector/collect_rl_runs.py collect --runs-dir runs --manifest "$MANIFEST"
+
+      # Rebased on whatever reached rl-runs since the checkout, never forced. If that conflicts or
+      # the push is rejected, the step fails, nothing is deleted, and the next pass collects the
+      # same files again.
+      - name: Commit and push the records
+        working-directory: runs
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'No new records'
+          else
+            git commit --quiet -m 'Collect RL training runs'
+            git pull --quiet --rebase origin rl-runs
+            git push --quiet origin HEAD:rl-runs
+          fi
+
+      # Only reached when the push succeeded; files that fail to delete are collected again
+      # next time, which is harmless
+      - name: Delete collected tracker files
+        run: python .github/rl-runs-collector/collect_rl_runs.py delete --manifest "$MANIFEST"

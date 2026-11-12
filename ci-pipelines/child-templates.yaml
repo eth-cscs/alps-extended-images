@@ -58,7 +58,8 @@ include:
 
 # Common build wrapper for generated build jobs. The generated job provides the
 # canonical target ref and selected Dockerfile/build args; the CSCS builder
-# helper reads these variables and performs the podman build/push.
+# helper reads these variables and performs the podman build/push. Generated jobs
+# set a resource-group lock keyed by the full canonical image ref.
 .child-build-images-template:
   variables:
     CUSTOM_REGISTRY_USERNAME: $JFROG_USER
@@ -70,6 +71,15 @@ include:
   before_script:
     - |
       set -euo pipefail
+      # Generation may have raced another pipeline. Check again while holding
+      # the resource-group lock so a queued build cannot overwrite its image.
+      source ci-pipelines/helpers/skopeo.sh
+      skopeo_login
+      canon_digest="$(img_digest "$CANON_IMAGE_REF")"
+      if [[ -n "$canon_digest" ]]; then
+        echo "Canonical image already exists; skipping build: $CANON_IMAGE_REF"
+        exit 0
+      fi
       export OCI_CREATED="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
       export PERSIST_IMAGE_NAME="$CANON_IMAGE_REF"
       echo "Building: $PERSIST_IMAGE_NAME"
@@ -120,6 +130,8 @@ include:
       "ROCM_REBUILD_RCCL",
       "ROCM_SYSTEMS_REPO",
       "ROCM_SYSTEMS_COMMIT",
+      "ROCM_LIBRARIES_REPO",
+      "ROCM_LIBRARIES_COMMIT",
       "RCCL_GPU_TARGETS",
       "RCCL_TESTS_GPU_TARGETS",
       "ROCM_PYPI_INDEX_URL",
@@ -239,7 +251,7 @@ include:
       fi
     - echo "[image-vet] diagnose"
     - source "$venv/bin/activate"
-    - vetnode diagnose "$config"
+    - NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET vetnode diagnose --verbose "$config"
   variables:
     SLURM_JOB_NUM_NODES: 4
     SLURM_NTASKS: 16
@@ -293,7 +305,64 @@ include:
           print("ROCm device is not visible to PyTorch", file=sys.stderr, flush=True)
           sys.exit(1)
       print(torch.cuda.get_device_name(0), flush=True)
+      # Call MIOpen explicitly: a generic convolution could select another backend.
+      # Private ATen schema used by the Torch 2.11 (ROCm 7.14) and 2.13 (ROCm 10)
+      # profiles; review the positional arguments when upgrading either profile.
+      torch.manual_seed(0)
+      x = torch.randn(2, 3, 16, 16)
+      weight = torch.randn(5, 3, 3, 3) * 0.1
+      bias = torch.randn(5)
+      expected = torch.nn.functional.conv2d(x, weight, bias, padding=1)
+      actual = torch.ops.aten.miopen_convolution(
+          x.cuda(), weight.cuda(), bias.cuda(),
+          [1, 1], [1, 1], [1, 1], 1, False, True,
+      )
+      torch.testing.assert_close(actual.cpu(), expected, rtol=1e-4, atol=1e-4)
+      print("MIOpen GPU convolution agrees with the CPU reference", flush=True)
       PY
+    - |
+      set -euo pipefail
+      source /opt/alps/env/alps-rocm-build.env
+      : "${ROCM_BUILD_PREFIX:?ROCM_BUILD_PREFIX missing from alps-rocm-build.env}"
+      : "${ROCM_CORE_PREFIX:?ROCM_CORE_PREFIX missing from alps-rocm-build.env}"
+      work="$(mktemp -d)"
+      trap 'rm -rf "$work"' EXIT
+      cat > "$work/miopen.cpp" <<'CPP'
+      #include <miopen/miopen.h>
+      #include <miopen/version.h>
+      #include <cstdio>
+      int main() {
+          size_t major = 0, minor = 0, patch = 0;
+          if (miopenGetVersion(&major, &minor, &patch) != miopenStatusSuccess) {
+              std::fprintf(stderr, "MIOpen validation failed: miopenGetVersion\n");
+              return 1;
+          }
+          if (major != MIOPEN_VERSION_MAJOR || minor != MIOPEN_VERSION_MINOR ||
+              patch != MIOPEN_VERSION_PATCH) {
+              std::fprintf(stderr, "MIOpen validation failed: header/runtime version mismatch "
+                           "(headers=%d.%d.%d, runtime=%zu.%zu.%zu)\n",
+                           MIOPEN_VERSION_MAJOR, MIOPEN_VERSION_MINOR, MIOPEN_VERSION_PATCH,
+                           major, minor, patch);
+              return 2;
+          }
+          miopenHandle_t handle = nullptr;
+          if (miopenCreate(&handle) != miopenStatusSuccess) {
+              std::fprintf(stderr, "MIOpen validation failed: miopenCreate\n");
+              return 3;
+          }
+          if (miopenDestroy(handle) != miopenStatusSuccess) {
+              std::fprintf(stderr, "MIOpen validation failed: miopenDestroy\n");
+              return 4;
+          }
+          std::printf("MIOpen headers/runtime agree: %zu.%zu.%zu; GPU handle created\n",
+                      major, minor, patch);
+      }
+      CPP
+      env -u ROCM_PATH -u HIP_PATH "${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++" \
+        -std=c++17 -D__HIP_PLATFORM_AMD__ -I"${ROCM_BUILD_PREFIX}/include" "$work/miopen.cpp" \
+        -L"${ROCM_BUILD_PREFIX}/lib" -Wl,-rpath,"${ROCM_BUILD_PREFIX}/lib" \
+        -lMIOpen -o "$work/miopen"
+      "$work/miopen"
   variables:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1

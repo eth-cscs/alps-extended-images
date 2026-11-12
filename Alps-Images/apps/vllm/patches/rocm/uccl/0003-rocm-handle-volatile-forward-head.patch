@@ -1,0 +1,94 @@
+From 76751d08665676680d3018751a638c6dbb2f9834 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 15 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: snapshot volatile heads before comparison
+
+ROCm 10 does not provide a matching device min overload when one argument is a
+volatile-qualified shared-memory value. Snapshot each value once and compare it
+directly; this also avoids reading a concurrently updated head twice.
+---
+ ep/src/internode.cu | 40 +++++++++++++++++++++++++---------------
+ 1 file changed, 25 insertions(+), 15 deletions(-)
+
+diff --git a/ep/src/internode.cu b/ep/src/internode.cu
+index 886f642..c694919 100644
+--- a/ep/src/internode.cu
++++ b/ep/src/internode.cu
+@@ -1439,8 +1439,10 @@ __global__ void __launch_bounds__(
+       int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+       for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+-        if (not forward_channel_retired[i])
+-          min_head = min(min_head, forward_channel_head[i][target_rdma]);
++        if (not forward_channel_retired[i]) {
++          int const forward_head = forward_channel_head[i][target_rdma];
++          min_head = min_head < forward_head ? min_head : forward_head;
++        }
+       if (__all_sync(WARP_MASK, min_head == std::numeric_limits<int>::max()))
+         break;
+ 
+@@ -2577,11 +2579,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+ #pragma unroll
+         for (int j = 0; j < num_warps_per_rdma_rank; ++j)
+           if (not forwarder_retired[dst_rdma_rank * num_warps_per_rdma_rank +
+-                                    j])
+-            min_head = min(
+-                min_head,
++                                    j]) {
++            int const forward_head =
+                 forwarder_nvl_head[dst_rdma_rank * num_warps_per_rdma_rank + j]
+-                                  [dst_nvl_rank]);
++                                  [dst_nvl_rank];
++            min_head = min_head < forward_head ? min_head : forward_head;
++          }
+         if (min_head != std::numeric_limits<int>::max() and
+             min_head > last_nvl_head[dst_rdma_rank] and
+             lane_id < NUM_MAX_NVL_PEERS)
+@@ -2866,8 +2869,11 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+         int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+         for (int i = 0; i < kNumRDMAReceivers; ++i)
+-          if (not rdma_receiver_retired[i])
+-            min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
++          if (not rdma_receiver_retired[i]) {
++            int const receiver_head =
++                rdma_receiver_rdma_head[i][dst_rdma_rank];
++            min_head = min_head < receiver_head ? min_head : receiver_head;
++          }
+         if (min_head != std::numeric_limits<int>::max() and
+             min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
+             lane_id < kNumRDMARanks) {
+@@ -2994,9 +3000,11 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+           int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+           for (int i = 0; i < kNumRDMAReceivers; ++i)
+-            if (not rdma_receiver_retired[i])
+-              min_head =
+-                  min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
++            if (not rdma_receiver_retired[i]) {
++              int const receiver_head =
++                  rdma_receiver_rdma_head[i][dst_rdma_rank];
++              min_head = min_head < receiver_head ? min_head : receiver_head;
++            }
+           if (min_head != std::numeric_limits<int>::max() and
+               min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
+               lane_id < kNumRDMARanks) {
+@@ -3019,10 +3027,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+             int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+             for (int j = 0; j < num_warps_per_rdma_rank; ++j)
+-              if (not forwarder_retired[i * num_warps_per_rdma_rank + j])
+-                min_head = min(min_head,
+-                               forwarder_nvl_head[i * num_warps_per_rdma_rank +
+-                                                  j][dst_nvl_rank]);
++              if (not forwarder_retired[i * num_warps_per_rdma_rank + j]) {
++                int const forward_head =
++                    forwarder_nvl_head[i * num_warps_per_rdma_rank + j]
++                                      [dst_nvl_rank];
++                min_head = min_head < forward_head ? min_head : forward_head;
++              }
+             if (min_head != std::numeric_limits<int>::max() and
+                 min_head > last_nvl_head[i] and lane_id < NUM_MAX_NVL_PEERS)
+               st_relaxed_sys_global(
+-- 
+2.51.0

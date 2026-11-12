@@ -7,7 +7,7 @@ runtime_env="/opt/alps/env/alps-runtime.env"
 cat >> "${runtime_env}" <<'EOF'
 
 # ROCm 7.14 bundled RCCL is unreliable for 2-node MI300A collectives with P2P
-# enabled on Beverin's current kernel. Keep this scoped to this image variant;
-# users can override it by setting NCCL_P2P_DISABLE before the runtime env loads.
+# enabled on Beverin's current kernel.
+# Users can override by setting NCCL_P2P_DISABLE before the runtime env loads.
 defvar NCCL_P2P_DISABLE "1"
 EOF

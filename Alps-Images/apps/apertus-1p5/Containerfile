@@ -5,20 +5,6 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG OCI_SOURCE="unknown"
-ARG OCI_REVISION="unknown"
-ARG OCI_CREATED="unknown"
-ARG OCI_DESCRIPTION="unknown"
-ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
-
-LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
-      org.opencontainers.image.revision="${OCI_REVISION}" \
-      org.opencontainers.image.created="${OCI_CREATED}" \
-      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
-      com.cscs.alps.git.repo="${OCI_SOURCE}" \
-      com.cscs.alps.git.commit="${OCI_REVISION}" \
-      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
-
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
 RUN set -eux; \
@@ -53,3 +39,22 @@ COPY Alps-Images/apps/apertus-1p5/tests/ /opt/tests/apertus-1p5/
 RUN chmod -R a+rX /opt/tests/apertus-1p5
 
 WORKDIR /opt/megatron
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+

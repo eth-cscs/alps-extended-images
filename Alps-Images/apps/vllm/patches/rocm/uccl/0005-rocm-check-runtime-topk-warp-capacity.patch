@@ -1,0 +1,37 @@
+From 6d105d31b512217687d669497c85b8a78c4d0caf Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Tue, 15 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: check runtime top-k against dispatch warp capacity
+
+The dispatch kernel needs one warp per selected expert plus its bookkeeping
+warp. Checking the compile-time maximum top-k makes every AMD launch fail:
+MI300 can launch 16 wave64 warps, while the check demands 17 even when the
+runtime top-k is much smaller. Keep the independent maximum check, then compare
+the actual runtime top-k with the available warps.
+---
+ ep/src/internode_ll.cu | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ep/src/internode_ll.cu b/ep/src/internode_ll.cu
+index ebd730f..0791b67 100644
+--- a/ep/src/internode_ll.cu
++++ b/ep/src/internode_ll.cu
+@@ -668,14 +668,14 @@ void dispatch(void* packed_recv_x, void* packed_recv_x_scales,
+               void** ipc_rdma_base_ptrs, void* rdma_buffer_ptr,
+               void* atomic_buffer_ptr, int64_t* rdma_recv_count_internode) {
+   constexpr int kNumMaxTopK = 16;
++  EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
+   int const num_warp_groups = ceil_div(num_experts, num_device_sms);
+   int const num_warps_per_group = kNumMaxWarpGroups / num_warp_groups;
+   EP_HOST_ASSERT(num_warp_groups > 0 and num_warps_per_group > 0);
+-  EP_HOST_ASSERT(kNumMaxTopK + 1 <= num_warp_groups * num_warps_per_group);
++  EP_HOST_ASSERT(num_topk + 1 <= num_warp_groups * num_warps_per_group);
+ 
+   auto const num_warps = num_warp_groups * num_warps_per_group;
+   auto const num_sms = ceil_div(num_experts, num_warp_groups);
+-  EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
+ 
+   // Workspace checks
+   auto atomic_counter_per_expert = static_cast<int*>(workspace);
+-- 
+2.51.0

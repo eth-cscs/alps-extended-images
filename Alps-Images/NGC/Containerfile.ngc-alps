@@ -5,20 +5,6 @@ FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG OCI_SOURCE="unknown"
-ARG OCI_REVISION="unknown"
-ARG OCI_CREATED="unknown"
-ARG OCI_DESCRIPTION="unknown"
-ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
-
-LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
-      org.opencontainers.image.revision="${OCI_REVISION}" \
-      org.opencontainers.image.created="${OCI_CREATED}" \
-      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
-      com.cscs.alps.git.repo="${OCI_SOURCE}" \
-      com.cscs.alps.git.commit="${OCI_REVISION}" \
-      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
-
 # Shared stack build args. Defaults live in common/alps-stack-versions.env.
 ARG BOOST_VER=""
 ARG BOOST_BUILD_JOBS=""
@@ -50,11 +36,13 @@ ARG NVSHMEM_PATCH="nvshmem/requirements-v3.6.5-0.patch"
 
 ARG NCCL_TESTS_VER=2.18.2
 
-COPY Alps-Images/patches/ /opt/alps/patches/
+COPY Alps-Images/patches/libfabric/ /opt/alps/patches/libfabric/
+COPY Alps-Images/patches/aws-ofi-nccl/ /opt/alps/patches/aws-ofi-nccl/
+COPY Alps-Images/patches/nccl/ /opt/alps/patches/nccl/
+COPY Alps-Images/patches/nvshmem/ /opt/alps/patches/nvshmem/
 COPY Alps-Images/common/alps-stack-versions.env /opt/alps/alps-stack-versions.env
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
-COPY Alps-Images/common/run-alps-variant-hooks.sh /opt/alps/run-alps-variant-hooks.sh
 COPY Alps-Images/NGC/install-alps-cuda-components.sh /opt/alps/install-alps-cuda-components.sh
 COPY Alps-Images/NGC/install-alps-cuda-stack.sh /opt/alps/install-alps-cuda-stack.sh
 
@@ -86,7 +74,27 @@ RUN set -eux; \
 
 # Optional image-specific fixes (late hooks)
 ARG NGC_VARIANT_DIR=""
+COPY Alps-Images/common/run-alps-variant-hooks.sh /opt/alps/run-alps-variant-hooks.sh
 COPY Alps-Images/NGC/${NGC_VARIANT_DIR}/ /opt/alps/ngc-variant/
 RUN set -eux; \
     chmod +x /opt/alps/run-alps-variant-hooks.sh; \
     /opt/alps/run-alps-variant-hooks.sh /opt/alps/ngc-variant "NGC_VARIANT_DIR=${NGC_VARIANT_DIR}"
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+

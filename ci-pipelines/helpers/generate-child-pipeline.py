@@ -19,6 +19,8 @@ reviewed static templates.
 """
 from __future__ import annotations
 
+import argparse
+import hashlib
 import os
 import re
 import shlex
@@ -68,6 +70,12 @@ def slug(value: str) -> str:
     return result
 
 
+def canonical_build_lock(canonical_ref: str) -> str:
+    """Serialize writers of one canonical ref without blocking other images."""
+    digest = hashlib.sha256(canonical_ref.encode("utf-8")).hexdigest()
+    return f"canonical-build-{digest}"
+
+
 def load_yaml(path: Path) -> dict[str, Any]:
     """Load a YAML mapping from path."""
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -87,27 +95,10 @@ def load_env_text(text: str) -> dict[str, str]:
 
 
 def app_variants_from_profile(profile: Path) -> list[str]:
-    """Parse APP_VARIANTS from profile.env without executing the profile."""
-    value = None
-    for line in profile.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith("export "):
-            stripped = stripped[len("export ") :].lstrip()
-        if not stripped.startswith("APP_VARIANTS="):
-            continue
-        raw_value = stripped.split("=", 1)[1]
-        try:
-            value = " ".join(shlex.split(raw_value, comments=True, posix=True))
-        except ValueError as exc:
-            raise RuntimeError(f"{profile}: failed to parse APP_VARIANTS: {exc}") from exc
-    if value is None:
-        raise RuntimeError(f"{profile}: APP_VARIANTS must be set")
-    variants = value.split()
-    if not variants:
-        raise RuntimeError(f"{profile}: APP_VARIANTS must not be empty")
-    return variants
+    """Read validated targets through meta.sh without executing the profile."""
+    return run_bash(
+        f"source ci-pipelines/helpers/meta.sh && app_variants_from_profile {shell_quote(str(profile))}"
+    ).split()
 
 
 def img_digest(ref: str) -> str:
@@ -163,9 +154,8 @@ def base_env(family: str, name: str, variant: str) -> dict[str, str]:
 def app_env(app: str, variant: str) -> dict[str, str]:
     """Return generated-job variables for one app variant."""
     data = helper_env("write_app_build_env", app, variant)
-    # App variants are accelerator-family names today; validate_app_variant_name
-    # in meta.sh keeps them safe as generated-job metadata keys.
-    data.update({"FAMILY": variant, "NAME": app, "VARIANT": variant})
+    # The selected base determines the accelerator family, not the target name.
+    data.update({"NAME": app, "VARIANT": variant})
     return data
 
 
@@ -191,6 +181,7 @@ class Child:
         variables: dict[str, str] | None = None,
         timeout: str | None = None,
         script: list[str] | None = None,
+        resource_group: str | None = None,
     ) -> None:
         """Add a concrete generated job that extends one hidden template."""
         if name in self.jobs:
@@ -207,6 +198,8 @@ class Child:
             job["variables"] = {key: str(value) for key, value in sorted(variables.items())}
         if script:
             job["script"] = script
+        if resource_group:
+            job["resource_group"] = resource_group
         self.data[name] = job
 
     def add_noop(self) -> None:
@@ -260,8 +253,8 @@ def require_list(value: Any, context: str) -> list[Any]:
     return value
 
 
-def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
-    """Validate one family base ci.yaml file."""
+def validate_base_variants(path: Path, cfg: dict[str, Any]) -> None:
+    """Validate local base selectors without requiring CI test metadata."""
     family = cfg.get("family")
     if not isinstance(family, str) or family not in BASE_TEST_TEMPLATES:
         supported = ", ".join(sorted(BASE_TEST_TEMPLATES))
@@ -270,6 +263,12 @@ def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
         item = require_mapping(variant, f"{path}: variants[{idx}]")
         if not item.get("name") or not item.get("variant"):
             raise RuntimeError(f"{path}: variants[{idx}] must define name and variant")
+
+
+def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
+    """Validate one family base ci.yaml file."""
+    validate_base_variants(path, cfg)
+    family = cfg["family"]
     tests = require_list(cfg.get("tests"), f"{path}: tests")
     if not tests:
         raise RuntimeError(f"{path}: tests must not be empty")
@@ -282,10 +281,15 @@ def validate_base_ci(path: Path, cfg: dict[str, Any]) -> None:
             raise RuntimeError(f"{path}: unsupported {family} base test name: {name}")
 
 
-def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> None:
-    """Validate one app ci.yaml file against declared variants."""
+def validate_app_ci(
+    path: Path, variants: list[str], cfg: dict[str, Any], families: dict[str, str]
+) -> None:
+    """Validate app tests using the required base-derived family for each target."""
     tests_by_variant = require_mapping(cfg.get("tests"), f"{path}: tests")
     for variant in variants:
+        if variant not in families:
+            raise RuntimeError(f"{path}: missing base-derived family for app target {variant!r}")
+        family = families[variant]
         tests = require_list(tests_by_variant.get(variant), f"{path}: tests.{variant}")
         if not tests:
             raise RuntimeError(f"{path}: tests.{variant} must not be empty")
@@ -297,14 +301,14 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
             if kind not in APP_TEST_KINDS:
                 raise RuntimeError(f"{path}: unsupported app test kind: {kind}")
             if kind == "cuda-vetnode":
-                if variant != "cuda":
+                if family != "cuda":
                     raise RuntimeError(f"{path}: cuda-vetnode is only supported for cuda app tests")
                 extra_keys = set(item) - APP_CUDA_VETNODE_KEYS
                 if extra_keys:
                     extras = ", ".join(sorted(extra_keys))
                     raise RuntimeError(f"{path}: cuda-vetnode app tests do not support: {extras}")
                 continue
-            runner = str(item.get("runner", variant))
+            runner = str(item.get("runner", family))
             if runner not in APP_TEST_RUNNERS:
                 raise RuntimeError(f"{path}: unsupported app test runner: {runner}")
             require_list(item.get("script"), f"{path}: tests.{variant}[{idx}].script")
@@ -312,15 +316,41 @@ def validate_app_ci(path: Path, variants: list[str], cfg: dict[str, Any]) -> Non
             require_mapping(variables, f"{path}: tests.{variant}[{idx}].variables")
 
 
-def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
-    """Load base variants/tests from family-local ci.yaml files."""
-    result = []
+def base_definitions() -> list[tuple[Path, dict[str, Any]]]:
+    """Read declared base variants shared by listing and pipeline discovery."""
+    definitions = []
     for path in sorted((ROOT / "Alps-Images").glob("*/ci.yaml")):
         if path.parent.name in {"apps", "common"}:
             continue
         cfg = load_yaml(path)
         if "family" not in cfg:
             continue
+        validate_base_variants(path, cfg)
+        definitions.append((path, cfg))
+    return definitions
+
+
+def app_definitions() -> list[tuple[Path, list[str]]]:
+    """Read declared app variants through the same validator as manual builds."""
+    return [(profile, app_variants_from_profile(profile))
+            for profile in sorted((ROOT / "Alps-Images" / "apps").glob("*/profile.env"))]
+
+
+def build_selectors() -> list[list[str]]:
+    """List local build candidates without resolving refs or querying registries."""
+    selectors = []
+    for _, cfg in base_definitions():
+        for variant in cfg["variants"]:
+            selectors.append(["base", cfg["family"], str(variant["name"]), str(variant["variant"])])
+    for profile, variants in app_definitions():
+        selectors.extend(["app", profile.parent.name, variant] for variant in variants)
+    return selectors
+
+
+def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
+    """Load base variants/tests from family-local ci.yaml files."""
+    result = []
+    for path, cfg in base_definitions():
         validate_base_ci(path, cfg)
         family = str(cfg["family"])
         tests = cfg.get("tests") or []
@@ -333,16 +363,21 @@ def discover_bases() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
 def discover_apps() -> list[tuple[dict[str, str], list[dict[str, Any]]]]:
     """Load app variants from profile.env and tests from app-local ci.yaml."""
     apps = []
-    for profile in sorted((ROOT / "Alps-Images" / "apps").glob("*/profile.env")):
+    for profile, variants in app_definitions():
         app = profile.parent.name
-        variants = app_variants_from_profile(profile)
         ci_file = profile.parent / "ci.yaml"
         cfg = load_yaml(ci_file)
-        validate_app_ci(ci_file, variants, cfg)
+        images = {}
+        families = {}
+        for variant in variants:
+            data = app_env(app, variant)
+            images[variant] = data
+            families[variant] = data["FAMILY"]
+        validate_app_ci(ci_file, variants, cfg, families)
         tests_by_variant = cfg.get("tests") or {}
         for variant in variants:
             tests = tests_by_variant.get(variant) or []
-            data = app_env(app, variant)
+            data = images[variant]
             apps.append((data, tests))
     return apps
 
@@ -379,7 +414,12 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], va
             for key, value in base.items()
             if key not in {"FAMILY", "NAME", "VARIANT", "TESTED_IMAGE_REF", "VALIDATION_HASH", "STABLE_IMAGE_REF", "GHCR_STABLE_IMAGE_REF", "OCI_CREATED"}
         }
-        child.add_job(build, f".child-{base['FAMILY']}-base-build-template", variables=build_vars)
+        child.add_job(
+            build,
+            f".child-{base['FAMILY']}-base-build-template",
+            variables=build_vars,
+            resource_group=canonical_build_lock(base["CANON_IMAGE_REF"]),
+        )
     if valid:
         add_publish(child, base, [], prefix)
         return None
@@ -398,13 +438,15 @@ def add_base(child: Child, base: dict[str, str], tests: list[dict[str, Any]], va
 
 def add_app_test(child: Child, app: dict[str, str], test: dict[str, Any], needs: list[str]) -> str:
     """Emit one generated app test job and return its name."""
-    prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
+    prefix = slug(f"app-{app['NAME']}-{app['VARIANT']}")
     name = f"test-{prefix}-{slug(str(test['name']))}"
     kind = str(test.get("kind", "custom"))
-    runner = str(test.get("runner", app["FAMILY"]))
     if kind == "cuda-vetnode":
+        if app["FAMILY"] != "cuda":
+            raise RuntimeError("cuda-vetnode requires a CUDA base image")
         child.add_job(name, ".child-cuda-app-vetnode-test-template", image=app["CANON_IMAGE_REF"], needs=needs)
         return name
+    runner = str(test.get("runner", app["FAMILY"]))
     template = ".child-rocm-custom-test-template" if runner == "rocm" else ".child-cuda-custom-test-template"
     variables = {str(k): str(v) for k, v in (test.get("variables") or {}).items()}
     child.add_job(
@@ -425,11 +467,11 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
     App builds depend on base validation, not just base build completion. This
     keeps app images from being built on top of an untested base digest.
     """
-    prefix = slug(f"app-{app['NAME']}-{app['FAMILY']}")
+    prefix = slug(f"app-{app['NAME']}-{app['VARIANT']}")
     base_ref = app["BASE_IMAGE"]
     base_needs = [base_marks[base_ref]] if base_marks.get(base_ref) else []
     if not base_valid.get(base_ref, False) and base_ref not in base_marks:
-        raise RuntimeError(f"base metadata missing for {app['NAME']}/{app['FAMILY']}: {base_ref}")
+        raise RuntimeError(f"base metadata missing for {app['NAME']}/{app['VARIANT']}: {base_ref}")
 
     valid = tested_marker_matches_existing_canonical(app["CANON_IMAGE_REF"], app["TESTED_IMAGE_REF"])
     if valid:
@@ -443,6 +485,7 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
             build_job,
             f".child-{app['FAMILY']}-app-build-template",
             needs=base_needs,
+            resource_group=canonical_build_lock(app["CANON_IMAGE_REF"]),
             variables={
                 "DOCKERFILE": app["DOCKERFILE"],
                 "CANON_IMAGE_REF": app["CANON_IMAGE_REF"],
@@ -455,7 +498,7 @@ def add_app(child: Child, app: dict[str, str], tests: list[dict[str, Any]], base
         )
 
     if not tests:
-        raise RuntimeError(f"no tests declared for {app['NAME']}/{app['FAMILY']}")
+        raise RuntimeError(f"no tests declared for {app['NAME']}/{app['VARIANT']}")
     test_needs = [build_job] if build_job else base_needs
     test_jobs = [add_app_test(child, app, test, test_needs) for test in tests]
     mark = f"mark-{prefix}-tested"
@@ -480,4 +523,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--list", action="store_true", help="list local build selectors without generating a pipeline")
+    args = parser.parse_args()
+    if args.list:
+        # Materialize first so invalid metadata cannot produce a partial listing.
+        for selector in build_selectors():
+            print(shlex.join(selector))
+    else:
+        main()
