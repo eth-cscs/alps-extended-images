@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-# Configuration is baked into the read-only image; runtime state is private tmpfs.
+# Trusted configuration is mounted read-only by the host; runtime state is private tmpfs.
 # Disable upward and on-read project discovery, including PR-supplied AGENTS.md.
 export OPENCODE_DISABLE_PROJECT_CONFIG=1
 export XDG_CONFIG_HOME=/opt/reviewer/config

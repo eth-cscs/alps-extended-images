@@ -51,9 +51,9 @@ The finishing job runs after failed dependencies too, but skips cancelled runs.
 It also reports artifact-download and publication failures.
 
 GitHub loads Conversation-comment workflows from the repository's **default branch**, currently `main`.
-The caller selects the worker explicitly from `main`, and host helpers and repository instructions are checked out from the default branch into `default-branch/`.
+The caller selects the worker explicitly from `main`, and host helpers, configuration, and repository instructions are checked out from the default branch into `default-branch/`.
 The PR's **base branch** is its merge target, which may differ from the default branch and is used to compute the review diff, not to select trusted helpers.
-PR changes to workflows, helpers, or image sources are review material; they do not replace the code running that review.
+PR changes to workflows, helpers, configuration, or image sources are review material; they do not replace the code or settings running that review.
 
 ### Context and history
 
@@ -71,7 +71,8 @@ The reviewer treats prior discussions and source-local instructions as untrusted
 | --- | --- |
 | [`.github/workflows/`](../workflows/) | Authorization, job permissions, checkout selection, publication, and reactions |
 | [`host/`](host/) | Python helpers executed on the GitHub runner; regression tests in `host/tests/` |
-| [`image/`](image/) | Image definition, runtime, reviewer policy, model configuration, and phase-runner tests |
+| [`config/`](config/) | Trusted runtime configuration from the default branch; not baked into the image |
+| [`image/`](image/) | Image definition, runtime, reviewer policy, and phase-runner tests |
 
 The [Containerfile](image/Containerfile) copies runtime files explicitly; tests are not packaged into the image.
 The worker pulls the published image by digest, so changing a tag cannot change the image used by a review.
@@ -85,19 +86,20 @@ The reviewer receives these trusted instructions:
 | [run-review.mjs](image/run-review.mjs) | Phase selection, input location, current allowance, and incomplete-inspection status | Separate CLI tasks in the same session |
 
 The phase runner reapplies the same policy file in the final task so earlier reviews and inspection summaries do not displace it in a long session.
-[opencode.json](image/opencode.json) defines the model, provider, agents, permissions, and generation settings.
+[opencode.json](config/opencode.json) defines the model, provider, agents, permissions, and generation settings.
 The inspection agent cannot launch subagents.
 The finalizer denies tool permissions and selects the `review-final` variant with provider-level `tool_choice: none`, since permissions alone still advertise skill discovery in the CLI.
 [entrypoint.sh](image/entrypoint.sh) disables PR-supplied configuration, plugins, agents, and automatic instruction discovery with `OPENCODE_DISABLE_PROJECT_CONFIG=1` before starting the phase runner.
 
 ### Container isolation
 
-[run.py](host/run.py) accepts repository instructions separately from the PR checkout and rejects paths that resolve inside that checkout.
-It stages read-only copies of the context and instructions before launching the container.
+[run.py](host/run.py) accepts repository instructions and the configuration directory separately from the PR checkout and rejects paths that resolve inside that checkout.
+It reads one configuration snapshot, validates the execution limits, and stages read-only copies of the configuration, context, and instructions before launching the container.
 
 | Container path | Origin | Access |
 | --- | --- | --- |
-| `/opt/reviewer/` | Published image software and configuration | Read-only |
+| `/opt/reviewer/` | Published image runtime and reviewer policy | Read-only |
+| `/opt/reviewer/config/opencode/` | Default-branch `config/opencode.json` and `config/limits.json` | Read-only mount |
 | `/instructions/AGENTS.md` | Default-branch repository instructions | Read-only mount |
 | `/input/pr-source/` | Validated PR-head checkout | Read-only mount |
 | `/input/context.md` | Prepared review context | Read-only mount |
@@ -112,21 +114,27 @@ Both PR context and model output remain untrusted text.
 
 ## Limits and output
 
-The limits are maintained where they are enforced:
+Change runtime settings in [`config/`](config/) on the default branch to apply them to subsequent reviews without rebuilding the image.
+Each run snapshots these files, so edits do not change an active review.
 
 | Definition | Meaning |
 | --- | --- |
-| Agent `steps` in [opencode.json](image/opencode.json) | Maximum model iterations for each phase, not individual tool calls |
+| Agent `steps` in [opencode.json](config/opencode.json) | Maximum model iterations for each phase, not individual tool calls |
 | Model and variant `body.max_tokens` in the same configuration | Per-request output allowances, not a review-wide token quota |
 | Provider `settings.timeout` in the same configuration | Request deadline, including response-body consumption |
-| [run-review.mjs](image/run-review.mjs) | Separate inspection and finalization deadlines and process termination grace |
-| [run.py](host/run.py) | Container execution backstop and cleanup deadlines |
+| `inspection_seconds`, `finalization_seconds` in [limits.json](config/limits.json) | Separate phase deadlines |
+| `execution_overhead_seconds` in the same file | Extra time for container startup and phase transitions |
+| `termination_grace_seconds` in the same file | Grace before force-killing a stopped process |
 | Worker `timeout-minutes` | GitHub job timeout |
 
 Each phase can finish before reaching its iteration allowance.
 Finalization starts a new message and has its own allowance, with room to avoid the CLI's generic last-step summary prompt on its first response.
 Recovery from empty or token-truncated responses can add provider requests, so step limits are not hard HTTP request-count quotas.
 Provider retries do not extend phase deadlines, and a job timeout does not guarantee a publishable response.
+The host deadline is calculated as `inspection_seconds + finalization_seconds + 2 × termination_grace_seconds + execution_overhead_seconds`.
+It grows automatically with the phase deadlines; leave time within the GitHub job timeout for setup, host cleanup, and artifact upload.
+All configured durations must be positive finite seconds.
+The workflow's job timeout is configured separately; changing it alone does not extend inspection.
 
 The image and host share a phase-marked JSONL event contract.
 Inspection must complete a qualifying `read`, `grep`, `shell`, or Code Mode `execute` call successfully before finalization; this proves neither coverage nor correctness.
@@ -163,10 +171,11 @@ Provider-exposed reasoning is captured in the private event stream but never pub
 
 Provide the repository or organization secret `CSCS_INFERENCE_KEY` to the caller workflow.
 The worker exposes it only to the inference step as `CSCS_INFERENCE_API_KEY`; GitHub API operations use the jobs' automatically issued tokens.
-For this workflow to run, its caller, worker, and host helpers must be on `main`, and the pinned image must be publicly pullable.
-Changes to host helpers and repository instructions take effect through the default branch without rebuilding the image.
-Image runtime, policy, and configuration changes require a new image and digest pin.
-Publish a compatible image before deploying host changes that require a different event contract.
+For this workflow to run, its caller, worker, host helpers, and configuration must be on `main`, and the pinned image must be publicly pullable.
+Changes to host helpers, runtime configuration, and repository instructions take effect through the default branch without rebuilding the image.
+Image runtime and reviewer-policy changes still require a new image and digest pin.
+The image requires the mounted configuration; there are no baked fallback settings.
+Deploy compatible host and image code together when changing configuration-file formats or the event protocol.
 
 ### Web search
 

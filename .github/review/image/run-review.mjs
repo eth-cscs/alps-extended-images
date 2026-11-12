@@ -121,8 +121,17 @@ async function phase(name, agent, prompt, session, budget, control) {
   }
 }
 
-export async function runReview({ inspectionMs = 600000, finalMs = 300000, killGraceMs = 5000 } = {}) {
-  const config = JSON.parse(await readFile(`${process.env.XDG_CONFIG_HOME}/opencode/opencode.json`, 'utf8'));
+export async function runReview() {
+  const configDirectory = `${process.env.XDG_CONFIG_HOME}/opencode`;
+  const config = JSON.parse(await readFile(`${configDirectory}/opencode.json`, 'utf8'));
+  const limits = JSON.parse(await readFile(`${configDirectory}/limits.json`, 'utf8'));
+  const seconds = ['inspection_seconds', 'finalization_seconds', 'termination_grace_seconds'];
+  if (!limits || seconds.some(key => typeof limits[key] !== 'number' || !Number.isFinite(limits[key]) || limits[key] <= 0)) {
+    throw new Error('limits.json must define positive finite phase deadlines and termination grace');
+  }
+  const inspectionMs = limits.inspection_seconds * 1000;
+  const finalMs = limits.finalization_seconds * 1000;
+  const killGraceMs = limits.termination_grace_seconds * 1000;
   const inspectionSteps = config.agents['grumpy-reviewer'].steps;
   const control = { config };
   const handlers = new Map(['SIGINT', 'SIGTERM'].map(signal => [signal, () => {
