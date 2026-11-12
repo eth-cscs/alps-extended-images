@@ -33,22 +33,28 @@
   ],
   "providers": {
     "cscs": {
-      "package": "@opencode/ai/providers/anthropic",
+      "package": "@opencode/ai/providers/openai-compatible",
       "name": "CSCS Inference",
+      "env": ["CSCS_INFERENCE_API_KEY"],
       "settings": {
         "baseURL": "https://api.inference.cscs.ch/v1",
         "apiKey": "{env:CSCS_INFERENCE_API_KEY}",
-        "systemMessageMode": "system",
         "timeout": 240000
       },
       "models": {
         "zai-org/GLM-5.3": {
           "name": "GLM-5.3 [CSCS]",
           "limit": { "context": 1048576, "output": 32768 },
-          "body": { "max_tokens": 16384 },
-          "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
+          "body": { "max_tokens": 16384, "reasoning_effort": "high" },
+          "capabilities": {
+            "tools": true,
+            "reasoning": { "supported": true },
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "compatibility": { "reasoningField": "reasoning", "maxTokensField": "max_tokens" },
           "variants": [
-            { "id": "review-final", "body": { "max_tokens": 32768, "tool_choice": { "type": "none" } } }
+            { "id": "review-final", "body": { "max_tokens": 32768, "reasoning_effort": "low", "tool_choice": "none" } }
           ]
         }
       }

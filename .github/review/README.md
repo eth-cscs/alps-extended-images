@@ -87,6 +87,8 @@ The reviewer receives these trusted instructions:
 
 The phase runner reapplies the same policy file in the final task so earlier reviews and inspection summaries do not displace it in a long session.
 [opencode.json](config/opencode.json) defines the model, provider, agents, permissions, and generation settings.
+The provider uses CSCS's OpenAI-compatible Chat Completions API.
+Its compatibility settings select `max_tokens` for the output limit and `reasoning` for streamed reasoning and retained assistant history.
 The inspection agent cannot launch subagents.
 The finalizer denies tool permissions and selects the `review-final` variant with provider-level `tool_choice: none`, since permissions alone still advertise skill discovery in the CLI.
 [entrypoint.sh](image/entrypoint.sh) disables PR-supplied configuration, plugins, agents, and automatic instruction discovery with `OPENCODE_DISABLE_PROJECT_CONFIG=1` before starting the phase runner.
@@ -120,13 +122,15 @@ Each run snapshots these files, so edits do not change an active review.
 | Definition | Meaning |
 | --- | --- |
 | Agent `steps` in [opencode.json](config/opencode.json) | Maximum model iterations for each phase, not individual tool calls |
-| Model and variant `body.max_tokens` in the same configuration | Per-request output allowances, not a review-wide token quota |
+| Model and variant `body.max_tokens` in the same configuration | Per-request output allowances, including reasoning tokens, not a review-wide token quota |
+| Model and variant `body.reasoning_effort` in the same configuration | Inspection effort and the finalizer's separate override |
 | Provider `settings.timeout` in the same configuration | Request deadline, including response-body consumption |
 | `inspection_seconds`, `finalization_seconds` in [limits.json](config/limits.json) | Separate phase deadlines |
 | `execution_overhead_seconds` in the same file | Extra time for container startup and phase transitions |
 | `termination_grace_seconds` in the same file | Grace before force-killing a stopped process |
 | Worker `timeout-minutes` | GitHub job timeout |
 
+Reasoning effort is a qualitative setting, not a token quota or completion-time guarantee.
 Each phase can finish before reaching its iteration allowance.
 Finalization starts a new message and has its own allowance, with room to avoid the CLI's generic last-step summary prompt on its first response.
 Recovery from empty or token-truncated responses can add provider requests, so step limits are not hard HTTP request-count quotas.
