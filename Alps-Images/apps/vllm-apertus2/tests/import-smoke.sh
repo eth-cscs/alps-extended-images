@@ -4,6 +4,7 @@ set -euo pipefail
 python3 - <<'PY'
 import importlib.metadata as metadata
 import inspect
+import os
 
 import torch
 
@@ -11,7 +12,8 @@ assert torch.cuda.is_available(), "no CUDA device visible"
 print("torch", torch.__version__, "cuda", torch.version.cuda)
 
 vllm_version = metadata.version("vllm")
-assert vllm_version == "0.28.0+apertus2.200556e64", vllm_version
+expected_vllm_version = os.environ["ALPS_VLLM_APERTUS2_VERSION"]
+assert vllm_version == expected_vllm_version, (vllm_version, expected_vllm_version)
 assert metadata.version("nixl") == "1.3.2"
 assert metadata.version("runai-model-streamer") == "0.15.7"
 assert metadata.version("transformers") == "5.17.0"
@@ -43,8 +45,6 @@ for name in (
 ):
     assert hasattr(deep_ep.Buffer, name), name
 print("deep_ep.Buffer", inspect.signature(deep_ep.Buffer.__init__))
-
-import os
 
 os.environ["UCCL_EP_DISPATCH_CONFIG"] = "24,12,512,32,512"
 os.environ["UCCL_EP_COMBINE_CONFIG"] = "24,2,512,24,512"

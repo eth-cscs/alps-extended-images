@@ -1,0 +1,294 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+# Apertus2 vLLM release tag (swiss-ai/vllm) and the wheel version it builds.
+ARG VLLM_REF="v0.31.0+Apertus2.1"
+ARG VLLM_VERSION_OVERRIDE="0.31.0+apertus2.1"
+
+FROM ${BASE_IMAGE} AS uv-base
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG UV_VERSION="0.11.23"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+
+RUN source /opt/alps/package-helpers.sh; \
+    pip_install python3 --no-cache-dir "uv==${UV_VERSION}"; \
+    uv --version
+
+ENV UV_DEFAULT_INDEX="https://jfrog.svc.cscs.ch/artifactory/api/pypi/pypi-remote/simple" \
+    UV_BREAK_SYSTEM_PACKAGES="1" \
+    UV_PYTHON_DOWNLOADS="never" \
+    UV_LINK_MODE="copy"
+
+RUN set -eux; \
+    : > /opt/alps/base-pins.txt; \
+    for package in torch torchvision triton numpy; do \
+      version="$(python3 -c "import importlib.metadata as m; print(m.version('${package}'))" 2>/dev/null || true)"; \
+      if [[ -n "${version}" ]]; then printf '%s==%s\n' "${package}" "${version}" >> /opt/alps/base-pins.txt; fi; \
+    done; \
+    cat /opt/alps/base-pins.txt
+
+
+FROM uv-base AS vllm-builder
+
+ARG VLLM_REPO="https://github.com/swiss-ai/vllm.git"
+ARG VLLM_REF
+ARG VLLM_TARGET_DEVICE="cuda"
+ARG VLLM_CUDA_ARCH_LIST="9.0"
+ARG VLLM_TORCH_CUDA_ARCH_LIST="9.0"
+ARG VLLM_VERSION_OVERRIDE
+ARG MAX_JOBS="32"
+ARG NVCC_THREADS="4"
+
+RUN source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+      build-essential cargo ca-certificates cmake curl git ninja-build \
+      pkg-config python3-dev rustc; \
+    rm -rf /var/lib/apt/lists/*; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
+      build jinja2 'packaging<=25.0' 'setuptools>=77.0.3,<81.0.0' \
+      setuptools-rust setuptools-scm wheel; \
+    uv pip uninstall --system grpcio-tools
+
+RUN set -eux; \
+    export VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
+      CUDA_ARCH_LIST="${VLLM_CUDA_ARCH_LIST}" \
+      TORCH_CUDA_ARCH_LIST="${VLLM_TORCH_CUDA_ARCH_LIST}" \
+      VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE}" \
+      MAX_JOBS="${MAX_JOBS}" \
+      NVCC_THREADS="${NVCC_THREADS}" \
+      CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}"; \
+    git clone --recursive "${VLLM_REPO}" /tmp/vllm; \
+    cd /tmp/vllm; \
+    git checkout -q "refs/tags/${VLLM_REF}"; \
+    git submodule update --init --recursive; \
+    python use_existing_torch.py --prefix || python use_existing_torch.py; \
+    build_requirements=requirements/build/cuda.txt; \
+    if [[ ! -f "${build_requirements}" ]]; then build_requirements=requirements/build.txt; fi; \
+    awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/) { print }' \
+      "${build_requirements}" > /tmp/vllm-build-requirements.txt; \
+    source /opt/alps/package-helpers.sh; \
+    printf 'protobuf>=5.29.6,<7\n' > /tmp/vllm-constraints.txt; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/vllm-constraints.txt \
+      -r /tmp/vllm-build-requirements.txt; \
+    awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/ || $0 ~ /^cuda-toolkit/ || $0 ~ /^nvidia-cuda-/ || $0 ~ /^nvidia-nvjitlink/ || $0 ~ /^nvidia-nvvm/) { print }' \
+      requirements/cuda.txt > requirements/cuda-alps.txt; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/vllm-constraints.txt \
+      -r requirements/cuda-alps.txt; \
+    mkdir -p /opt/artifacts/vllm; \
+    uv build --wheel --no-build-isolation --no-cache --python python3 \
+      --out-dir /opt/artifacts/vllm .; \
+    cp -a requirements /opt/artifacts/vllm/
+
+RUN test "$(find /opt/artifacts/vllm -maxdepth 1 -name 'vllm-*.whl' | wc -l)" -eq 1
+
+
+FROM uv-base AS uccl-builder
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG UCCL_REPO="https://github.com/uccl-project/uccl.git"
+ARG UCCL_REF="52d4184c89deb5631be6dac6a9b1c40896c9e26e"
+ARG UCCL_CUDA_ARCH="9.0"
+ARG UCCL_NVL_PEERS="4"
+ARG UCCL_MAX_JOBS="8"
+ARG NANOBIND_VERSION="3.0.1"
+
+RUN source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+      build-essential ca-certificates cmake curl git libelf-dev \
+      libgflags-dev libgfortran5 libgomp1 libgtest-dev libhwloc-dev \
+      libibverbs-dev libnl-3-dev libnl-route-3-dev libnuma-dev ninja-build \
+      pkg-config python3-dev \
+      rdma-core zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
+      auditwheel build intervaltree "nanobind==${NANOBIND_VERSION}" \
+      patchelf pybind11 uv wheel
+
+RUN set -eux; \
+    git clone --recursive "${UCCL_REPO}" /io; \
+    cd /io; \
+    git checkout -q "${UCCL_REF}"; \
+    git submodule update --init --recursive; \
+    libfabric_prefix="$(pkg-config --variable=prefix libfabric)"; \
+    libfabric_libdir="$(pkg-config --variable=libdir libfabric)"; \
+    test -n "${libfabric_prefix}"; \
+    test -f "${libfabric_libdir}/libfabric.so"; \
+    printf '%s\n' "${libfabric_libdir}" > /etc/ld.so.conf.d/98-alps-libfabric.conf; \
+    ldconfig; \
+    python3 -c 'import torch'; \
+    mkdir -p /tmp/gpustub /opt/artifacts/uccl; \
+    printf '#!/usr/bin/python3\nimport sys\na = " ".join(sys.argv[1:])\nif "query-gpu=name" in a:\n    print("NVIDIA GH200 120GB")\nelif "query-gpu=compute_cap" in a:\n    print("9.0")\nelse:\n    sys.exit(1)\n' > /tmp/gpustub/nvidia-smi; \
+    chmod +x /tmp/gpustub/nvidia-smi; \
+    export PATH="/tmp/gpustub:${PATH}" \
+      CUDA_HOME=/usr/local/cuda \
+      LIBFABRIC_HOME="${libfabric_prefix}" \
+      LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}" \
+      TORCH_CUDA_ARCH_LIST="${UCCL_CUDA_ARCH}" \
+      NUM_MAX_NVL_PEERS="${UCCL_NVL_PEERS}" \
+      MAX_JOBS="${UCCL_MAX_JOBS}" \
+      USE_LIBFABRIC_CXI=1 \
+      PER_EXPERT_BATCHING=1 \
+      TARGET=cu13 \
+      PY_VER=3.12 \
+      ARCH=aarch64 \
+      BUILD_TYPE=all \
+      IS_EFA="" \
+      WHEEL_DIR=wheelhouse-cu13 \
+      HOST_GLIBC_VER="$(python -c 'import platform; print(platform.libc_ver()[1])')" \
+      UCCL_RETAG_TO_HOST_GLIBC=0 \
+      UCCL_LOCAL_VERSION=cu13; \
+    bash ./build_inner.sh; \
+    cp wheelhouse-cu13/uccl*.whl /opt/artifacts/uccl/; \
+    source /opt/alps/package-helpers.sh; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps wheelhouse-cu13/uccl*.whl; \
+    echo "Installing UCCL P2P public headers and linker library for NIXL"; \
+    make -C p2p -j"${UCCL_MAX_JOBS}" install \
+      PYTHON=python LIBFABRIC_HOME="${libfabric_prefix}"; \
+    printf '%s\n' /usr/local/lib > /etc/ld.so.conf.d/98-uccl.conf; \
+    ldconfig; \
+    cd ep/deep_ep_wrapper; \
+    uv build --wheel --no-build-isolation --no-cache --python python3 \
+      --out-dir /opt/artifacts/uccl .
+
+RUN test "$(find /opt/artifacts/uccl -maxdepth 1 -name 'uccl-*.whl' | wc -l)" -eq 1; \
+    test "$(find /opt/artifacts/uccl -maxdepth 1 -name 'deep_ep-*.whl' | wc -l)" -eq 1
+
+
+FROM uccl-builder AS nixl-builder
+
+ARG NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
+ARG NIXL_REF="de8115ca97d3f8fb63a4988e9b4d4a038b2e0f72"
+ARG NIXL_LIBDIR="lib/aarch64-linux-gnu"
+ARG NIXL_MAX_JOBS="16"
+
+RUN source /opt/alps/package-helpers.sh; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
+      build meson meson-python patchelf pybind11 pyyaml pytest \
+      'setuptools>=80.9.0' tomlkit types-PyYAML uv
+
+RUN set -eux; \
+    export LIBRARY_PATH="/usr/local/lib:${LIBRARY_PATH:-}" \
+      LDFLAGS="-L/usr/local/lib -Wl,-rpath,/usr/local/lib ${LDFLAGS:-}"; \
+    git clone "${NIXL_REPO}" /tmp/nixl; \
+    cd /tmp/nixl; \
+    git checkout -q "${NIXL_REF}"; \
+    python contrib/tomlutil.py --wheel-name nixl-cu13 pyproject.toml; \
+    mkdir -p /opt/artifacts/nixl; \
+    uv build --wheel --no-build-isolation --no-cache --python python3 \
+      --out-dir /opt/artifacts/nixl \
+      -Cbuild-dir=/tmp/nixl-build \
+      -Ccompile-args="-j${NIXL_MAX_JOBS}" \
+      -Csetup-args="-Dlibdir=${NIXL_LIBDIR}" \
+      -Csetup-args=-Denable_plugins=UCCL \
+      -Csetup-args=-Dbuild_tests=false \
+      -Csetup-args=-Dbuild_examples=false \
+      -Csetup-args=-Dinstall_headers=false \
+      -Csetup-args=-Dnixl_cuda_arch_list=90 \
+      -Csetup-args=-Dwheel_variant=cu13; \
+    cp /tmp/nixl-build/src/bindings/python/nixl-meta/nixl-*.whl \
+      /opt/artifacts/nixl/
+
+RUN test "$(find /opt/artifacts/nixl -maxdepth 1 -name 'nixl_cu13-*.whl' | wc -l)" -eq 1; \
+    test "$(find /opt/artifacts/nixl -maxdepth 1 -name 'nixl-*.whl' | wc -l)" -eq 1
+
+
+FROM uv-base AS runtime
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+ARG NIXL_LIBDIR="lib/aarch64-linux-gnu"
+ARG TRANSFORMERS_VERSION="5.17.0"
+ARG VLLM_VERSION_OVERRIDE
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+ENV UCCL_EP_TRANSPORT="cxi" \
+    UCCL_P2P_TRANSPORT="cxi" \
+    UCCL_CXI_THREADING="safe" \
+    NIXL_PLUGIN_DIR="/usr/local/${NIXL_LIBDIR}/plugins" \
+    ALPS_VLLM_APERTUS2_VERSION="${VLLM_VERSION_OVERRIDE}"
+
+COPY --from=vllm-builder /opt/artifacts/vllm/ /opt/wheels/vllm/
+COPY --from=uccl-builder /opt/artifacts/uccl/ /opt/wheels/uccl/
+COPY --from=nixl-builder /opt/artifacts/nixl/ /opt/wheels/nixl/
+
+RUN set -eux; \
+    source /opt/alps/package-helpers.sh; \
+    apt_get update; \
+    apt_get install -y --no-install-recommends \
+      ca-certificates libelf1 libgfortran5 libgomp1 libhwloc15 libibverbs1 \
+      libnl-3-200 libnl-route-3-200 libnuma1 rdma-core zlib1g; \
+    rm -rf /var/lib/apt/lists/*; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
+      'setuptools>=77.0.3,<81.0.0' wheel; \
+    uv pip uninstall --system grpcio-tools; \
+    printf 'protobuf>=5.29.6,<7\npackaging<=26.2\n' > /tmp/runtime-constraints.txt; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
+      -r /opt/wheels/vllm/requirements/cuda-alps.txt; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/vllm/vllm-*.whl; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
+      "ray[default]" "runai-model-streamer==0.15.7" sentencepiece tiktoken; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
+      "transformers==${TRANSFORMERS_VERSION}" "grpcio-tools==1.76.0" intervaltree pytest; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/uccl/uccl-*.whl; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/uccl/deep_ep-*.whl; \
+    uv pip uninstall --system nixl nixl-cu12 nixl-cu13; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/nixl/nixl_cu13-*.whl; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/nixl/nixl-*.whl; \
+    site_dir="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    torch_lib_dir="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"; \
+    nixl_plugin="$(find "${site_dir}" /usr/local \
+      -type f -name libplugin_UCCL.so -print -quit 2>/dev/null)"; \
+    test -n "${nixl_plugin}"; \
+    nixl_lib="$(find "${site_dir}" /usr/local \
+      -type f -name 'libnixl.so*' -print -quit 2>/dev/null)"; \
+    test -n "${nixl_lib}"; \
+    mkdir -p "/usr/local/${NIXL_LIBDIR}/plugins"; \
+    if [[ "${nixl_plugin}" != "/usr/local/${NIXL_LIBDIR}/plugins/libplugin_UCCL.so" ]]; then \
+      ln -sfn "${nixl_plugin}" "/usr/local/${NIXL_LIBDIR}/plugins/libplugin_UCCL.so"; \
+    fi; \
+    printf '%s\n%s\n%s\n%s\n%s\n' \
+      "${torch_lib_dir}" \
+      "/usr/local/lib" \
+      "${site_dir}/uccl/lib" \
+      "$(dirname "${nixl_lib}")" \
+      "$(dirname "${nixl_plugin}")" \
+      > /etc/ld.so.conf.d/99-vllm-apertus2.conf; \
+    ldconfig; \
+    rm -rf /opt/wheels /tmp/runtime-constraints.txt /root/.cache/pip
+
+RUN set -eux; \
+    ldconfig -p | grep -F 'libfabric.so.1'; \
+    uv pip check --system; \
+    python -c 'import importlib.metadata as m, os, torch, vllm; assert m.version("vllm") == os.environ["ALPS_VLLM_APERTUS2_VERSION"], m.version("vllm"); print("torch={} cuda={}".format(torch.__version__, torch.version.cuda)); print("vllm={}".format(vllm.__version__))'; \
+    python -c 'from vllm.model_executor.models.apertus2 import Apertus2KDAForCausalLM; from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated; print(Apertus2KDAForCausalLM, FusedRMSNormGated)'; \
+    python -c 'import importlib.metadata as m, uccl; assert m.version("uccl") == "0.1.1"; assert m.version("deep-ep") == "0.1.0"; print("uccl={}".format(uccl.__version__))'; \
+    python -c 'import importlib.metadata as m, torch, nixl; assert torch.version.cuda.split(".")[0] == "13"; assert m.version("nixl") == m.version("nixl-cu13") == "1.3.2"; assert nixl._bindings.__name__ == "nixl_cu13._bindings"; assert not any(d.metadata["Name"].lower().replace("_", "-") == "nixl-cu12" for d in m.distributions()); print("nixl-cu13={} bindings={}".format(m.version("nixl-cu13"), nixl._bindings.__file__))'; \
+    test -f "${NIXL_PLUGIN_DIR}/libplugin_UCCL.so"; \
+    site_dir="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+    nixl_lib_dir="$(dirname "$(find "${site_dir}" -type f -name 'libnixl.so*' -print -quit)")"; \
+    test -d "${nixl_lib_dir}"; \
+    all_missing="$(find "$(python -c 'import vllm; print(vllm.__path__[0])')" "${site_dir}/uccl" "${nixl_lib_dir}" "${NIXL_PLUGIN_DIR}" -name '*.so' \
+      -exec ldd {} + 2>/dev/null | awk '/not found/ { print }' || true)"; \
+    missing="$(printf '%s\n' "${all_missing}" | awk 'NF && $1 != "libcuda.so.1" { print }')"; \
+    if [[ -n "${missing}" ]]; then printf '%s\n' "${missing}" >&2; exit 1; fi
+
+COPY Alps-Images/apps/vllm-apertus2/tests/ /opt/tests/vllm-apertus2/
+RUN chmod -R a+rX /opt/tests/vllm-apertus2

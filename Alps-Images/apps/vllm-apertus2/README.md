@@ -1,14 +1,22 @@
 # Apertus2 vLLM on Alps
 
-CUDA/GH200 serving image based on `pytorch-cuda:26.07-py3`. The recipe builds
+CUDA/GH200 serving images based on `pytorch-cuda:26.07-py3`. The recipe builds
 the pinned Apertus2 vLLM fork, UCCL EP/P2P, the `deep_ep` wrapper, and NIXL 1.3.2 with its
 UCCL plugin from pinned sources. It preserves the base Torch/CUDA stack.
 
-The source pin is `swiss-ai/vllm@200556e646ff4e6c13dc1b443d973830485f3c0f`
-from `apertus2/main`. It includes the MoE/EPLB interface and FP8 SSSGLU DeepGEMM changes.
-The wheel version is `0.28.0+apertus2.200556e64`; the commit identifies the fork snapshot.
-UCCL is pinned to
-`andresnowak/uccl@0c166355310a04b2344ca0c5c0df818b04d26af0`.
+Two app targets build the same recipe from different `swiss-ai/vllm` release tags:
+
+| Target | Image | Containerfile | vLLM tag | Wheel version |
+|--------|-------|---------------|----------|---------------|
+| `cuda` | `vllm-apertus2-cuda` | `Containerfile` | [`v0.28.0+Apertus2.2`](https://github.com/swiss-ai/vllm/releases/tag/v0.28.0%2BApertus2.2) | `0.28.0+apertus2.2` |
+| `v031-cuda` | `vllm-apertus2-v031-cuda` | `Containerfile.v031` | [`v0.31.0+Apertus2.1`](https://github.com/swiss-ai/vllm/releases/tag/v0.31.0%2BApertus2.1) | `0.31.0+apertus2.1` |
+
+The two Containerfiles differ only in `VLLM_REF` and `VLLM_VERSION_OVERRIDE`.
+The image sets `ALPS_VLLM_APERTUS2_VERSION` to the wheel version, and the build check and smoke test assert it.
+vLLM 0.31 uses Model Runner V2 by default; set `VLLM_USE_V2_MODEL_RUNNER=0` to select V1.
+
+Both targets pin UCCL to `uccl-project/uccl@52d4184c89deb5631be6dac6a9b1c40896c9e26e` (`main`, 2026-11-11).
+It includes the runtime EP configuration overrides (#1056) and the CXI hybrid MR descriptor, proxy pinning, and warp quiet changes (#1137, #1139, #1143).
 
 ## Serving examples
 
@@ -29,10 +37,11 @@ cscs-ci run build-images
 The existing pipeline discovers this app through `profile.env`, builds against
 the canonical PyTorch 26.07 base, runs vetnode and the GPU import smoke test,
 and promotes validated images to JFrog/GHCR under the repository's publish policy.
-The stable JFrog ref is:
+The stable JFrog refs are:
 
 ```text
-jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/vllm-apertus2-cuda:alps7-dev
+jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/vllm-apertus2-cuda:alps7-dev       # vLLM 0.28
+jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/vllm-apertus2-v031-cuda:alps7-dev  # vLLM 0.31
 ```
 
 UCCL defaults to `UCCL_MAX_JOBS=8`. PR #64's follow-up build with 16 jobs failed
