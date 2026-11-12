@@ -65,7 +65,7 @@ RUN set -eux; \
     cd /tmp/vllm; \
     git checkout -q "refs/tags/${VLLM_REF}"; \
     git submodule update --init --recursive; \
-    python use_existing_torch.py --prefix || python use_existing_torch.py; \
+    python tools/use_existing_torch.py --prefix; \
     build_requirements=requirements/build/cuda.txt; \
     if [[ ! -f "${build_requirements}" ]]; then build_requirements=requirements/build.txt; fi; \
     awk 'BEGIN { IGNORECASE=1 } !($0 ~ /^torch==/ || $0 ~ /^torchaudio==/ || $0 ~ /^torchvision==/) { print }' \

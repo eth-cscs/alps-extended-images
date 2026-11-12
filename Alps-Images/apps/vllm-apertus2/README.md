@@ -11,7 +11,7 @@ All images preserve the base Torch stack.
 | `v031-cuda` | `vllm-apertus2-v031-cuda` | `Containerfile.v031` | [`v0.31.0+Apertus2.1`](https://github.com/swiss-ai/vllm/releases/tag/v0.31.0%2BApertus2.1) | `0.31.0+apertus2.1` |
 | `v031-rocm` | `vllm-apertus2-v031-rocm` | `Containerfile.v031.rocm` | [`v0.31.0+Apertus2.1`](https://github.com/swiss-ai/vllm/releases/tag/v0.31.0%2BApertus2.1) | `0.31.0+apertus2.1` |
 
-The two CUDA Containerfiles differ only in `VLLM_REF` and `VLLM_VERSION_OVERRIDE`.
+The two CUDA Containerfiles differ only in `VLLM_REF`, `VLLM_VERSION_OVERRIDE`, and the `use_existing_torch.py` path (vLLM 0.31 moved it to `tools/`).
 Each image sets `ALPS_VLLM_APERTUS2_VERSION` to the wheel version, and the build check and smoke test assert it.
 vLLM 0.31 uses Model Runner V2 by default; set `VLLM_USE_V2_MODEL_RUNNER=0` to select V1.
 
