@@ -53,8 +53,8 @@ jobs:
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       head_sha: ${{ steps.prepare.outputs.head_sha }}
     steps:
-      # PR changes cannot replace the helpers or repository instructions used by this run.
-      - name: Checkout default-branch helpers and instructions
+      # PR changes cannot replace the helpers, configuration, or instructions used by this run.
+      - name: Checkout default-branch helpers, configuration, and instructions
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: ${{ github.repository }}
@@ -107,7 +107,7 @@ jobs:
       - name: Pull trusted prebuilt review image
         run: docker pull "$OPENCODE_REVIEW_IMAGE"
 
-      # run.py mounts the PR checkout, context, and default-branch AGENTS.md read-only.
+      # run.py mounts the PR checkout, context, and default-branch configuration/instructions read-only.
       # Only CSCS_INFERENCE_API_KEY is forwarded from the host environment; the Docker socket is not mounted.
       # Runtime files go in /work and /tmp; the image filesystem is read-only.
       # The host enforces a hard deadline and bounded process/container cleanup.
@@ -122,6 +122,7 @@ jobs:
             --engine docker \
             --image "$OPENCODE_REVIEW_IMAGE" \
             --instructions "$GITHUB_WORKSPACE/default-branch/AGENTS.md" \
+            --config "$GITHUB_WORKSPACE/default-branch/.github/review/config" \
             --checkout "$GITHUB_WORKSPACE/pr-source" \
             --context "$RUNNER_TEMP/opencode-review/input/context.md" \
             --events "$RUNNER_TEMP/opencode-review/model-output/events.jsonl"

@@ -4,6 +4,7 @@
 import argparse
 from collections import Counter, deque
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,8 +23,6 @@ from extract import EVENT_TYPES
 
 
 _PROGRESS_INTERVAL = 30
-_REVIEW_TIMEOUT = 17 * 60
-_KILL_GRACE = 5
 _CLEANUP_TIMEOUT = 30
 _FINISH_REASONS = {"stop", "end_turn", "length", "tool-calls", "content-filter", "error", "unknown"}
 _TOOL_NAMES = {"execute", "glob", "grep", "question", "read", "shell",
@@ -178,14 +177,14 @@ def _report_progress(output, stopped, started, diagnostic=None):
                   f"{summary}; phase={phase}; last_finish={last_finish}", flush=True)
             previous = size
 
-def _stop_process(process):
+def _stop_process(process, grace):
     """Bound termination of the engine client and any local descendants."""
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         return "completed"
     try:
-        process.wait(timeout=_KILL_GRACE)
+        process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         pass
     # Kill surviving descendants even if their process-group leader exited.
@@ -194,7 +193,7 @@ def _stop_process(process):
     except ProcessLookupError:
         pass
     try:
-        process.wait(timeout=_KILL_GRACE)
+        process.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         return "failed"
     return "completed"
@@ -213,7 +212,7 @@ def checkout_state(checkout):
             git(checkout, "status", "--porcelain=v1", "--untracked-files=all"))
 
 
-def run_review(engine, image, checkout, context, events, instructions):
+def run_review(engine, image, checkout, context, events, instructions, config_dir):
     checkout = worktree_root(checkout)
     context = Path(context).resolve(strict=True)
     events = Path(events).resolve()
@@ -223,17 +222,38 @@ def run_review(engine, image, checkout, context, events, instructions):
         raise ValueError("trusted AGENTS.md must be a file")
     if checkout in instructions.parents:
         raise ValueError("instructions must be outside the PR checkout")
+    config_dir = Path(config_dir).resolve(strict=True)
+    if config_dir == checkout or checkout in config_dir.parents:
+        raise ValueError("trusted configuration must be outside the PR checkout")
+    config_paths = {name: (config_dir / name).resolve(strict=True)
+                    for name in ("opencode.json", "limits.json")}
+    for path in config_paths.values():
+        if not path.is_file() or checkout in path.parents:
+            raise ValueError("trusted configuration must contain files outside the PR checkout")
+    # Read one snapshot so the host and image use the same limits even if files change later.
+    configuration = {name: path.read_bytes() for name, path in config_paths.items()}
+    limits = json.loads(configuration["limits.json"])
+    fields = {"inspection_seconds", "finalization_seconds", "execution_overhead_seconds", "termination_grace_seconds"}
+    if (not isinstance(limits, dict) or set(limits) != fields
+            or any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                   for value in limits.values())):
+        raise ValueError("limits.json must define positive finite seconds for every execution limit")
+    kill_grace = limits["termination_grace_seconds"]
+    # Reserve termination grace for each phase, plus container startup and phase transitions.
+    execution_seconds = (limits["inspection_seconds"] + limits["finalization_seconds"]
+                         + 2 * kill_grace + limits["execution_overhead_seconds"])
+    inputs = {context, instructions, *config_paths.values()}
     if not context.is_file():
         raise ValueError("context must be a file")
-    if events == checkout or checkout in events.parents or events in (context, instructions):
-        raise ValueError("events output must be outside the checkout, context and instructions files")
+    if events == checkout or checkout in events.parents or events in inputs:
+        raise ValueError("events output must not overwrite the checkout, context, instructions, or configuration")
     diagnostics = events.with_suffix(".diagnostics.json").resolve()
     if (diagnostics == events or diagnostics == checkout or checkout in diagnostics.parents
-            or diagnostics in (context, instructions)):
+            or diagnostics in inputs):
         raise ValueError("diagnostics output must not overwrite review inputs or events")
     stderr = events.with_suffix(".stderr.log").resolve()
     if (stderr == checkout or checkout in stderr.parents
-            or stderr in (events, diagnostics, context, instructions)):
+            or stderr in inputs or stderr in (events, diagnostics)):
         raise ValueError("stderr output must not overwrite review inputs, events or diagnostics")
     if not os.environ.get("CSCS_INFERENCE_API_KEY"):
         raise ValueError("CSCS_INFERENCE_API_KEY is required")
@@ -250,6 +270,12 @@ def run_review(engine, image, checkout, context, events, instructions):
         for source, destination in ((context, staged_context), (instructions, staged_instructions)):
             shutil.copyfile(source, destination)
             destination.chmod(0o444)
+        staged_config = Path(staging) / "config"
+        staged_config.mkdir(mode=0o755)
+        for filename, content in configuration.items():
+            destination = staged_config / filename
+            destination.write_bytes(content)
+            destination.chmod(0o444)
         name = "opencode-review-" + uuid.uuid4().hex
         command = [
             executable, "run", "--rm", "--name", name, "--pull=never", "--read-only",
@@ -260,6 +286,7 @@ def run_review(engine, image, checkout, context, events, instructions):
             "--volume", f"{checkout}:/input/pr-source:ro",
             "--volume", f"{staged_context}:/input/context.md:ro",
             "--volume", f"{staged_instructions}:/instructions/AGENTS.md:ro",
+            "--volume", f"{staged_config}:/opt/reviewer/config/opencode:ro",
             # Deliberately do not forward GitHub/Actions tokens, SSH agents,
             # Docker sockets, host HOME, or any other environment variable.
             "--env", "CSCS_INFERENCE_API_KEY", image,
@@ -277,7 +304,7 @@ def run_review(engine, image, checkout, context, events, instructions):
             with events.open("w", encoding="utf-8") as output, stderr.open("w", encoding="utf-8") as errors:
                 os.fchmod(output.fileno(), 0o600)
                 os.fchmod(errors.fileno(), 0o600)
-                print(f"review runner: starting isolated reviewer; deadline={_REVIEW_TIMEOUT}s; "
+                print(f"review runner: starting isolated reviewer; deadline={execution_seconds:g}s; "
                       f"progress every {_PROGRESS_INTERVAL}s "
                       "(byte counts and fixed event/tool summaries only)", flush=True)
                 stopped = threading.Event()
@@ -289,20 +316,20 @@ def run_review(engine, image, checkout, context, events, instructions):
                     # Raw stderr may contain source, model text, or credentials; never log it.
                     process = subprocess.Popen(command, stdout=output, stderr=errors,
                                                start_new_session=True)
-                    diagnostic["exit_code"] = process.wait(timeout=_REVIEW_TIMEOUT)
+                    diagnostic["exit_code"] = process.wait(timeout=execution_seconds)
                 except BaseException as error:
                     diagnostic["failure"] = (
                         "timeout" if isinstance(error, subprocess.TimeoutExpired)
                         else "interrupted" if isinstance(error, KeyboardInterrupt) else "runner_error")
                     if process is not None:
-                        diagnostic["process_cleanup"] = _stop_process(process)
+                        diagnostic["process_cleanup"] = _stop_process(process, kill_grace)
                         diagnostic["exit_code"] = process.returncode
                     if isinstance(error, subprocess.TimeoutExpired):
-                        raise ValueError("isolated reviewer exceeded the 17-minute hard deadline") from error
+                        raise ValueError(f"isolated reviewer exceeded the {execution_seconds:g}s hard deadline") from error
                     raise
                 finally:
                     stopped.set()
-                    reporter.join(timeout=_KILL_GRACE)
+                    reporter.join(timeout=kill_grace)
                 print(f"review runner: exited; status={diagnostic['exit_code']}; "
                       f"elapsed={int(time.monotonic() - started)}s; "
                       f"stdout={os.fstat(output.fileno()).st_size} bytes", flush=True)
@@ -346,6 +373,7 @@ def main(argv=None):
     parser.add_argument("--checkout", required=True)
     parser.add_argument("--context", required=True)
     parser.add_argument("--instructions", required=True, help="AGENTS.md from the default-branch checkout")
+    parser.add_argument("--config", required=True, help="review configuration directory from the default-branch checkout")
     parser.add_argument("--events", required=True)
     args = parser.parse_args(argv)
 
@@ -354,7 +382,7 @@ def main(argv=None):
 
     previous_handler = signal.signal(signal.SIGTERM, interrupted)
     try:
-        run_review(args.engine, args.image, args.checkout, args.context, args.events, args.instructions)
+        run_review(args.engine, args.image, args.checkout, args.context, args.events, args.instructions, args.config)
     except (OSError, ValueError) as error:
         parser.exit(1, f"review runner: {error}\n")
     except KeyboardInterrupt:

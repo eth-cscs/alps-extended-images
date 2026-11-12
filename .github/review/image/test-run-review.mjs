@@ -16,6 +16,10 @@ function exercise(t, scenario) {
   writeFileSync(join(root, 'opencode', 'opencode.json'), JSON.stringify({
     model: 'fixture/reviewer', agents: { 'grumpy-reviewer': { steps: 2 } },
   }));
+  writeFileSync(join(root, 'opencode', 'limits.json'), JSON.stringify({
+    inspection_seconds: 0.8, finalization_seconds: 0.8,
+    execution_overhead_seconds: 0.3, termination_grace_seconds: 0.05,
+  }));
   // A real child process supplies adversarial CLI events, including failures with exit status zero.
   writeFileSync(join(bin, 'opencode'), `#!/usr/bin/env node
 import { appendFileSync } from 'node:fs';
@@ -70,7 +74,7 @@ if (!final && scenario === 'inspection-exit') process.exit(7);
   const calls = join(root, 'calls');
   const harness = join(root, 'run.mjs');
   writeFileSync(harness, `import { runReview } from ${JSON.stringify(runner.href)};
-try { await runReview({ inspectionMs: 800, finalMs: 800, killGraceMs: 50 }); }
+try { await runReview(); }
 catch (error) { console.error(error.message); process.exitCode = error.exitCode || 1; }`);
   const result = spawnSync(process.execPath, [harness], {
     env: { ...process.env, PATH: bin + delimiter + process.env.PATH, XDG_CONFIG_HOME: root, SCENARIO: scenario, CALLS: calls },

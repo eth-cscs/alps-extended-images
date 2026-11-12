@@ -23,6 +23,18 @@ def trusted_runner(tmp_path):
 
 
 @pytest.fixture
+def trusted_config(tmp_path):
+    config = tmp_path / "trusted-config"
+    config.mkdir()
+    (config / "opencode.json").write_text("{}\n")
+    (config / "limits.json").write_text(json.dumps({
+        "inspection_seconds": 10, "finalization_seconds": 5,
+        "execution_overhead_seconds": 13, "termination_grace_seconds": 1,
+    }))
+    return config
+
+
+@pytest.fixture
 def checkout(tmp_path):
     checkout = tmp_path / "pr-source"
     checkout.mkdir()
@@ -47,8 +59,8 @@ def runner(monkeypatch):
     return module
 
 
-@pytest.mark.parametrize("target", ["checkout-alias", "context", "instructions-alias"])
-def test_runner_cannot_overwrite_inputs(tmp_path, trusted_runner, checkout, target):
+@pytest.mark.parametrize("target", ["checkout-alias", "context", "instructions-alias", "configuration"])
+def test_runner_cannot_overwrite_inputs(tmp_path, trusted_runner, trusted_config, checkout, target):
     helper, instructions = trusted_runner
     source = checkout / "app.py"
     environment = dict(os.environ, CSCS_INFERENCE_API_KEY="local-path-safety-test")
@@ -60,6 +72,8 @@ def test_runner_cannot_overwrite_inputs(tmp_path, trusted_runner, checkout, targ
         output = alias / "app.py"
     elif target == "context":
         output = context
+    elif target == "configuration":
+        output = trusted_config / "opencode.json"
     else:
         output = tmp_path / "instruction-alias"
         output.symlink_to(instructions)
@@ -69,16 +83,17 @@ def test_runner_cannot_overwrite_inputs(tmp_path, trusted_runner, checkout, targ
     result = subprocess.run([
         sys.executable, str(helper), "--engine", "/bin/false", "--image", "unused",
         "--checkout", str(checkout), "--context", str(context), "--events", str(output),
-        "--instructions", str(instructions),
+        "--instructions", str(instructions), "--config", str(trusted_config),
     ], env=environment, text=True, capture_output=True)
     assert result.returncode == 1
     assert source.read_text() == "important source\n"
     assert context.read_text() == "important context\n"
     assert instructions.read_text() == "trusted repository instructions\n"
+    assert (trusted_config / "opencode.json").read_text() == "{}\n"
 
 
 @pytest.mark.parametrize("alias", [False, True])
-def test_runner_rejects_pr_supplied_instructions(tmp_path, checkout, alias):
+def test_runner_rejects_pr_supplied_instructions(tmp_path, trusted_config, checkout, alias):
     instructions = checkout / "AGENTS.md"
     instructions.write_text("untrusted PR instructions\n")
     if alias:
@@ -93,7 +108,7 @@ def test_runner_rejects_pr_supplied_instructions(tmp_path, checkout, alias):
     result = subprocess.run([
         sys.executable, str(HELPER), "--engine", "/bin/true", "--image", "unused",
         "--checkout", str(checkout), "--context", str(context), "--events", str(output),
-        "--instructions", str(instructions),
+        "--instructions", str(instructions), "--config", str(trusted_config),
     ], env=environment, text=True, capture_output=True)
     assert result.returncode == 1
     assert not output.exists()
@@ -102,7 +117,7 @@ def test_runner_rejects_pr_supplied_instructions(tmp_path, checkout, alias):
 
 @pytest.mark.parametrize("changed_source", [False, True])
 def test_cleanup_timeout_preserves_failure_and_checks_source(
-        tmp_path, trusted_runner, checkout, runner, monkeypatch, capsys, changed_source):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, capsys, changed_source):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("review input\n")
@@ -121,7 +136,7 @@ def test_cleanup_timeout_preserves_failure_and_checks_source(
     expected = "checkout" if changed_source else "exit 1"
     with pytest.raises(ValueError, match=expected):
         runner.run_review("/bin/false", "unused", checkout, context,
-                          tmp_path / "events.jsonl", instructions)
+                          tmp_path / "events.jsonl", instructions, trusted_config)
     assert "container cleanup failed" in capsys.readouterr().err
     diagnostic = json.loads((tmp_path / "events.diagnostics.json").read_text())
     assert diagnostic["status"] == "failed"
@@ -306,7 +321,7 @@ def test_progress_classifies_tool_results_without_exposing_payload(
 
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_runner_retains_private_events_and_sanitized_diagnostics(
-        tmp_path, trusted_runner, checkout, runner, monkeypatch, capfd, exit_code):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, capfd, exit_code):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("private context marker\n")
@@ -328,9 +343,9 @@ def test_runner_retains_private_events_and_sanitized_diagnostics(
     events = tmp_path / "events.jsonl"
     if exit_code:
         with pytest.raises(ValueError, match=f"exit {exit_code}"):
-            runner.run_review(str(engine), "unused", checkout, context, events, instructions)
+            runner.run_review(str(engine), "unused", checkout, context, events, instructions, trusted_config)
     else:
-        runner.run_review(str(engine), "unused", checkout, context, events, instructions)
+        runner.run_review(str(engine), "unused", checkout, context, events, instructions, trusted_config)
     diagnostic_path = tmp_path / "events.diagnostics.json"
     raw = diagnostic_path.read_text()
     diagnostic = json.loads(raw)
@@ -352,7 +367,7 @@ def test_runner_retains_private_events_and_sanitized_diagnostics(
 
 
 def test_hanging_reviewer_is_killed_and_container_cleanup_is_bounded(
-        tmp_path, trusted_runner, checkout, runner, monkeypatch):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("review input\n")
@@ -369,13 +384,15 @@ def test_hanging_reviewer_is_killed_and_container_cleanup_is_bounded(
     )
     engine.chmod(0o700)
     monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-deadline-test")
-    monkeypatch.setattr(runner, "_REVIEW_TIMEOUT", 0.5)
-    monkeypatch.setattr(runner, "_KILL_GRACE", 0.1)
+    (trusted_config / "limits.json").write_text(json.dumps({
+        "inspection_seconds": 0.1, "finalization_seconds": 0.1,
+        "execution_overhead_seconds": 0.1, "termination_grace_seconds": 0.1,
+    }))
     monkeypatch.setattr(runner, "_CLEANUP_TIMEOUT", 0.5)
     started = time.monotonic()
     with pytest.raises(ValueError, match="hard deadline"):
         runner.run_review(str(engine), "unused", checkout, context,
-                          tmp_path / "events.jsonl", instructions)
+                          tmp_path / "events.jsonl", instructions, trusted_config)
     assert time.monotonic() - started < 5
     diagnostic = json.loads((tmp_path / "events.diagnostics.json").read_text())
     assert diagnostic["status"] == "failed"
@@ -389,7 +406,7 @@ def test_hanging_reviewer_is_killed_and_container_cleanup_is_bounded(
 
 @pytest.mark.parametrize("suffix", ["diagnostics.json", "stderr.log"])
 def test_private_outputs_cannot_overwrite_inputs(
-        tmp_path, trusted_runner, checkout, runner, monkeypatch, suffix):
+        tmp_path, trusted_runner, trusted_config, checkout, runner, monkeypatch, suffix):
     _, instructions = trusted_runner
     context = tmp_path / "context.md"
     context.write_text("review input\n")
@@ -397,8 +414,50 @@ def test_private_outputs_cannot_overwrite_inputs(
     monkeypatch.setenv("CSCS_INFERENCE_API_KEY", "local-path-safety-test")
     with pytest.raises(ValueError, match=suffix.split(".")[0]):
         runner.run_review("/bin/true", "unused", checkout, context,
-                          tmp_path / "events.jsonl", instructions)
+                          tmp_path / "events.jsonl", instructions, trusted_config)
     assert context.read_text() == "review input\n"
     assert not (tmp_path / "events.jsonl").exists()
+
+
+@pytest.mark.parametrize("target", ["directory", "opencode.json", "limits.json"])
+def test_runner_rejects_pr_configuration_symlinks(
+        tmp_path, trusted_runner, trusted_config, checkout, runner, target):
+    _, instructions = trusted_runner
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    if target == "directory":
+        alias = tmp_path / "config-alias"
+        alias.symlink_to(checkout, target_is_directory=True)
+        config = alias
+    else:
+        source = checkout / target
+        source.write_bytes((trusted_config / target).read_bytes())
+        (trusted_config / target).unlink()
+        (trusted_config / target).symlink_to(source)
+        config = trusted_config
+    output = tmp_path / "events.jsonl"
+    with pytest.raises(ValueError, match="trusted configuration"):
+        runner.run_review("/bin/true", "unused", checkout, context, output, instructions, config)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("changes", [
+    {"inspection_seconds": 0},
+    {"finalization_seconds": True},
+    {"termination_grace_seconds": float("inf")},
+    {"execution_seconds": 17},
+])
+def test_invalid_limits_fail_before_launch(
+        tmp_path, trusted_runner, trusted_config, checkout, runner, changes):
+    _, instructions = trusted_runner
+    context = tmp_path / "context.md"
+    context.write_text("review input\n")
+    path = trusted_config / "limits.json"
+    limits = json.loads(path.read_text())
+    path.write_text(json.dumps(limits | changes))
+    output = tmp_path / "events.jsonl"
+    with pytest.raises(ValueError, match="limits.json"):
+        runner.run_review("/bin/true", "unused", checkout, context, output, instructions, trusted_config)
+    assert not output.exists()
 
 

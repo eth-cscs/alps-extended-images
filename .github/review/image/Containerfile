@@ -18,13 +18,12 @@ RUN set -eux; \
     test "$(opencode --version)" = "opencode v${OPENCODE_VERSION}"; \
     npm cache clean --force
 
-COPY .github/review/image/opencode.json /opt/reviewer/config/opencode/opencode.json
 COPY .github/review/image/grumpy-reviewer.md /opt/reviewer/grumpy-reviewer.md
 COPY .github/review/image/entrypoint.sh /opt/reviewer/entrypoint.sh
 COPY .github/review/image/run-review.mjs /opt/reviewer/run-review.mjs
 RUN set -eux; \
     chmod 0555 /opt/reviewer/entrypoint.sh; \
-    mkdir -p /input/pr-source /instructions /work; \
+    mkdir -p /input/pr-source /instructions /work /opt/reviewer/config/opencode; \
     touch /input/context.md /instructions/AGENTS.md
 
 LABEL org.opencontainers.image.source="https://github.com/eth-cscs/alps-extended-images" \
