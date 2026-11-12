@@ -124,20 +124,22 @@ Each run snapshots these files, so edits do not change an active review.
 | Agent `steps` in [opencode.json](config/opencode.json) | Maximum model iterations for each phase, not individual tool calls |
 | Model and variant `body.max_tokens` in the same configuration | Per-request output allowances, including reasoning tokens, not a review-wide token quota |
 | Model and variant `body.reasoning_effort` in the same configuration | Inspection effort and the finalizer's separate override |
-| Provider `settings.timeout` in the same configuration | Request deadline, including response-body consumption |
+| Provider `settings.headerTimeout` in the same configuration | Time allowed for response headers to arrive |
+| Provider `settings.chunkTimeout` in the same configuration | Maximum wait between streamed response chunks |
 | `inspection_seconds`, `finalization_seconds` in [limits.json](config/limits.json) | Separate phase deadlines |
 | `execution_overhead_seconds` in the same file | Extra time for container startup and phase transitions |
 | `termination_grace_seconds` in the same file | Grace before force-killing a stopped process |
 | Worker `timeout-minutes` | GitHub job timeout |
 
 Reasoning effort is a qualitative setting, not a token quota or completion-time guarantee.
+There is no separate total-request deadline, so a response can keep streaming until its phase deadline.
 Each phase can finish before reaching its iteration allowance.
 Finalization starts a new message and has its own allowance, with room to avoid the CLI's generic last-step summary prompt on its first response.
 Recovery from empty or token-truncated responses can add provider requests, so step limits are not hard HTTP request-count quotas.
 Provider retries do not extend phase deadlines, and a job timeout does not guarantee a publishable response.
 The host deadline is calculated as `inspection_seconds + finalization_seconds + 2 × termination_grace_seconds + execution_overhead_seconds`.
 It grows automatically with the phase deadlines; leave time within the GitHub job timeout for setup, host cleanup, and artifact upload.
-All configured durations must be positive finite seconds.
+Durations in `limits.json` must be positive finite seconds; provider timeout settings use milliseconds.
 The workflow's job timeout is configured separately; changing it alone does not extend inspection.
 
 The image and host share a phase-marked JSONL event contract.
