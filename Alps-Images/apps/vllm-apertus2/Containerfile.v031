@@ -45,7 +45,7 @@ ARG NVCC_THREADS="4"
 RUN source /opt/alps/package-helpers.sh; \
     apt_get update; \
     apt_get install -y --no-install-recommends \
-      build-essential cargo ca-certificates cmake curl git ninja-build \
+      build-essential cargo ca-certificates cmake curl git libdw-dev ninja-build \
       pkg-config python3-dev rustc; \
     rm -rf /var/lib/apt/lists/*; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
@@ -233,7 +233,7 @@ RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     apt_get update; \
     apt_get install -y --no-install-recommends \
-      ca-certificates libelf1 libgfortran5 libgomp1 libhwloc15 libibverbs1 \
+      ca-certificates libdw1 libelf1 libgfortran5 libgomp1 libhwloc15 libibverbs1 \
       libnl-3-200 libnl-route-3-200 libnuma1 rdma-core zlib1g; \
     rm -rf /var/lib/apt/lists/*; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt --upgrade \
