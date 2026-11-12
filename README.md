@@ -57,7 +57,9 @@ Both releases use `Containerfile.primus-alps`, with release-specific helpers in 
 Component inputs are copied immediately before use; the existing profile and patch-tree hashes cover them.
 The 26.3 steps preserve the system SDK during network cleanup and build private, checksum-pinned OpenMPI 4.1.6 against the Alps libfabric/CXI, UCX and UCC stack.
 This preserves the unchanged vendor Torch dependency on `libmpi_cxx.so.40`; the private helpers reject other profiles, and the final Torch loader check requires all MPI4 core libraries to resolve under `/opt/hpcx/ompi`.
-Primus26.8 and existing PyTorch images retain the shared MPI5 installer and defaults; only the26.3 Apertus2 child inherits MPI4.
+The vendor `libtorch_cpu.so` references removed MPI C++ bindings, which are outside [Open MPI 5's C ABI compatibility guarantee](https://docs.open-mpi.org/en/v5.0.x/building-apps/abi-compatibility.html); library or directory symlinks cannot replace those symbols.
+The Primus 26.3 base installs MPI4, which its derived images, including Apertus2, inherit.
+Primus 26.8 and existing PyTorch images retain the shared MPI5 installer and defaults.
 The private cleanup deliberately retains inherited APT package ownership metadata while replacing vendor network files, avoiding dependency-driven removal of the compute SDK.
 The private MPI4 source patch replaces an OFI convenience macro removed by newer libfabric headers with equivalent `offsetof` pointer arithmetic.
 A26.3-only final RCCL relink explicitly retains the ROCm SMI dependency that unchanged Torch2.10 previously obtained through vendor RCCL; it reuses compiled device objects and does not modify Torch or introduce a preload override.
@@ -192,6 +194,16 @@ The generated child pipeline can contain these stages:
 5. **test-apps** — runs app workload tests and app `vetnode` coverage declared in app-local `ci.yaml` files
 6. **mark-app-tested** — creates tested-marker tags for app images that passed the current validation
 7. **publish** — promotes validated images to stable JFrog and GHCR refs while preserving stable-tag immutability rules
+
+ROCm bases declare separate `env`, `rccl`, and `mpi` validation jobs.
+Previously, RCCL all-reduce and OSU all-to-all ran one after the other in the same Slurm step.
+Both programs use MPI.
+With MPI4, RCCL passed, but OSU then failed to create its MPI session directory during startup.
+We suspect MPI4 cleanup after RCCL removed directories that OSU needed; the log did not show the exact filesystem error.
+Each benchmark now runs in its own two-node, eight-rank job, with separate MPI session directories.
+GPU CI still needs to confirm this fixes the failure.
+All three jobs must pass before the base tested marker is created; app builds and base publication depend on that marker.
+This uses one additional two-node allocation per ROCm base compared with running both benchmarks in one job.
 
 **Image tagging strategy:** canonical image tags include deterministic content hashes, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds.
 App hashes include the accelerator variant, canonical base image ref, selected Containerfile and profile values, declared tests and patches, source files, and copied shared helpers.

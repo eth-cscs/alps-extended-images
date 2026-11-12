@@ -780,7 +780,7 @@ def test_schema_current_repo_metadata_is_valid(gen, monkeypatch):
 
 
 @pytest.mark.parametrize('version,suffix', [('26.3','263'),('26.8','268')])
-def test_primus_app_waits_for_both_base_validations(monkeypatch, gen, version, suffix):
+def test_primus_app_waits_for_all_base_validations(monkeypatch, gen, version, suffix):
     for key, value in {
         'IMAGE_PREFIX': 'registry/alps', 'GHCR_IMAGE_PREFIX': 'ghcr/alps',
         'ALPS_REV': 'alps7-dev', 'CI_COMMIT_SHORT_SHA': 'abc123',
@@ -792,13 +792,51 @@ def test_primus_app_waits_for_both_base_validations(monkeypatch, gen, version, s
     app = gen.app_env('apertus-2', f'megatron-primus{suffix}-rocm')
     assert app['BASE_IMAGE'] == base['CANON_IMAGE_REF']
     child = gen.Child()
-    mark = gen.add_base(child, base, [{'name':'env'}, {'name':'collectives'}], valid=False)
+    base_tests = gen.load_yaml(ROOT/'Alps-Images/ROCm/ci.yaml')['tests']
+    mark = gen.add_base(child, base, base_tests, valid=False)
     tests = gen.load_yaml(ROOT/'Alps-Images/apps/apertus-2/ci.yaml')['tests'][app['VARIANT']]
     gen.add_app(child, app, tests, {base['CANON_IMAGE_REF']:mark}, {base['CANON_IMAGE_REF']:False})
     prefix = f'app-apertus-2-megatron-primus{suffix}-rocm'
     assert child.data[f'build-{prefix}']['needs'] == [mark]
     assert child.data[mark]['needs'] == [f'test-base-primus-rocm-{version.replace(".","-")}-env',
-                                         f'test-base-primus-rocm-{version.replace(".","-")}-collectives']
+                                         f'test-base-primus-rocm-{version.replace(".","-")}-rccl',
+                                         f'test-base-primus-rocm-{version.replace(".","-")}-mpi']
     assert child.data[f'build-{prefix}']['variables']['BASE_IMAGE'] == base['CANON_IMAGE_REF']
     for test in tests:
         assert child.data[f'test-{prefix}-{test["name"]}']['image'] == app['CANON_IMAGE_REF']
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_rocm_benchmarks_have_independent_launches_and_required_marker_dependencies(monkeypatch, gen, exists):
+    metadata = gen.load_yaml(ROOT / "Alps-Images/ROCm/ci.yaml")
+    templates = gen.load_yaml(ROOT / "ci-pipelines/child-templates.yaml")
+    commands = {
+        "rccl": "all_reduce_perf -b 32 -e 4M -f 2 -g 1",
+        "mpi": "/usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator rocm",
+    }
+    for variant in metadata["variants"]:
+        base = base_image(FAMILY="rocm", NAME=variant["name"], VARIANT=variant["variant"])
+        fake_registry(monkeypatch, gen, {base["CANON_IMAGE_REF"]: "sha256:existing"} if exists else {})
+        child = gen.Child()
+        mark = gen.add_base(child, base, metadata["tests"], valid=False)
+        prefix = gen.slug(f'base-{base["NAME"]}-rocm-{base["VARIANT"]}')
+        expected_tests = [f"test-{prefix}-{name}" for name in ("env", "rccl", "mpi")]
+        assert child.data[mark]["needs"] == expected_tests
+        assert child.data[f"publish-{prefix}"]["needs"] == [mark]
+        for name, command in commands.items():
+            job = child.data[f"test-{prefix}-{name}"]
+            assert job["image"] == base["CANON_IMAGE_REF"]
+            assert job["needs"] == ([] if exists else [f"build-{prefix}"])
+            template = templates[job["extends"][0]]
+            assert template["stage"] == "test-base"
+            assert template["extends"] == [".container-runner-beverin-mi300", ".child-slurm-template"]
+            # Each runner script launches exactly one MPI executable, without
+            # nesting srun inside the runner's already distributed rank shells.
+            assert template["script"] == [command]
+            assert template["variables"]["SLURM_JOB_NUM_NODES"] == 2
+            assert template["variables"]["SLURM_NTASKS"] == 8
+            # Neither a benchmark failure nor a skipped benchmark may publish
+            # a tested marker through an optional edge or allow_failure policy.
+            for config in (job, template, child.data[mark], templates[".child-mark-base-tested-template"]):
+                assert not config.get("allow_failure", False)
+                assert config.get("when", "on_success") == "on_success"

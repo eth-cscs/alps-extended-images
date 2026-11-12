@@ -377,12 +377,22 @@ include:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
-# ROCm base multi-node RCCL and MPI smoke test.
-.child-rocm-base-collectives-test-template:
+# The container runner launches the entire script in one Slurm/PMIx step.
+# RCCL tests also use MPI: give each independent MPI executable its own job so
+# MPI4 finalization cannot clean up session directories reused by the next one.
+.child-rocm-base-rccl-test-template:
   stage: test-base
   extends: [.container-runner-beverin-mi300, .child-slurm-template]
   script:
     - all_reduce_perf -b 32 -e 4M -f 2 -g 1
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 8
+
+.child-rocm-base-mpi-test-template:
+  stage: test-base
+  extends: [.container-runner-beverin-mi300, .child-slurm-template]
+  script:
     - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator rocm
   variables:
     SLURM_JOB_NUM_NODES: 2

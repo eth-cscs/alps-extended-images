@@ -10,4 +10,5 @@ variants:
     variant: "26.8"
 tests:
   - name: env
-  - name: collectives
+  - name: rccl
+  - name: mpi

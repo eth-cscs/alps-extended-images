@@ -235,7 +235,8 @@ BASE_TEST_TEMPLATES = {
     },
     "rocm": {
         "env": ".child-rocm-base-env-test-template",
-        "collectives": ".child-rocm-base-collectives-test-template",
+        "rccl": ".child-rocm-base-rccl-test-template",
+        "mpi": ".child-rocm-base-mpi-test-template",
     },
 }
 # Adding a new accelerator family requires registering its base test templates
