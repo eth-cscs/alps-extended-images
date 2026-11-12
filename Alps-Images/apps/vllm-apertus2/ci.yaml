@@ -21,3 +21,38 @@ tests:
       variables:
         SLURM_JOB_NUM_NODES: "1"
         SLURM_NTASKS: "1"
+  v031-rocm:
+    - name: imports
+      runner: rocm
+      timeout: 30m
+      script:
+        - /opt/tests/vllm-apertus2/apertus2_import_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+    - name: ray-rccl-uccl-ep
+      runner: rocm
+      timeout: 30m
+      script:
+        - /opt/tests/vllm-apertus2/ray_nccl_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "2"
+        SLURM_NTASKS: "2"
+        VLLM_RAY_NCCL_WORLD_SIZE: "8"
+        FI_CXI_ENABLE_WRITEDATA: "1"
+    - name: mooncake-cxi
+      runner: rocm
+      timeout: 15m
+      script:
+        - /opt/tests/vllm-apertus2/mooncake_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"
+    - name: aiter
+      runner: rocm
+      timeout: 15m
+      script:
+        - /opt/tests/vllm-apertus2/aiter_smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"

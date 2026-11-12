@@ -55,6 +55,7 @@ CUDA app variants are available for the listed workloads; ROCm app variants are 
 | `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.07-py3` | vLLM serving workloads built from source (v0.31.0, Torch 2.13 stable-libtorch APIs), with UCCL-EP and Mooncake CXI KV transfer over Slingshot CXI |
 | `vllm-apertus2-cuda:alps7-dev` | `pytorch-cuda:26.07-py3` | Apertus2 vLLM 0.28 with UCCL EP/P2P and NIXL CXI KV transfer |
 | `vllm-apertus2-v031-cuda:alps7-dev` | `pytorch-cuda:26.07-py3` | Apertus2 vLLM 0.31 with UCCL EP/P2P and NIXL CXI KV transfer |
+| `vllm-apertus2-v031-rocm:alps7-dev` | `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` | Apertus2 vLLM 0.31 for ROCm/MI300A, with AITER, UCCL-EP, and Mooncake CXI KV transfer |
 | `vllm-rocm:alps7-dev`        | `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` | vLLM serving workloads built from source for ROCm/MI300 (v0.31.0), with AITER, UCCL-EP, and Mooncake CXI KV transfer over Slingshot CXI |
 
 ## HPC Stack Components
