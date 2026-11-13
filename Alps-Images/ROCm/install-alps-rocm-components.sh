@@ -736,6 +736,7 @@ PY
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
     register_rocm_sdk_ldconfig
+    link_hsa_runtime_to_core
     install_amdsmi_python
     link_amdsmi_package_library
     patch_torch_rocm_disable_implicit_amdsmi
@@ -815,6 +816,53 @@ else:
             except Exception:
                 pass
 PY
+}
+
+link_hsa_runtime_to_core() {
+    # Torch and HIP map libhsa-runtime64.so.1 from the ROCm core tree (via
+    # RPATH). Libraries that dlopen("libhsa-runtime64.so") instead -- notably
+    # the libfabric the Container Engine's CXI hook injects -- only find the
+    # unversioned name in the devel tree, which loads a second HSA runtime from
+    # a different inode. Its hsa_init() fails with OUT_OF_RESOURCES, libfabric
+    # disables ROCr hmem, and GPU buffers get pinned as host memory
+    # ("cxil_map ... Bad address"). Point every other copy, in any installed
+    # Python package or ROCm prefix, at the core one so any load path maps the
+    # same file, including auditwheel-renamed copies (libhsa-runtime64-<hash>.so*).
+    # Idempotent; rerun after installing packages that bundle HSA.
+    local core_lib="${ROCM_CORE_PREFIX}/lib/libhsa-runtime64.so.1"
+    local root lib
+    local -a roots=()
+
+    [[ -e "${core_lib}" ]] || die "ROCm core HSA runtime not found: ${core_lib}"
+    core_lib="$(readlink -f "${core_lib}")"
+    mapfile -t roots < <("${ROCM_PYTHON}" - <<'PY'
+import site
+import sysconfig
+
+paths = list(site.getsitepackages())
+paths += [sysconfig.get_paths()[key] for key in ("purelib", "platlib")]
+for path in dict.fromkeys(paths):
+    print(path)
+PY
+)
+    roots+=(
+        "${ROCM_DEVEL_PREFIX:-}"
+        "${ROCM_LIBRARIES_PREFIX:-}"
+        "${ROCM_BUILD_PREFIX:-}"
+        "${ROCM_SDK_ROOT:-}"
+    )
+    for root in "${roots[@]}"; do
+        [[ -n "${root}" && -d "${root}" ]] || continue
+        while IFS= read -r -d '' lib; do
+            [[ "$(readlink -f "${lib}")" == "${core_lib}" ]] && continue
+            ln -sfn "${core_lib}" "${lib}"
+            echo "Linked ${lib} -> ${core_lib}"
+        done < <(find "${root}" \( -type f -o -type l \) -name 'libhsa-runtime64*.so*' -print0)
+    done
+    # The core tree itself has no unversioned name; add it so dlopen() of
+    # libhsa-runtime64.so through ldconfig also lands on the core copy.
+    ln -sfn libhsa-runtime64.so.1 "${ROCM_CORE_PREFIX}/lib/libhsa-runtime64.so"
+    ldconfig
 }
 
 link_amdsmi_package_library() {
