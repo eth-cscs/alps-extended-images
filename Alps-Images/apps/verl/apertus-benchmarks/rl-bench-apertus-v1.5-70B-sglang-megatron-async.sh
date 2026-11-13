@@ -549,21 +549,25 @@ sbcast -f ${TRAINING_CONFIG}/sglang-apertus1p5-local-fixes.diff ${TRAINING_CONFI
 # CLAUDE.md).
 export MEGATRON_LM_DIR=${TRAINING_HOME}/Megatron-LM
 export MEGATRON_BRIDGE_DIR=${MEGATRON_LM_DIR}/Megatron-Bridge
-# Re-clone unless both checkouts are intact on the apertus branch: the scratch purge
+# Pinned apertus-branch commits (the versions the validated runs built:
+# megatron-core 0.18.0+60b5c9588, megatron-bridge 0.5.0+032c0740).
+export MEGATRON_LM_SHA="60b5c9588c53992ccb73032e1ab972740e5d95df"
+export MEGATRON_BRIDGE_SHA="032c0740fc084bc69fcf0a9c0ec35a588715153d"
+# Re-clone unless both checkouts are intact at the pinned commits: the scratch purge
 # deletes files from a stale checkout (.git/HEAD, models/apertus) but keeps the dirs.
-if ! git -C "${MEGATRON_LM_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1 \
-    || ! git -C "${MEGATRON_BRIDGE_DIR}" rev-parse --verify -q HEAD >/dev/null 2>&1 \
+if [ "$(git -C "${MEGATRON_LM_DIR}" rev-parse -q --verify HEAD 2>/dev/null)" != "${MEGATRON_LM_SHA}" ] \
+    || [ "$(git -C "${MEGATRON_BRIDGE_DIR}" rev-parse -q --verify HEAD 2>/dev/null)" != "${MEGATRON_BRIDGE_SHA}" ] \
     || [ ! -d "${MEGATRON_BRIDGE_DIR}/src/megatron/bridge/models/apertus" ]; then
-    echo "Cloning wqwqazwsxedc/Megatron-LM + Megatron-Bridge (apertus branches)..."
+    echo "Cloning wqwqazwsxedc/Megatron-LM ${MEGATRON_LM_SHA:0:9} + Megatron-Bridge ${MEGATRON_BRIDGE_SHA:0:9}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
         --container-writable bash -c '
         set -e
         rm -rf ${MEGATRON_LM_DIR}
         git clone https://github.com/wqwqazwsxedc/Megatron-LM.git ${MEGATRON_LM_DIR}
-        git -C ${MEGATRON_LM_DIR} checkout apertus
+        git -C ${MEGATRON_LM_DIR} checkout ${MEGATRON_LM_SHA}
         git clone https://github.com/wqwqazwsxedc/Megatron-Bridge.git ${MEGATRON_BRIDGE_DIR}
-        git -C ${MEGATRON_BRIDGE_DIR} checkout apertus
+        git -C ${MEGATRON_BRIDGE_DIR} checkout ${MEGATRON_BRIDGE_SHA}
     '
     [ -d "${MEGATRON_LM_DIR}/.git" ] && [ -d "${MEGATRON_BRIDGE_DIR}/.git" ] \
         || { echo "FATAL: Megatron-LM/Megatron-Bridge clone failed"; exit 1; }
@@ -965,7 +969,8 @@ echo "Added Apertus1p5Bridge (new bridge for Apertus1p5ForConditionalGeneration)
 # before that source change existed -- bump this string whenever the
 # packaged source changes in a way that needs a fresh wheel.
 export MEGATRON_WHEEL_DIR=${TRAINING_HOME}/wheels
-export MEGATRON_WHEEL_BUILD_VERSION="v3-apertus1p5-bridge-pruned-vocab"
+# The source commits are part of the marker, so a new pin forces a wheel rebuild.
+export MEGATRON_WHEEL_BUILD_VERSION="v3-apertus1p5-bridge-pruned-vocab-${MEGATRON_LM_SHA:0:9}-${MEGATRON_BRIDGE_SHA:0:9}"
 mkdir -p ${MEGATRON_WHEEL_DIR}
 if ! ls ${MEGATRON_WHEEL_DIR}/megatron_core-*.whl >/dev/null 2>&1 \
     || ! ls ${MEGATRON_WHEEL_DIR}/megatron_bridge-*.whl >/dev/null 2>&1 \
