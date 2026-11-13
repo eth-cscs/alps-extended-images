@@ -906,6 +906,20 @@ def test_named_target_recursive_sources_exclude_transients_and_cover_dockerignor
     assert run_meta(command, cwd=named_app_root).stdout != changed_source
 
 
+def test_manual_build_generates_both_megatron_targets(tmp_path):
+    for target, recipe in (
+        ("megatron-base-cuda", "Containerfile.megatron-base"),
+        ("megatron-cuda", "Containerfile.megatron"),
+    ):
+        script = generate_manual("app", "apertus-2", target, output=tmp_path / f"{target}.sh")
+
+        assert f"Alps-Images/apps/apertus-2/{recipe}" in script
+        assert re.search(
+            r'--build-arg BASE_IMAGE="localhost/alps-images/pytorch-cuda:.*-[0-9a-f]{32}"',
+            script,
+        )
+
+
 def source_rocm(command):
     return (
         "set -e; source Alps-Images/ROCm/install-alps-rocm-components.sh; "
