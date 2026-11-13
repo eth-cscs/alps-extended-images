@@ -27,6 +27,8 @@ cd $TRAINING_HOME
 export ROLLOUT_NNODES=$(python3 -c "import math; print(max(1, math.ceil($SLURM_JOB_NUM_NODES * 0.25)))")
 export TRAINING_NNODES=$(( SLURM_JOB_NUM_NODES - ROLLOUT_NNODES ))
 
+[ -s ~/HF_TOKEN ] || { echo "FATAL: ~/HF_TOKEN not found or empty (needed for Hugging Face downloads)"; exit 1; }
+HF_TOKEN_VALUE=$(cat ~/HF_TOKEN)
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users","/tmp"]
@@ -37,10 +39,12 @@ entrypoint = true
 # /users is mounted: keep ~/.local site-packages from shadowing the image.
 PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
-HF_TOKEN = "$(cat ~/HF_TOKEN)"
+HF_TOKEN = "${HF_TOKEN_VALUE}"
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
+# env.toml carries the token; keep it readable by the owner only.
+chmod 600 "${TRAINING_CONFIG}/env.toml"
 
 cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
@@ -355,10 +359,15 @@ fi
 
 # SGLang has no native apertus1p5 model
 export SGLANG_APERTUS_PATCH_URL="https://github.com/sgl-project/sglang/pull/32979.diff"
+# sha256 of the PR diff at head 9595c6a2 (2026-10-28). The PR is still open: a push changes the
+# diff and the job stops. Review the new diff and update this hash.
+export SGLANG_APERTUS_PATCH_SHA256="${SGLANG_APERTUS_PATCH_SHA256:-407f476dfa7ce8b12b34ca7a86d5cf182bdcacf7d223d47ff0939159a9dbbd94}"
 curl -sfL "${SGLANG_APERTUS_PATCH_URL}" -o ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff \
     || { echo "FATAL: could not download sglang PR #32979 diff"; exit 1; }
 [ -s ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff ] \
     || { echo "FATAL: sglang PR #32979 diff is empty"; exit 1; }
+echo "${SGLANG_APERTUS_PATCH_SHA256}  ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff" | sha256sum -c --quiet - \
+    || { echo "FATAL: sglang PR #32979 diff changed upstream (sha256 mismatch); review it and update SGLANG_APERTUS_PATCH_SHA256"; exit 1; }
 # This is an open, unmerged, still-actively-evolving PR (see CLAUDE.md) -- its
 # diff is re-fetched fresh on every submission, not pinned to a commit, so its
 # file list grows over time as the PR is updated upstream. Run 3152782 (sibling
@@ -856,7 +865,8 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --port=$PORT \
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
-        --disable-usage-stats || true
+        --disable-usage-stats \
+        || { echo "FATAL: ray start --head failed"; exit 1; }
 
     # Fail instead of idling the allocation when a node never joins (pyxis container-start
     # failure left run 3260837 waiting at 15/16 nodes).

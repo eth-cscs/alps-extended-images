@@ -318,34 +318,8 @@ srun --mpi=pmix --network=disable_rdzv_get -N ${SLURM_JOB_NUM_NODES} --ntasks-pe
     --environment="${TRAINING_CONFIG}/env.toml" \
     --container-writable bash -c '
 
-# Redirect pip cache to local tmpfs — ~/.cache/pip is on Lustre which causes
-# "Stale file handle" (ESTALE) errors during package downloads.
-export PIP_CACHE_DIR=/tmp/pip_cache_${SLURM_JOB_ID}
-export TMPDIR=/tmp
-mkdir -p $PIP_CACHE_DIR
-
-# Some proxies intercept PyPI HTTPS; set PIP_TRUSTED="--trusted-host pypi.org --trusted-host
-# files.pythonhosted.org" at submit time (or in pip.conf) if yours does.
-PIP_TRUSTED="${PIP_TRUSTED:-}"
-
-pip install "PyYAML>=6.0.2" --ignore-installed ${PIP_TRUSTED} --quiet
-
-# megatron-bridges PyPI wheel ships only megatron/bridge/* — its megatron-core dep
-# (a local path in the source repo) is excluded from requires_dist, so install separately.
-pip install megatron-bridge "megatron-core>=0.17.0" "nvidia-resiliency-ext>=0.6.0" \
-    ${PIP_TRUSTED} --quiet
-pip install nvidia-modelopt[hf] ${PIP_TRUSTED} --quiet
-
-# megatron-bridges mlflow/comet-ml deps upgrade opentelemetry-exporter-prometheus
-# to 0.64b0 which requires opentelemetry-sdk~=1.43.0, but the SDK stays at 1.33.1
-# → Ray dashboard crashes with AttributeError → GCS never starts → all workers fail.
-# Fix: upgrade the SDK to match the already-upgraded exporters.
-pip install "opentelemetry-sdk>=1.43.0" ${PIP_TRUSTED} --quiet
-
-# Restore sglang-compatible versions that megatron-bridge overwrites
-pip install "transformers==5.8.1" "timm==1.0.16" ${PIP_TRUSTED} --quiet
-pip install "flashinfer_cubin==0.6.12" "flashinfer_python[cu13]==0.6.12" \
-    ${PIP_TRUSTED} --quiet
+# No runtime pip installs: the image bakes megatron-core/bridge, nvidia-modelopt, opentelemetry-sdk,
+# transformers and flashinfer at the versions sglang needs (see the Containerfile).
 
 
 
@@ -383,7 +357,8 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --port=$PORT \
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
-        --disable-usage-stats || true
+        --disable-usage-stats \
+        || { echo "FATAL: ray start --head failed"; exit 1; }
 
     # Fail instead of idling the allocation when a node never joins (pyxis container-start
     # failure left run 3260837 waiting at 15/16 nodes).

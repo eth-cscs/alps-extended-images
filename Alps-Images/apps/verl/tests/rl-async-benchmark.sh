@@ -280,8 +280,10 @@ export RAY_memory_usage_threshold=0.99
 
 # Apply Verl fixes
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Fix-fsdp-model-loading-on-async
-git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+# Pinned commit (branch tip of theely/verl Fix-fsdp-model-loading-on-async as of 2026-11-10).
+git fetch pr_origin 9708019aba71867b506578fb5c3b35868cc01efa \
+    || { echo "FATAL: could not fetch theely/verl 9708019a"; exit 1; }
+git reset --hard 9708019aba71867b506578fb5c3b35868cc01efa
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
 export FLASHINFER_WORKSPACE_BASE=/tmp/flashinfer_${SLURM_JOB_ID}_${SLURM_PROCID}

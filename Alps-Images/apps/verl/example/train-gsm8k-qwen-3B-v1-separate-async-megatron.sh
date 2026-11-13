@@ -425,7 +425,8 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --port=$PORT \
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
-        --disable-usage-stats || true
+        --disable-usage-stats \
+        || { echo "FATAL: ray start --head failed"; exit 1; }
 
     # Fail instead of idling the allocation when a node never joins (pyxis container-start
     # failure left run 3260837 waiting at 15/16 nodes).

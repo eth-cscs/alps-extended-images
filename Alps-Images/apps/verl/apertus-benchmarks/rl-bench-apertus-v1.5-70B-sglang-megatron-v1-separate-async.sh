@@ -68,9 +68,10 @@ export MODEL_REPO="swiss-ai"
 # be a real HF-format snapshot dir (config.json, tokenizer files, safetensors) --
 # same shape as what `hf download` produces -- and the HF download step below is
 # skipped entirely.
-# Example: /capstor/store/cscs/swissai/infra01/users/xyixuan/rl-bench/models/ap1p5-70b-sft-262k-2700_corr
+# The benchmark runs in CLAUDE.md used the Apertus SFT checkpoint:
+#   MODEL_CHECKPOINT_PATH=/capstor/store/cscs/swissai/infra01/RL_Infra/models/ap1p5-70b-sft-262k-2700_corr
 # IMPORTANT: do not include a trailing slash in the path.
-export MODEL_CHECKPOINT_PATH="/capstor/store/cscs/swissai/infra01/RL_Infra/models/ap1p5-70b-sft-262k-2700_corr"
+export MODEL_CHECKPOINT_PATH="${MODEL_CHECKPOINT_PATH:-}"
 
 
 # Passed through to data.apply_chat_template_kwargs.enable_thinking (verl's
@@ -246,6 +247,8 @@ export PPO_MINI_BATCH_SIZE=48        # prompts; x ROLLOUT_N (16) = 768 rows
 export PARAMETER_SYNC_STEP=1         # was 2 -- see comment above
 export TRAIN_BATCH_SIZE=$(( PARAMETER_SYNC_STEP * PPO_MINI_BATCH_SIZE ))  # 48
 
+[ -s ~/HF_TOKEN ] || { echo "FATAL: ~/HF_TOKEN not found or empty (needed for Hugging Face downloads)"; exit 1; }
+HF_TOKEN_VALUE=$(cat ~/HF_TOKEN)
 cat > "${TRAINING_CONFIG}/env.toml" <<- EOF
 image = "${VERL_IMAGE}"
 mounts = ["/capstor", "/iopsstor", "/users","/tmp"]
@@ -256,13 +259,15 @@ entrypoint = true
 # /users is mounted: keep ~/.local site-packages from shadowing the image.
 PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
-HF_TOKEN = "$(cat ~/HF_TOKEN)"
+HF_TOKEN = "${HF_TOKEN_VALUE}"
 ENABLE_THINKING = "${ENABLE_THINKING}"  # chat-template thinking switch (reward.py no longer reads it)
 BENCHMARK = "${BENCHMARK}"  # dataset_prepare.py reads this (gsm8k | dapo-math)
 REWARD_MODE = "${REWARD_MODE}"  # reward.py reads this (shaped | binary)
 [annotations]
 com.hooks.cxi.enabled = "false"
 EOF
+# env.toml carries the token; keep it readable by the owner only.
+chmod 600 "${TRAINING_CONFIG}/env.toml"
 
 cat > "${TRAINING_CONFIG}/grpo_gsm8k.yaml" <<- EOF
 defaults:
@@ -685,12 +690,17 @@ fi
 
 # SGLang has no native apertus1p5 model
 export SGLANG_APERTUS_PATCH_URL="https://github.com/sgl-project/sglang/pull/32979.diff"
+# sha256 of the PR diff at head 9595c6a2 (2026-10-28). The PR is still open: a push changes the
+# diff and the job stops. Review the new diff and update this hash.
+export SGLANG_APERTUS_PATCH_SHA256="${SGLANG_APERTUS_PATCH_SHA256:-407f476dfa7ce8b12b34ca7a86d5cf182bdcacf7d223d47ff0939159a9dbbd94}"
 curl -sfL "${SGLANG_APERTUS_PATCH_URL}" -o ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff \
     || { echo "FATAL: could not download sglang PR #32979 diff"; exit 1; }
 [ -s ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff ] \
     || { echo "FATAL: sglang PR #32979 diff is empty"; exit 1; }
+echo "${SGLANG_APERTUS_PATCH_SHA256}  ${TRAINING_CONFIG}/sglang-apertus1p5-full.diff" | sha256sum -c --quiet - \
+    || { echo "FATAL: sglang PR #32979 diff changed upstream (sha256 mismatch); review it and update SGLANG_APERTUS_PATCH_SHA256"; exit 1; }
 # This is an open, unmerged, still-actively-evolving PR (see CLAUDE.md) -- its
-# diff is re-fetched fresh on every submission, not pinned to a commit, so its
+# diff is re-fetched on every submission (sha256-checked above), and its
 # file list grows over time as the PR is updated upstream. Run 3152782: between
 # the previous submission and this one the PR grew from 6 files to 10 (adding
 # docs/test files plus a new hunk in detokenizer_manager.py, a tool-call-parser
@@ -1178,7 +1188,8 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --port=$PORT \
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
-        --disable-usage-stats || true
+        --disable-usage-stats \
+        || { echo "FATAL: ray start --head failed"; exit 1; }
 
     # Fail instead of idling the allocation when a node never joins (pyxis container-start
     # failure left run 3260837 waiting at 15/16 nodes).
