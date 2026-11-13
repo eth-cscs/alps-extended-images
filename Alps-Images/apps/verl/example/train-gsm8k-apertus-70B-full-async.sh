@@ -34,6 +34,8 @@ workdir = "/workspace/verl"
 writable = true
 entrypoint = true
 [env]
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -254,7 +256,9 @@ sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.p
 
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -285,6 +289,8 @@ export MASTER_NODE_IP=$(hostname -i)
 export PORT=6382
 export RAY_ADDRESS="${MASTER_NODE_IP}:${PORT}"
 
+[ -r /users/${USER}/.wandb_api_key ] \
+    || { echo "FATAL: /users/${USER}/.wandb_api_key not found (wandb logging needs the API key)"; exit 1; }
 export WANDB_API_KEY=$(cat /users/${USER}/.wandb_api_key)
 export WANDB_SILENT=true # Suppress WandB logs
 
@@ -303,8 +309,10 @@ sed -i "s/s_aux=s_aux\.to(query\.dtype),/s_aux=s_aux.to(query.dtype) if s_aux is
 
 # Apply Verl fixes
 git remote add pr_origin https://github.com/theely/verl.git 2>/dev/null || true
-git fetch pr_origin Fix-fsdp-model-loading-on-async
-git reset --hard pr_origin/Fix-fsdp-model-loading-on-async
+# Pinned commit (branch tip of theely/verl Fix-fsdp-model-loading-on-async as of 2026-11-10).
+git fetch pr_origin 9708019aba71867b506578fb5c3b35868cc01efa \
+    || { echo "FATAL: could not fetch theely/verl 9708019a"; exit 1; }
+git reset --hard 9708019aba71867b506578fb5c3b35868cc01efa
 
 
 # Redirect all JIT/kernel caches to local tmpfs — Lustre does not support file locking
@@ -334,8 +342,12 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --port=$PORT \
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
-        --disable-usage-stats || true
+        --disable-usage-stats \
+        || { echo "FATAL: ray start --head failed"; exit 1; }
 
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -343,6 +355,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5

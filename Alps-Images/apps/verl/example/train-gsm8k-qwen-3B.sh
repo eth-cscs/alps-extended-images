@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --time=8:00:00
 
-export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl-cuda:alps7-dev"
+export VERL_IMAGE="jfrog.svc.cscs.ch/docker-group-csstaff/alps-images/verl:alps7-dev-e797f7d7c5a406c3"
 
 export MODEL_NAME="Qwen2.5-3B-Instruct"
 export MODEL_REPO="Qwen"
@@ -28,6 +28,8 @@ workdir = "/workspace/verl"
 writable = true
 entrypoint = true
 [env]
+# /users is mounted: keep ~/.local site-packages from shadowing the image.
+PYTHONNOUSERSITE = "1"
 PMIX_MCA_psec = "native"
 [annotations]
 com.hooks.cxi.enabled = "false"
@@ -185,7 +187,9 @@ sbcast -f ${TRAINING_CONFIG}/gsm8k_reward.py ${TRAINING_CONFIG}/gsm8k_reward.py
 sbcast -f ${TRAINING_CONFIG}/prepare_gsm8k.py ${TRAINING_CONFIG}/prepare_gsm8k.py
 
 # Download model (skip if already present)
-if [ ! -d "${TRAINING_HOME}/models/${MODEL_NAME}" ]; then
+if [ ! -f "${TRAINING_HOME}/models/${MODEL_NAME}/config.json" ] \
+    || ! ls "${TRAINING_HOME}/models/${MODEL_NAME}"/*.safetensors >/dev/null 2>&1; then
+    # Check files, not the directory: the scratch purge leaves empty model dirs behind.
     echo "Downloading ${MODEL_NAME}..."
     srun --mpi=pmix --network=disable_rdzv_get -N 1 --ntasks=1 -u \
         --environment="${TRAINING_CONFIG}/env.toml" \
@@ -248,8 +252,12 @@ if [ $SLURM_PROCID -eq 0 ]; then
         --port=$PORT \
         --num-cpus=${SLURM_CPUS_PER_TASK} \
         --num-gpus=4 \
-        --disable-usage-stats || true
+        --disable-usage-stats \
+        || { echo "FATAL: ray start --head failed"; exit 1; }
     
+    # Fail instead of idling the allocation when a node never joins (pyxis container-start
+    # failure left run 3260837 waiting at 15/16 nodes).
+    RAY_JOIN_DEADLINE=$(( SECONDS + ${RAY_JOIN_TIMEOUT:-1200} ))
     while true; do
             alive_nodes=$(ray status | awk "/Active:/{flag=1;next}/Pending:/{flag=0}flag" | grep "node_" | wc -l)
             if ! [[ "$alive_nodes" =~ ^[0-9]+$ ]]; then
@@ -257,6 +265,10 @@ if [ $SLURM_PROCID -eq 0 ]; then
             fi
             if [ "$alive_nodes" -ge "$SLURM_JOB_NUM_NODES" ]; then
                 break
+            fi
+            if [ "$SECONDS" -ge "$RAY_JOIN_DEADLINE" ]; then
+                echo "FATAL: only $alive_nodes/$SLURM_JOB_NUM_NODES nodes joined Ray within ${RAY_JOIN_TIMEOUT:-1200}s"
+                exit 1
             fi
             echo "Waiting for all nodes to join [$alive_nodes/$SLURM_JOB_NUM_NODES]"
             sleep 5
