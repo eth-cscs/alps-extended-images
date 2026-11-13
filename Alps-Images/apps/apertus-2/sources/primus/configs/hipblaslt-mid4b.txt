@@ -1,0 +1,216 @@
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,128,16384,2560,1,128,0,0,2560,0,128,0,128,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,259334,1995.99,41.4038,76046,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,1280,8192,2560,1,2560,0,0,2560,0,1280,0,1280,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,467737,563.661,114.78,82030,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,12960,16384,2560,1,12960,0,0,2560,0,12960,0,12960,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,496017,244.29,2191.79,89849,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,12960,2560,16384,1,12960,0,1,2560,0,12960,0,12960,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,492760,326.716,2206.27,95760,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,12960,2560,8192,1,12960,0,1,2560,0,12960,0,12960,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,475083,423.017,1144.18,95758,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,12960,8192,2560,1,12960,0,0,2560,0,12960,0,12960,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,480940,264.202,1130.25,89849,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,1440,16384,2560,1,1440,0,0,2560,0,1440,0,1440,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,422892,451.392,285.642,76354,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,1440,2560,16384,1,1440,0,1,2560,0,1440,0,1440,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,334260,413.789,361.383,96119,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,1440,2560,8192,1,1440,0,1,2560,0,1440,0,1440,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,328677,481.609,183.761,96120,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,1440,8192,2560,1,1440,0,0,2560,0,1440,0,1440,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,407343,457.95,148.273,89852,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,200064,16384,2560,1,2560,0,0,2560,0,200064,0,200064,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,441183,187.634,38039.9,83027,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,128,2560,16384,1,128,0,1,2560,0,128,0,128,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,117514,924.498,91.3714,96366,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,200064,8192,2560,1,2560,0,0,2560,0,200064,0,200064,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,440395,212.332,19054,83027,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,1280,16384,1,2560,0,1,1280,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,384897,507.59,278.968,96255,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,1280,8192,1,2560,0,1,1280,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,358204,553.834,149.878,96256,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,16384,128,1,128,0,0,128,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,178430,1373.3,60.1774,90198,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,16384,1280,1,1280,0,0,1280,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,436715,501.452,245.868,83026,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,1280,1,2560,0,0,1280,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,449139,515.718,239.067,89850,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,16384,12960,1,12960,0,0,12960,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,529141,260.603,2054.58,83111,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,16384,1440,1,1440,0,0,1440,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,458622,489.53,263.389,82197,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,200064,1,2560,0,0,200064,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,542433,230.695,30939.5,76634,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,2560,1,2560,0,0,2560,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,499061,391.483,430.305,76634,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,128,2560,8192,1,128,0,1,2560,0,128,0,128,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,106539,862.38,50.392,96366,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,16384,2560,1,2560,0,0,2560,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,475029,372.632,452.074,83026,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,25920,1,2560,0,0,25920,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,525015,239.707,4141.45,76634,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,2880,1,2560,0,0,2880,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,504190,375.126,479.168,76634,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,5120,1,2560,0,0,5120,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,534383,321.987,803.725,76634,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,7680,1,2560,0,0,7680,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,528387,286.337,1219.27,75696,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,16384,7956,1,2560,0,0,7956,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,524236,281.882,1273.09,76634,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,200064,16384,1,2560,0,1,200064,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,487905,290.707,34397.3,95778,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,200064,8192,1,2560,0,1,200064,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,475353,391.31,17652.8,95778,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,2560,16384,1,2560,0,1,2560,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,439796,419.992,488.29,96109,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,2560,8192,1,2560,0,1,2560,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,426992,504.851,251.466,96109,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,128,8192,2560,1,128,0,0,2560,0,128,0,128,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,196136,1520.73,27.3723,89797,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,25920,16384,1,2560,0,1,25920,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,499527,313.255,4352.77,96073,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,25920,8192,1,2560,0,1,25920,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,470050,401.646,2312.87,96048,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,2880,16384,1,2560,0,1,2880,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,454987,416.107,530.987,96461,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,2880,8192,1,2560,0,1,2880,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,436302,498.222,276.863,96461,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,5120,16384,1,2560,0,1,5120,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,470849,364,912.174,95741,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,5120,8192,1,2560,0,1,5120,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,453355,453.556,473.687,95985,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,7680,16384,1,2560,0,1,7680,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,452451,322.343,1423.9,96038,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,7680,8192,1,2560,0,1,7680,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,443048,416.381,727.061,95675,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,7956,16384,1,2560,0,1,7956,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,463253,328.09,1440.68,96123,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,2560,7956,8192,1,2560,0,1,7956,0,2560,0,2560,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,446160,417.43,747.935,96123,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,1280,16384,2560,1,1280,0,0,2560,0,1280,0,1280,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,472026,541.997,227.475,76398,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,8192,128,1,128,0,0,128,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,173786,1347.44,30.8926,90194,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,8192,1280,1,1280,0,0,1280,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,425185,512.382,126.268,82197,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,1280,1,2560,0,0,1280,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,424237,511.24,126.55,76335,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,8192,12960,1,12960,0,0,12960,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,529613,290.941,1026.38,82197,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,8192,1440,1,1440,0,0,1440,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,440675,495.423,137.058,82197,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,200064,1,2560,0,0,200064,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,529240,255.168,15855.4,76625,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,2560,1,2560,0,0,2560,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,468940,394.511,228.972,75719,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2560,8192,2560,1,2560,0,0,2560,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,470133,395.515,228.391,83021,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,25920,1,2560,0,0,25920,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,522105,268.057,2082.27,76625,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,2880,1,2560,0,0,2880,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,481857,385.9,250.689,76625,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,1280,16384,2560,1,2560,0,0,2560,0,1280,0,1280,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,475604,546.106,225.764,82030,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,5120,1,2560,0,0,5120,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,510737,336.772,420.468,76625,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,7680,1,2560,0,0,7680,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,515840,308.859,624.462,76398,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,2560,8192,7956,1,2560,0,0,7956,0,2560,0,2560,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,506548,301.165,658.77,75719,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,25920,16384,2560,1,2560,0,0,2560,0,25920,0,25920,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,481335,219.764,4517.28,90116,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,25920,8192,2560,1,2560,0,0,2560,0,25920,0,25920,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,491246,252.213,2213.07,90149,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2880,16384,2560,1,2560,0,0,2560,0,2880,0,2880,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,464344,345.48,520.287,82890,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,2880,8192,2560,1,2560,0,0,2560,0,2880,0,2880,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,451964,361.96,267.269,90131,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,5120,16384,2560,1,2560,0,0,2560,0,5120,0,5120,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,479357,288.832,895.984,90131,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,5120,8192,2560,1,2560,0,0,2560,0,5120,0,5120,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,472731,311.711,454.272,90116,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,7680,16384,2560,1,2560,0,0,2560,0,7680,0,7680,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,506129,274.275,1272.89,90171,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,1280,2560,16384,1,1280,0,1,2560,0,1280,0,1280,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,385980,509.018,278.186,96256,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,7680,8192,2560,1,2560,0,0,2560,0,7680,0,7680,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,498591,298.532,646.065,90149,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,7956,16384,2560,1,2560,0,0,2560,0,7956,0,7956,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,461932,248.381,1444.8,90131,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    T,N,0,1,7956,8192,2560,1,2560,0,0,2560,0,7956,0,7956,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,454342,270.126,734.467,90190,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,T,0,1,1280,2560,8192,1,1280,0,1,2560,0,1280,0,1280,0,bf16_r,bf16_r,f32_r,f32_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,f32_r,0,1,0,360885,557.979,148.765,96256,gfx942:sramecc+:xnack-,228
+Git Version: c4b2dc9869-dirty
+    transA,transB,grouped_gemm,batch_count,m,n,k,alpha,lda,stride_a,beta,ldb,stride_b,ldc,stride_c,ldd,stride_d,a_type,b_type,c_type,d_type,compute_type,scaleA,scaleB,scaleC,scaleD,amaxD,swizzle_a,swizzle_b,activation_type,bias_vector,bias_type,aux_type,rotating_buffer,flush,use_gpu_timer,hipblaslt-Gflops,hipblaslt-GB/s,us,solution_index,gcnArchName,CUs
+    N,N,0,1,1280,8192,2560,1,1280,0,0,2560,0,1280,0,1280,0,bf16_r,bf16_r,bf16_r,bf16_r,f32_r,0,0,0,0,0,0,0,none,0,f32_r,bf16_r,0,1,0,438065,527.904,122.555,76316,gfx942:sramecc+:xnack-,228

@@ -1,0 +1,297 @@
+Subject: [PATCH] Preserve Alps CXI and ROCm 10 EP fixes on UCCL 18b588a
+
+Reconcile vLLM common UCCL patches 1-3 (physical GPU rank selection,
+serialized barrier cleanup, serialized CXI initialization) and ROCm patches
+1-4 (ROCR HMEM, HIP extended launch, volatile-head snapshots, device math).
+All seven fixes remain needed at 18b588a048a3a3fe3d4bd60aa5678c66e284df31.
+The old ROCm runtime top-k capacity patch is omitted: that fix is upstream.
+The pinned source preserves the device-memory D2H handle table fix, avoiding
+managed-memory eviction faults during training combine.
+
+diff --git a/ep/bench/utils.py b/ep/bench/utils.py
+index f21b1a5..852e8c3 100644
+--- a/ep/bench/utils.py
++++ b/ep/bench/utils.py
+@@ -595,18 +595,6 @@ def initialize_uccl(
+     use_normal_mode=False,
+     rdma_buffer_is_host_allocated=False,
+ ):
+-    # Only sweep barriers belonging to OUR mode so we don't stomp on a
+-    # coexisting Buffer of the other mode in the same process. The C++
+-    # shm name format is `/uccl_barrier_<ip>_uid<uid>_<ht|ll>_th<idx>`,
+-    # where `ht` = high-throughput (use_normal_mode=True) and `ll` =
+-    # low-latency.
+-    try:
+-        mode_token = "_ht_" if use_normal_mode else "_ll_"
+-        for shm_file in glob.glob(f"/dev/shm/uccl_barrier_*{mode_token}*"):
+-            os.remove(shm_file)
+-    except Exception:
+-        pass
+-
+     (
+         local_rank,
+         node_local_rank,
+@@ -615,6 +603,22 @@ def initialize_uccl(
+         num_nodes,
+         detected_is_intranode,
+     ) = detect_group_topology(group)
++
++    # Only one rank per node may sweep the node-local barriers. Otherwise a
++    # rank can unlink a barrier that another rank has just created. Keep the
++    # mode filter so coexisting high-throughput and low-latency buffers do not
++    # remove each other's barriers.
++    if node_local_rank == 0:
++        try:
++            mode_token = "_ht_" if use_normal_mode else "_ll_"
++            for shm_file in glob.glob(
++                f"/dev/shm/uccl_barrier_*{mode_token}*"
++            ):
++                os.remove(shm_file)
++        except Exception:
++            pass
++    dist.barrier(group)
++
+     if is_intranode is None:
+         is_intranode = detected_is_intranode
+     elif is_intranode and not detected_is_intranode:
+diff --git a/ep/include/cxi_transport.hpp b/ep/include/cxi_transport.hpp
+index e6fcc39..fa29c6a 100644
+--- a/ep/include/cxi_transport.hpp
++++ b/ep/include/cxi_transport.hpp
+@@ -20,6 +20,7 @@ class CxiTransport final : public EpTransport {
+   ~CxiTransport() override;
+ 
+   void init(ProxyCtx& ctx) override;
++  void init(ProxyCtx& ctx, int cxi_local_rank);
+   void register_main_buffer(void* ptr, size_t len, int cuda_device) override;
+   void register_atomic_buffer(void* ptr, size_t len, int cuda_device) override;
+   LocalConnInfo local_info() const override;
+diff --git a/ep/include/ep_configs.cuh b/ep/include/ep_configs.cuh
+index 7188822..a144fda 100644
+--- a/ep/include/ep_configs.cuh
++++ b/ep/include/ep_configs.cuh
+@@ -65,6 +65,18 @@
+ typedef uint8_t __hip_fp8_storage_t;
+ typedef uint16_t __hip_fp8x2_storage_t;
+ #endif
++
++// ROCm 10 no longer exposes the CUDA-compatible global integer min/max
++// overloads expected by the kernels and HIP cooperative-groups headers.
++template <typename T, typename U>
++__host__ __device__ __forceinline__ constexpr auto min(T lhs, U rhs) {
++  return rhs < lhs ? rhs : lhs;
++}
++
++template <typename T, typename U>
++__host__ __device__ __forceinline__ constexpr auto max(T lhs, U rhs) {
++  return lhs < rhs ? rhs : lhs;
++}
+ #define nv_bfloat16 hip_bfloat16
+ #define __nv_fp8x2_storage_t __hip_fp8x2_storage_t
+ #define __nv_fp8_storage_t __hip_fp8_storage_t
+diff --git a/ep/include/ep_launch.cuh b/ep/include/ep_launch.cuh
+index b80131e..c872af3 100644
+--- a/ep/include/ep_launch.cuh
++++ b/ep/include/ep_launch.cuh
+@@ -2,6 +2,15 @@
+ #include "exception.cuh"
+ 
+ #ifndef SETUP_LAUNCH_CONFIG
++#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
++#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                    \
++  hipLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
++  hipLaunchAttribute attr[1];                                                \
++  attr[0].id = hipLaunchAttributeCooperative;                                \
++  attr[0].val.cooperative = 1;                                               \
++  cfg.attrs = attr;                                                          \
++  cfg.numAttrs = 1
++#else
+ #ifndef DISABLE_SM90_FEATURES
+ #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                     \
+   cudaLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
+@@ -24,11 +33,17 @@
+   cfg.numAttrs = 1
+ #endif
+ #endif
++#endif
+ 
+ #ifndef LAUNCH_KERNEL
++#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
++#define LAUNCH_KERNEL(config, kernel, ...) \
++  CUDA_CHECK(hipLaunchKernelEx(config, kernel, ##__VA_ARGS__))
++#else
+ #define LAUNCH_KERNEL(config, kernel, ...) \
+   CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
+ #endif
++#endif
+ 
+ #ifndef SET_SHARED_MEMORY_FOR_TMA
+ #ifndef DISABLE_SM90_FEATURES
+diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
+index 3e92888..0c766c2 100644
+--- a/ep/src/cxi_transport.cpp
++++ b/ep/src/cxi_transport.cpp
+@@ -8,6 +8,7 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
++#include <mutex>
+ #include <string>
+ #include <sys/uio.h>
+ 
+@@ -20,7 +21,8 @@ void CxiTransport::unavailable() {
+ 
+ #ifndef USE_LIBFABRIC_CXI
+ 
+-void CxiTransport::init(ProxyCtx&) { unavailable(); }
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++void CxiTransport::init(ProxyCtx&, int) { unavailable(); }
+ void CxiTransport::register_main_buffer(void*, size_t, int) { unavailable(); }
+ void CxiTransport::register_atomic_buffer(void*, size_t, int) { unavailable(); }
+ LocalConnInfo CxiTransport::local_info() const { unavailable(); }
+@@ -72,8 +74,13 @@ fid_mr* register_cuda_mr(fid_domain* domain, fid_ep* ep, void* ptr, size_t len,
+   attr.iov_count = 1;
+   attr.access =
+       FI_SEND | FI_RECV | FI_WRITE | FI_READ | FI_REMOTE_WRITE | FI_REMOTE_READ;
++#ifdef __HIP_PLATFORM_AMD__
++  attr.iface = FI_HMEM_ROCR;
++  attr.device.rocr = cuda_device;
++#else
+   attr.iface = FI_HMEM_CUDA;
+   attr.device.cuda = static_cast<uint64_t>(cuda_device);
++#endif
+ 
+   fid_mr* mr = nullptr;
+   int rc = fi_mr_regattr(domain, &attr, 0, &mr);
+@@ -136,7 +143,14 @@ fi_info* select_cxi_info(fi_info* infos, int local_rank) {
+ 
+ }  // namespace
+ 
+-void CxiTransport::init(ProxyCtx& ctx) {
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++
++void CxiTransport::init(ProxyCtx& ctx, int cxi_local_rank) {
++  // CXI provider discovery is not safe when proxy threads initialize it
++  // concurrently within one process.
++  static std::mutex cxi_init_mutex;
++  std::lock_guard<std::mutex> lock(cxi_init_mutex);
++
+   ctx_ = &ctx;
+ 
+   fi_info* hints = fi_allocinfo();
+@@ -157,7 +171,7 @@ void CxiTransport::init(ProxyCtx& ctx) {
+   check_fi(rc, "fi_getinfo(cxi)");
+ 
+   try {
+-    fi_info* selected = select_cxi_info(info, ctx.local_rank);
++    fi_info* selected = select_cxi_info(info, cxi_local_rank);
+ 
+     check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr), "fi_fabric");
+     check_fi(fi_domain(fabric_, selected, &domain_, nullptr), "fi_domain");
+diff --git a/ep/src/internode.cu b/ep/src/internode.cu
+index 886f642..c694919 100644
+--- a/ep/src/internode.cu
++++ b/ep/src/internode.cu
+@@ -1439,8 +1439,10 @@ __global__ void __launch_bounds__(
+       int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+       for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i)
+-        if (not forward_channel_retired[i])
+-          min_head = min(min_head, forward_channel_head[i][target_rdma]);
++        if (not forward_channel_retired[i]) {
++          int const forward_head = forward_channel_head[i][target_rdma];
++          min_head = min_head < forward_head ? min_head : forward_head;
++        }
+       if (__all_sync(WARP_MASK, min_head == std::numeric_limits<int>::max()))
+         break;
+ 
+@@ -2577,11 +2579,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+ #pragma unroll
+         for (int j = 0; j < num_warps_per_rdma_rank; ++j)
+           if (not forwarder_retired[dst_rdma_rank * num_warps_per_rdma_rank +
+-                                    j])
+-            min_head = min(
+-                min_head,
++                                    j]) {
++            int const forward_head =
+                 forwarder_nvl_head[dst_rdma_rank * num_warps_per_rdma_rank + j]
+-                                  [dst_nvl_rank]);
++                                  [dst_nvl_rank];
++            min_head = min_head < forward_head ? min_head : forward_head;
++          }
+         if (min_head != std::numeric_limits<int>::max() and
+             min_head > last_nvl_head[dst_rdma_rank] and
+             lane_id < NUM_MAX_NVL_PEERS)
+@@ -2866,8 +2869,11 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+         int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+         for (int i = 0; i < kNumRDMAReceivers; ++i)
+-          if (not rdma_receiver_retired[i])
+-            min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
++          if (not rdma_receiver_retired[i]) {
++            int const receiver_head =
++                rdma_receiver_rdma_head[i][dst_rdma_rank];
++            min_head = min_head < receiver_head ? min_head : receiver_head;
++          }
+         if (min_head != std::numeric_limits<int>::max() and
+             min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
+             lane_id < kNumRDMARanks) {
+@@ -2994,9 +3000,11 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+           int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+           for (int i = 0; i < kNumRDMAReceivers; ++i)
+-            if (not rdma_receiver_retired[i])
+-              min_head =
+-                  min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
++            if (not rdma_receiver_retired[i]) {
++              int const receiver_head =
++                  rdma_receiver_rdma_head[i][dst_rdma_rank];
++              min_head = min_head < receiver_head ? min_head : receiver_head;
++            }
+           if (min_head != std::numeric_limits<int>::max() and
+               min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and
+               lane_id < kNumRDMARanks) {
+@@ -3019,10 +3027,12 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
+             int min_head = std::numeric_limits<int>::max();
+ #pragma unroll
+             for (int j = 0; j < num_warps_per_rdma_rank; ++j)
+-              if (not forwarder_retired[i * num_warps_per_rdma_rank + j])
+-                min_head = min(min_head,
+-                               forwarder_nvl_head[i * num_warps_per_rdma_rank +
+-                                                  j][dst_nvl_rank]);
++              if (not forwarder_retired[i * num_warps_per_rdma_rank + j]) {
++                int const forward_head =
++                    forwarder_nvl_head[i * num_warps_per_rdma_rank + j]
++                                      [dst_nvl_rank];
++                min_head = min_head < forward_head ? min_head : forward_head;
++              }
+             if (min_head != std::numeric_limits<int>::max() and
+                 min_head > last_nvl_head[i] and lane_id < NUM_MAX_NVL_PEERS)
+               st_relaxed_sys_global(
+diff --git a/ep/src/internode_ll.cu b/ep/src/internode_ll.cu
+index c3da6b2..d1116d0 100644
+--- a/ep/src/internode_ll.cu
++++ b/ep/src/internode_ll.cu
+@@ -187,7 +187,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(
+ #pragma unroll
+           for (int j = 0; j < kNumElemsPerRead; ++j) {
+             fp32_values[j] = static_cast<float>(bf16_values[j]);
+-            amax = fmaxf(amax, fabsf(fp32_values[j]));
++            amax =
++                __builtin_fmaxf(amax, __builtin_fabsf(fp32_values[j]));
+           }
+ 
+           // Reduce amax and scale
+diff --git a/ep/src/proxy.cpp b/ep/src/proxy.cpp
+index beb513e..d585294 100644
+--- a/ep/src/proxy.cpp
++++ b/ep/src/proxy.cpp
+@@ -272,7 +272,7 @@ void Proxy::init_common() {
+       if (!should_connect_peer(peer)) continue;
+ 
+       auto transport = std::make_unique<CxiTransport>();
+-      transport->init(ctx_);
++      transport->init(ctx_, cfg_.nic_local_rank);
+       transport->register_main_buffer(cfg_.gpu_buffer, cfg_.total_size,
+                                       cfg_.local_rank);
+       transport->register_atomic_buffer(atomic_buffer_ptr_, kAtomicBufferSize,

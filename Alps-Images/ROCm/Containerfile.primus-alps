@@ -1,0 +1,109 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG ALPS_ROCM_VERSION
+# Primus26.3 bakes ROCM_VERSION=72000; avoid that ENV shadowing the build ARG.
+ENV ROCM_VERSION=${ALPS_ROCM_VERSION} \
+    PYTHONDONTWRITEBYTECODE=1
+# Profile-selected SDK location: system (/opt/rocm) for 26.3, wheel for 26.8.
+ARG ROCM_SDK_LAYOUT
+# Preserve vendor compute: forbid missing SDK-wheel installs and skip SDK init
+# and Torch/AMD-SMI modifications; RCCL and Alps networking are still rebuilt.
+ARG ROCM_PRESERVE_COMPUTE=1
+ARG ROCM_PYPI_INDEX_URL
+ARG RCCL_GPU_TARGETS
+ARG ALPS_BUILD_JOBS=16
+ARG ALPS_CMAKE_BUILD_JOBS=16
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+COPY Alps-Images/common/alps-stack-versions.env /opt/alps/alps-stack-versions.env
+COPY Alps-Images/common/install-alps-hpc-stack.sh /opt/alps/install-alps-hpc-stack.sh
+COPY Alps-Images/ROCm/install-alps-rocm-components.sh /opt/alps/install-alps-rocm-components.sh
+COPY Alps-Images/ROCm/install-alps-rocm-stack.sh /opt/alps/install-alps-rocm-stack.sh
+COPY Alps-Images/ROCm/sources/primus/check-compute.py /opt/alps/check-primus-compute.py
+RUN python3 /opt/alps/check-primus-compute.py --write /opt/alps/primus-compute-before.json \
+    && bash /opt/alps/install-alps-rocm-stack.sh bootstrap
+ARG ROCM_VARIANT_DIR
+COPY Alps-Images/ROCm/${ROCM_VARIANT_DIR}/sources/purge-network.sh /opt/alps/primus/purge-network.sh
+RUN bash /opt/alps/primus/purge-network.sh
+ARG BOOST_VER=""
+ARG BOOST_BUILD_JOBS=16
+RUN bash /opt/alps/install-alps-rocm-stack.sh boost
+ARG XPMEM_REF=""
+RUN bash /opt/alps/install-alps-rocm-stack.sh xpmem
+ARG CASSINI_HEADERS_VERSION=""
+ARG CXI_DRIVER_VERSION=""
+ARG LIBCXI_VERSION=""
+RUN bash /opt/alps/install-alps-rocm-stack.sh cxi-bits
+ARG LIBFABRIC_COMMIT=""
+ARG LIBFABRIC_PATCH=""
+COPY Alps-Images/patches/libfabric/ /opt/alps/patches/libfabric/
+RUN bash /opt/alps/install-alps-rocm-stack.sh libfabric
+ARG ROCM_REBUILD_RCCL=1
+ARG ROCM_SYSTEMS_REPO
+ARG ROCM_SYSTEMS_COMMIT
+RUN bash /opt/alps/install-alps-rocm-stack.sh rccl
+ENV RCCL_HOME=/opt/alps/rocm/rccl \
+    MPI_HOME=/opt/hpcx/ompi \
+    MPI_PATH=/usr/local/mpi \
+    UCX_HOME=/opt/hpcx/ucx \
+    PATH=/opt/venv/bin:/usr/local/mpi/bin:${PATH} \
+    LD_LIBRARY_PATH=/opt/alps/rocm/rccl/lib:/opt/hpcx/ompi/lib:/opt/hpcx/ucx/lib:/opt/hpcx/ucc/lib:${LD_LIBRARY_PATH}
+ARG UCX_VERSION=""
+RUN bash /opt/alps/install-alps-rocm-stack.sh ucx
+ARG UCC_VERSION=""
+RUN bash /opt/alps/install-alps-rocm-stack.sh ucc
+ARG OMPI_VER=""
+COPY Alps-Images/ROCm/${ROCM_VARIANT_DIR}/sources/mpi* /opt/alps/primus/
+COPY Alps-Images/patches/openmpi/ /opt/alps/patches/openmpi/
+RUN bash /opt/alps/primus/mpi-install.sh
+ARG AWS_OFI_NCCL_REPO=""
+ARG AWS_OFI_NCCL_COMMIT=""
+ARG AWS_OFI_NCCL_PATCH=""
+COPY Alps-Images/patches/aws-ofi-nccl/ /opt/alps/patches/aws-ofi-nccl/
+RUN bash /opt/alps/install-alps-rocm-stack.sh aws-ofi
+ARG RCCL_TESTS_GPU_TARGETS
+ARG OSU_VERSION=""
+RUN bash /opt/alps/install-alps-rocm-stack.sh tests \
+    && bash /opt/alps/install-alps-rocm-stack.sh cleanup
+COPY Alps-Images/common/alps-runtime.common.env /opt/alps/env/alps-runtime.common.env
+COPY Alps-Images/common/alps-runtime.nccl-like.env /opt/alps/env/alps-runtime.nccl-like.env
+COPY Alps-Images/ROCm/alps-runtime.rocm.env /opt/alps/env/alps-runtime.rocm.env
+COPY Alps-Images/common/source-alps-env.sh /opt/alps/env/source-alps-env.sh
+COPY Alps-Images/common/install-alps-runtime-env.sh /opt/alps/env/install-alps-runtime-env.sh
+RUN bash /opt/alps/env/install-alps-runtime-env.sh \
+      /opt/alps/env/alps-runtime.common.env \
+      /opt/alps/env/alps-runtime.nccl-like.env \
+      /opt/alps/env/alps-runtime.rocm.env
+ENV BASH_ENV=/opt/alps/env/source-alps-env.sh
+COPY Alps-Images/common/alps-runtime-warning.txt /opt/alps/env/alps-runtime-warning.txt
+COPY Alps-Images/common/alps-runtime-warning.sh /opt/alps/env/alps-runtime-warning.sh
+COPY Alps-Images/common/alps-runtime-warning.py /opt/alps/env/alps-runtime-warning.py
+COPY Alps-Images/common/install-alps-runtime-warnings.sh /opt/alps/env/install-alps-runtime-warnings.sh
+RUN bash /opt/alps/env/install-alps-runtime-warnings.sh --python /opt/venv/bin/python
+COPY Alps-Images/common/run-alps-variant-hooks.sh /opt/alps/run-alps-variant-hooks.sh
+COPY Alps-Images/ROCm/${ROCM_VARIANT_DIR}/ /opt/alps/rocm-variant/
+RUN bash /opt/alps/run-alps-variant-hooks.sh /opt/alps/rocm-variant "ROCM_VARIANT_DIR=${ROCM_VARIANT_DIR}" \
+    && python3 /opt/alps/check-primus-compute.py --compare /opt/alps/primus-compute-before.json
+# Primus26.8 enables device-memory AQL rings. On Beverin MI300A the vendor
+# HIP/rocprofiler launch path segfaults before the first kernel with that policy.
+# Keep system-memory rings without changing vendor compute binaries or networking.
+# The older26.3 runtime ignores this newer flag; its reference numerics also pass.
+# A normal container environment override (including an empty value) is preserved.
+ENV DEBUG_CLR_AQL_DEV_QUEUE=0
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"

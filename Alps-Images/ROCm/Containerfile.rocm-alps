@@ -25,6 +25,12 @@ ARG AWS_OFI_NCCL_PATCH=""
 ARG OSU_VERSION=""
 
 ARG ROCM_VERSION
+# SDK location: wheel = Python-packaged ROCm; system = existing /opt/rocm SDK.
+ARG ROCM_SDK_LAYOUT=wheel
+# Set to 1 to forbid missing SDK-wheel installs and skip rocm-sdk init and
+# Torch/AMD-SMI modifications. RCCL and Alps networking are still replaceable.
+# The default 0 retains the normal PyTorch-base installation behavior.
+ARG ROCM_PRESERVE_COMPUTE=0
 ARG ROCM_REBUILD_RCCL
 ARG ROCM_SYSTEMS_REPO
 ARG ROCM_SYSTEMS_COMMIT
@@ -95,4 +101,3 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       com.cscs.alps.git.repo="${OCI_SOURCE}" \
       com.cscs.alps.git.commit="${OCI_REVISION}" \
       com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
-

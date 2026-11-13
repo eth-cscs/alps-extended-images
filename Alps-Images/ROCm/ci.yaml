@@ -4,6 +4,11 @@ variants:
     variant: rocm10.0-ubuntu24.04-py3.12-torch2.13
   - name: pytorch
     variant: rocm7.14-ubuntu24.04-py3.12-torch2.11
+  - name: primus
+    variant: "26.3"
+  - name: primus
+    variant: "26.8"
 tests:
   - name: env
-  - name: collectives
+  - name: rccl
+  - name: mpi

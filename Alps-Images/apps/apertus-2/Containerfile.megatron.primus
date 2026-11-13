@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTORCH_ROCM_ARCH=gfx942
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+COPY Alps-Images/apps/apertus-2/sources/primus/versions.env /opt/alps/apertus2-primus/versions.env
+COPY Alps-Images/apps/apertus-2/sources/primus/install.sh /opt/alps/apertus2-primus/install.sh
+COPY Alps-Images/apps/apertus-2/sources/primus/requirements.lock /opt/alps/apertus2-primus/requirements.lock
+COPY Alps-Images/apps/apertus-2/sources/primus/kda-gate.py /opt/alps/apertus2-primus/kda-gate.py
+ARG APERTUS_BUILD_JOBS=4
+RUN bash /opt/alps/apertus2-primus/install.sh dependencies
+COPY Alps-Images/apps/apertus-2/sources/primus/vendor/ /opt/alps/apertus2-primus/vendor/
+COPY Alps-Images/apps/apertus-2/sources/primus/install-source.py /opt/alps/apertus2-primus/install-source.py
+COPY Alps-Images/apps/apertus-2/sources/primus/build-share-storage.py /opt/alps/apertus2-primus/build-share-storage.py
+COPY Alps-Images/apps/apertus-2/sources/primus/prepare-source.py /opt/alps/apertus2-primus/prepare-source.py
+COPY Alps-Images/apps/apertus-2/patches/primus/ /opt/alps/apertus2-primus/patches/
+RUN bash /opt/alps/apertus2-primus/install.sh megatron
+COPY Alps-Images/apps/apertus-2/sources/primus/configs/ /opt/alps/apertus2-primus/configs/
+COPY Alps-Images/apps/apertus-2/sources/primus/reference.env /opt/alps/apertus2-primus/reference.env
+RUN bash /opt/alps/apertus2-primus/install.sh reference-config
+COPY Alps-Images/apps/apertus-2/tests/primus/ /opt/tests/apertus-2/primus/
+RUN python3 /opt/tests/apertus-2/primus/check-stack.py --metadata-only \
+    && python3 /opt/alps/check-primus-compute.py --compare /opt/alps/primus-compute-before.json
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"

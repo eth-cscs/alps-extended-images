@@ -41,6 +41,53 @@ Each variant corresponds to an AMD ROCm container extended with the Alps HPC sta
 | `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13-alps7-dev` | `docker.io/rocm/pytorch:rocm10.0_ubuntu24.04_py3.12_pytorch_release_2.13.0` | ROCm PyTorch workloads on MI300-class systems |
 | `pytorch-rocm:rocm7.14-ubuntu24.04-py3.12-torch2.11-alps7-dev` | `docker.io/rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0` | ROCm PyTorch workloads on MI300-class systems |
 
+### Primus ROCm bases (build/validation candidates)
+
+The independent `primus-rocm:26.3-alps7-dev` and `primus-rocm:26.8-alps7-dev` selectors use digest-pinned `docker.io/rocm/primus` images, not the PyTorch base profiles.
+Recipe selectors identify build inputs; use CI validation markers and publication records to establish the status of a particular image.
+The existing PyTorch-based variants remain separate.
+
+| Base selector | SDK layout | Audited upstream compute stack |
+| --- | --- | --- |
+| `primus-rocm:26.3` | System ROCm7.2.1 | Torch2.10 (`94c6e04`), Triton3.6, TE2.12, AITER0.1.1.dev1611, Turbo0.2 |
+| `primus-rocm:26.8` | Vendor-initialized ROCm10.1.0 wheels | Torch2.14, Triton3.8, TE2.17.1, AITER0.1.22.post1, Turbo0.5.1.dev7 |
+
+Profiles own `ROCM_BASE_IMAGE_REF`, `ROCM_VERSION`, `ROCM_SDK_LAYOUT` (`system` or `wheel`), and `ROCM_PRESERVE_COMPUTE=1`.
+Both releases use `Containerfile.primus-alps`, with release-specific helpers in each profile's `sources/` directory and MPI patches in `Alps-Images/patches/openmpi/`.
+Component inputs are copied immediately before use; the existing profile and patch-tree hashes cover them.
+The 26.3 steps preserve the system SDK during network cleanup and build private, checksum-pinned OpenMPI 4.1.6 against the Alps libfabric/CXI, UCX and UCC stack.
+This preserves the unchanged vendor Torch dependency on `libmpi_cxx.so.40`; the private helpers reject other profiles, and the final Torch loader check requires all MPI4 core libraries to resolve under `/opt/hpcx/ompi`.
+The vendor `libtorch_cpu.so` references removed MPI C++ bindings, which are outside [Open MPI 5's C ABI compatibility guarantee](https://docs.open-mpi.org/en/v5.0.x/building-apps/abi-compatibility.html); library or directory symlinks cannot replace those symbols.
+The Primus 26.3 base installs MPI4, which its derived images, including Apertus2, inherit.
+Primus 26.8 and existing PyTorch images retain the shared MPI5 installer and defaults.
+The private cleanup deliberately retains inherited APT package ownership metadata while replacing vendor network files, avoiding dependency-driven removal of the compute SDK.
+The private MPI4 source patch replaces an OFI convenience macro removed by newer libfabric headers with equivalent `offsetof` pointer arithmetic.
+A26.3-only final RCCL relink explicitly retains the ROCm SMI dependency that unchanged Torch2.10 previously obtained through vendor RCCL; it reuses compiled device objects and does not modify Torch or introduce a preload override.
+When rebuilding RCCL, the shared ROCm installer replaces direct and nested RCCL copies in SDK, Python-package and system-library roots with links to the Alps build and verifies their targets.
+Package-local loading paths remain available, while the canonical RCCL build and unrelated compute libraries are preserved.
+For system SDKs, the installer also forwards RCCL CMake metadata to the rebuilt package.
+Selector, helper-guard and hash-invalidation tests cover these image-specific exceptions.
+Preserve mode refuses missing SDK-wheel installation and skips implicit Torch/amdsmi rewrites and reinitialization of the vendor devel tree.
+The Primus Containerfile uses `ALPS_ROCM_VERSION` to avoid the older image's inherited numeric `ROCM_VERSION` shadowing the build argument.
+A before/after compute fingerprint guards package versions and selected Python/native library bytes, excluding the deliberately replaced RCCL.
+Both profiles rebuild RCCL from our pinned `rocm-systems` source for `gfx942`, and use our shared Alps libfabric/CXI, UCX, UCC, OpenMPI and aws-ofi-rccl builders.
+They retain unchanged Alps network defaults, including `NCCL_P2P_DISABLE=1` with override-preserving `defvar` semantics, rather than the reference launcher's network overrides.
+RCCL compilation and actual loaded-library compatibility must still pass independently on each release.
+Primus bases default to `DEBUG_CLR_AQL_DEV_QUEUE=0` in a late metadata/configuration layer, avoiding a vendor-enabled device-memory AQL-ring launch crash observed on Beverin MI300A with26.8.
+This changes HIP dispatch policy only, not compute-library bytes, the dedicated-device-queue setting, or Alps networking; explicit container environment overrides remain possible.
+The same setting is neutral for the older26.3 runtime, and standalone reference pointer-GEMM forward/dgrad/fused-wgrad numerical checks passed on both releases with it.
+These upstream kernel probes are not new-base, multi-node or training/restart acceptance.
+
+The associated Apertus2 targets are `megatron-primus263-rocm` and `megatron-primus268-rocm`.
+They install the checksum-verified Megatron reference snapshot, pinned optimizer, and FLA 0.5.2 plus its reference KDA gate without accessing the original scratch checkout.
+Reference compute settings are opt-in through `/opt/alps/apertus2-primus/reference.env`; image startup does not enable them or install a Python/Triton monkeypatch.
+Image-local reference tests select these settings explicitly; external training should supply its own source and experiment environment.
+The reference storage-sharing CPU extension is rebuilt for each base's Torch ABI, not copied as a binary.
+The opt-in configuration includes historical FLA/hipBLASLt tuning only for the matching Torch 2.10/Triton 3.6 generation.
+The source archive and its licenses are under `Alps-Images/apps/apertus-2/sources/primus/vendor/`; commit `d1277d86e0c1925f8438fd7630d86d05ab398dcd` was unavailable from the public upstream API at capture time.
+The26.8 app additionally carries a version-gated three-file private-API import adapter;26.3 keeps the unmodified reference source, and both retain unchanged vendor compute packages.
+See [Primus provenance and validation](Alps-Images/apps/apertus-2/sources/primus/README.md).
+
 ### Application Images
 
 Application images are built on top of accelerator-specific base images and include additional software for specific workloads.
@@ -49,7 +96,9 @@ CUDA app variants are available for the listed workloads; ROCm app variants are 
 | Image | Base | Description |
 |-------|------|-------------|
 | `apertus-1p5-cuda:alps7-dev` | `pytorch-cuda:26.02-py3` | Megatron-LM distributed LLM pretraining |
-| `apertus-2-cuda:alps7-dev`   | `pytorch-cuda:26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `apertus-2-megatron-base-cuda:alps7-dev` | `pytorch-cuda:25.12-py3` | Minimal Apertus2 Chonk and Megachonk training stack |
+| `apertus-2-megatron-cuda:alps7-dev` | `pytorch-cuda:26.06-py3` | Full Megatron training, test, server and inference stack |
+| `apertus-2-megatron-rocm:alps7-dev` | `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` | Native MI300 Megatron training with ROCm TE, UCCL EP, KDA and Muon; excludes CUDA expert offloading and serving extras |
 | `sfttrainer-cuda:alps7-dev`  | `pytorch-cuda:26.02-py3` | Supervised fine-tuning trainer image |
 | `verl-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | VeRL reinforcement learning workloads |
 | `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.07-py3` | vLLM serving workloads built from source (v0.31.0, Torch 2.13 stable-libtorch APIs), with UCCL-EP and Mooncake CXI KV transfer over Slingshot CXI |
@@ -120,6 +169,7 @@ NGC images assemble `common/alps-runtime.common.env`, `common/alps-runtime.nccl-
 - **NVSHMEM**: libfabric remote transport over the Cassini provider, CUDA VMM disabled
 - **OpenMPI / PMIX**: security modules, byte transfer layer restricted to supported backends
 - **CUDA**: JIT cache disabled for shared-filesystem compatibility
+- **ROCm hwloc**: OpenGL display discovery disabled (`HWLOC_COMPONENTS=-gl`) to avoid blocking OFI initialization on headless compute nodes
 
 Both shipped ROCm profiles default `NCCL_P2P_DISABLE=1` in Podman and Sarus/Enroot; the earlier runtime-specific exception was removed because the Sarus results were inconclusive.
 Explicit user values, including an empty value, remain unchanged.
@@ -144,6 +194,16 @@ The generated child pipeline can contain these stages:
 5. **test-apps** — runs app workload tests and app `vetnode` coverage declared in app-local `ci.yaml` files
 6. **mark-app-tested** — creates tested-marker tags for app images that passed the current validation
 7. **publish** — promotes validated images to stable JFrog and GHCR refs while preserving stable-tag immutability rules
+
+ROCm bases declare separate `env`, `rccl`, and `mpi` validation jobs.
+Previously, RCCL all-reduce and OSU all-to-all ran one after the other in the same Slurm step.
+Both programs use MPI.
+With MPI4, RCCL passed, but OSU then failed to create its MPI session directory during startup.
+We suspect MPI4 cleanup after RCCL removed directories that OSU needed; the log did not show the exact filesystem error.
+Each benchmark now runs in its own two-node, eight-rank job, with separate MPI session directories.
+GPU CI still needs to confirm this fixes the failure.
+All three jobs must pass before the base tested marker is created; app builds and base publication depend on that marker.
+This uses one additional two-node allocation per ROCm base compared with running both benchmarks in one job.
 
 **Image tagging strategy:** canonical image tags include deterministic content hashes, allowing the pipeline to detect unchanged inputs and skip unnecessary rebuilds.
 App hashes include the accelerator variant, canonical base image ref, selected Containerfile and profile values, declared tests and patches, source files, and copied shared helpers.

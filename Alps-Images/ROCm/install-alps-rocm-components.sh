@@ -622,6 +622,7 @@ install_rocm_sdk_wheels() {
         sdk_packages+=("${pkg}==${ROCM_VERSION}")
     done
     if [[ "${#sdk_packages[@]}" -gt 0 ]]; then
+        [[ "${ROCM_PRESERVE_COMPUTE:-0}" != 1 ]] || die "Preserved compute stack is missing SDK wheels: ${sdk_packages[*]}; refusing to install/replace its ROCm runtime"
         "${ROCM_PYTHON}" -m pip install --no-cache-dir --index-url "${ROCM_PYPI_INDEX_URL}" --no-deps "${sdk_packages[@]}" \
             || die "Failed to install required ROCm SDK wheels"
         for pkg in "${distributions[@]}"; do
@@ -632,10 +633,49 @@ install_rocm_sdk_wheels() {
     fi
 }
 
+# Primus 26.3 predates the wheel SDK layout. Reuse its complete system SDK;
+# never install a newer wheel runtime alongside the vendor compute stack.
+bootstrap_rocm_system() {
+    local prefix="${ROCM_PATH:-/opt/rocm}" actual
+    prefix="$(readlink -f "$prefix")"
+    [[ -f "$prefix/include/hip/hip_runtime_api.h" && -f "$prefix/include/hsa/hsa.h" ]] \
+        || die "System ROCm SDK is incomplete: $prefix"
+    [[ -f "$prefix/.info/version" ]] || die "System ROCm version marker missing: $prefix/.info/version"
+    actual="$(head -n1 "$prefix/.info/version")"
+    [[ "$actual" == "$ROCM_VERSION" || "$actual" == "$ROCM_VERSION"-* ]] \
+        || die "System ROCm version $actual differs from requested $ROCM_VERSION"
+    ROCM_SDK=""
+    ROCM_SDK_ROOT="$prefix"
+    ROCM_SDK_BIN="$prefix/bin"
+    ROCM_SDK_CMAKE="$prefix/lib/cmake"
+    ROCM_CORE_DIR="$prefix"
+    ROCM_CORE_PREFIX="$prefix"
+    ROCM_LIBRARIES_DIR="$prefix"
+    ROCM_LIBRARIES_PREFIX="$prefix"
+    ROCM_DEVEL_DIR="$prefix"
+    ROCM_DEVEL_PREFIX="$prefix"
+    ROCM_BUILD_PREFIX="$prefix"
+    export ROCM_SDK ROCM_SDK_ROOT ROCM_SDK_BIN ROCM_SDK_CMAKE
+    export ROCM_CORE_DIR ROCM_CORE_PREFIX ROCM_LIBRARIES_DIR ROCM_LIBRARIES_PREFIX
+    export ROCM_DEVEL_DIR ROCM_DEVEL_PREFIX ROCM_BUILD_PREFIX
+    export ROCM_HOME="$prefix" HIP_PATH="$prefix" ROCM_PATH="$prefix"
+    export PATH="$prefix/bin:$prefix/llvm/bin:$PATH"
+    export CMAKE_PREFIX_PATH="$prefix:$ROCM_SDK_CMAKE:${CMAKE_PREFIX_PATH:-}"
+    register_rocm_sdk_ldconfig
+    persist_rocm_sdk_env
+    record_alps_version_var ROCM_VERSION "$ROCM_VERSION"
+    echo "Using preserved system ROCm SDK: $prefix ($actual)"
+}
+
 bootstrap_rocm_sdk() {
     : "${ROCM_VERSION:?ROCM_VERSION must be set}"
-    : "${ROCM_PYPI_INDEX_URL:?ROCM_PYPI_INDEX_URL must be set to the ROCm wheel index}"
     : "${ROCM_PYTHON:=/opt/venv/bin/python}"
+    if [[ "${ROCM_SDK_LAYOUT:-wheel}" == system ]]; then
+        bootstrap_rocm_system
+        return
+    fi
+    [[ "${ROCM_SDK_LAYOUT:-wheel}" == wheel ]] || die "Unknown ROCm SDK layout: ${ROCM_SDK_LAYOUT}"
+    : "${ROCM_PYPI_INDEX_URL:?ROCM_PYPI_INDEX_URL must be set to the ROCm wheel index}"
     : "${ROCM_SDK:=/opt/venv/bin/rocm-sdk}"
 
     [[ -x "${ROCM_PYTHON}" ]] || die "ROCm Python not found: ${ROCM_PYTHON}"
@@ -643,7 +683,11 @@ bootstrap_rocm_sdk() {
     install_rocm_sdk_wheels
     local have_devel="${ROCM_HAVE_DEVEL}"
     if [[ "${have_devel}" == yes ]]; then
-        "${ROCM_SDK}" init
+        if [[ "${ROCM_PRESERVE_COMPUTE:-0}" != 1 ]]; then
+            "${ROCM_SDK}" init
+        else
+            echo "Preserving the vendor-initialized ROCm devel tree"
+        fi
     else
         echo "Source-pinned profile: deriving SDK layout without rocm-sdk-devel"
     fi
@@ -736,10 +780,12 @@ PY
     export CMAKE_PREFIX_PATH="${ROCM_SDK_CMAKE}:${ROCM_SDK_ROOT}:${ROCM_BUILD_PREFIX}:${ROCM_CORE_PREFIX}:${ROCM_LIBRARIES_PREFIX}:${ROCM_DEVEL_PREFIX}:${ROCM_CORE_DIR}:${ROCM_LIBRARIES_DIR}:${ROCM_DEVEL_DIR}:${CMAKE_PREFIX_PATH:-}"
 
     register_rocm_sdk_ldconfig
-    install_amdsmi_python
-    link_amdsmi_package_library
-    patch_torch_rocm_disable_implicit_amdsmi
-    smoke_check_amdsmi_python
+    if [[ "${ROCM_PRESERVE_COMPUTE:-0}" != 1 ]]; then
+        install_amdsmi_python
+        link_amdsmi_package_library
+        patch_torch_rocm_disable_implicit_amdsmi
+        smoke_check_amdsmi_python
+    fi
     persist_rocm_sdk_env
     record_alps_version_var ROCM_VERSION "${ROCM_VERSION}"
 }
@@ -1242,7 +1288,7 @@ configure_rccl() {
             ;;
         1)
             build_rccl
-            replace_wheel_rccl
+            replace_bundled_rccl
             ;;
         *)
             die "ROCM_REBUILD_RCCL must be 0 or 1, got: ${ROCM_REBUILD_RCCL}"
@@ -1366,7 +1412,8 @@ rocm_hip_cxx_compiler() {
     # The devel tree provides bin/amdclang++; wheel-only SDKs keep clang++
     # under the core wheel's lib/llvm/bin.
     local candidate
-    for candidate in "${ROCM_SDK_BIN}/amdclang++" "${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++"; do
+    for candidate in "${ROCM_SDK_BIN}/amdclang++" "${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++" \
+        "${ROCM_BUILD_PREFIX:-}/llvm/bin/amdclang++" "${ROCM_BUILD_PREFIX:-}/llvm/bin/clang++"; do
         if [[ -x "${candidate}" ]]; then
             printf '%s\n' "${candidate}"
             return 0
@@ -1411,33 +1458,82 @@ build_rccl() {
     ldconfig
 }
 
-replace_wheel_rccl() {
-    : "${RCCL_PREFIX:=/opt/alps/rocm/rccl}"
-
-    local src_dir="" dst_dir="" d f
-    for d in "${RCCL_PREFIX}/lib" "${RCCL_PREFIX}/lib64"; do
-        if compgen -G "${d}/librccl.so*" >/dev/null; then
-            src_dir="${d}"
-            break
-        fi
+replace_rccl_libraries() {
+    # Retain package-local loading paths, but remove every competing binary.
+    # Resolve roots first so overlapping SDK roots and top-level aliases are safe.
+    local source_libdir="${1:?built RCCL library directory required}"
+    shift
+    local root directory library target directories
+    local -a roots=() libraries=()
+    source_libdir="$(readlink -e "$source_libdir")" || die "Missing built RCCL directory"
+    [[ -f "$source_libdir/librccl.so.1" ]] || die "Missing built RCCL library: $source_libdir/librccl.so.1"
+    for library in "$source_libdir"/librccl.so*; do
+        target="$(readlink -e "$library")" || die "Broken built RCCL library: $library"
+        [[ -f "$target" && "$target" == "$source_libdir/"* ]] \
+            || die "Built RCCL library resolves outside its library directory: $library"
+        libraries+=("$library")
     done
-    [[ -n "${src_dir}" ]] || die "No built RCCL libraries found under ${RCCL_PREFIX}"
-
-    while IFS= read -r d; do
-        dst_dir="${d}"
-        break
-    done < <(find "${ROCM_LIBRARIES_DIR}" "${ROCM_SDK_ROOT}" \
-        \( -type f -o -type l \) -name 'librccl.so*' -printf '%h\n')
-    [[ -n "${dst_dir}" ]] || die "No wheel-bundled RCCL library directory found"
-
-    find "${dst_dir}" -maxdepth 1 \( -type f -o -type l \) -name 'librccl.so*' -print -delete
-    for f in "${src_dir}"/librccl.so*; do
-        [[ -e "${f}" ]] || continue
-        ln -s "${f}" "${dst_dir}/$(basename "${f}")"
+    for root in "$@"; do
+        root="$(readlink -e "$root")" || die "Missing RCCL search root"
+        [[ -d "$root" ]] || die "RCCL search root is not a directory: $root"
+        roots+=("$root")
     done
+    [[ ${#roots[@]} -gt 0 ]] || die "No RCCL search roots supplied"
+    # Complete discovery before deleting anything; exclude the canonical build.
+    # Do not follow internal directory symlinks (SDK trees can contain cycles).
+    directories="$(find "${roots[@]}" -path "$source_libdir" -prune -o \
+        \( -type f -o -type l \) -name 'librccl.so*' -printf '%h\n')" || return 1
+    [[ -n "$directories" ]] || die "No bundled RCCL library directories found"
+    directories="$(printf '%s\n' "$directories" | sort -u)" || return 1
+    while IFS= read -r directory; do
+        find "$directory" -maxdepth 1 \( -type f -o -type l \) -name 'librccl.so*' -print -delete || return 1
+        for library in "${libraries[@]}"; do
+            ln -s "$library" "$directory/${library##*/}" || return 1
+        done
+        for library in "$directory"/librccl.so*; do
+            target="$(readlink -e "$library")" || die "Broken RCCL replacement: $library"
+            [[ -L "$library" && -f "$target" && "$target" == "$source_libdir/"* ]] \
+                || die "RCCL replacement does not resolve to the Alps build: $library"
+        done
+    done <<< "$directories"
+}
 
+forward_rccl_configs() {
+    local source=${1:?} destination=${2:?} config
+    [[ -f "$source/rccl-config.cmake" && -f "$source/rccl-config-version.cmake" ]] \
+        || die "Missing built RCCL CMake package: $source"
+    [[ "$(readlink -m "$source")" != "$(readlink -m "$destination")" ]] \
+        || die "RCCL CMake forwarding would overwrite the built package"
+    install -d "$destination" || return 1
+    # Absolute includes preserve the prefix used by generated imported targets.
+    for config in "$source"/*.cmake; do
+        printf 'include("%s")\n' "$config" > "$destination/${config##*/}" || return 1
+    done
+}
+
+replace_bundled_rccl() {
+    : "${RCCL_LIB_DIR:?RCCL_LIB_DIR must identify the rebuilt library directory}"
+    local root python_roots
+    local -a roots=()
+    # sysconfig finds both pure-Python and platform package trees without loading
+    # Torch, which may still depend on the vendor RCCL during this transition.
+    python_roots="$("${ROCM_PYTHON}" -c 'import sysconfig; print(sysconfig.get_path("purelib")); print(sysconfig.get_path("platlib"))')" || return 1
+    for root in "${ROCM_SDK_ROOT}" "${ROCM_LIBRARIES_DIR}" "${ROCM_CORE_PREFIX:-}" \
+        "${ROCM_LIBRARIES_PREFIX:-}" "${ROCM_DEVEL_PREFIX:-}" "${ROCM_BUILD_PREFIX:-}" \
+        /opt/rocm /usr/local/lib /usr/local/lib64 /usr/lib /usr/lib64 /lib /lib64; do
+        [[ ! -d "$root" ]] || roots+=("$root")
+    done
+    while IFS= read -r root; do
+        [[ ! -d "$root" ]] || roots+=("$root")
+    done <<< "$python_roots"
+    replace_rccl_libraries "$RCCL_LIB_DIR" "${roots[@]}" || return 1
+    # System SDK metadata names the removed vendor version; keep its CMake
+    # discovery path pointing at the rebuilt package as well as its libraries.
+    if [[ "${ROCM_SDK_LAYOUT:-wheel}" == system ]]; then
+        forward_rccl_configs "$RCCL_LIB_DIR/cmake/rccl" "$ROCM_BUILD_PREFIX/lib/cmake/rccl" || return 1
+    fi
     cat > /etc/ld.so.conf.d/99-alps-rocm-rccl.conf <<EOF
-${src_dir}
+${RCCL_LIB_DIR}
 EOF
     ldconfig
 }
@@ -1565,13 +1661,15 @@ anchor = "add_library(rccl_common OBJECT ${HIP_COMMON_SOURCES})"
 if anchor not in src:
     sys.exit(f"rccl_common anchor not found in {path}")
 targets = os.environ["RCCL_TESTS_GPU_TARGETS"].replace(";", ",")
+# Keep -x and its language joined: CMake de-duplicates standalone -x tokens
+# against upstream HIP options, potentially consuming --offload-arch as a language.
 addition = (
     anchor
-    + f"\ntarget_compile_options(rccl_common PRIVATE -x hip --offload-arch={targets}"
+    + f"\ntarget_compile_options(rccl_common PRIVATE -xhip --offload-arch={targets}"
     + " -include /tmp/rccl-tests-force-include.h)\n"
     # Directory-level options for the *_perf executables created later: the
     # hipified sources and the common object library both need HIP mode.
-    + f"\nadd_compile_options(-x hip --offload-arch={targets}"
+    + f"\nadd_compile_options(-xhip --offload-arch={targets}"
     + " -include /tmp/rccl-tests-force-include.h)\n"
 )
 src = src.replace(anchor, addition, 1)

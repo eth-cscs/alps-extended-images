@@ -288,6 +288,17 @@ rocm_base_image_ref() {
         return 0
       fi
       ;;
+    primus)
+      local profile_file upstream
+      profile_file="$(rocm_profile_file "$rocm_name" "$rocm_variant")"
+      upstream="$(profile_value "$profile_file" ROCM_BASE_IMAGE_REF)"
+      [[ "$upstream" =~ ^docker\.io/rocm/primus@sha256:[0-9a-f]{64}$ ]] || {
+        echo "ERROR: Primus profile requires a digest-pinned ROCM_BASE_IMAGE_REF: $profile_file" >&2
+        return 1
+      }
+      printf '%s\n' "$upstream"
+      return 0
+      ;;
   esac
 
   echo "ERROR: can not derive ROCm base image ref from ${rocm_name}:${rocm_variant}" >&2
@@ -297,7 +308,11 @@ rocm_base_image_ref() {
 validate_rocm_profile() {
   local profile_file="${1:?profile_file required}"
 
-  [[ -n "${ROCM_PYPI_INDEX_URL:-}" ]] || { echo "ERROR: ROCM_PYPI_INDEX_URL must be set in $profile_file" >&2; return 1; }
+  [[ "${ROCM_SDK_LAYOUT:-wheel}" == wheel || "${ROCM_SDK_LAYOUT:-wheel}" == system ]] || { echo "ERROR: ROCM_SDK_LAYOUT must be wheel or system in $profile_file" >&2; return 1; }
+  [[ "${ROCM_PRESERVE_COMPUTE:-0}" == 0 || "${ROCM_PRESERVE_COMPUTE:-0}" == 1 ]] || { echo "ERROR: ROCM_PRESERVE_COMPUTE must be 0 or 1 in $profile_file" >&2; return 1; }
+  if [[ "${ROCM_SDK_LAYOUT:-wheel}" == wheel ]]; then
+    [[ -n "${ROCM_PYPI_INDEX_URL:-}" ]] || { echo "ERROR: ROCM_PYPI_INDEX_URL must be set in $profile_file" >&2; return 1; }
+  fi
   [[ "${ROCM_REBUILD_RCCL:-0}" == "0" || "${ROCM_REBUILD_RCCL:-0}" == "1" ]] || { echo "ERROR: ROCM_REBUILD_RCCL must be 0 or 1 in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_REPO:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_REPO must be set in $profile_file" >&2; return 1; }
   [[ -n "${ROCM_SYSTEMS_COMMIT:-}" ]] || { echo "ERROR: ROCM_SYSTEMS_COMMIT must be set in $profile_file" >&2; return 1; }
@@ -311,6 +326,9 @@ validate_rocm_profile() {
 load_rocm_profile() {
   local profile_file="${1:?profile_file required}"
 
+  ROCM_VERSION=""
+  ROCM_SDK_LAYOUT="wheel"
+  ROCM_PRESERVE_COMPUTE="0"
   ROCM_PYPI_INDEX_URL=""
   ROCM_REBUILD_RCCL="0"
   ROCM_SYSTEMS_REPO=""
@@ -330,6 +348,9 @@ rocm_base_build_args() {
   cat <<EOF
   --build-arg ROCM_VARIANT_DIR="$rocm_variant_dir" \\
   --build-arg ROCM_VERSION="$ROCM_VERSION" \\
+  --build-arg ALPS_ROCM_VERSION="$ROCM_VERSION" \\
+  --build-arg ROCM_SDK_LAYOUT="$ROCM_SDK_LAYOUT" \\
+  --build-arg ROCM_PRESERVE_COMPUTE="$ROCM_PRESERVE_COMPUTE" \\
   --build-arg ROCM_REBUILD_RCCL="$ROCM_REBUILD_RCCL" \\
   --build-arg ROCM_SYSTEMS_REPO="$ROCM_SYSTEMS_REPO" \\
   --build-arg ROCM_SYSTEMS_COMMIT="$ROCM_SYSTEMS_COMMIT" \\
@@ -347,6 +368,9 @@ rocm_base_dotenv() {
   cat <<EOF
 ROCM_VARIANT_DIR=$rocm_variant_dir
 ROCM_VERSION=$ROCM_VERSION
+ALPS_ROCM_VERSION=$ROCM_VERSION
+ROCM_SDK_LAYOUT=$ROCM_SDK_LAYOUT
+ROCM_PRESERVE_COMPUTE=$ROCM_PRESERVE_COMPUTE
 ROCM_REBUILD_RCCL=$ROCM_REBUILD_RCCL
 ROCM_SYSTEMS_REPO=$ROCM_SYSTEMS_REPO
 ROCM_SYSTEMS_COMMIT=$ROCM_SYSTEMS_COMMIT
@@ -371,6 +395,9 @@ rocm_base_refs() {
   local profile_file
   profile_file="$(rocm_profile_file "$rocm_name" "$rocm_variant")"
   local dockerfile="Alps-Images/ROCm/Containerfile.rocm-alps"
+  if [[ "$rocm_name" == primus ]]; then
+    dockerfile="Alps-Images/ROCm/Containerfile.primus-alps"
+  fi
   local rocm_installer="Alps-Images/ROCm/install-alps-rocm-stack.sh"
   local rocm_components="Alps-Images/ROCm/install-alps-rocm-components.sh"
   local rocm_runtime_env="Alps-Images/ROCm/alps-runtime.rocm.env"
@@ -386,20 +413,21 @@ rocm_base_refs() {
   [[ -d "$common_dir" ]]   || { echo "ERROR: missing $common_dir" >&2; return 1; }
   [[ -d "$patches_dir" ]]  || { echo "ERROR: missing $patches_dir" >&2; return 1; }
 
-  local ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
+  local ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SDK_LAYOUT ROCM_PRESERVE_COMPUTE
   local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
   local ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT
   load_rocm_profile "$profile_file"
-  ROCM_VERSION="$(rocm_version_from_variant "$rocm_variant")"
+  ROCM_VERSION="${ROCM_VERSION:-$(rocm_version_from_variant "$rocm_variant")}"
   local base_image_ref
   base_image_ref="$(rocm_base_image_ref "$rocm_name" "$rocm_variant")"
 
   local -a hash_paths=("$dockerfile" "$rocm_installer" "$rocm_components" "$rocm_runtime_env" "$common_dir" "$patches_dir" "$image_dir")
+  [[ "$rocm_name" != primus ]] || hash_paths+=(Alps-Images/ROCm/sources/primus)
   [[ ! -f .dockerignore ]] || hash_paths+=(.dockerignore)
   local name="${rocm_name}-rocm"
   local tag="${rocm_variant}-${ALPS_REV}"
   local h
-  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
+  h="$(content_hash "name tag base_image_ref ROCM_VERSION ROCM_SDK_LAYOUT ROCM_PRESERVE_COMPUTE ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS CSCS_CI_ORIG_CLONE_URL" "${hash_paths[@]}")"
   local canon_ref stable_ref
   read -r canon_ref stable_ref < <(image_refs "$name" "$tag" "$h")
 
@@ -576,12 +604,12 @@ write_base_build_env() {
       ;;
     rocm)
       read -r base_image_ref dockerfile canon_image_ref stable_image_ref < <(rocm_base_refs "$name" "$variant")
-      local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL
+      local profile_file ROCM_VERSION ROCM_PYPI_INDEX_URL ROCM_REBUILD_RCCL ROCM_SDK_LAYOUT ROCM_PRESERVE_COMPUTE
       local ROCM_SYSTEMS_REPO ROCM_SYSTEMS_COMMIT RCCL_GPU_TARGETS RCCL_TESTS_GPU_TARGETS
       local ROCM_LIBRARIES_REPO ROCM_LIBRARIES_COMMIT
       profile_file="$(rocm_profile_file "$name" "$variant")"
       load_rocm_profile "$profile_file"
-      ROCM_VERSION="$(rocm_version_from_variant "$variant")"
+      ROCM_VERSION="${ROCM_VERSION:-$(rocm_version_from_variant "$variant")}"
       image_description="This image extends ${base_image_ref} with a fully-optimized ROCm HPC networking stack tailored for the Alps supercomputer."
       family_dotenv="$(rocm_base_dotenv "${name}-${variant}")"
       ;;
