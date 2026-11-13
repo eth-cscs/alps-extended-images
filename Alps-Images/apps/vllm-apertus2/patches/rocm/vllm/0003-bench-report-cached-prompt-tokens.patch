@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Thu, 15 Oct 2026 00:00:00 +0000
+Subject: [PATCH] benchmarks: report cached prompt tokens in vllm bench serve
+
+vllm bench serve drops usage.prompt_tokens_details.cached_tokens. Sum it per
+run and report it as total_cached_tokens in the result JSON and the printed
+summary, when the server returns the counts (--enable-prompt-tokens-details).
+First commit of the pending upstream PR from aurianer/vllm
+add_cached_tokens_to_vllm_bench_serve.
+---
+ vllm/benchmarks/lib/endpoint_request_func.py |  5 +++++
+ vllm/benchmarks/serve.py                     | 12 ++++++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/vllm/benchmarks/lib/endpoint_request_func.py b/vllm/benchmarks/lib/endpoint_request_func.py
+index 14ff6c1ab1..3386e585ea 100644
+--- a/vllm/benchmarks/lib/endpoint_request_func.py
++++ b/vllm/benchmarks/lib/endpoint_request_func.py
+@@ -97,6 +97,7 @@ class RequestFuncOutput:
+     itl: list[float] = field(default_factory=list)  # list of inter-token latencies
+     tpot: float = 0.0  # avg next-token latencies
+     prompt_len: int = 0
++    cached_tokens: int | None = None  # prompt tokens served from prefix cache
+     error: str = ""
+     start_time: float = 0.0
+     # Time spent awaiting the benchmark client concurrency semaphore.
+@@ -249,6 +250,8 @@ async def async_request_openai_completions(
+                                 output.output_tokens = usage.get("completion_tokens")
+                                 if (pt := usage.get("prompt_tokens")) is not None:
+                                     output.prompt_len = pt
++                                if details := usage.get("prompt_tokens_details"):
++                                    output.cached_tokens = details.get("cached_tokens")
+                 if first_chunk_received:
+                     output.success = True
+                 else:
+@@ -423,6 +426,8 @@ async def async_request_openai_chat_completions(
+                                 output.output_tokens = usage.get("completion_tokens")
+                                 if (pt := usage.get("prompt_tokens")) is not None:
+                                     output.prompt_len = pt
++                                if details := usage.get("prompt_tokens_details"):
++                                    output.cached_tokens = details.get("cached_tokens")
+
+                 output.generated_text = generated_text
+                 if first_chunk_received:
+diff --git a/vllm/benchmarks/serve.py b/vllm/benchmarks/serve.py
+index 19130716f4..b490663b53 100644
+--- a/vllm/benchmarks/serve.py
++++ b/vllm/benchmarks/serve.py
+@@ -356,6 +356,9 @@ class BenchmarkMetrics:
+     max_output_tokens_per_s: float
+     max_concurrent_requests: int
+     rtfx: float = 0.0  # Inverse Real-Time Factor for ASR benchmarks
++    # Only set when the server reports usage.prompt_tokens_details.cached_tokens
++    # (requires --enable-prompt-tokens-details on the vLLM server).
++    total_cached: int | None = None
+
+
+ @dataclass
+@@ -593,6 +596,7 @@ def calculate_metrics(
+     """
+     actual_output_lens: list[int] = []
+     total_input = 0
++    total_cached: int | None = None
+     completed = 0
+     good_completed = 0
+     itls: list[float] = []
+@@ -621,6 +625,8 @@ def calculate_metrics(
+                     )
+             actual_output_lens.append(output_len)
+             total_input += outputs[i].prompt_len
++            if (cached := outputs[i].cached_tokens) is not None:
++                total_cached = (total_cached or 0) + cached
+             tpot = 0.0
+             if output_len > 1:
+                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+@@ -777,6 +783,7 @@ def calculate_metrics(
+         max_output_tokens_per_s=max_output_tokens_per_s,
+         max_concurrent_requests=max_concurrent_requests,
+         rtfx=input_audio_duration / dur_s,
++        total_cached=total_cached,
+     )
+
+     return metrics, actual_output_lens
+@@ -1198,6 +1205,8 @@ async def benchmark(
+         print("{:<40} {:<10.2f}".format("Request rate configured (RPS):", request_rate))
+     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
++    if isinstance(metrics, BenchmarkMetrics) and metrics.total_cached is not None:
++        print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached))
+     if isinstance(metrics, BenchmarkMetrics) and tokenizer:
+         print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
+     print(
+@@ -1326,6 +1335,9 @@ async def benchmark(
+             "errors": [output.error for output in outputs],
+         }
+
++    if isinstance(metrics, BenchmarkMetrics) and metrics.total_cached is not None:
++        result["total_cached_tokens"] = metrics.total_cached
++
+     queue_times: list[float] | None = None
+     e2els_including_queue: list[float] | None = None
+     if max_concurrency is not None:

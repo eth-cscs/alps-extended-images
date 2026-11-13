@@ -1,0 +1,222 @@
+# syntax=docker/dockerfile:1
+
+# ROCm/MI300A Apertus2 vLLM 0.31 image. Follows Alps-Images/apps/vllm/Containerfile.rocm:
+# AITER, UCCL-EP over CXI, the swiss-ai/vllm release tag, and Mooncake with CXI.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG VLLM_TARGET_DEVICE="rocm"
+ENV VLLM_TARGET_DEVICE="${VLLM_TARGET_DEVICE}" \
+    PYTHONNOUSERSITE="1" \
+    LIBRARY_PATH="/opt/rocm/lib:/opt/rocm/lib64" \
+    TVM_FFI_CACHE_DIR="/opt/alps/tvm-ffi" \
+    AITER_JIT_DIR="/opt/aiter-jit" \
+    UCCL_EP_TRANSPORT="cxi" \
+    UCCL_SOCKET_IFNAME="hsn"
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+COPY Alps-Images/apps/vllm-apertus2/sources/build-rocm-env.sh /opt/alps/vllm-build-env.sh
+
+# Keep package bootstrap independent of AITER/UCCL/vLLM source and patch changes.
+RUN set -eux; \
+    source /opt/alps/vllm-build-env.sh; \
+    mkdir -p /opt/alps; \
+    python -c 'import importlib.metadata as m; names = ("torch", "triton"); named = ((d.metadata.get("Name"), d.version) for d in m.distributions()); installed = {name.lower(): version for name, version in named if isinstance(name, str) and name}; missing = [n for n in names if n not in installed]; assert not missing, f"missing base packages: {missing}"; print("\n".join(f"{n}=={installed[n]}" for n in names))' > /opt/alps/vllm-base-pins.txt; \
+    vllm_build_begin; \
+    cat "${PIP_CONSTRAINT}"; \
+    pip_install python --no-cache-dir --upgrade \
+      'cmake<4' \
+      Cython \
+      ninja \
+      numba \
+      pybind11 \
+      scipy \
+      'huggingface-hub[cli]' \
+      'setuptools>=77.0.3,<80.0.0' \
+      setuptools-rust \
+      setuptools-scm \
+      wheel; \
+    vllm_build_end
+
+# MI300A has 228 CUs; gfx942 alone selects AITER's 304-CU MI300X default.
+ARG PYTORCH_ROCM_ARCH="gfx942"
+ARG CU_NUM="228"
+ARG MAX_JOBS="32"
+ENV PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
+    GPU_ARCHS="${PYTORCH_ROCM_ARCH}" \
+    CU_NUM="${CU_NUM}" \
+    MAX_JOBS="${MAX_JOBS}" \
+    CMAKE_BUILD_PARALLEL_LEVEL="${MAX_JOBS}"
+
+ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_REF="v0.1.23"
+ARG AITER_COMMIT="50da036acdedec2dd596f93188d6c615e2561672"
+COPY Alps-Images/apps/vllm-apertus2/sources/install-aiter.sh /opt/alps/install-aiter.sh
+COPY Alps-Images/apps/vllm-apertus2/patches/rocm/aiter/ /opt/alps/aiter-patches/
+RUN set -eux; \
+    source /opt/alps/vllm-build-env.sh; \
+    vllm_build_begin; \
+    AITER_REPO="${AITER_REPO}" \
+      AITER_REF="${AITER_REF}" \
+      AITER_COMMIT="${AITER_COMMIT}" \
+      GPU_ARCHS="${PYTORCH_ROCM_ARCH}" \
+      CU_NUM="${CU_NUM}" \
+      MAX_JOBS="${MAX_JOBS}" \
+      AITER_JIT_DIR="${AITER_JIT_DIR}" \
+      bash /opt/alps/install-aiter.sh; \
+    vllm_build_end
+
+ARG UCCL_REPO="https://github.com/uccl-project/uccl.git"
+ARG UCCL_COMMIT="52d4184c89deb5631be6dac6a9b1c40896c9e26e"
+ARG UCCL_NANOBIND_VERSION="3.0.1"
+ARG UCCL_NUM_LOCAL_GPUS="4"
+COPY Alps-Images/apps/vllm-apertus2/patches/rocm/uccl/ /opt/alps-uccl-patches/
+RUN set -eux; \
+    source /opt/alps/vllm-build-env.sh; \
+    vllm_build_begin; \
+    pip_install python --no-cache-dir --upgrade "nanobind==${UCCL_NANOBIND_VERSION}"; \
+    rm -rf /opt/uccl /tmp/uccl-ep-build; \
+    git init -q /opt/uccl; \
+    git -C /opt/uccl remote add origin "${UCCL_REPO}"; \
+    git -C /opt/uccl fetch --depth=1 origin "${UCCL_COMMIT}"; \
+    git -C /opt/uccl checkout -q --detach FETCH_HEAD; \
+    test "$(git -C /opt/uccl rev-parse HEAD)" = "${UCCL_COMMIT}"; \
+    shopt -s nullglob; uccl_patch_files=(/opt/alps-uccl-patches/*.patch); shopt -u nullglob; \
+    for patch_file in "${uccl_patch_files[@]}"; do \
+      echo "Applying UCCL patch: ${patch_file}"; \
+      git -C /opt/uccl apply --check "${patch_file}"; \
+      git -C /opt/uccl apply "${patch_file}"; \
+    done; \
+    uccl_site_packages="$(python -c 'import site; paths = site.getsitepackages(); print(paths[0] if paths else "")')"; \
+    test -n "${uccl_site_packages}" || { echo "ERROR: site-packages not found" >&2; exit 1; }; \
+    cd /opt/uccl/ep; \
+    LIBFABRIC_HOME=/usr \
+      USE_LIBFABRIC_CXI=1 \
+      PER_EXPERT_BATCHING=1 \
+      NUM_MAX_NVL_PEERS="${UCCL_NUM_LOCAL_GPUS}" \
+      MAX_NUM_GPUS="${UCCL_NUM_LOCAL_GPUS}" \
+      PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
+      INSTALL_DIR="${uccl_site_packages}/uccl" \
+      python setup.py build --build-base /tmp/uccl-ep-build install; \
+    printf '%s\n' '"""UCCL expert-parallel extension."""' > "${uccl_site_packages}/uccl/__init__.py"; \
+    cp -LR /opt/uccl/ep/deep_ep_wrapper/deep_ep "${uccl_site_packages}/deep_ep"; \
+    vllm_build_end; \
+    rm -rf /opt/uccl /tmp/uccl-ep-build
+
+# Apertus2 vLLM release tag (swiss-ai/vllm) and the wheel version it builds.
+ARG VLLM_REPO="https://github.com/swiss-ai/vllm.git"
+ARG VLLM_REF="v0.31.0+Apertus2.1"
+ARG VLLM_VERSION_OVERRIDE="0.31.0+apertus2.1"
+ENV ALPS_VLLM_APERTUS2_VERSION="${VLLM_VERSION_OVERRIDE}"
+COPY Alps-Images/apps/vllm-apertus2/patches/rocm/vllm/ /opt/alps-vllm-patches/
+RUN set -eux; \
+    source /opt/alps/vllm-build-env.sh; \
+    vllm_build_begin; \
+    rm -rf /opt/vllm; \
+    git clone --recursive "${VLLM_REPO}" /opt/vllm; \
+    cd /opt/vllm; \
+    git checkout -q "refs/tags/${VLLM_REF}"; \
+    git submodule update --init --recursive; \
+    export VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE}"; \
+    shopt -s nullglob; \
+    vllm_patch_files=(/opt/alps-vllm-patches/*.patch); \
+    shopt -u nullglob; \
+    for patch_file in "${vllm_patch_files[@]}"; do \
+      echo "Applying vLLM patch: ${patch_file}"; \
+      git apply --check "${patch_file}"; \
+      git apply "${patch_file}"; \
+    done; \
+    pip_install python --no-cache-dir -r requirements/rocm.txt; \
+    # The wheel compiler needs these unset; ROCM_HOME still supplies CMake's SDK root.
+    rm -rf /tmp/vllm-dist; \
+    mkdir -p /tmp/vllm-dist; \
+    env -u ROCM_PATH -u HIP_PATH \
+      python setup.py bdist_wheel --dist-dir /tmp/vllm-dist; \
+    pip_install python --no-cache-dir --no-deps /tmp/vllm-dist/*.whl; \
+    pip_install python --no-cache-dir "ray[default]" sentencepiece tiktoken; \
+    tvm_ffi_torch_version="$(python -c 'import torch; print("".join(torch.__version__.split(".")[:2]))')"; \
+    tvm_ffi_addon="${TVM_FFI_CACHE_DIR}/libtorch_c_dlpack_addon_torch${tvm_ffi_torch_version}-rocm.so"; \
+    TVM_FFI_DISABLE_TORCH_C_DLPACK=1 \
+      python -m tvm_ffi.utils._build_optional_torch_c_dlpack \
+        --output-dir "${TVM_FFI_CACHE_DIR}" \
+        --libname "$(basename "${tvm_ffi_addon}")" \
+        --build-with-rocm; \
+    test -s "${tvm_ffi_addon}"; \
+    chmod -R a+rX "${TVM_FFI_CACHE_DIR}"; \
+    torch_lib_dir="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib"))')"; \
+    test -d "${torch_lib_dir}"; \
+    printf '%s\n' "${torch_lib_dir}" > /etc/ld.so.conf.d/99-alps-vllm-torch.conf; \
+    ldconfig; \
+    vllm_build_end; \
+    rm -rf /opt/vllm /tmp/vllm-dist
+
+RUN set -eux; \
+    while IFS= read -r pin; do \
+      package="${pin%%==*}"; \
+      expected="${pin#*==}"; \
+      actual="$(python -c 'import importlib.metadata as m, sys; print(m.version(sys.argv[1]))' "${package}")"; \
+      test "${actual}" = "${expected}"; \
+    done < /opt/alps/vllm-base-pins.txt; \
+    vllm_version="$(python -c 'import importlib.metadata as m; print(m.version("vllm"))')"; \
+    printf 'vllm=%s\n' "${vllm_version}"; \
+    test "${vllm_version}" = "${ALPS_VLLM_APERTUS2_VERSION}"; \
+    python -c 'import importlib.metadata as m; print("amd-aiter={}".format(m.version("amd-aiter")))'; \
+    python -c 'import torch; print("torch={} hip={}".format(torch.__version__, torch.version.hip))'; \
+    python -c 'import uccl.ep; import deep_ep; print("uccl.ep={} deep_ep={}".format(uccl.ep.__file__, deep_ep.__file__))'; \
+    python -c 'import os; path = os.path.join(os.environ["TVM_FFI_CACHE_DIR"], "libtorch_c_dlpack_addon_torch{}-rocm.so".format("".join(__import__("torch").__version__.split(".")[:2]))); assert os.path.isfile(path), path; print("tvm_ffi_rocm_addon={}".format(path))'; \
+    python -m pip check || echo "WARN: inconsistent pip dependency resolution (see above)"; \
+    vllm_dir="$(python -c 'import importlib.util; spec = importlib.util.find_spec("vllm"); print(spec.submodule_search_locations[0] if spec else "")')"; \
+    if [ -z "${vllm_dir}" ]; then \
+      echo "FATAL: vllm is not importable by the runtime python" >&2; \
+      exit 1; \
+    fi; \
+    test -f "${vllm_dir}/model_executor/models/apertus2.py"; \
+    missing="$(find "${vllm_dir}" -name '*.so' \
+                 -exec ldd {} + 2>/dev/null | grep 'not found' || true)"; \
+    if [ -n "${missing}" ]; then \
+      echo "FATAL: vLLM native extensions have unresolved dependencies:" >&2; \
+      echo "${missing}" >&2; \
+      exit 1; \
+    fi; \
+    uccl_ep_so="$(python -c 'import uccl.ep; print(uccl.ep.__file__)')"; \
+    missing="$(ldd "${uccl_ep_so}" 2>/dev/null | grep 'not found' || true)"; \
+    if [ -n "${missing}" ]; then \
+      echo "FATAL: UCCL-EP has unresolved dependencies:" >&2; \
+      echo "${missing}" >&2; \
+      exit 1; \
+    fi; \
+    echo "OK: Apertus2 vLLM ROCm smoke checks passed"
+
+# Mooncake transfer engine (CXI)
+COPY Alps-Images/apps/vllm-apertus2/sources/install-mooncake.sh /opt/alps/install-mooncake.sh
+COPY Alps-Images/apps/vllm-apertus2/patches/rocm/mooncake /opt/alps/mooncake-patches
+
+RUN set -eux; \
+    chmod u+x /opt/alps/install-mooncake.sh; \
+    /opt/alps/install-mooncake.sh rocm
+
+# Tests shipped with the image
+COPY Alps-Images/apps/vllm-apertus2/tests-rocm/ /opt/tests/vllm-apertus2/
+RUN chmod -R a+rX /opt/tests/vllm-apertus2
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
+LABEL org.opencontainers.image.vllm.revision="${VLLM_REF}" \
+      org.opencontainers.image.uccl.revision="${UCCL_COMMIT}" \
+      org.opencontainers.image.aiter.revision="${AITER_COMMIT}"
