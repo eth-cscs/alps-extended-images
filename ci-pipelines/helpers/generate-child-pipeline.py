@@ -159,6 +159,17 @@ def app_env(app: str, variant: str) -> dict[str, str]:
     return data
 
 
+class _ChildDumper(yaml.SafeDumper):
+    """Keep HH:MM:SS strings quoted for GitLab's YAML parser."""
+
+    def represent_str(self, value: str) -> yaml.ScalarNode:
+        style = '"' if re.fullmatch(r"[0-9]+:[0-9]{2}:[0-9]{2}", value) else None
+        return self.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+
+_ChildDumper.add_representer(str, _ChildDumper.represent_str)
+
+
 class Child:
     def __init__(self) -> None:
         self.data: dict[str, Any] = {
@@ -213,7 +224,7 @@ class Child:
         """Write the generated child pipeline YAML."""
         if not self.jobs:
             self.add_noop()
-        OUTPUT.write_text(yaml.safe_dump(self.data, sort_keys=False, width=float("inf")), encoding="utf-8")
+        OUTPUT.write_text(yaml.dump(self.data, Dumper=_ChildDumper, sort_keys=False, width=float("inf")), encoding="utf-8")
 
 
 BASE_TEST_TEMPLATES = {

@@ -1,0 +1,90 @@
+# Megatron-LM-MoE test group at 0789b8e429553c2f17c350afa8619c69d01bec25.
+coverage
+nltk
+wrapt
+pytest==8.3.5
+pytest-mock
+mock
+pytest-cov
+pytest-random-order
+pytest-asyncio==0.26.0
+PyGithub
+pydantic
+tensorboard==2.20.0
+PyYAML==6.0.3
+nemo-run @ git+https://github.com/NVIDIA-NeMo/Run.git@01a9a8ba360f7b2908728ad0516e0ad9d936966d
+
+# Training and storage paths.
+accelerate==1.15.0
+sentencepiece==0.2.2
+tiktoken==0.14.0
+transformers==5.17.0
+tokenizers==0.23.2
+huggingface-hub==1.31.0
+wandb==0.30.0
+datasets==4.4.1
+tensorstore==0.1.85
+einops==0.8.1
+nvtx==0.2.15
+multi-storage-client~=0.27
+boto3
+botocore
+msgpack
+pyzmq==27.1.0
+omegaconf==2.3.0
+griffe
+
+# API and dynamic inference servers.
+openai[aiohttp]==2.7.2
+fastapi
+uvicorn
+flask
+flask-restful==0.3.10
+quart==0.22.0
+hypercorn==0.18.0
+aiohttp
+httpx
+
+# CUDA-13 runtime additions. Other native kernels are built separately.
+cupy-cuda13x==14.2.0
+torch-memory-saver==0.0.10
+apache-tvm-ffi==0.1.11
+nvidia-cutlass-dsl[cu13]==4.6.2
+nvidia-mathdx==25.6.0
+
+# Dependencies of the source-built and separately installed native packages.
+cuda-tile>=1.4.0
+nccl4py==0.6.0
+nvidia-cudnn-frontend>=1.25.0
+nvidia-ml-py>=12.570.86
+grpcio-tools>=1.76.0
+onnx
+onnxscript
+nvdlfw-inspect
+
+# Keep the telemetry family consistent.
+opentelemetry-api==1.43.0
+opentelemetry-sdk==1.43.0
+opentelemetry-semantic-conventions==0.64b0
+opentelemetry-proto==1.43.0
+opentelemetry-exporter-otlp-proto-common==1.43.0
+opentelemetry-exporter-otlp-proto-http==1.43.0
+opentelemetry-exporter-otlp-proto-grpc==1.43.0
+protobuf==6.33.6
+
+# TorchX compatibility and native-extension build tools.
+urllib3==1.26.20
+types-requests==2.31.0.6
+types-urllib3==1.26.25.14
+auditwheel
+build
+intervaltree
+nanobind==3.0.1
+ninja
+patchelf
+pybind11
+setuptools==79.0.1
+wheel
+hatchling==1.32.4
+hatch-vcs
+Cython>=3.0
