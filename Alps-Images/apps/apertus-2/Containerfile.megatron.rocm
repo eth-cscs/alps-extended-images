@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+ENV PYTHONNOUSERSITE=1 \
+    PYTORCH_ROCM_ARCH=gfx942 \
+    UCCL_EP_TRANSPORT=cxi \
+    UCCL_SOCKET_IFNAME=hsn \
+    UCCL_CXI_THREADING=safe \
+    NVTE_FUSED_ATTN_CK=1 \
+    NVTE_FUSED_ATTN_AOTRITON=0
+
+COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
+COPY Alps-Images/apps/apertus-2/sources/rocm/versions.env /opt/alps/apertus2-rocm/versions.env
+COPY Alps-Images/apps/apertus-2/sources/rocm/install.sh /opt/alps/apertus2-rocm/install.sh
+COPY Alps-Images/apps/apertus-2/sources/rocm/requirements.lock /opt/alps/apertus2-rocm/requirements.lock
+
+RUN bash /opt/alps/apertus2-rocm/install.sh system
+
+COPY Alps-Images/apps/apertus-2/sources/rocm/install-uccl.sh /opt/alps/apertus2-rocm/install-uccl.sh
+COPY Alps-Images/apps/apertus-2/patches/rocm/uccl/ /opt/alps/apertus2-rocm/patches/uccl/
+ARG APERTUS_BUILD_JOBS=8
+RUN bash /opt/alps/apertus2-rocm/install.sh uccl
+
+COPY Alps-Images/apps/apertus-2/patches/rocm/transformer-engine/ /opt/alps/apertus2-rocm/patches/transformer-engine/
+COPY Alps-Images/apps/apertus-2/patches/rocm/ck-jit/ /opt/alps/apertus2-rocm/patches/ck-jit/
+RUN bash /opt/alps/apertus2-rocm/install.sh transformer-engine
+
+RUN bash /opt/alps/apertus2-rocm/install.sh training
+
+RUN bash /opt/alps/apertus2-rocm/install.sh megatron
+
+COPY Alps-Images/apps/apertus-2/sources/rocm/requirements.in /opt/alps/apertus2-rocm/requirements.in
+COPY Alps-Images/apps/apertus-2/sources/rocm/requirements.overrides /opt/alps/apertus2-rocm/requirements.overrides
+# Keep the compiler and headers: TE CK attention and FLA use runtime JIT.
+COPY Alps-Images/apps/apertus-2/tests/rocm/ /opt/tests/apertus-2/rocm/
+RUN python3 /opt/tests/apertus-2/rocm/check-stack.py --metadata-only
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
