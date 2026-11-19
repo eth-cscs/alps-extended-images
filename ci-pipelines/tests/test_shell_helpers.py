@@ -350,6 +350,7 @@ def isolated_meta_repo(tmp_path):
 
     shutil.copytree(ROOT / "Alps-Images", tmp_path / "Alps-Images", ignore=shutil.ignore_patterns("__pycache__"))
     shutil.copytree(ROOT / "ci-pipelines/helpers", tmp_path / "ci-pipelines/helpers", ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(ROOT / "ci-pipelines/base-tests", tmp_path / "ci-pipelines/base-tests")
     shutil.copy2(ROOT / "ci-pipelines/child-templates.yaml", tmp_path / "ci-pipelines")
     shutil.copy2(ROOT / ".dockerignore", tmp_path)
 
@@ -496,6 +497,7 @@ def test_meta_validation_hashes_include_helper_scripts():
     paths = result.stdout.split()
     assert "ci-pipelines/helpers/meta.sh" in paths
     assert "ci-pipelines/helpers/skopeo.sh" in paths
+    assert "ci-pipelines/base-tests" in paths
 
 
 def generate_manual(*args, output):
