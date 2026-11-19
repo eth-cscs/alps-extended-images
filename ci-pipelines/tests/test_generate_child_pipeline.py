@@ -456,6 +456,19 @@ def test_generate_jobs_use_expected_templates(monkeypatch, gen):
     assert child.data["publish-base-pytorch-cuda-26-06-py3"]["extends"] == [".child-publish-template"]
 
 
+def test_generate_cuda_base_cxi_hybrid_mr_desc_test(monkeypatch, gen):
+    base = base_image()
+    fake_registry(monkeypatch, gen, {})
+    child = gen.Child()
+
+    gen.add_base(child, base, [{"name": "cxi-hybrid-mr-desc"}], valid=False)
+
+    job = child.data["test-base-pytorch-cuda-26-06-py3-cxi-hybrid-mr-desc"]
+    assert job["extends"] == [".child-cuda-base-cxi-hybrid-mr-desc-test-template"]
+    assert "mark-base-pytorch-cuda-26-06-py3-tested" in child.data
+    assert job["image"] == base["CANON_IMAGE_REF"]
+
+
 def test_schema_base_rejects_empty_tests(gen):
     with pytest.raises(RuntimeError, match="tests must not be empty"):
         gen.validate_base_ci(Path("base.yaml"), {"family": "cuda", "variants": [{"name": "pytorch", "variant": "x"}], "tests": []})

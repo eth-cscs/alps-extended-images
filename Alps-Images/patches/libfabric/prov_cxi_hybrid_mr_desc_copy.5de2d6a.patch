@@ -1,0 +1,337 @@
+From 969e87e594c6369b9228036b478bc59eb326abf5 Mon Sep 17 00:00:00 2001
+From: Andres Nowak <andresnowak52@gmail.com>
+Date: Thu, 19 Nov 2026 14:48:05 +0100
+Subject: [PATCH] prov/cxi: Use hybrid MR desc for HMEM operand copies
+
+In hybrid MR desc mode, the IDC AMO and IDC RMA paths ignored the
+caller's MR desc when the CPU copied the payload into the command.
+They called cxip_txc_copy_from_hmem() with a NULL MD. With FI_HMEM
+enabled, this maps the buffer through the MR cache for every
+operation, although the user gave a valid desc. The DMA paths had the
+same NULL MD for their operand copies (FI_ATOMIC_WRITE, FI_MSWAP,
+compare buffers and FI_INJECT bounce copies).
+
+Add cxip_txc_mr_copy_md(). It returns the MD of the user MR when hybrid
+MR desc mode is on, the MR belongs to the TX domain, the MD covers the
+copied range, and the MD has a dev reg handle if the endpoint requires
+one. Otherwise it returns NULL, which keeps the existing internal
+mapping. Plumb the operand, compare and RMA source descs to all
+cxip_txc_copy_from_hmem() calls that copy from user buffers.
+---
+ prov/cxi/include/cxip.h    | 37 ++++++++++++++++++++++
+ prov/cxi/src/cxip_atomic.c | 65 ++++++++++++++++++++++++++++++--------
+ prov/cxi/src/cxip_rma.c    | 18 ++++++++---
+ 3 files changed, 101 insertions(+), 19 deletions(-)
+
+diff --git a/prov/cxi/include/cxip.h b/prov/cxi/include/cxip.h
+index cd5005fea..65519d4f7 100644
+--- a/prov/cxi/include/cxip.h
++++ b/prov/cxi/include/cxip.h
+@@ -3947,6 +3947,43 @@ cxip_txc_copy_from_hmem(struct cxip_txc *txc, struct cxip_md *hmem_md,
+ 	return FI_SUCCESS;
+ }
+ 
++/* Return the MD of a user MR desc for a CPU copy of [buf, buf + len), to pass
++ * to cxip_txc_copy_from_hmem(). This lets the copy skip the internal mapping
++ * (MR cache lookup) when hybrid MR desc mode gives a valid desc.
++ *
++ * Return NULL, so that the copy maps the buffer internally as before, if
++ * hybrid MR desc mode is off, the MR has no MD, the MR belongs to a different
++ * domain, the MD does not cover the range, or the MD lacks a dev reg handle
++ * that the endpoint requires.
++ */
++static inline struct cxip_md *
++cxip_txc_mr_copy_md(struct cxip_txc *txc, struct cxip_mr *mr,
++		    const void *buf, size_t len)
++{
++	struct cxip_md *md;
++	uintptr_t start;
++	uintptr_t end;
++
++	if (!mr || !buf || !txc->domain->hybrid_mr_desc || !txc->hmem)
++		return NULL;
++
++	md = mr->md;
++	if (!md || mr->domain != txc->domain)
++		return NULL;
++
++	start = (uintptr_t)md->info.iov.iov_base;
++	end = start + md->info.iov.iov_len;
++	if ((uintptr_t)buf < start || (uintptr_t)buf > end ||
++	    len > end - (uintptr_t)buf)
++		return NULL;
++
++	if (txc->ep_obj->require_dev_reg_copy[md->info.iface] &&
++	    !md->handle_valid)
++		return NULL;
++
++	return md;
++}
++
+ static inline
+ int cxip_set_recv_match_id(struct cxip_rxc *rxc, fi_addr_t src_addr,
+ 			   bool auth_key, uint32_t *match_id, uint16_t *vni)
+diff --git a/prov/cxi/src/cxip_atomic.c b/prov/cxi/src/cxip_atomic.c
+index f568311bb..89e328824 100644
+--- a/prov/cxi/src/cxip_atomic.c
++++ b/prov/cxi/src/cxip_atomic.c
+@@ -523,6 +523,7 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ 			     enum cxip_amo_req_type req_type,
+ 			     const struct fi_msg_atomic *msg, void *buf,
+ 			     void *compare, void *result,
++			     struct cxip_mr *buf_mr, struct cxip_mr *compare_mr,
+ 			     struct cxip_mr *result_mr, uint64_t key,
+ 			     uint64_t remote_offset, union c_fab_addr *dfa,
+ 			     uint8_t *idx_ext, uint16_t vni,
+@@ -534,6 +535,8 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ {
+ 	struct cxip_domain *dom = txc->domain;
+ 	struct cxip_md *result_md = NULL;
++	struct cxip_md *buf_md;
++	struct cxip_md *compare_md;
+ 	struct c_cstate_cmd cstate_cmd = {};
+ 	struct c_idc_amo_cmd idc_amo_cmd = {};
+ 	struct cxip_req *req = NULL;
+@@ -718,9 +721,16 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ 	if (result)
+ 		idc_amo_cmd.local_addr = CXI_VA_TO_IOVA(result_md->md, result);
+ 
++	/* Use the caller's MR desc for the operand copies when it is valid.
++	 * This skips the internal mapping of the operand buffers.
++	 */
++	buf_md = cxip_txc_mr_copy_md(txc, buf_mr, buf, atomic_type_len);
++	compare_md = cxip_txc_mr_copy_md(txc, compare_mr, compare,
++					 atomic_type_len);
++
+ 	switch (msg->op) {
+ 	case FI_MSWAP:
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &hmem_buf, buf,
++		ret = cxip_txc_copy_from_hmem(txc, buf_md, &hmem_buf, buf,
+ 					      atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc, "cxip_txc_copy_from_hmem failed: %d:%s\n",
+@@ -728,8 +738,8 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ 			goto err_unmap_result_buf;
+ 		}
+ 
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &hmem_compare, compare,
+-					      atomic_type_len);
++		ret = cxip_txc_copy_from_hmem(txc, compare_md, &hmem_compare,
++					      compare, atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc, "cxip_txc_copy_from_hmem failed: %d:%s\n",
+ 				 ret, fi_strerror(-ret));
+@@ -755,7 +765,8 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ 	case FI_ATOMIC_WRITE:
+ 		assert(compare == NULL);
+ 
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &idc_amo_cmd.op2_word1,
++		ret = cxip_txc_copy_from_hmem(txc, buf_md,
++					      &idc_amo_cmd.op2_word1,
+ 					      buf, atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc, "cxip_txc_copy_from_hmem failed: %d:%s\n",
+@@ -765,7 +776,8 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ 
+ 		/* Fall through. */
+ 	default:
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &idc_amo_cmd.op1_word1,
++		ret = cxip_txc_copy_from_hmem(txc, buf_md,
++					      &idc_amo_cmd.op1_word1,
+ 					      buf, atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc, "cxip_txc_copy_from_hmem failed: %d:%s\n",
+@@ -776,7 +788,8 @@ static int cxip_amo_emit_idc(struct cxip_txc *txc,
+ 
+ 	if (compare) {
+ 		/* Note: 16-byte value will overflow into op2_word2 */
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &idc_amo_cmd.op2_word1,
++		ret = cxip_txc_copy_from_hmem(txc, compare_md,
++					      &idc_amo_cmd.op2_word1,
+ 					      compare, atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc, "cxip_txc_copy_from_hmem failed: %d:%s\n",
+@@ -878,7 +891,8 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 			     enum cxip_amo_req_type req_type,
+ 			     const struct fi_msg_atomic *msg, void *buf,
+ 			     void *compare, void *result,
+-			     struct cxip_mr *buf_mr, struct cxip_mr *result_mr,
++			     struct cxip_mr *buf_mr, struct cxip_mr *compare_mr,
++			     struct cxip_mr *result_mr,
+ 			     uint64_t key, uint64_t remote_offset,
+ 			     union c_fab_addr *dfa, uint8_t *idx_ext,
+ 			     uint16_t vni, enum c_atomic_op atomic_op,
+@@ -900,15 +914,25 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 	uint64_t hmem_buf;
+ 	uint64_t hmem_compare;
+ 	struct cxip_md *buf_md;
++	struct cxip_md *buf_copy_md;
++	struct cxip_md *compare_copy_md;
+ 	struct cxip_md *result_md = NULL;
+ 	void *selective_completion_req;
+ 
+ 	/* MR desc cannot be value unless hybrid MR desc is enabled. */
+ 	if (!dom->hybrid_mr_desc) {
+ 		buf_mr = NULL;
++		compare_mr = NULL;
+ 		result_mr = NULL;
+ 	}
+ 
++	/* MDs for CPU copies of the user operand buffers. NULL makes the copy
++	 * map the buffer internally.
++	 */
++	buf_copy_md = cxip_txc_mr_copy_md(txc, buf_mr, buf, atomic_type_len);
++	compare_copy_md = cxip_txc_mr_copy_md(txc, compare_mr, compare,
++					      atomic_type_len);
++
+ 	/* Since fetching AMO with flush results in two commands, if the
+ 	 * target MR needs events, this would results in two remote MR counter
+ 	 * increments. Thus, this functionality cannot be supported.
+@@ -990,7 +1014,7 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 				break;
+ 
+ 			case FI_MSWAP:
+-				ret = cxip_txc_copy_from_hmem(txc, NULL,
++				ret = cxip_txc_copy_from_hmem(txc, buf_copy_md,
+ 							      &hmem_buf, buf,
+ 							      atomic_type_len);
+ 				if (ret) {
+@@ -1000,7 +1024,8 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 					goto err_unmap_operand_buf;
+ 				}
+ 
+-				ret = cxip_txc_copy_from_hmem(txc, NULL,
++				ret = cxip_txc_copy_from_hmem(txc,
++							      compare_copy_md,
+ 							      &hmem_compare,
+ 							      compare,
+ 							      atomic_type_len);
+@@ -1019,7 +1044,7 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 
+ 			/* Copy over user payload for FI_INJECT operation. */
+ 			default:
+-				ret = cxip_txc_copy_from_hmem(txc, NULL,
++				ret = cxip_txc_copy_from_hmem(txc, buf_copy_md,
+ 							      req->amo.ibuf,
+ 							      buf,
+ 							      atomic_type_len);
+@@ -1100,7 +1125,13 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 	if (msg->op == FI_ATOMIC_WRITE) {
+ 		assert(compare == NULL);
+ 
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &dma_amo_cmd.op2_word1,
++		/* For FI_INJECT, buf now points to the internal buffer. The MR
++		 * desc does not cover it, so the helper returns NULL then.
++		 */
++		buf_copy_md = cxip_txc_mr_copy_md(txc, buf_mr, buf,
++						  atomic_type_len);
++		ret = cxip_txc_copy_from_hmem(txc, buf_copy_md,
++					      &dma_amo_cmd.op2_word1,
+ 					      buf, atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc,
+@@ -1110,7 +1141,8 @@ static int cxip_amo_emit_dma(struct cxip_txc *txc,
+ 		}
+ 	} else if (compare) {
+ 		/* Note: 16-byte value will overflow into op2_word2 */
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, &dma_amo_cmd.op2_word1,
++		ret = cxip_txc_copy_from_hmem(txc, compare_copy_md,
++					      &dma_amo_cmd.op2_word1,
+ 					      compare, atomic_type_len);
+ 		if (ret) {
+ 			TXC_WARN(txc,
+@@ -1249,6 +1281,7 @@ int cxip_amo_common(enum cxip_amo_req_type req_type, struct cxip_txc *txc,
+ 	uint8_t idx_ext;
+ 	uint32_t pid_idx;
+ 	struct cxip_mr *buf_mr = NULL;
++	struct cxip_mr *compare_mr = NULL;
+ 	struct cxip_mr *result_mr = NULL;
+ 	uint16_t vni;
+ 
+@@ -1266,6 +1299,8 @@ int cxip_amo_common(enum cxip_amo_req_type req_type, struct cxip_txc *txc,
+ 		}
+ 
+ 		compare = comparev[0].addr;
++		if (comparedesc && comparedesc[0])
++			compare_mr = comparedesc[0];
+ 
+ 		/* FALLTHRU */
+ 	case CXIP_RQ_AMO_FETCH:
+@@ -1352,13 +1387,15 @@ int cxip_amo_common(enum cxip_amo_req_type req_type, struct cxip_txc *txc,
+ 		      &idx_ext);
+ 	if (idc)
+ 		ret = cxip_amo_emit_idc(txc, req_type, msg, buf, compare,
+-					result, result_mr, key, remote_offset,
++					result, buf_mr, compare_mr, result_mr,
++					key, remote_offset,
+ 					&dfa, &idx_ext, vni, atomic_op,
+ 					cswap_op, atomic_type, atomic_type_len,
+ 					flags, tclass);
+ 	else
+ 		ret = cxip_amo_emit_dma(txc, req_type, msg, buf, compare,
+-					result, buf_mr, result_mr, key,
++					result, buf_mr, compare_mr, result_mr,
++					key,
+ 					remote_offset, &dfa, &idx_ext, vni,
+ 					atomic_op, cswap_op, atomic_type,
+ 					atomic_type_len, flags, tclass,
+diff --git a/prov/cxi/src/cxip_rma.c b/prov/cxi/src/cxip_rma.c
+index 40cd59896..9d61bcda3 100644
+--- a/prov/cxi/src/cxip_rma.c
++++ b/prov/cxi/src/cxip_rma.c
+@@ -207,6 +207,7 @@ static int cxip_rma_emit_dma(struct cxip_txc *txc, const void *buf, size_t len,
+ {
+ 	struct cxip_req *req = NULL;
+ 	struct cxip_md *dma_md = NULL;
++	struct cxip_md *copy_md;
+ 	void *dma_buf = NULL;
+ 	struct c_full_dma_cmd dma_cmd = {};
+ 	int ret;
+@@ -258,8 +259,9 @@ static int cxip_rma_emit_dma(struct cxip_txc *txc, const void *buf, size_t len,
+ 				goto err_free_cq_req;
+ 			}
+ 
+-			ret = cxip_txc_copy_from_hmem(txc, NULL, req->rma.ibuf,
+-						      buf, len);
++			copy_md = cxip_txc_mr_copy_md(txc, mr, buf, len);
++			ret = cxip_txc_copy_from_hmem(txc, copy_md,
++						      req->rma.ibuf, buf, len);
+ 			if (ret){
+ 				TXC_WARN(txc,
+ 					 "cxip_txc_copy_from_hmem failed: %d:%s\n",
+@@ -409,6 +411,7 @@ err:
+ }
+ 
+ static int cxip_rma_emit_idc(struct cxip_txc *txc, const void *buf, size_t len,
++			     struct cxip_mr *mr,
+ 			     union c_fab_addr *dfa, uint8_t *idx_ext,
+ 			     uint16_t vni, uint64_t addr, uint64_t key,
+ 			     uint64_t data, uint64_t flags, void *context,
+@@ -454,7 +457,12 @@ static int cxip_rma_emit_idc(struct cxip_txc *txc, const void *buf, size_t len,
+ 			goto err_free_cq_req;
+ 		}
+ 
+-		ret = cxip_txc_copy_from_hmem(txc, NULL, hmem_buf, buf, len);
++		/* Use the caller's MR desc for the copy when it is valid. This
++		 * skips the internal mapping of the source buffer.
++		 */
++		ret = cxip_txc_copy_from_hmem(txc,
++					      cxip_txc_mr_copy_md(txc, mr, buf, len),
++					      hmem_buf, buf, len);
+ 		if (ret) {
+ 			TXC_WARN(txc,
+ 				 "cxip_txc_copy_from_hmem failed: %d:%s\n",
+@@ -718,8 +726,8 @@ ssize_t cxip_rma_common(enum fi_op_type op, struct cxip_txc *txc,
+ 	 */
+ 	ofi_genlock_lock(&txc->ep_obj->lock);
+ 	if (idc)
+-		ret = cxip_rma_emit_idc(txc, buf, len, &dfa, &idx_ext, vni,
+-					addr, key, data, flags, context, unr,
++		ret = cxip_rma_emit_idc(txc, buf, len, desc, &dfa, &idx_ext,
++					vni, addr, key, data, flags, context, unr,
+ 					tclass, tc_type);
+ 	else
+ 		ret = cxip_rma_emit_dma(txc, buf, len, desc, &dfa, &idx_ext,
+-- 
+2.43.0
+

@@ -131,7 +131,8 @@ validation_helper_paths() {
     "ci-pipelines/helpers/generate-child-pipeline.py" \
     "ci-pipelines/helpers/meta.sh" \
     "ci-pipelines/helpers/skopeo.sh" \
-    "ci-pipelines/helpers/vetnode-config.yaml"
+    "ci-pipelines/helpers/vetnode-config.yaml" \
+    "ci-pipelines/base-tests"
 }
 
 base_validation_hash() {

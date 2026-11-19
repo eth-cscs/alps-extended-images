@@ -221,6 +221,7 @@ BASE_TEST_TEMPLATES = {
         "env": ".child-cuda-base-env-test-template",
         "collectives": ".child-cuda-base-collectives-test-template",
         "vetnode": ".child-cuda-vetnode-test-template",
+        "cxi-hybrid-mr-desc": ".child-cuda-base-cxi-hybrid-mr-desc-test-template",
     },
     "rocm": {
         "env": ".child-rocm-base-env-test-template",
