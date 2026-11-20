@@ -5,4 +5,3 @@ __pycache__/
 *.py[cod]
 generated-child-pipeline.yaml
 ci-generator-image.env
-*.env
