@@ -20,6 +20,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 COPY Alps-Images/common/package-helpers.sh /opt/alps/package-helpers.sh
 
 # python3-dev and the toolchain are needed by the native extensions built below.
+# libdw-dev: vLLM's bundled DeepGEMM extension includes elfutils/libdwfl.h and links libdw.
 RUN set -eux; \
     source /opt/alps/package-helpers.sh; \
     apt_get update; \
@@ -34,6 +35,7 @@ RUN set -eux; \
       cmake \
       ninja-build \
       zlib1g-dev \
+      libdw-dev \
     ; \
     rm -rf /var/lib/apt/lists/*
 
