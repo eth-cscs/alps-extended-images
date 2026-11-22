@@ -183,16 +183,30 @@ ARG TE_MAX_JOBS=8
 # TE 2.18 takes the cuDNN frontend headers from this wheel, so it must be installed
 # before the no-isolation build. Same pin as runtime-requirements.txt (FlashInfer needs >=1.31).
 ARG CUDNN_FRONTEND_VERSION=1.31.0
+# The base image carries an older copy of the frontend headers. nvcc searches the CUDA
+# include dir before user -I paths, so the .cu files would compile against that copy
+# (no Tensor_attributes::set_ragged_offset_multiplier). Every copy outside the wheel is
+# moved aside for the TE build and put back afterwards.
 RUN set -eux; \
     uv pip uninstall --system transformer_engine transformer_engine_cu13 transformer_engine_torch; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
       "nvidia-cudnn-frontend==${CUDNN_FRONTEND_VERSION}"; \
+    fe_inc="$(python3 -c 'import importlib.metadata as m, pathlib; print(pathlib.Path(m.distribution("nvidia-cudnn-frontend").locate_file("include")).resolve())')"; \
+    grep -q set_ragged_offset_multiplier "${fe_inc}/cudnn_frontend/graph_properties.h"; \
+    mapfile -t stale_dirs < <(find / -xdev -name cudnn_frontend.h -not -path "${fe_inc}/*" -printf '%h\n' 2>/dev/null | sort -u); \
+    for d in "${stale_dirs[@]}"; do \
+      echo "moving aside stale cuDNN frontend headers in ${d}"; \
+      mkdir -p "/tmp/cfe-stale${d}"; \
+      mv "${d}"/cudnn_frontend* "/tmp/cfe-stale${d}/"; \
+    done; \
     MAX_JOBS="${TE_MAX_JOBS}" \
     NVTE_CUDA_ARCHS=90 \
     NVTE_WITH_NCCL_EP=0 \
     uv pip install --system --no-cache --no-build-isolation \
       -c /opt/alps/base-pins.txt \
-      "git+${TE_REPO}@${TE_COMMIT}"
+      "git+${TE_REPO}@${TE_COMMIT}"; \
+    for d in "${stale_dirs[@]}"; do mv "/tmp/cfe-stale${d}"/cudnn_frontend* "${d}/"; done; \
+    rm -rf /tmp/cfe-stale
 
 # ---- causal-conv1d / mamba-ssm -----------------------------------------------
 # Required by Megatron-Bridge's [ssm] extra, which NeMo-RL's mcore extra installs.
