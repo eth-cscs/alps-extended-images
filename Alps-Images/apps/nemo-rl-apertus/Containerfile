@@ -180,8 +180,13 @@ ARG TE_REPO=https://github.com/NVIDIA/TransformerEngine.git
 # v2.18
 ARG TE_COMMIT=27486e03cfc1fa41f6932dcecdc47c71c47eac3e
 ARG TE_MAX_JOBS=8
+# TE 2.18 takes the cuDNN frontend headers from this wheel, so it must be installed
+# before the no-isolation build. Same pin as runtime-requirements.txt (FlashInfer needs >=1.31).
+ARG CUDNN_FRONTEND_VERSION=1.31.0
 RUN set -eux; \
     uv pip uninstall --system transformer_engine transformer_engine_cu13 transformer_engine_torch; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt \
+      "nvidia-cudnn-frontend==${CUDNN_FRONTEND_VERSION}"; \
     MAX_JOBS="${TE_MAX_JOBS}" \
     NVTE_CUDA_ARCHS=90 \
     NVTE_WITH_NCCL_EP=0 \
