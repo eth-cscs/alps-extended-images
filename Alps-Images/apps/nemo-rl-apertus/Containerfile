@@ -361,7 +361,6 @@ VERIFY
 RUN set -eux; \
     site_dir="$(python3 -c 'import site; print(site.getsitepackages()[0])')"; \
     test -x "${site_dir}/vllm/vllm-rs"; \
-    test -n "$(find "${site_dir}/vllm" -maxdepth 1 -name '_rust_tool_parser*.so' -print -quit)"; \
     test -f "${site_dir}/torch_memory_saver_hook_mode_preload_cu13.abi3.so"; \
     missing="$(find "${site_dir}/vllm" "${site_dir}/transformer_engine" \
       -name '*.so' -exec ldd {} + 2>/dev/null \

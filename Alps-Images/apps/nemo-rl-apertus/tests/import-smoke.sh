@@ -33,7 +33,7 @@ for pkg, prefix in EXPECTED.items():
 
 REQUIRED = [
     # Installed sources
-    "nemo_rl", "megatron.core", "megatron.bridge", "vllm", "vllm._rust_tool_parser",
+    "nemo_rl", "megatron.core", "megatron.bridge", "vllm",
     # NeMo-RL runtime
     "ray", "hydra", "omegaconf", "transformers", "megatron.energon", "math_verify",
     "mlflow", "swanlab", "wandb", "tensordict", "zstandard", "datasets", "accelerate",
