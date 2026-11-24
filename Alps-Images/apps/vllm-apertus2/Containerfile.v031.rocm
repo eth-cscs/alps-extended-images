@@ -127,6 +127,11 @@ RUN set -eux; \
       git apply --check "${patch_file}"; \
       git apply "${patch_file}"; \
     done; \
+    # install-mooncake.sh builds Mooncake with CXI later; skip the PyPI ROCm wheel.
+    sed -i -E '/^mooncake-transfer-engine/Id' requirements/rocm.txt; \
+    if grep -qi '^mooncake' requirements/rocm.txt; then \
+      echo "ERROR: Mooncake still listed in requirements/rocm.txt" >&2; exit 1; \
+    fi; \
     pip_install python --no-cache-dir -r requirements/rocm.txt; \
     # The wheel compiler needs these unset; ROCM_HOME still supplies CMake's SDK root.
     rm -rf /tmp/vllm-dist; \

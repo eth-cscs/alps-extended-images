@@ -312,6 +312,29 @@ fi
 # only build requirement that may be missing.
 pip_install "${python_bin}" --no-cache-dir wheel
 
+# Remove Mooncake wheels that other requirements installed, for example
+# mooncake-transfer-engine-rocm from vLLM's requirements/rocm.txt. They use a
+# different distribution name, so pip does not replace them with this build.
+# Their leftover files (mooncake/store/_store.so in 0.3.14) then shadow this
+# build and fail to load against its libasio.so.
+mapfile -t preinstalled_mooncake < <("${python_bin}" -c '
+import importlib.metadata as m
+for d in m.distributions():
+    name = d.metadata["Name"] or ""
+    if name.lower().replace("_", "-").startswith("mooncake-transfer-engine"):
+        print(name)
+')
+if [[ ${#preinstalled_mooncake[@]} -gt 0 ]]; then
+    echo "INFO: removing preinstalled Mooncake distributions: ${preinstalled_mooncake[*]}"
+    "${python_bin}" -m pip uninstall -y "${preinstalled_mooncake[@]}"
+fi
+while IFS= read -r site_dir; do
+    if [[ -d "${site_dir}/mooncake" ]] \
+        && [[ -n "$(find "${site_dir}/mooncake" -type f -print -quit)" ]]; then
+        die "stale files remain in ${site_dir}/mooncake after removing preinstalled Mooncake"
+    fi
+done < <("${python_bin}" -c 'import site; print("\n".join(site.getsitepackages()))')
+
 # mooncake-wheel's pyproject.toml references a README.md that is materialized
 # next to it only for the duration of the build (upstream does the same).
 cp "${src_dir}/README.md" "${wheel_dir}/README.md"
