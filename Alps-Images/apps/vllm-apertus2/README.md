@@ -1,7 +1,7 @@
 # Apertus2 vLLM on Alps
 
 Apertus2 vLLM serving images built from `swiss-ai/vllm` release tags.
-The CUDA/GH200 images use `pytorch-cuda:26.07-py3` and build the Apertus2 vLLM fork, UCCL EP/P2P, the `deep_ep` wrapper, and NIXL 1.3.2 with its UCCL plugin from pinned sources.
+The CUDA/GH200 images use `pytorch-cuda:26.07-py3` and build the Apertus2 vLLM fork, UCCL EP/P2P, the `deep_ep` wrapper, NIXL 1.3.2 with its UCCL plugin, and Mooncake with the CXI transport from pinned sources.
 The ROCm/MI300A image uses `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` and follows [`apps/vllm/Containerfile.rocm`](../vllm/Containerfile.rocm): AITER, UCCL-EP over CXI, and Mooncake with the CXI transport for KV transfer.
 All images preserve the base Torch stack.
 
@@ -28,7 +28,6 @@ It applies these `git format-patch` series from `patches/rocm/` with `git apply 
 | `aiter/` | MI300A XCD count and GLM-5.3 tuning tables | Same as `apps/vllm/patches/rocm/aiter` (AITER `v0.1.23`) |
 | `vllm/` | DeepEP HT CUDA-graph guard, bundled `triton_kernels`, bench cached tokens, two ROCm 10 build fixes | `apps/vllm/patches/{common,rocm}/vllm`, renumbered; all apply to `v0.31.0+Apertus2.1` |
 | `uccl/` | Physical-rank CXI domain selection, shared-barrier cleanup, four ROCm build fixes | `apps/vllm/patches/{common,rocm}/uccl`, renumbered |
-| `mooncake/` | CXI topology discovery for the Store | Same as `apps/vllm/patches/common/mooncake` (Mooncake `v0.3.13.post1`) |
 
 UCCL `52d4184c` differs from the `e22a3e8f` pin of `apps/vllm`:
 
@@ -37,7 +36,16 @@ UCCL `52d4184c` differs from the `e22a3e8f` pin of `apps/vllm`:
 - `rocm-check-runtime-topk-warp-capacity` is dropped: upstream checks the runtime top-k against the warp capacity (#1057).
 
 ROCm tests in `tests-rocm/` check Apertus2 imports, the installed version, UCCL configuration overrides, and an SSSGLU Triton kernel on one GPU.
-The Ray/RCCL UCCL-EP, Mooncake CXI, and AITER tests are copies of the `apps/vllm` tests.
+The Ray/RCCL UCCL-EP and AITER tests are copies of the `apps/vllm` tests.
+
+## Mooncake
+
+All targets build Mooncake `v0.3.13.post1` with the CXI transport through `sources/install-mooncake.sh`, a copy of the `apps/vllm` installer.
+Mooncake links the libfabric of the base image, so it shares one libfabric instance with the NCCL/RCCL plugin.
+`patches/common/mooncake/` holds the CXI topology discovery patch for the Store, the same patch as `apps/vllm/patches/common/mooncake`.
+The CUDA images build Mooncake after NIXL and constrain it to the base Torch stack.
+`tests/mooncake_smoke.sh` is a copy of the `apps/vllm` test.
+It runs a host-memory and a GPU-memory self-transfer over CXI and a Store put/get on one node, and every target ships it.
 
 ## Serving examples
 
@@ -56,7 +64,7 @@ cscs-ci run build-images
 ```
 
 The existing pipeline discovers this app through `profile.env`, builds against
-the canonical PyTorch 26.07 base, runs vetnode and the GPU import smoke test,
+the canonical PyTorch 26.07 base, runs vetnode, the GPU import smoke test, and the Mooncake CXI test,
 and promotes validated images to JFrog/GHCR under the repository's publish policy.
 The stable JFrog refs are:
 

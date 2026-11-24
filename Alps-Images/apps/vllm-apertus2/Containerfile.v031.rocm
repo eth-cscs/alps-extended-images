@@ -190,7 +190,7 @@ RUN set -eux; \
 
 # Mooncake transfer engine (CXI)
 COPY Alps-Images/apps/vllm-apertus2/sources/install-mooncake.sh /opt/alps/install-mooncake.sh
-COPY Alps-Images/apps/vllm-apertus2/patches/rocm/mooncake /opt/alps/mooncake-patches
+COPY Alps-Images/apps/vllm-apertus2/patches/common/mooncake /opt/alps/mooncake-patches
 
 RUN set -eux; \
     chmod u+x /opt/alps/install-mooncake.sh; \
@@ -198,6 +198,7 @@ RUN set -eux; \
 
 # Tests shipped with the image
 COPY Alps-Images/apps/vllm-apertus2/tests-rocm/ /opt/tests/vllm-apertus2/
+COPY Alps-Images/apps/vllm-apertus2/tests/mooncake_smoke.sh /opt/tests/vllm-apertus2/mooncake_smoke.sh
 RUN chmod -R a+rX /opt/tests/vllm-apertus2
 
 ARG OCI_SOURCE="unknown"

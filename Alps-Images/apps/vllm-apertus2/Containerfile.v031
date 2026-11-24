@@ -202,22 +202,9 @@ FROM uv-base AS runtime
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-ARG OCI_SOURCE="unknown"
-ARG OCI_REVISION="unknown"
-ARG OCI_CREATED="unknown"
-ARG OCI_DESCRIPTION="unknown"
-ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
 ARG NIXL_LIBDIR="lib/aarch64-linux-gnu"
 ARG TRANSFORMERS_VERSION="5.17.0"
 ARG VLLM_VERSION_OVERRIDE
-
-LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
-      org.opencontainers.image.revision="${OCI_REVISION}" \
-      org.opencontainers.image.created="${OCI_CREATED}" \
-      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
-      com.cscs.alps.git.repo="${OCI_SOURCE}" \
-      com.cscs.alps.git.commit="${OCI_REVISION}" \
-      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
 
 ENV UCCL_EP_TRANSPORT="cxi" \
     UCCL_P2P_TRANSPORT="cxi" \
@@ -274,6 +261,14 @@ RUN set -eux; \
     ldconfig; \
     rm -rf /opt/wheels /tmp/runtime-constraints.txt /root/.cache/pip
 
+# Mooncake transfer engine (CXI), built as in apps/vllm against the base libfabric.
+COPY Alps-Images/apps/vllm-apertus2/sources/install-mooncake.sh /opt/alps/install-mooncake.sh
+COPY Alps-Images/apps/vllm-apertus2/patches/common/mooncake /opt/alps/mooncake-patches
+
+RUN set -eux; \
+    chmod u+x /opt/alps/install-mooncake.sh; \
+    PIP_CONSTRAINT=/opt/alps/base-pins.txt /opt/alps/install-mooncake.sh cuda
+
 RUN set -eux; \
     ldconfig -p | grep -F 'libfabric.so.1'; \
     uv pip check --system; \
@@ -292,3 +287,21 @@ RUN set -eux; \
 
 COPY Alps-Images/apps/vllm-apertus2/tests/ /opt/tests/vllm-apertus2/
 RUN chmod -R a+rX /opt/tests/vllm-apertus2
+
+ARG OCI_SOURCE="unknown"
+ARG OCI_REVISION="unknown"
+ARG OCI_CREATED="unknown"
+ARG OCI_DESCRIPTION="unknown"
+ARG CSCS_ALPS_GIT_COMMIT_SHORT="unknown"
+
+# Podman needs a RUN boundary to refresh cached labels after ARG-only changes.
+RUN : "${OCI_SOURCE}" "${OCI_REVISION}" "${OCI_CREATED}" \
+      "${OCI_DESCRIPTION}" "${CSCS_ALPS_GIT_COMMIT_SHORT}"
+
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      org.opencontainers.image.created="${OCI_CREATED}" \
+      org.opencontainers.image.description="${OCI_DESCRIPTION}" \
+      com.cscs.alps.git.repo="${OCI_SOURCE}" \
+      com.cscs.alps.git.commit="${OCI_REVISION}" \
+      com.cscs.alps.git.commit_short="${CSCS_ALPS_GIT_COMMIT_SHORT}"
