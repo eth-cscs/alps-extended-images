@@ -91,7 +91,7 @@ FROM uv-base AS uccl-builder
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 ARG UCCL_REPO="https://github.com/uccl-project/uccl.git"
-ARG UCCL_REF="52d4184c89deb5631be6dac6a9b1c40896c9e26e"
+ARG UCCL_REF="1c9e39bbec2ddcd401cfe5323ee34f1fed139aac"
 ARG UCCL_CUDA_ARCH="9.0"
 ARG UCCL_NVL_PEERS="4"
 ARG UCCL_MAX_JOBS="8"

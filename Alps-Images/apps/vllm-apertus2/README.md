@@ -15,8 +15,10 @@ The two CUDA Containerfiles differ only in `VLLM_REF`, `VLLM_VERSION_OVERRIDE`, 
 Each image sets `ALPS_VLLM_APERTUS2_VERSION` to the wheel version, and the build check and smoke test assert it.
 vLLM 0.31 uses Model Runner V2 by default; set `VLLM_USE_V2_MODEL_RUNNER=0` to select V1.
 
-All targets pin UCCL to `uccl-project/uccl@52d4184c89deb5631be6dac6a9b1c40896c9e26e` (`main`, 2026-11-11).
+All targets pin UCCL to `uccl-project/uccl@1c9e39bbec2ddcd401cfe5323ee34f1fed139aac` (`main`, 2026-11-21).
 It includes the runtime EP configuration overrides (#1056) and the CXI hybrid MR descriptor, proxy pinning, and warp quiet changes (#1137, #1139, #1143).
+It also includes the CXI teardown close order fix (#1149), which prevents a libfabric crash when the NIXL UCCL backend recreates endpoints, and the EP RDMA scratch double-free fix (#1168).
+Since #1152, EP init fails when the ranks of a group use different `Buffer` configurations, for example when `UCCL_EP_DISPATCH_CONFIG` is set on one rank only.
 
 ## ROCm image
 
@@ -29,9 +31,10 @@ It applies these `git format-patch` series from `patches/rocm/` with `git apply 
 | `vllm/` | DeepEP HT CUDA-graph guard, bundled `triton_kernels`, bench cached tokens, two ROCm 10 build fixes | `apps/vllm/patches/{common,rocm}/vllm`, renumbered; all apply to `v0.31.0+Apertus2.1` |
 | `uccl/` | Physical-rank CXI domain selection, shared-barrier cleanup, four ROCm build fixes | `apps/vllm/patches/{common,rocm}/uccl`, renumbered |
 
-UCCL `52d4184c` differs from the `e22a3e8f` pin of `apps/vllm`:
+UCCL `1c9e39bb` differs from the `e22a3e8f` pin of `apps/vllm`:
 
 - `0001-cxi-use-physical-gpu-rank.patch` is rebased: upstream still selects `cxi<local_rank>` from the logical device. The rebase also makes the NUMA lookup of #1139 use the physical rank.
+- `0002-serialize-shared-barrier-cleanup.patch` is rebased: #1168 removed the `rdma_buffer_is_host_allocated` argument from its context.
 - `serialize-cxi-initialization` is dropped: upstream serializes CXI setup across proxy threads (#1101, #1109).
 - `rocm-check-runtime-topk-warp-capacity` is dropped: upstream checks the runtime top-k against the warp capacity (#1057).
 

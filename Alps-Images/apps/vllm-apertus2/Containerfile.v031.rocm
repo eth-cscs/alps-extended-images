@@ -68,7 +68,7 @@ RUN set -eux; \
     vllm_build_end
 
 ARG UCCL_REPO="https://github.com/uccl-project/uccl.git"
-ARG UCCL_COMMIT="52d4184c89deb5631be6dac6a9b1c40896c9e26e"
+ARG UCCL_COMMIT="1c9e39bbec2ddcd401cfe5323ee34f1fed139aac"
 ARG UCCL_NANOBIND_VERSION="3.0.1"
 ARG UCCL_NUM_LOCAL_GPUS="4"
 COPY Alps-Images/apps/vllm-apertus2/patches/rocm/uccl/ /opt/alps-uccl-patches/

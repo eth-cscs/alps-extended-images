@@ -11,15 +11,15 @@ objects and crashing the proxy runtime nondeterministically.
 Detect the node topology first, let one rank per node remove stale barriers,
 and synchronize the group before any proxy creates new barriers.
 ---
- ep/bench/utils.py | 25 +++++++++++++++----------
- 1 file changed, 15 insertions(+), 10 deletions(-)
+ ep/bench/utils.py | 28 ++++++++++++++++------------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
 
 diff --git a/ep/bench/utils.py b/ep/bench/utils.py
 --- a/ep/bench/utils.py
 +++ b/ep/bench/utils.py
-@@ -577,18 +577,6 @@ def initialize_uccl(
+@@ -606,18 +606,6 @@ def initialize_uccl(
+     is_intranode: Optional[bool] = None,
      use_normal_mode=False,
-     rdma_buffer_is_host_allocated=False,
  ):
 -    # Only sweep barriers belonging to OUR mode so we don't stomp on a
 -    # coexisting Buffer of the other mode in the same process. The C++
@@ -36,7 +36,7 @@ diff --git a/ep/bench/utils.py b/ep/bench/utils.py
      (
          local_rank,
          node_local_rank,
-@@ -597,6 +585,22 @@ def initialize_uccl(
+@@ -626,6 +614,22 @@ def initialize_uccl(
          num_nodes,
          detected_is_intranode,
      ) = detect_group_topology(group)
