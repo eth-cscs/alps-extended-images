@@ -227,8 +227,22 @@ RUN set -eux; \
       'setuptools>=77.0.3,<81.0.0' wheel; \
     uv pip uninstall --system grpcio-tools; \
     printf 'protobuf>=5.29.6,<7\npackaging<=26.2\n' > /tmp/runtime-constraints.txt; \
+    # vLLM's cuda.txt adds flashinfer.ai as an extra index, so uv asks it about
+    # every requirement and one 503 from it stops the build. Only flashinfer-cubin
+    # comes from there, so install that package alone from that index. Keep the
+    # filtered file next to cuda-alps.txt so its "-r common.txt" still resolves.
+    vllm_reqs_dir=/opt/wheels/vllm/requirements; \
+    flashinfer_cubin="$(grep -iE '^flashinfer[-_]cubin==' "${vllm_reqs_dir}/cuda-alps.txt")"; \
+    test -n "${flashinfer_cubin}"; \
+    grep -viE '^--extra-index-url[[:space:]=]+https://flashinfer\.ai/|^flashinfer[-_]cubin==' \
+      "${vllm_reqs_dir}/cuda-alps.txt" > "${vllm_reqs_dir}/cuda-runtime.txt"; \
+    if grep -qi 'flashinfer\.ai' "${vllm_reqs_dir}/cuda-runtime.txt"; then \
+      echo "ERROR: flashinfer.ai index still in cuda-runtime.txt" >&2; exit 1; \
+    fi; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
-      -r /opt/wheels/vllm/requirements/cuda-alps.txt; \
+      -r "${vllm_reqs_dir}/cuda-runtime.txt"; \
+    uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps \
+      --index-url https://flashinfer.ai/whl/ "${flashinfer_cubin}"; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/vllm/vllm-*.whl; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
       "ray[default]" "runai-model-streamer==0.15.7" sentencepiece tiktoken; \
