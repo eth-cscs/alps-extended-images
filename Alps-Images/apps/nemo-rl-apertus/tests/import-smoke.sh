@@ -21,6 +21,7 @@ EXPECTED = {
     "ray": "2.58.0",
     "openai": "2.45.0",
     "flashinfer-python": "0.7.2.post1",
+    "flashinfer-jit-cache": "0.7.2.post1",
     "flashinfer-jit-cache-sm90a": "0.7.2.post1",
     "nvidia-cutlass-dsl": "4.8.0",
     "megatron-energon": "7.4.1",
@@ -52,6 +53,9 @@ for name in REQUIRED:
     print("ok        ", name)
 
 from flashinfer.sampling import top_k_top_p_sampling_from_probs  # noqa: F401
+from flashinfer.jit.env import FLASHINFER_AOT_PROVIDERS
+
+assert any(p.provider_id == "sm90a" for p in FLASHINFER_AOT_PROVIDERS), FLASHINFER_AOT_PROVIDERS
 
 # transformers: Apertus 1.0 is in the release, Apertus 1.5 comes from the backport.
 from transformers import (  # noqa: F401

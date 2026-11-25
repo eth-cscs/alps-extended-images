@@ -264,6 +264,9 @@ RUN set -eux; \
 # (which names torch) cannot touch the NGC stack; its other requirements are in
 # runtime-requirements.txt. The cubin and SM90a JIT-cache wheels come from FlashInfer's
 # own indexes, as in NeMo-RL (the GH200 aarch64 wheels are published there).
+# Since 0.7 the JIT cache is a shim (flashinfer-jit-cache: the flashinfer_jit_cache package
+# itself) plus per-architecture provider wheels that only add providers/<arch>/. Without the
+# shim, flashinfer_jit_cache is an empty namespace package and `import flashinfer` fails.
 ARG FLASHINFER_VERSION=0.7.2.post1
 ARG FLASHINFER_INDEX=https://flashinfer.ai/whl/
 ARG FLASHINFER_CU130_INDEX=https://flashinfer.ai/whl/cu130
@@ -273,7 +276,11 @@ RUN set -eux; \
     uv pip install --system --no-cache --no-deps --index "${FLASHINFER_INDEX}" \
       "flashinfer-cubin==${FLASHINFER_VERSION}"; \
     uv pip install --system --no-cache --no-deps --index "${FLASHINFER_CU130_INDEX}" \
-      "flashinfer-jit-cache-sm90a==${FLASHINFER_VERSION}+cu130"
+      "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" \
+      "flashinfer-jit-cache-sm90a==${FLASHINFER_VERSION}+cu130"; \
+    python3 -c 'import flashinfer_jit_cache as c; \
+      ids = [p.provider_id for p in c.get_jit_cache_providers()]; \
+      print("flashinfer-jit-cache", c.__version__, ids); assert "sm90a" in ids, ids'
 
 # ---- NemoLens ------------------------------------------------------------------
 # NeMo-RL main's telemetry SDK, at its [tool.uv.sources] revision. Its metadata says
@@ -331,6 +338,7 @@ EXPECTED = {
     "openai": "2.45.0",
     "flashinfer-python": "0.7.2.post1",
     "flashinfer-cubin": "0.7.2.post1",
+    "flashinfer-jit-cache": "0.7.2.post1",
     "flashinfer-jit-cache-sm90a": "0.7.2.post1",
     "apache-tvm-ffi": "0.1.11",
     "tilelang": "0.1.12",

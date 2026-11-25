@@ -1,5 +1,5 @@
 diff --git a/docs/features/reasoning_outputs.md b/docs/features/reasoning_outputs.md
-index 5e59644de..f94a69896 100644
+index 5e59644..f94a698 100644
 --- a/docs/features/reasoning_outputs.md
 +++ b/docs/features/reasoning_outputs.md
 @@ -14,6 +14,7 @@ vLLM currently supports the following reasoning models:
@@ -11,7 +11,7 @@ index 5e59644de..f94a69896 100644
  | [Cohere Command A Plus](https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16) | `cohere_command4` | `json`, `regex` | ✅ |
  | [DeepSeek R1 series](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d) | `deepseek_r1` | `json`, `regex` | ❌ |
 diff --git a/docs/features/tool_calling.md b/docs/features/tool_calling.md
-index ee9776b90..6ee49b929 100644
+index ee9776b..6ee49b9 100644
 --- a/docs/features/tool_calling.md
 +++ b/docs/features/tool_calling.md
 @@ -580,12 +580,17 @@ Flags: `--tool-call-parser gigachat3`
@@ -34,7 +34,7 @@ index ee9776b90..6ee49b929 100644
  Flags: `--tool-call-parser apertus`
  
 diff --git a/docs/models/supported_models.md b/docs/models/supported_models.md
-index 8cb133a66..f297977aa 100644
+index 8520a33..24f1c58 100644
 --- a/docs/models/supported_models.md
 +++ b/docs/models/supported_models.md
 @@ -542,6 +542,7 @@ These models primarily accept the [`LLM.generate`](./generative_models.md#llmgen
@@ -46,7 +46,7 @@ index 8cb133a66..f297977aa 100644
  | `AudioFlamingo3ForConditionalGeneration` | AudioFlamingo3 | T + A | `nvidia/audio-flamingo-3-hf`, `nvidia/music-flamingo-hf` | ✅︎ | ✅︎ |
  | `BagelForConditionalGeneration` | BAGEL | T + I<sup>+</sup> | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ |
 diff --git a/tests/models/multimodal/generation/test_common.py b/tests/models/multimodal/generation/test_common.py
-index 9ea2cc43c..0341f8eeb 100644
+index 9ea2cc4..0341f8e 100644
 --- a/tests/models/multimodal/generation/test_common.py
 +++ b/tests/models/multimodal/generation/test_common.py
 @@ -13,6 +13,7 @@ from transformers import (
@@ -78,7 +78,7 @@ index 9ea2cc43c..0341f8eeb 100644
      ## To reduce test burden, we only test batching arbitrary image size
      # Dynamic image length and number of patches
 diff --git a/tests/models/registry.py b/tests/models/registry.py
-index c9ff9648c..1488d40c9 100644
+index fb93cb1..887e080 100644
 --- a/tests/models/registry.py
 +++ b/tests/models/registry.py
 @@ -832,6 +832,11 @@ _AUTOMATIC_CONVERTED_MODELS = {
@@ -95,7 +95,7 @@ index c9ff9648c..1488d40c9 100644
          "nvidia/audio-flamingo-3-hf"
 diff --git a/tests/reasoning/test_apertus_reasoning_parser.py b/tests/reasoning/test_apertus_reasoning_parser.py
 new file mode 100644
-index 000000000..0efe352d5
+index 0000000..0efe352
 --- /dev/null
 +++ b/tests/reasoning/test_apertus_reasoning_parser.py
 @@ -0,0 +1,74 @@
@@ -175,10 +175,10 @@ index 000000000..0efe352d5
 +    assert content == output
 diff --git a/vllm/model_executor/models/apertus_mm.py b/vllm/model_executor/models/apertus_mm.py
 new file mode 100644
-index 000000000..121bf3ff5
+index 0000000..3f8135d
 --- /dev/null
 +++ b/vllm/model_executor/models/apertus_mm.py
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,674 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Apertus 1.5 multimodal model."""
@@ -292,11 +292,25 @@ index 000000000..121bf3ff5
 +    )
 +
 +
++def _component_config(
++    config: Apertus1p5Config, name: str, legacy_name: str
++) -> PreTrainedConfig | dict[str, Any]:
++    # Checkpoints written before huggingface/transformers#47662 renamed the media
++    # sub-configs still carry `<legacy_name>` in config.json. Transformers does not
++    # map that key, so it arrives as a plain dict and `<name>` holds the defaults.
++    legacy = getattr(config, legacy_name, None)
++    return legacy if isinstance(legacy, dict) else getattr(config, name)
++
++
 +def _init_component_model(
-+    component_config: PreTrainedConfig,
++    component_config: PreTrainedConfig | dict[str, Any],
 +    model_cls: type[torch.nn.Module] | None = None,
 +) -> torch.nn.Module:
-+    config_dict = component_config.to_dict()
++    config_dict = (
++        dict(component_config)
++        if isinstance(component_config, dict)
++        else component_config.to_dict()
++    )
 +    config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
 +    return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 +
@@ -646,12 +660,16 @@ index 000000000..121bf3ff5
 +            with set_default_torch_dtype(torch.float32):
 +                with self._mark_tower_model(vllm_config, "image"):
 +                    self.vision_tower = _init_component_model(
-+                        config.vision_tokenizer_config,
++                        _component_config(
++                            config, "vision_config", "vision_tokenizer_config"
++                        ),
 +                        model_cls=Apertus1p5VisionTokenizerModel,
 +                    )
 +                with self._mark_tower_model(vllm_config, "audio"):
 +                    self.audio_tower = _init_component_model(
-+                        config.audio_tokenizer_config,
++                        _component_config(
++                            config, "audio_config", "audio_tokenizer_config"
++                        ),
 +                    )
 +
 +        self.image_token_offset = getattr(
@@ -836,7 +854,7 @@ index 000000000..121bf3ff5
 +            is_multimodal=is_multimodal,
 +        )
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index ccba81ce6..b39e37370 100644
+index b5f0f98..2be4586 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
 @@ -352,6 +352,10 @@ _SEQUENCE_CLASSIFICATION_MODELS = {
@@ -851,7 +869,7 @@ index ccba81ce6..b39e37370 100644
      "AudioFlamingo3ForConditionalGeneration": (
          "audioflamingo3",
 diff --git a/vllm/reasoning/__init__.py b/vllm/reasoning/__init__.py
-index c22a43a61..8e0b9a5a4 100644
+index c22a43a..8e0b9a5 100644
 --- a/vllm/reasoning/__init__.py
 +++ b/vllm/reasoning/__init__.py
 @@ -20,6 +20,10 @@ Example:
@@ -867,7 +885,7 @@ index c22a43a61..8e0b9a5a4 100644
          "DeepSeekR1ReasoningParser",  # class_name
 diff --git a/vllm/reasoning/apertus_reasoning_parser.py b/vllm/reasoning/apertus_reasoning_parser.py
 new file mode 100644
-index 000000000..f48bb12fd
+index 0000000..f48bb12
 --- /dev/null
 +++ b/vllm/reasoning/apertus_reasoning_parser.py
 @@ -0,0 +1,39 @@
