@@ -50,6 +50,7 @@ CUDA app variants are available for the listed workloads; ROCm app variants are 
 |-------|------|-------------|
 | `apertus-1p5-cuda:alps7-dev` | `pytorch-cuda:26.02-py3` | Megatron-LM distributed LLM pretraining |
 | `apertus-2-cuda:alps7-dev`   | `pytorch-cuda:26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
+| `nemo-rl-apertus-cuda:alps7-dev` | `pytorch-cuda:26.06-py3` | NeMo-RL (upstream main) for Apertus 1.0 and 1.5, with Megatron training and vLLM 0.33.0 generation |
 | `sfttrainer-cuda:alps7-dev`  | `pytorch-cuda:26.02-py3` | Supervised fine-tuning trainer image |
 | `verl-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | VeRL reinforcement learning workloads |
 | `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.07-py3` | vLLM serving workloads built from source (v0.31.0, Torch 2.13 stable-libtorch APIs), with UCCL-EP and Mooncake CXI KV transfer over Slingshot CXI |
