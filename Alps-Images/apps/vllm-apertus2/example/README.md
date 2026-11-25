@@ -58,7 +58,7 @@ minutes to become ready. The server URL is in `server-url.txt`.
 Both launchers accept `FP8=1`. Chonk also accepts the independent `EPLB=1` option.
 Both options default to `0`, so the existing BF16 launches are unchanged.
 
-The default EDF selects a compatible build of [`apertus2/main`](https://github.com/swiss-ai/vllm/tree/200556e646ff4e6c13dc1b443d973830485f3c0f) that passed CI GPU import and Vetnode checks. No EDF override is needed for these options. The moving `alps7-dev` tag still requires CI promotion before use.
+The default EDF selects a compatible build of [`apertus2/main`](https://github.com/swiss-ai/vllm/tree/200556e646ff4e6c13dc1b443d973830485f3c0f) that passed the CI GPU import, Vetnode, and Mooncake CXI checks. No EDF override is needed for these options. The moving `alps7-dev` tag still requires CI promotion before use.
 
 Source-built Chonk checks passed on one four-GPU GH200 node with an 8,192-token context limit: Triton FP8 for routed experts, routed-expert FP8 with EPLB, and FP8 including shared experts and dense MLPs. All three passed serving and short-context numerical checks against BF16. This does not validate the new container image or the default multi-node layouts.
 
