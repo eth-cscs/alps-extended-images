@@ -231,6 +231,7 @@ RUN set -eux; \
     # every requirement and one 503 from it stops the build. Only flashinfer-cubin
     # comes from there, so install that package alone from that index. Keep the
     # filtered file next to cuda-alps.txt so its "-r common.txt" still resolves.
+    # Use --default-index: uv ignores --index-url when UV_DEFAULT_INDEX is set.
     vllm_reqs_dir=/opt/wheels/vllm/requirements; \
     flashinfer_cubin="$(grep -iE '^flashinfer[-_]cubin==' "${vllm_reqs_dir}/cuda-alps.txt")"; \
     test -n "${flashinfer_cubin}"; \
@@ -242,7 +243,7 @@ RUN set -eux; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
       -r "${vllm_reqs_dir}/cuda-runtime.txt"; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps \
-      --index-url https://flashinfer.ai/whl/ "${flashinfer_cubin}"; \
+      --default-index https://flashinfer.ai/whl/ "${flashinfer_cubin}"; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt --no-deps /opt/wheels/vllm/vllm-*.whl; \
     uv pip install --system --no-cache -c /opt/alps/base-pins.txt -c /tmp/runtime-constraints.txt \
       "ray[default]" "runai-model-streamer==0.15.7" sentencepiece tiktoken; \
