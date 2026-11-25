@@ -19,6 +19,7 @@
 set -euo pipefail
 
 # Submit from this directory. FP8=1 and EPLB=1 opt into newer vLLM features.
+# PP=4 with sbatch --nodes=1 selects the faster TP1xPP4 layout; see ../README.md.
 MODEL=${MODEL:-/capstor/store/cscs/swissai/infra01/apertus_checkpoints/v2/hf/chonk/pretraining/long_context/long-context-iter-0003576}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-65536}
 CONTAINER_EDF=${CONTAINER_EDF:-$SLURM_SUBMIT_DIR/../environment.toml}
@@ -27,13 +28,27 @@ FP8=${FP8:-0}
 FP8_SCOPE=${FP8_SCOPE:-experts}
 MOE_BACKEND=${MOE_BACKEND:-triton}
 EPLB=${EPLB:-0}
+TP=1  # Chonk has seven KV heads: TP1 only.
+PP=${PP:-1}
 [[ $FP8 == [01] && $EPLB == [01] ]] || { echo 'FP8 and EPLB must be 0 or 1' >&2; exit 2; }
 [[ $FP8_SCOPE == experts || $FP8_SCOPE == mlp ]] || { echo 'FP8_SCOPE must be experts or mlp' >&2; exit 2; }
+[[ $PP =~ ^[1-9][0-9]*$ ]] || { echo 'PP must be a positive integer' >&2; exit 2; }
+(( PP == 1 || EPLB == 0 )) || { echo 'EPLB=1 needs the DP layout (PP=1): with TP1xPP each stage has one expert-parallel GPU' >&2; exit 2; }
+if (( PP > 1 && TP * PP != SLURM_JOB_NUM_NODES * 4 )); then
+  echo "TP x PP = $((TP * PP)) must equal the $((SLURM_JOB_NUM_NODES * 4)) GPUs of the job; set sbatch --nodes=$((TP * PP / 4))" >&2
+  exit 2
+fi
+# The DP layout keeps its tested 0.95; the PP layouts were measured at 0.88.
+if (( PP > 1 )); then GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.88}; else GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.95}; fi
 
 mkdir -p "$RUN_DIR"
 exec > >(tee "$RUN_DIR/server.log") 2>&1
 
 [[ -f "$MODEL/config.json" && -f "$CONTAINER_EDF" ]]
+if [[ $FP8 == 1 ]] && grep -q '"quantization_config"' "$MODEL/config.json"; then
+  echo "FP8=1 quantizes BF16 weights online; $MODEL is already quantized, so leave FP8=0" >&2
+  exit 2
+fi
 
 mapfile -t nodes < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 head_ip=$(getent ahostsv4 "${nodes[0]}" | awk 'NR == 1 {print $1}')
@@ -52,7 +67,7 @@ srun \
   --kill-on-bad-exit=1 \
   --environment="$CONTAINER_EDF" \
   --container-mounts="${SCRATCH}:${SCRATCH},${HOME}:${HOME},/capstor:/capstor,/iopsstor:/iopsstor,/ritom:/ritom" \
-  -u bash -s -- "$head_ip" "$MODEL" "$MAX_MODEL_LEN" "$SLURM_JOB_NUM_NODES" "$FP8" "$EPLB" "$FP8_SCOPE" "$MOE_BACKEND" <<'VLLM_ROLE'
+  -u bash -s -- "$head_ip" "$MODEL" "$MAX_MODEL_LEN" "$SLURM_JOB_NUM_NODES" "$FP8" "$EPLB" "$FP8_SCOPE" "$MOE_BACKEND" "$TP" "$PP" "$GPU_MEMORY_UTILIZATION" <<'VLLM_ROLE'
 set -euo pipefail
 
 head_ip=$1
@@ -63,11 +78,13 @@ fp8=$5
 eplb=$6
 fp8_scope=$7
 moe_backend=$8
+tp=$9
+pp=${10}
+gpu_memory_utilization=${11}
 loader_distributed=true
 if [[ $fp8 == 1 ]]; then loader_distributed=false; fi
-printf 'Online FP8=%s; scope=%s; EPLB=%s; MoE backend=%s\n' "$fp8" "$fp8_scope" "$eplb" "$moe_backend"
+printf 'TP=%s; PP=%s; online FP8=%s; scope=%s; EPLB=%s; MoE backend=%s\n' "$tp" "$pp" "$fp8" "$fp8_scope" "$eplb" "$moe_backend"
 
-tp=1
 local_dp=$((4 / tp))
 start_rank=$((SLURM_NODEID * local_dp))
 
@@ -93,8 +110,6 @@ args=(
   --served-model-name chonk
 
   --tensor-parallel-size "$tp"
-  --data-parallel-size "$((node_count * local_dp))"
-  --data-parallel-size-local "$local_dp"
   --enable-expert-parallel
   --all2all-backend allgather_reducescatter
   --moe-backend "$moe_backend"
@@ -104,16 +119,49 @@ args=(
   --numa-bind
 
   --load-format runai_streamer
-  --model-loader-extra-config "{\"distributed\":$loader_distributed,\"concurrency\":4,\"memory_limit\":17179869184}"
 
   --max-model-len "$max_model_len"
-  --gpu-memory-utilization 0.95
-  --max-num-seqs 8
-  --max-num-batched-tokens 512
-
-  --data-parallel-address "$head_ip"
-  --data-parallel-rpc-port 13345
+  --gpu-memory-utilization "$gpu_memory_utilization"
 )
+
+if (( pp > 1 )); then
+  # One engine: PP stages across the nodes, EP = TP inside each stage on NVLink.
+  # These are the settings of the measured PP runs, with vLLM's default RunAI loader.
+  export VLLM_ENGINE_READY_TIMEOUT_S=${VLLM_ENGINE_READY_TIMEOUT_S:-7200}
+  args+=(
+    --pipeline-parallel-size "$pp"
+    --distributed-executor-backend mp
+    --nnodes "$node_count"
+    --node-rank "$SLURM_NODEID"
+    --master-addr "$head_ip"
+    --master-port 13345
+    --max-num-seqs 256
+    --max-num-batched-tokens 2048
+  )
+  if [[ $fp8 == 1 ]]; then
+    args+=(--model-loader-extra-config "{\"distributed\":false,\"concurrency\":4,\"memory_limit\":17179869184}")
+  fi
+  if (( SLURM_NODEID == 0 )); then
+    args+=(--port 8000)
+  else
+    args+=(--headless)
+  fi
+else
+  args+=(
+    --data-parallel-size "$((node_count * local_dp))"
+    --data-parallel-size-local "$local_dp"
+    --model-loader-extra-config "{\"distributed\":$loader_distributed,\"concurrency\":4,\"memory_limit\":17179869184}"
+    --max-num-seqs 8
+    --max-num-batched-tokens 512
+    --data-parallel-address "$head_ip"
+    --data-parallel-rpc-port 13345
+  )
+  if (( start_rank == 0 )); then
+    args+=(--api-server-count 1 --port 8000)
+  else
+    args+=(--data-parallel-start-rank "$start_rank" --headless)
+  fi
+fi
 
 if [[ $fp8 == 1 ]]; then
   quant_config='{"moe":{"weight":"fp8_per_block_static"}}'
@@ -124,12 +172,6 @@ if [[ $fp8 == 1 ]]; then
 fi
 if [[ $eplb == 1 ]]; then
   args+=(--enable-eplb --eplb-config '{"num_redundant_experts":0,"use_async":false,"log_balancedness":true}')
-fi
-
-if (( start_rank == 0 )); then
-  args+=(--api-server-count 1 --port 8000)
-else
-  args+=(--data-parallel-start-rank "$start_rank" --headless)
 fi
 
 exec vllm serve "${args[@]}"
