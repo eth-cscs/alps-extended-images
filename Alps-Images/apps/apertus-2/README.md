@@ -252,12 +252,16 @@ The stack includes:
   The app-local CK-JIT patch keeps AITER's interceptor discovery environment, but removes `ROCM_PATH`/`HIP_PATH` from real compiler/linker subprocesses at build time and during runtime CK JIT: those overrides break clang 23 device-math discovery with the wheel SDK.
   The base SDK compatibility layout provides development links in the physical wheel library directories as well as `/opt/rocm`, so HIP compiler detection and shared-library linking work without overriding the compiler's SDK root.
   MIOpen's public development headers come from the base, matching its bundled runtime; hipified ATen MIOpen includes need no app-local workaround.
-- UCCL EP and its real DeepEP wrapper at `18b588a048a3a3fe3d4bd60aa5678c66e284df31`.
+- UCCL EP and its real DeepEP wrapper at `52d4184c89deb5631be6dac6a9b1c40896c9e26e`.
   This retains the D2H handle-table memory-pressure fix used by the full CUDA target.
-  App-local patches retain physical-GPU CXI selection, serialized barrier cleanup/provider initialization, ROCR GPU-memory registration, HIP launch and ROCm 10 compiler compatibility.
+  App-local patches retain consistent physical-GPU CXI/NUMA selection, ROCR GPU-memory registration, HIP launch and audited compiler compatibility.
+  The original mode-filtered barrier cleanup is already ordered by topology all-gather; no redundant extra group barrier is added.
+  Upstream now owns CXI provider-setup serialization and bounded fresh-info retries; the superseded local mutex is removed.
   Proxies borrow the wrapper's RDMA allocation; its DLPack/Torch owner frees it.
   Communication uses a PyTorch pool stream so recorded tensors remain safe to release after EP buffer destruction.
+  The stream is passed by an optional trailing keyword, preserving the native positional argument order and its legacy native-owned-stream behavior.
   The older runtime-top-k patch is already upstream and is not applied twice.
+  See the [patch disposition](patches/rocm/uccl/README.md).
 - The same Swiss AI FLA per-channel KDA gates and Emerging-Optimizers Muon `moonlight` scaling as the CUDA targets, plus a native causal-conv1d build.
 - Swiss AI Megatron-LM-MoE at `0789b8e429553c2f17c350afa8619c69d01bec25`, installed from `/opt/megatron-lm`, with its CPU dataset helpers (including BFD packing) prebuilt.
 

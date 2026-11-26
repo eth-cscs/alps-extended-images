@@ -86,6 +86,8 @@ The reference storage-sharing CPU extension is rebuilt for each base's Torch ABI
 The opt-in configuration includes historical FLA/hipBLASLt tuning only for the matching Torch 2.10/Triton 3.6 generation.
 The source archive and its licenses are under `Alps-Images/apps/apertus-2/sources/primus/vendor/`; commit `d1277d86e0c1925f8438fd7630d86d05ab398dcd` was unavailable from the public upstream API at capture time.
 The26.8 app additionally carries a version-gated three-file private-API import adapter;26.3 keeps the unmodified reference source, and both retain unchanged vendor compute packages.
+The26.8 candidate adds pinned native training UCCL and an AITER core JIT seed in the same image, without replacing vendor Torch, TE or AITER.
+The read-only `/opt/aiter-jit` seed must be copied into a writable private `AITER_JIT_DIR` before runtime imports; it is not a full attention-kernel cache.
 See [Primus provenance and validation](Alps-Images/apps/apertus-2/sources/primus/README.md).
 
 ### Application Images

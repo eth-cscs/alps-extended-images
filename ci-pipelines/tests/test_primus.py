@@ -206,7 +206,8 @@ def test_primus_app_uses_canonical_base_and_self_contained_tests(suffix, version
     base = bash(f'source ci-pipelines/helpers/meta.sh; rocm_base_refs primus {version}').stdout.split()[2]
     fields = bash(f'source ci-pipelines/helpers/meta.sh; app_refs apertus-2 {variant}').stdout.split()
     assert fields[0] == base
-    assert fields[1] == 'Alps-Images/apps/apertus-2/Containerfile.megatron.primus'
+    recipe = 'Containerfile.megatron.primus268' if suffix == '268' else 'Containerfile.megatron.primus'
+    assert fields[1] == f'Alps-Images/apps/apertus-2/{recipe}'
     script = bash(f'manual-build/manual-build.sh app apertus-2 {variant}').stdout
     assert f'--build-arg BASE_IMAGE="{base}"' in script
     tests = yaml.safe_load((ROOT/'Alps-Images/apps/apertus-2/ci.yaml').read_text())['tests'][variant]

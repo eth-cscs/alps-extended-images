@@ -15,7 +15,7 @@ source /opt/alps/apertus2-rocm/versions.env
 
 # Build only the native training transport. Do not invoke build_inner.sh: it
 # also builds serving transports and can install a different torch/ROCm stack.
-# The pinned 18b588a source keeps D2H handles in device memory so combine cannot
+# The pinned upstream source keeps D2H handles in device memory so combine cannot
 # fault when managed pages are evicted under training memory pressure.
 git init -q /opt/uccl
 git -C /opt/uccl remote add origin "$UCCL_REPO"

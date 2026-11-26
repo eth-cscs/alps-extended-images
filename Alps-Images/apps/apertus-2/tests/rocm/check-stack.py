@@ -24,7 +24,7 @@ from packaging.version import Version
 ROOT = Path("/opt/alps/apertus2-rocm")
 SOURCES = {
     "transformer-engine": ("TE", "b56021a0e4a2e4a7822482ffdf5353368a777e0e"),
-    "uccl": ("UCCL", "18b588a048a3a3fe3d4bd60aa5678c66e284df31"),
+    "uccl": ("UCCL", "52d4184c89deb5631be6dac6a9b1c40896c9e26e"),
     "megatron": ("MEGATRON", "0789b8e429553c2f17c350afa8619c69d01bec25"),
     "emerging-optimizers": (
         "EMERGING_OPTIMIZERS", "cc1385eec1966aea2aebfb6dd6fc66a898312a55"

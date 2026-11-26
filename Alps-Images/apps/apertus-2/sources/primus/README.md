@@ -36,7 +36,7 @@ Existing published images retain their original behavior; this change takes effe
 `install-source.py` checks the archive digest, member paths, per-file checksums and internal symlinks before source acceptance.
 The installer uses `--no-deps` and base constraints to avoid implicit compute upgrades.
 The source's storage-sharing C++ extension and dataset helpers are rebuilt for the image ABI.
-The app deliberately does not import the old native UCCL/TE rebuild policy or Imanol's communication overrides.
+The26.8 candidate adds native training UCCL and an AITER JIT seed in independent layers of the same image; it does not rebuild vendor TE, Torch or AITER or import Imanol's communication overrides.
 The two app targets conservatively hash the complete app `sources/` tree, selected tests/Containerfile/profile/compatibility patches and canonical base reference.
 Primus26.3 retains the exact reference source without compatibility patches.
 The26.8 upstream API probe confirmed that Turbo0.5.1 moved its offset helper and removed older private CU/gfx950/Origami helpers.
@@ -62,3 +62,32 @@ New-image stack checks, multi-node communication and training/restart acceptance
 The declared CI training layouts are two-node EP8/PP1 and four-node EP4/PP2 with four consecutive expert ranks per node, matching T6's topology contract.
 The tests keep writable JIT caches in executable node-local tmpfs and durable evidence on shared storage.
 Consult image-specific CI records and retained run artifacts for outcomes; recipe presence and CPU checks do not establish GPU acceptance.
+
+## Combined26.8 training components
+
+The `megatron-primus268-rocm` selector uses `Containerfile.megatron.primus268` and the canonical `primus-rocm:26.8` base derived by `meta.sh`.
+Its upstream base is pinned to `docker.io/rocm/primus@sha256:79629b5e5ba4fcfef1d49cfd9dc5247681243437e7fd1db815279870f41c1b3c`, with ROCm10.1.0 and rocm-systems `6b0e43f341195e203754e08f850e437ff2fc09f9` for RCCL.
+The existing vendor Torch2.14.0+rocm10.1.0, Triton3.8.0+git669b31ac.rocm10.1.0 and amd-aiter0.1.22.post1 are preserved by the final complete vendor-compute fingerprint check.
+UCCL uses `sources/rocm/versions.env` at `52d4184c89deb5631be6dac6a9b1c40896c9e26e`; only `ep/setup.py` and the public DeepEP wrapper are built, never `build_inner.sh` or a serving/P2P stack.
+The [UCCL patch disposition](../../patches/rocm/uccl/README.md) records retained and superseded corrections.
+The26.8 Containerfile selects the minimal HIP-launch/ROCR/CXI patch in `patches/rocm/uccl-primus268/` plus the shared ownership patch, leaving cleanup and numerical kernel/config inputs byte-identical to upstream.
+Exact-stack joint optimized host/device codegen passes without the legacy min/max, volatile-snapshot and builtin-math rewrites; these are not copied into or applied by the26.8 candidate.
+No network defaults change, and this candidate makes no P2P-correctness claim.
+
+`seed-aiter.py` follows the GPU-free standalone `jit/core.py` build used by the vLLM recipe, but uses the already installed vendor AITER sources rather than installing another wheel.
+Only `module_aiter_core` is baked for gfx942/CU228, with package/source/module hashes recorded in `/opt/aiter-jit/seed.json`.
+Attention and other workload kernels still JIT into each rank's private cache.
+The image exports `AITER_JIT_DIR=/opt/aiter-jit` to identify the baked seed; the runner replaces this with a private cache path before import and copies only missing regular top-level `.so` files without replacing restored whole objects.
+For a fresh cache, copy without preserving read-only modes:
+
+```bash
+export AITER_JIT_DIR="${TMPDIR}/aiter-rank-${SLURM_PROCID:-0}"
+mkdir -p "$AITER_JIT_DIR"
+cp -r --no-preserve=mode /opt/aiter-jit/. "$AITER_JIT_DIR/"
+```
+
+Image-build checks run `check-components.py` and `aiter-seed-smoke.py --metadata-only`, including native UCCL import/linkage and private-copy AITER core ABI/import without recompilation.
+After parent-coordinated allocation, run `aiter-seed-smoke.py` on one GPU and `uccl-lifetime-smoke.py` on two exclusive nodes with four block-ordered direct Slurm ranks per node, all allocated GPUs visible, `--gpu-bind=none`, `--kill-on-bad-exit=1`, and a bounded step timeout.
+The latter checks exact BF16 dispatch/combine and recorded-tensor release, stream reuse and RCCL after Buffer destruction.
+The existing `with-reference-env.sh python3 /opt/tests/apertus-2/primus/check-stack.py` remains the separate reference AITER attention forward/backward check.
+Build metadata, component correctness, numerical attention checks and real training acceptance remain distinct gates.

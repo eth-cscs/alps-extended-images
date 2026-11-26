@@ -8,6 +8,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import sys
+import tempfile
 
 
 def main():
@@ -168,4 +171,16 @@ def main():
         scope='Source/adapter identity, reference Turbo pointer GEMM fwd/dgrad/fused wgrad, CPU storage lifetime and AITER attention forward/backward; not training/restart acceptance.'),indent=2))
 
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    # The26.8 image exports its immutable seed for the external runner. Keep this
+    # standalone reference smoke safe too, without mutating that shared seed.
+    if '--metadata-only' not in sys.argv and os.environ.get('AITER_JIT_DIR')=='/opt/aiter-jit':
+        with tempfile.TemporaryDirectory(prefix='apertus2-reference-aiter-') as private:
+            seed=Path('/opt/aiter-jit')
+            for module in seed.glob('*.so'):
+                if module.is_file() and not module.is_symlink():
+                    shutil.copyfile(module,Path(private)/module.name)
+            os.environ['AITER_JIT_DIR']=private
+            main()
+    else:
+        main()

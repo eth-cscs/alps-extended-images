@@ -1,59 +1,15 @@
-Subject: [PATCH] Preserve Alps CXI and ROCm 10 EP fixes on UCCL 18b588a
+Subject: [PATCH] Retain Alps CXI and ROCm 10 EP fixes on UCCL 52d4184
 
-Reconcile vLLM common UCCL patches 1-3 (physical GPU rank selection,
-serialized barrier cleanup, serialized CXI initialization) and ROCm patches
-1-4 (ROCR HMEM, HIP extended launch, volatile-head snapshots, device math).
-All seven fixes remain needed at 18b588a048a3a3fe3d4bd60aa5678c66e284df31.
-The old ROCm runtime top-k capacity patch is omitted: that fix is upstream.
-The pinned source preserves the device-memory D2H handle table fix, avoiding
-managed-memory eviction faults during training combine.
-
-diff --git a/ep/bench/utils.py b/ep/bench/utils.py
-index f21b1a5..852e8c3 100644
---- a/ep/bench/utils.py
-+++ b/ep/bench/utils.py
-@@ -595,18 +595,6 @@ def initialize_uccl(
-     use_normal_mode=False,
-     rdma_buffer_is_host_allocated=False,
- ):
--    # Only sweep barriers belonging to OUR mode so we don't stomp on a
--    # coexisting Buffer of the other mode in the same process. The C++
--    # shm name format is `/uccl_barrier_<ip>_uid<uid>_<ht|ll>_th<idx>`,
--    # where `ht` = high-throughput (use_normal_mode=True) and `ll` =
--    # low-latency.
--    try:
--        mode_token = "_ht_" if use_normal_mode else "_ll_"
--        for shm_file in glob.glob(f"/dev/shm/uccl_barrier_*{mode_token}*"):
--            os.remove(shm_file)
--    except Exception:
--        pass
--
-     (
-         local_rank,
-         node_local_rank,
-@@ -615,6 +603,22 @@ def initialize_uccl(
-         num_nodes,
-         detected_is_intranode,
-     ) = detect_group_topology(group)
-+
-+    # Only one rank per node may sweep the node-local barriers. Otherwise a
-+    # rank can unlink a barrier that another rank has just created. Keep the
-+    # mode filter so coexisting high-throughput and low-latency buffers do not
-+    # remove each other's barriers.
-+    if node_local_rank == 0:
-+        try:
-+            mode_token = "_ht_" if use_normal_mode else "_ll_"
-+            for shm_file in glob.glob(
-+                f"/dev/shm/uccl_barrier_*{mode_token}*"
-+            ):
-+                os.remove(shm_file)
-+        except Exception:
-+            pass
-+    dist.barrier(group)
-+
-     if is_intranode is None:
-         is_intranode = detected_is_intranode
-     elif is_intranode and not detected_is_intranode:
+The non-Primus ROCm10.0 profile retains these compiler workarounds.
+Primus26.8 selects the separate minimal patch under patches/rocm/uccl-primus268.
+Retain consistent physical NIC/NUMA selection (including fresh-info retry),
+ROCR HMEM, HIP extended launch, volatile-head
+snapshots and device math corrections at 52d4184c89deb5631be6dac6a9b1c40896c9e26e.
+Drop the local CXI initialization mutex: upstream g_cxi_setup_mu now serializes
+provider discovery/domain creation and implements bounded fresh-info retries.
+Do not replay the upstream top-k capacity or device-memory D2H handle fixes.
+Drop the redundant cleanup relocation/group barrier: topology all-gather
+already orders the original cleanup before every proxy construction.
 diff --git a/ep/include/cxi_transport.hpp b/ep/include/cxi_transport.hpp
 index e6fcc39..fa29c6a 100644
 --- a/ep/include/cxi_transport.hpp
@@ -128,18 +84,10 @@ index b80131e..c872af3 100644
  #ifndef SET_SHARED_MEMORY_FOR_TMA
  #ifndef DISABLE_SM90_FEATURES
 diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
-index 3e92888..0c766c2 100644
+index 59912f2..e854acf 100644
 --- a/ep/src/cxi_transport.cpp
 +++ b/ep/src/cxi_transport.cpp
-@@ -8,6 +8,7 @@
- #include <cstdio>
- #include <cstdlib>
- #include <cstring>
-+#include <mutex>
- #include <string>
- #include <sys/uio.h>
- 
-@@ -20,7 +21,8 @@ void CxiTransport::unavailable() {
+@@ -24,7 +24,8 @@ void CxiTransport::unavailable() {
  
  #ifndef USE_LIBFABRIC_CXI
  
@@ -149,7 +97,7 @@ index 3e92888..0c766c2 100644
  void CxiTransport::register_main_buffer(void*, size_t, int) { unavailable(); }
  void CxiTransport::register_atomic_buffer(void*, size_t, int) { unavailable(); }
  LocalConnInfo CxiTransport::local_info() const { unavailable(); }
-@@ -72,8 +74,13 @@ fid_mr* register_cuda_mr(fid_domain* domain, fid_ep* ep, void* ptr, size_t len,
+@@ -83,8 +84,13 @@ fid_mr* register_cuda_mr(fid_domain* domain, fid_ep* ep, void* ptr, size_t len,
    attr.iov_count = 1;
    attr.access =
        FI_SEND | FI_RECV | FI_WRITE | FI_READ | FI_REMOTE_WRITE | FI_REMOTE_READ;
@@ -163,7 +111,7 @@ index 3e92888..0c766c2 100644
  
    fid_mr* mr = nullptr;
    int rc = fi_mr_regattr(domain, &attr, 0, &mr);
-@@ -136,7 +143,14 @@ fi_info* select_cxi_info(fi_info* infos, int local_rank) {
+@@ -204,14 +210,16 @@ int cxi_domain_retries() {
  
  }  // namespace
  
@@ -171,23 +119,26 @@ index 3e92888..0c766c2 100644
 +void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
 +
 +void CxiTransport::init(ProxyCtx& ctx, int cxi_local_rank) {
-+  // CXI provider discovery is not safe when proxy threads initialize it
-+  // concurrently within one process.
-+  static std::mutex cxi_init_mutex;
-+  std::lock_guard<std::mutex> lock(cxi_init_mutex);
-+
    ctx_ = &ctx;
  
-   fi_info* hints = fi_allocinfo();
-@@ -157,7 +171,7 @@ void CxiTransport::init(ProxyCtx& ctx) {
-   check_fi(rc, "fi_getinfo(cxi)");
+   std::unique_lock<std::mutex> setup_lock(g_cxi_setup_mu);
+   fi_info* info = get_cxi_info();
  
    try {
 -    fi_info* selected = select_cxi_info(info, ctx.local_rank);
 +    fi_info* selected = select_cxi_info(info, cxi_local_rank);
  
      check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr), "fi_fabric");
-     check_fi(fi_domain(fabric_, selected, &domain_, nullptr), "fi_domain");
+     int rc = fi_domain(fabric_, selected, &domain_, nullptr);
+@@ -226,7 +234,7 @@ void CxiTransport::init(ProxyCtx& ctx) {
+       info = nullptr;
+       usleep(50000);
+       info = get_cxi_info();
+-      selected = select_cxi_info(info, ctx.local_rank);
++      selected = select_cxi_info(info, cxi_local_rank);
+       check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr),
+                "fi_fabric");
+       rc = fi_domain(fabric_, selected, &domain_, nullptr);
 diff --git a/ep/src/internode.cu b/ep/src/internode.cu
 index 886f642..c694919 100644
 --- a/ep/src/internode.cu
@@ -283,10 +234,10 @@ index c3da6b2..d1116d0 100644
  
            // Reduce amax and scale
 diff --git a/ep/src/proxy.cpp b/ep/src/proxy.cpp
-index beb513e..d585294 100644
+index 265ae39..be59c50 100644
 --- a/ep/src/proxy.cpp
 +++ b/ep/src/proxy.cpp
-@@ -272,7 +272,7 @@ void Proxy::init_common() {
+@@ -285,7 +285,7 @@ void Proxy::init_common() {
        if (!should_connect_peer(peer)) continue;
  
        auto transport = std::make_unique<CxiTransport>();
@@ -295,3 +246,20 @@ index beb513e..d585294 100644
        transport->register_main_buffer(cfg_.gpu_buffer, cfg_.total_size,
                                        cfg_.local_rank);
        transport->register_atomic_buffer(atomic_buffer_ptr_, kAtomicBufferSize,
+@@ -374,14 +374,14 @@ void Proxy::init_common() {
+     dst_pending_.assign(256, 0);  // TransferCmd::dst_rank is a uint8_t
+ #endif
+
+-    ctx_.numa_node = cxi_nic_numa_node(cfg_.local_rank);
++    ctx_.numa_node = cxi_nic_numa_node(cfg_.nic_local_rank);
+     if (ctx_.numa_node >= 0) {
+       pin_thread_to_numa_wrapper();
+     } else if (cfg_.pin_thread) {
+       fprintf(stderr,
+               "[Proxy] NUMA node of cxi%d is unknown; proxy thread %d is not "
+               "pinned\n",
+-              cfg_.local_rank, cfg_.thread_idx);
++              cfg_.nic_local_rank, cfg_.thread_idx);
+     }
+
+     return;
