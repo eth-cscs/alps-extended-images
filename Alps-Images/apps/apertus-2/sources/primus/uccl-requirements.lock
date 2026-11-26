@@ -1,0 +1,4 @@
+# Native training build dependencies only; never resolve a replacement compute stack.
+intervaltree==3.2.1
+nanobind==3.0.1
+sortedcontainers==2.4.0

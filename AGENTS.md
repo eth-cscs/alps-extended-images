@@ -63,6 +63,7 @@ Preserve reproducible content hashing, canonical base-image selection, generated
 - Prefer pinned tags/commits for downloaded sources.
 - Put app-local files copied into images under `Alps-Images/apps/<app>/sources/`; app hashes include this directory by default when it exists.
 - Prefer app patch files under `Alps-Images/apps/<app>/patches/` over inline source rewrites in app Containerfiles.
+- Follow existing recipes: keep helper inputs under `sources/` and patches in the established `patches/` trees; express cache boundaries through `COPY` ordering.
 - If tests must run without a repo checkout, copy them into `/opt/tests/<image>/` and include them in the app hash.
 
 ## Verification

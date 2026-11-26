@@ -1,0 +1,48 @@
+Subject: [PATCH] Default ROCm router GEMM to its existing ATen path
+
+Applies to Megatron-LM-MoE 0789b8e429553c2f17c350afa8619c69d01bec25.
+
+--- a/megatron/core/transformer/moe/moe_utils.py
++++ b/megatron/core/transformer/moe/moe_utils.py
+@@ -1893,6 +1893,16 @@
+     return RandomSTEShared.apply(logits, std, layer_number)
+ 
+ 
++def _use_te_router_gemm(router_dtype):
++    # ROCm 10 hipBLASLt solution selection can fault in real-shape training and
++    # fresh-process resume. Keep TE elsewhere; use the existing ATen router path.
++    default = "aten" if torch.version.hip is not None else "te"
++    backend = os.environ.get("APERTUS_ROCM_ROUTER_GEMM_BACKEND", default)
++    if backend not in {"aten", "te"}:
++        raise ValueError("APERTUS_ROCM_ROUTER_GEMM_BACKEND must be 'aten' or 'te'")
++    return backend == "te" and te_general_gemm is not None and router_dtype != torch.float64
++
++
+ class RouterGatingLinearFunction(torch.autograd.Function):
+     """
+     Autograd function for router gating linear.
+@@ -1919,13 +1929,14 @@
+             torch.Tensor: The output tensor.
+         """
+         ctx.save_for_backward(inp, weight, bias)
++        ctx.use_te_router_gemm = _use_te_router_gemm(router_dtype)
+         ctx.router_dtype = router_dtype
+         ctx.input_dtype = inp.dtype
+         ctx.weight_dtype = weight.dtype
+         inp_shape = inp.shape
+         inp = inp.view(-1, inp_shape[-1])
+ 
+-        if te_general_gemm is not None and router_dtype != torch.float64:
++        if ctx.use_te_router_gemm:
+             output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
+             output = output[0]
+         elif bias is None:
+@@ -1958,7 +1969,7 @@
+         inp = inp.view(-1, inp_shape[-1])
+         grad_output = grad_output.view(-1, grad_shape[-1])
+ 
+-        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
++        if ctx.use_te_router_gemm:
+             grad_input = te_general_gemm(
+                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+             )

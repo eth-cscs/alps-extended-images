@@ -1,0 +1,27 @@
+Subject: [PATCH] Materialize dispatch gradients before recording the event
+
+Applies to Megatron-LM-MoE 0789b8e429553c2f17c350afa8619c69d01bec25.
+
+--- a/megatron/core/transformer/moe/fused_a2a.py
++++ b/megatron/core/transformer/moe/fused_a2a.py
+@@ -143,13 +143,18 @@
+         """Backward pass of fused dispatch."""
+         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
+         handle = ctx.handle
++        # The native transport consumes dense raw pointers, not tensor strides.
++        # Sum gradients can be expanded views backed by only one scalar.
++        # Materialize both inputs BEFORE recording the communication dependency.
++        grad_output = grad_output.contiguous()
++        grad_token_probs = grad_token_probs.float().contiguous()
+         previous_event = None
+         if ctx.async_finish:
+             previous_event = EventOverlap(EventHandle())
+         grad_x, grad_token_probs, after_event = buffer.combine(
+-            grad_output.contiguous(),
++            grad_output,
+             handle,
+-            topk_weights=grad_token_probs.float(),
++            topk_weights=grad_token_probs,
+             previous_event=previous_event,
+             async_finish=ctx.async_finish,
+             allocate_on_comm_stream=ctx.allocate_on_comm_stream,

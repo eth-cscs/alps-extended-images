@@ -127,6 +127,9 @@ include:
       "BASE_IMAGE",
       "ROCM_VARIANT_DIR",
       "ROCM_VERSION",
+      "ALPS_ROCM_VERSION",
+      "ROCM_SDK_LAYOUT",
+      "ROCM_PRESERVE_COMPUTE",
       "ROCM_REBUILD_RCCL",
       "ROCM_SYSTEMS_REPO",
       "ROCM_SYSTEMS_COMMIT",
@@ -276,6 +279,10 @@ include:
       test "${NCCL_PROTO:-}" = "^LL128"
       test -n "${ROCM_VERSION:-}"
       test -n "${RCCL_VERSION:-}"
+      if [[ -f /opt/alps/primus-compute-before.json ]]; then
+        test "${DEBUG_CLR_AQL_DEV_QUEUE:-}" = "0"
+        test "${NCCL_P2P_DISABLE:-}" = "1"
+      fi
       /opt/venv/bin/python - <<'PY'
       import os
       import sys
@@ -358,7 +365,10 @@ include:
                       major, minor, patch);
       }
       CPP
-      env -u ROCM_PATH -u HIP_PATH "${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++" \
+      hip_cxx="${ROCM_CORE_PREFIX}/lib/llvm/bin/clang++"
+      [[ -x "$hip_cxx" ]] || hip_cxx="${ROCM_BUILD_PREFIX}/llvm/bin/clang++"
+      test -x "$hip_cxx"
+      env -u ROCM_PATH -u HIP_PATH "$hip_cxx" \
         -std=c++17 -D__HIP_PLATFORM_AMD__ -I"${ROCM_BUILD_PREFIX}/include" "$work/miopen.cpp" \
         -L"${ROCM_BUILD_PREFIX}/lib" -Wl,-rpath,"${ROCM_BUILD_PREFIX}/lib" \
         -lMIOpen -o "$work/miopen"
@@ -367,12 +377,22 @@ include:
     SLURM_JOB_NUM_NODES: 1
     SLURM_NTASKS: 1
 
-# ROCm base multi-node RCCL and MPI smoke test.
-.child-rocm-base-collectives-test-template:
+# The container runner launches the entire script in one Slurm/PMIx step.
+# RCCL tests also use MPI: give each independent MPI executable its own job so
+# MPI4 finalization cannot clean up session directories reused by the next one.
+.child-rocm-base-rccl-test-template:
   stage: test-base
   extends: [.container-runner-beverin-mi300, .child-slurm-template]
   script:
     - all_reduce_perf -b 32 -e 4M -f 2 -g 1
+  variables:
+    SLURM_JOB_NUM_NODES: 2
+    SLURM_NTASKS: 8
+
+.child-rocm-base-mpi-test-template:
+  stage: test-base
+  extends: [.container-runner-beverin-mi300, .child-slurm-template]
+  script:
     - /usr/local/libexec/osu-micro-benchmarks/mpi/collective/osu_alltoall --type mpi_float --message-size 32:2^22:2 --full --tail-lat --accelerator rocm
   variables:
     SLURM_JOB_NUM_NODES: 2

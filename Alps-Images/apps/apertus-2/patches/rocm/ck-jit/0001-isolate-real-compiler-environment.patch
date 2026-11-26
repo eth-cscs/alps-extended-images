@@ -1,0 +1,108 @@
+Subject: [PATCH] ck-jit: isolate real compiler calls from interceptor discovery
+
+AITER needs ROCM_PATH to find CK's build interceptor. On the ROCm 10 wheel
+SDK, clang 23 misdetects device math when that root override is inherited by
+the real HIP compiler. A minimal exp2f/std::sqrtf device kernel fails with
+ROCM_PATH set and compiles unchanged when it is unset. Preserve the shim's
+lookup environment but remove ROCM_PATH/HIP_PATH only for real compiler and
+linker subprocesses, including runtime JIT; keep the pinned kernels unchanged.
+
+Applies to ck-jit e0b303100e7deda4c117acabaf49e825243f8748, pinned by TE.
+
+diff --git a/ck_build_interceptor.py b/ck_build_interceptor.py
+index a3b7700..e45ea38 100755
+--- a/ck_build_interceptor.py
++++ b/ck_build_interceptor.py
+@@ -41,6 +41,8 @@ import re
+ import subprocess
+ import sys
+ 
++from ck_jit_utils import compiler_environment
++
+ # ---------------------------------------------------------------------------
+ # Configuration from environment
+ # ---------------------------------------------------------------------------
+@@ -255,7 +257,7 @@ def run_real_compiler(argv):
+     else:
+         compiler = REAL_HIPCC or _find_hipcc()
+     cmd = [compiler] + argv[1:]
+-    return subprocess.run(cmd, check=False).returncode
++    return subprocess.run(cmd, env=compiler_environment(), check=False).returncode
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -347,7 +349,7 @@ def _handle_api_source(argv, source_abs, output_abs, basename):
+         print(f"[CK-JIT] api compile: {' '.join(shlex.quote(a) for a in new_argv)}",
+               file=sys.stderr)
+ 
+-    rc = subprocess.run(new_argv, check=False).returncode
++    rc = subprocess.run(new_argv, env=compiler_environment(), check=False).returncode
+     if rc != 0:
+         print(f"[CK-JIT] ERROR: api compile failed for {basename} (rc={rc})", file=sys.stderr)
+         return rc
+diff --git a/ck_jit_utils.py b/ck_jit_utils.py
+index 322ecbd..611c3d2 100644
+--- a/ck_jit_utils.py
++++ b/ck_jit_utils.py
+@@ -14,6 +14,18 @@
+ import os
+ import shutil
+ 
++
++def compiler_environment():
++    """Keep shim lookup variables out of the real HIP compiler environment.
++
++    AITER needs ROCM_PATH to select the CK interceptor. Passing that value on
++    to clang 23 breaks HIP device-math discovery in wheel-only ROCm SDKs.
++    The real compiler path and explicit include/link flags already select
++    the SDK; only its environment must omit these two root overrides.
++    """
++    return {key: value for key, value in os.environ.items()
++            if key not in ("ROCM_PATH", "HIP_PATH")}
++
+ # ---------------------------------------------------------------------------
+ # Arch-family filtering
+ # ---------------------------------------------------------------------------
+diff --git a/ck_post_build.py b/ck_post_build.py
+index 8a53568..7e90726 100644
+--- a/ck_post_build.py
++++ b/ck_post_build.py
+@@ -23,7 +23,7 @@ import shlex
+ import subprocess
+ import sys
+ 
+-from ck_jit_utils import filter_offload_arch_flags, find_rocm
++from ck_jit_utils import compiler_environment, filter_offload_arch_flags, find_rocm
+ 
+ # ---------------------------------------------------------------------------
+ # Manifest helpers
+@@ -85,7 +85,7 @@ def link_so(hipcc, objs, out_path, ld_flags, rocm_lib_dir, verbose=False):
+     print(f"[CK-POST] link: {out_path}", file=sys.stderr)
+     if verbose:
+         print(f"[CK-POST] link cmd: {' '.join(shlex.quote(a) for a in cmd)}", file=sys.stderr)
+-    r = subprocess.run(cmd, capture_output=not verbose, text=True, check=False)
++    r = subprocess.run(cmd, env=compiler_environment(), capture_output=not verbose, text=True, check=False)
+     if r.returncode != 0:
+         print(f"[CK-POST] ERROR linking {out_path}:\n{r.stderr}", file=sys.stderr)
+     return r.returncode
+@@ -422,7 +422,7 @@ def build_lib(out_so, link_argv, jit_tmp_dir,
+                                      arch_flags=arch_fl)
+ 
+     print(f"{tag} Compiling ck_jit_runtime.cpp...", file=sys.stderr)
+-    r = subprocess.run(runtime_cmd, capture_output=not verbose, text=True, check=False)
++    r = subprocess.run(runtime_cmd, env=compiler_environment(), capture_output=not verbose, text=True, check=False)
+     if r.returncode != 0:
+         print(f"{tag} ERROR: ck_jit_runtime.cpp:\n{r.stderr}", file=sys.stderr)
+         return r.returncode
+diff --git a/ck_jit_compile.sh b/ck_jit_compile.sh
+--- a/ck_jit_compile.sh
++++ b/ck_jit_compile.sh
+@@ -73,7 +73,7 @@
+ atomic_link_so() {
+   _TMP_SO="$(mktemp "${OUTPUT}.XXXXXX")"
+   # shellcheck disable=SC2086
+-  if "$HIPCC_BIN" -shared -fPIC "$@" -o "$_TMP_SO"; then
++  if env -u ROCM_PATH -u HIP_PATH "$HIPCC_BIN" -shared -fPIC "$@" -o "$_TMP_SO"; then
+     mv -n "$_TMP_SO" "$OUTPUT" || [ -f "$OUTPUT" ]
+     rm -f "$_TMP_SO"  # no-op if mv moved it; removes stale temp on no-clobber
+     _TMP_SO=""

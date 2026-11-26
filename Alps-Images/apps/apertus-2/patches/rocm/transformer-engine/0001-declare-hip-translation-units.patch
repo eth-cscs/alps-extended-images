@@ -1,0 +1,38 @@
+Subject: [PATCH] Declare GPU C++ translation units as HIP
+
+The hipified _hip.cpp files and CK attention .cpp files contain device
+functions, CK host/device overloads and actual __global__ kernels. The wheel
+SDK compatibility hip::device target provides runtime headers and linking,
+not an implicit C++ language switch. Declare their language so CMake uses
+its HIP compiler and configured GPU architectures. Leave ordinary host-only
+C++ sources, such as amd_detail/system.cpp, in C++ mode.
+
+Applies to Transformer Engine b56021a0e4a2e4a7822482ffdf5353368a777e0e.
+
+diff --git a/transformer_engine/common/ck_fused_attn/CMakeLists.txt b/transformer_engine/common/ck_fused_attn/CMakeLists.txt
+--- a/transformer_engine/common/ck_fused_attn/CMakeLists.txt
++++ b/transformer_engine/common/ck_fused_attn/CMakeLists.txt
+@@ -211,6 +211,7 @@ foreach(file ${ck_fused_attn_SOURCES})
+   message(STATUS " ${file}")
+ endforeach()
+ 
++set_source_files_properties(${ck_fused_attn_SOURCES} PROPERTIES LANGUAGE HIP)
+ add_library(ck_fused_attn SHARED ${ck_fused_attn_SOURCES})
+ set(CK_FUSED_ATTN_COMPILE_OPTIONS)
+ #-Wno-unknown-warning-option is to suppress warning about -Wlifetime-safety-lifetimebound-violation
+diff --git a/transformer_engine/common/CMakeLists.txt b/transformer_engine/common/CMakeLists.txt
+--- a/transformer_engine/common/CMakeLists.txt
++++ b/transformer_engine/common/CMakeLists.txt
+@@ -489,6 +489,12 @@ else() #USE_ROCM
+   message("${message_line}")
+   message(STATUS "nvte hipified sources: ${te_hip_sources}")
+ 
++  foreach(_src IN LISTS te_hip_sources)
++    if(_src MATCHES "_hip\\.cpp$")
++      set_source_files_properties("${_src}" PROPERTIES LANGUAGE HIP)
++    endif()
++  endforeach()
++
+   add_library(transformer_engine SHARED ${te_hip_sources})
+ 
+   # Workaround for TheRock installation that moved some headers from system-wide location

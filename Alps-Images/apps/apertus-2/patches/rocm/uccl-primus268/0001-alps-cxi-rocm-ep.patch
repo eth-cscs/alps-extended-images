@@ -1,0 +1,146 @@
+Subject: [PATCH] Minimal Primus26.8 HIP launch and CXI corrections on UCCL52d4184
+
+Keep HIP cooperative extended launch, ROCR GPU-memory registration and
+consistent physical NIC/NUMA selection, including upstream fresh-info retries.
+Do not add another CXI mutex or host cleanup barrier: those intents are
+already covered by upstream setup serialization and topology all-gather.
+ROCm10.1/Torch2.14 joint host/device codegen ablations pass without the older
+min/max, volatile-snapshot and builtin-math rewrites; leave kernels unchanged.
+The separate ownership patch preserves the legacy native positional API.
+
+diff --git a/ep/include/cxi_transport.hpp b/ep/include/cxi_transport.hpp
+index f90578a..a63cfc9 100644
+--- a/ep/include/cxi_transport.hpp
++++ b/ep/include/cxi_transport.hpp
+@@ -20,6 +20,7 @@ class CxiTransport final : public EpTransport {
+   ~CxiTransport() override;
+
+   void init(ProxyCtx& ctx) override;
++  void init(ProxyCtx& ctx, int cxi_local_rank);
+   void register_main_buffer(void* ptr, size_t len, int cuda_device) override;
+   void register_atomic_buffer(void* ptr, size_t len, int cuda_device) override;
+   LocalConnInfo local_info() const override;
+diff --git a/ep/include/ep_launch.cuh b/ep/include/ep_launch.cuh
+index b80131e..c872af3 100644
+--- a/ep/include/ep_launch.cuh
++++ b/ep/include/ep_launch.cuh
+@@ -2,6 +2,15 @@
+ #include "exception.cuh"
+
+ #ifndef SETUP_LAUNCH_CONFIG
++#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
++#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                    \
++  hipLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
++  hipLaunchAttribute attr[1];                                                \
++  attr[0].id = hipLaunchAttributeCooperative;                                \
++  attr[0].val.cooperative = 1;                                               \
++  cfg.attrs = attr;                                                          \
++  cfg.numAttrs = 1
++#else
+ #ifndef DISABLE_SM90_FEATURES
+ #define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                     \
+   cudaLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
+@@ -24,11 +33,17 @@
+   cfg.numAttrs = 1
+ #endif
+ #endif
++#endif
+
+ #ifndef LAUNCH_KERNEL
++#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
++#define LAUNCH_KERNEL(config, kernel, ...) \
++  CUDA_CHECK(hipLaunchKernelEx(config, kernel, ##__VA_ARGS__))
++#else
+ #define LAUNCH_KERNEL(config, kernel, ...) \
+   CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
+ #endif
++#endif
+
+ #ifndef SET_SHARED_MEMORY_FOR_TMA
+ #ifndef DISABLE_SM90_FEATURES
+diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
+index 59912f2..e854acf 100644
+--- a/ep/src/cxi_transport.cpp
++++ b/ep/src/cxi_transport.cpp
+@@ -24,7 +24,8 @@ void CxiTransport::unavailable() {
+
+ #ifndef USE_LIBFABRIC_CXI
+
+-void CxiTransport::init(ProxyCtx&) { unavailable(); }
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++void CxiTransport::init(ProxyCtx&, int) { unavailable(); }
+ void CxiTransport::register_main_buffer(void*, size_t, int) { unavailable(); }
+ void CxiTransport::register_atomic_buffer(void*, size_t, int) { unavailable(); }
+ LocalConnInfo CxiTransport::local_info() const { unavailable(); }
+@@ -83,8 +84,13 @@ fid_mr* register_cuda_mr(fid_domain* domain, fid_ep* ep, void* ptr, size_t len,
+   attr.iov_count = 1;
+   attr.access =
+       FI_SEND | FI_RECV | FI_WRITE | FI_READ | FI_REMOTE_WRITE | FI_REMOTE_READ;
++#ifdef __HIP_PLATFORM_AMD__
++  attr.iface = FI_HMEM_ROCR;
++  attr.device.rocr = cuda_device;
++#else
+   attr.iface = FI_HMEM_CUDA;
+   attr.device.cuda = static_cast<uint64_t>(cuda_device);
++#endif
+
+   fid_mr* mr = nullptr;
+   int rc = fi_mr_regattr(domain, &attr, 0, &mr);
+@@ -204,14 +210,16 @@ int cxi_domain_retries() {
+
+ }  // namespace
+
+-void CxiTransport::init(ProxyCtx& ctx) {
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++
++void CxiTransport::init(ProxyCtx& ctx, int cxi_local_rank) {
+   ctx_ = &ctx;
+
+   std::unique_lock<std::mutex> setup_lock(g_cxi_setup_mu);
+   fi_info* info = get_cxi_info();
+
+   try {
+-    fi_info* selected = select_cxi_info(info, ctx.local_rank);
++    fi_info* selected = select_cxi_info(info, cxi_local_rank);
+
+     check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr), "fi_fabric");
+     int rc = fi_domain(fabric_, selected, &domain_, nullptr);
+@@ -226,7 +234,7 @@ void CxiTransport::init(ProxyCtx& ctx) {
+       info = nullptr;
+       usleep(50000);
+       info = get_cxi_info();
+-      selected = select_cxi_info(info, ctx.local_rank);
++      selected = select_cxi_info(info, cxi_local_rank);
+       check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr),
+                "fi_fabric");
+       rc = fi_domain(fabric_, selected, &domain_, nullptr);
+diff --git a/ep/src/proxy.cpp b/ep/src/proxy.cpp
+index 265ae39..be59c50 100644
+--- a/ep/src/proxy.cpp
++++ b/ep/src/proxy.cpp
+@@ -285,7 +285,7 @@ void Proxy::init_common() {
+       if (!should_connect_peer(peer)) continue;
+
+       auto transport = std::make_unique<CxiTransport>();
+-      transport->init(ctx_);
++      transport->init(ctx_, cfg_.nic_local_rank);
+       transport->register_main_buffer(cfg_.gpu_buffer, cfg_.total_size,
+                                       cfg_.local_rank);
+       transport->register_atomic_buffer(atomic_buffer_ptr_, kAtomicBufferSize,
+@@ -374,14 +374,14 @@ void Proxy::init_common() {
+     dst_pending_.assign(256, 0);  // TransferCmd::dst_rank is a uint8_t
+ #endif
+
+-    ctx_.numa_node = cxi_nic_numa_node(cfg_.local_rank);
++    ctx_.numa_node = cxi_nic_numa_node(cfg_.nic_local_rank);
+     if (ctx_.numa_node >= 0) {
+       pin_thread_to_numa_wrapper();
+     } else if (cfg_.pin_thread) {
+       fprintf(stderr,
+               "[Proxy] NUMA node of cxi%d is unknown; proxy thread %d is not "
+               "pinned\n",
+-              cfg_.local_rank, cfg_.thread_idx);
++              cfg_.nic_local_rank, cfg_.thread_idx);
+     }
+
+     return;

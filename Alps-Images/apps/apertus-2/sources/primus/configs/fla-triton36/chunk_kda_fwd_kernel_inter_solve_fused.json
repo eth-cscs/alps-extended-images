@@ -1,0 +1,33 @@
+{
+ "kernel_name": "chunk_kda_fwd_kernel_inter_solve_fused",
+ "triton_version": "3.6.0",
+ "autotune_entries": {
+  "195caf95a850f8402ca64e630141883a": {
+   "autotune_key": [
+    20,
+    20,
+    128,
+    64,
+    16,
+    4,
+    "torch.bfloat16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float32",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.bfloat16"
+   ],
+   "config": {
+    "kwargs": {
+     "BK": 64,
+     "waves_per_eu": 1
+    },
+    "num_warps": 1,
+    "num_stages": 1,
+    "num_ctas": 1,
+    "maxnreg": null
+   }
+  }
+ }
+}

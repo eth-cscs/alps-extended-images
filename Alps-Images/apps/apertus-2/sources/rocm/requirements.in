@@ -1,0 +1,34 @@
+# Native ROCm training dependencies; inherited Torch/Triton/NumPy are constrained.
+# CUDA serving, DeepGEMM and Swiss AI CUTLASS expert offloading are not installed.
+absl-py==2.5.1
+accelerate==1.15.0
+cmake<4
+einops==0.8.1
+huggingface-hub==1.31.0
+importlib-metadata==9.0.1
+intervaltree==3.2.1
+matplotlib>=3.9,<4
+nanobind==3.0.1
+ninja==1.13.2
+omegaconf==2.3.0
+onnx==1.23.2
+onnxscript==0.7.2
+packaging==26.3
+pandas==3.0.6
+psutil==7.2.2
+pybind11==3.1.0
+pydantic==2.14.1
+PyYAML==6.0.3
+safetensors==0.8.0
+sentencepiece==0.2.2
+setuptools==79.0.1
+six==1.17.0
+tensorboard==2.20.0
+tensorstore==0.1.85
+tiktoken==0.14.0
+tokenizers==0.23.2
+tqdm==4.70.1
+transformers==5.17.0
+wandb==0.30.0
+wheel==0.48.0
+wrapt==2.5.1
