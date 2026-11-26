@@ -52,6 +52,7 @@ CUDA app variants are available for the listed workloads; ROCm app variants are 
 | `apertus-2-cuda:alps7-dev`   | `pytorch-cuda:26.02-py3` | Multi-model ML benchmark suite (pplx-garden, DeepEP, quack-kernels) |
 | `sfttrainer-cuda:alps7-dev`  | `pytorch-cuda:26.02-py3` | Supervised fine-tuning trainer image |
 | `verl-cuda:alps7-dev`        | `pytorch-cuda:26.02-py3` | VeRL reinforcement learning workloads |
+| `verl-apertus-cuda:alps7-dev` | `pytorch-cuda:26.02-py3` | The VeRL image with Apertus 1.0 and 1.5 support for Megatron training and SGLang generation |
 | `vllm-cuda:alps7-dev`        | `pytorch-cuda:26.07-py3` | vLLM serving workloads built from source (v0.31.0, Torch 2.13 stable-libtorch APIs), with UCCL-EP and Mooncake CXI KV transfer over Slingshot CXI |
 | `vllm-rocm:alps7-dev`        | `pytorch-rocm:rocm10.0-ubuntu24.04-py3.12-torch2.13` | vLLM serving workloads built from source for ROCm/MI300 (v0.31.0), with AITER, UCCL-EP, and Mooncake CXI KV transfer over Slingshot CXI |
 

@@ -1,0 +1,49 @@
+# Apertus 1.5 always carries a vision_config, so verl's Megatron engine passes vision_model=True
+# and the forward turns the packed THD input_ids into a padded tensor while packed_seq_params
+# stays packed: RoPE then fails in split_with_sizes (apertus-benchmarks runs 3174079/3183472).
+# The recipe forced vision_model=False for every model; this patch does it for apertus1p5 only,
+# so other vision-language models keep their vision path.
+
+diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
+index 01499e8..13dd9f2 100644
+--- a/verl/workers/engine/megatron/transformer_impl.py
++++ b/verl/workers/engine/megatron/transformer_impl.py
+@@ -87,6 +87,20 @@ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+ 
++def _has_vision_model(hf_config) -> bool:
++    """Whether the forward should route inputs through the vision path.
++
++    Apertus 1.5 always carries a ``vision_config`` (it is multimodal), but its Megatron bridge
++    builds only the language model. With ``vision_model=True`` the forward replaces the packed THD
++    ``input_ids`` with a padded tensor while ``packed_seq_params`` stays packed, and RoPE fails in
++    ``split_with_sizes``. Text-only training is the only mode it supports, so the vision path is
++    off for it.
++    """
++    if getattr(hf_config, "model_type", None) == "apertus1p5":
++        return False
++    return hasattr(hf_config, "vision_config")
++
++
+ def _resolve_fused_temperature(temperature: float | torch.Tensor) -> float:
+     """Return the scalar temperature required by fused linear cross entropy."""
+     values = torch.as_tensor(temperature).detach().flatten()
+@@ -1401,7 +1415,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
+                 multi_modal_inputs,
+                 logits_processor=logits_processor,
+                 logits_processor_args=logits_processor_args,
+-                vision_model=hasattr(self.model_config.hf_config, "vision_config"),
++                vision_model=_has_vision_model(self.model_config.hf_config),
+                 pad_token_id=self.model_config.tokenizer.pad_token_id,
+                 data_format=data_format,
+                 mtp_enable_train=self.model_config.mtp.enable and self.model_config.mtp.enable_train,
+@@ -1521,7 +1535,7 @@ class MegatronEngineWithValueHead(MegatronEngineWithLMHead):
+             input_ids,
+             multi_modal_inputs,
+             value_model=True,
+-            vision_model=hasattr(self.model_config.hf_config, "vision_config"),
++            vision_model=_has_vision_model(self.model_config.hf_config),
+             pad_token_id=self.model_config.tokenizer.pad_token_id,
+             data_format="thd" if self.engine_config.use_remove_padding else "bshd",
+             forced_max_seqlen=tu.get_non_tensor_data(data=batch, key="forced_max_seqlen", default=None),
