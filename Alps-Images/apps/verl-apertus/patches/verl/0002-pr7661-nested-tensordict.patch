@@ -1,0 +1,153 @@
+From 00aae34a5eb74a45297d4f44f33cb1330a716c2d Mon Sep 17 00:00:00 2001
+From: Elia Palme <elia.palme@cscs.ch>
+Date: Tue, 1 Sep 2026 22:20:29 +0200
+Subject: [PATCH] [misc] fix: build nested tensors unconditionally in
+ list_of_dict_to_tensordict
+
+list_of_dict_to_tensordict decided dense-vs-ragged per field with
+`all(item.shape == val_list[0].shape for item in val_list)`. That check is
+vacuously true for a length-1 list (this function is called once per rollout
+output, so the list is frequently length 1) and also true whenever several
+genuinely ragged items coincidentally share a length -- most commonly a group
+of GRPO rollout responses that all saturate max_response_length. In both cases
+it silently torch.stack()'d ragged per-sample tensors (input_ids, responses,
+position_ids, ...) into a dense [N, L] tensor, and downstream code that expects
+a nested tensor then raised
+`AttributeError: 'Tensor' object has no attribute 'offsets'`
+-- observed from both current callers, the TransferQueue rollout-write path
+(verl/trainer/ppo/v1/agent_loop_tq.py) and the padding upsampler
+(verl/trainer/ppo/padding_utils.py).
+
+Replace the shape-equality heuristic: non-tensor / empty -> NonTensorStack,
+all-scalar (0-d) tensors -> torch.stack (no dimension to be ragged along),
+everything else -> nested_tensor_from_tensor_list (already used unconditionally
+elsewhere in this file for chunking/dispatch). The old `else` branch was
+already torch.nested.as_nested_tensor, so the only behavior change is that
+uniform-shape multi-element tensor fields now go nested instead of stacked.
+
+Add tests/utils/test_tensordict_utils_on_cpu.py covering the length-1,
+same-length, variable-length, scalar and non-tensor cases.
+
+Signed-off-by: Elia Palme <elia.palme@cscs.ch>
+---
+ tests/utils/test_tensordict_utils_on_cpu.py | 68 +++++++++++++++++++++
+ verl/utils/tensordict_utils.py              | 31 +++++-----
+ 2 files changed, 85 insertions(+), 14 deletions(-)
+ create mode 100644 tests/utils/test_tensordict_utils_on_cpu.py
+
+diff --git a/tests/utils/test_tensordict_utils_on_cpu.py b/tests/utils/test_tensordict_utils_on_cpu.py
+new file mode 100644
+index 00000000000..0607a0a9464
+--- /dev/null
++++ b/tests/utils/test_tensordict_utils_on_cpu.py
+@@ -0,0 +1,68 @@
++# Copyright 2024 Bytedance Ltd. and/or its affiliates
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import torch
++from tensordict import NonTensorStack
++
++from verl.utils.tensordict_utils import list_of_dict_to_tensordict
++
++
++def _sample(seq_len: int) -> dict:
++    return {
++        "input_ids": torch.arange(seq_len, dtype=torch.long),
++        "seq_len": torch.tensor(seq_len, dtype=torch.long),
++        "data_source": "gsm8k",
++    }
++
++
++def test_single_element_list_keeps_ragged_fields_nested():
++    # A length-1 list makes ``all(item.shape == val_list[0].shape ...)`` vacuously
++    # true, which used to stack the single ragged tensor into a dense [1, L] and
++    # break downstream ``.offsets()`` calls.
++    td = list_of_dict_to_tensordict([_sample(5)])
++
++    assert td["input_ids"].is_nested
++    assert td["input_ids"].offsets().tolist() == [0, 5]
++
++
++def test_same_length_ragged_fields_stay_nested():
++    # Several genuinely-ragged items that coincidentally share a length (e.g. a
++    # group of rollout responses all saturating max_response_length) must not be
++    # collapsed to a dense tensor.
++    td = list_of_dict_to_tensordict([_sample(7), _sample(7), _sample(7)])
++
++    assert td["input_ids"].is_nested
++    assert td["input_ids"].offsets().tolist() == [0, 7, 14, 21]
++
++
++def test_variable_length_ragged_fields_stay_nested():
++    td = list_of_dict_to_tensordict([_sample(3), _sample(6), _sample(4)])
++
++    assert td["input_ids"].is_nested
++    assert td["input_ids"].offsets().tolist() == [0, 3, 9, 13]
++    assert td["input_ids"][1].tolist() == [0, 1, 2, 3, 4, 5]
++
++
++def test_scalar_fields_are_stacked_dense():
++    td = list_of_dict_to_tensordict([_sample(3), _sample(6)])
++
++    assert not td["seq_len"].is_nested
++    assert td["seq_len"].tolist() == [3, 6]
++
++
++def test_non_tensor_fields_use_non_tensor_stack():
++    td = list_of_dict_to_tensordict([_sample(3), _sample(6)])
++
++    assert isinstance(td.get("data_source"), NonTensorStack)
++    assert td.get("data_source").tolist() == ["gsm8k", "gsm8k"]
+diff --git a/verl/utils/tensordict_utils.py b/verl/utils/tensordict_utils.py
+index 91d82b15ffd..0423c284f5e 100644
+--- a/verl/utils/tensordict_utils.py
++++ b/verl/utils/tensordict_utils.py
+@@ -930,20 +930,23 @@ def list_of_dict_to_tensordict(list_of_dicts: list[dict[str, Any]]) -> TensorDic
+     dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
+     batch_size = len(list_of_dicts)
+ 
+-    final_data = {
+-        key: (
+-            torch.stack(val_list)
+-            if val_list
+-            and all(isinstance(item, torch.Tensor) for item in val_list)
+-            and all(item.shape == val_list[0].shape for item in val_list)
+-            else (
+-                torch.nested.as_nested_tensor(val_list, layout=torch.jagged)
+-                if val_list and all(isinstance(item, torch.Tensor) for item in val_list)
+-                else NonTensorStack(*val_list)
+-            )
+-        )
+-        for key, val_list in dict_of_lists.items()
+-    }
++    def _pack(val_list):
++        if not val_list or not all(isinstance(item, torch.Tensor) for item in val_list):
++            return NonTensorStack(*val_list)
++        # Scalar (0-d) tensors have no dimension to be ragged along -> stack.
++        if all(item.dim() == 0 for item in val_list):
++            return torch.stack(val_list)
++        # For everything else build a nested tensor unconditionally. Do NOT decide
++        # dense-vs-ragged from shape equality: that check is vacuously true for a
++        # length-1 list (the sole item always "matches" its own shape) and also
++        # misfires whenever several genuinely ragged items coincidentally share a
++        # length -- e.g. a group of rollout responses that all saturate
++        # max_response_length. Either case silently produced a dense tensor for a
++        # field the caller treats as nested, so a downstream .offsets() raised
++        # ``AttributeError: 'Tensor' object has no attribute 'offsets'``.
++        return nested_tensor_from_tensor_list(val_list)
++
++    final_data = {key: _pack(val_list) for key, val_list in dict_of_lists.items()}
+ 
+     td = TensorDict(final_data, batch_size=[batch_size])
+ 

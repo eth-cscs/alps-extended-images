@@ -1,0 +1,29 @@
+# verl v0.9.1 passes print's flush=True to logging.Logger.info on the hybrid_engine=False path:
+# a TypeError at trainer init. verl main no longer does. From the apertus-benchmarks
+# rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh recipe, which applied it with sed.
+
+diff --git a/verl/trainer/ppo/v1/trainer_separate_async.py b/verl/trainer/ppo/v1/trainer_separate_async.py
+index 44ffc40..a6ac003 100644
+--- a/verl/trainer/ppo/v1/trainer_separate_async.py
++++ b/verl/trainer/ppo/v1/trainer_separate_async.py
+@@ -181,7 +181,6 @@ class PPOTrainerSeparateAsync(PPOTrainer):
+             logger.info(
+                 "[V1SepAsync] hybrid replicas disabled (actor_rollout_ref.hybrid_engine=False): "
+                 f"rollout served by {len(self.standalone_server_manager.get_replicas())} standalone replicas only",
+-                flush=True,
+             )
+ 
+     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+diff --git a/verl/workers/rollout/sglang_rollout/http_server_engine.py b/verl/workers/rollout/sglang_rollout/http_server_engine.py
+index 3508c73..bf55eb7 100644
+--- a/verl/workers/rollout/sglang_rollout/http_server_engine.py
++++ b/verl/workers/rollout/sglang_rollout/http_server_engine.py
+@@ -141,7 +141,7 @@ def launch_server_process(
+     """
+     p = multiprocessing.Process(target=launch_server, args=(server_args,))
+     if server_args.node_rank != 0 or not first_rank_in_node:
+-        logger.info(f"Server process started with PID {p.pid} for node rank {server_args.node_rank}", flush=True)
++        logger.info(f"Server process started with PID {p.pid} for node rank {server_args.node_rank}")
+         return p
+ 
+     p.start()

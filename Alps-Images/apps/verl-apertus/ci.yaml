@@ -1,0 +1,12 @@
+tests:
+  cuda:
+    - name: vetnode
+      kind: cuda-vetnode
+    - name: imports
+      runner: cuda
+      timeout: 30m
+      script:
+        - /opt/tests/verl-apertus/import-smoke.sh
+      variables:
+        SLURM_JOB_NUM_NODES: "1"
+        SLURM_NTASKS: "1"

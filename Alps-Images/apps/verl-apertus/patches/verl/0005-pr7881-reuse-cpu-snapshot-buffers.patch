@@ -1,0 +1,172 @@
+From a0f1399d4a4f900cf6706036f9903708a95c0ca3 Mon Sep 17 00:00:00 2001
+From: Elia Palme <elia.palme@cscs.ch>
+Date: Wed, 16 Sep 2026 07:57:31 +0200
+Subject: [PATCH] [megatron] fix: reuse pinned CPU snapshot buffers in
+ Decoupled PPO to stop a host-RAM leak
+
+copy_megatron_model_to_cpu allocated a brand-new pinned CPU buffer via
+buffer.param_data.data.cpu().clone().pin_memory() on every call. Under
+Decoupled PPO (algorithm.rollout_correction.bypass_mode: False),
+_compute_old_log_prob calls save_model_to_cpu once per training step to
+snapshot a stable pi_old across a parameter_sync_step cycle, and with a
+short parameter_sync_step (e.g. 1, syncing every step) this call happens
+every single step, at the same fixed size every time.
+
+PyTorch's pinned-host allocator does not always reclaim a previous call's
+freed blocks for reuse, so this pattern leaks host RAM unboundedly:
+observed on a 70B-parameter model, pinned allocations were an identical
+~18 GB on every call while process RSS climbed from ~40 GB to over
+100 GB across 3 steps before OOM-killing the node.
+
+Fix: copy_megatron_model_to_cpu now accepts an optional `cache` (a prior
+call's own return value) and does an in-place copy_() into the same
+pinned tensor for any buffer whose shape/dtype still matches, falling
+back to a fresh allocation only on a genuine mismatch or the first call.
+DetachActorWorker keeps a persistent per-slot buffer pool that survives
+clear_cpu_model, so a given snapshot slot's pinned buffer is allocated
+once and reused for the rest of training. Scoped to
+actor.strategy == "megatron" only; FSDP/FSDP2/VeOmni paths are untouched.
+
+Verified locally: exercised the reuse/fallback logic against real torch
+tensors with a hand-built DDP-buffer mock, confirming (1) a first call
+with no cache allocates correctly, (2) passing a prior call's own return
+value back as `cache` reuses the identical tensor objects (checked via
+`is`, not just value equality) and updates them to the new values
+correctly, (3) a shape-mismatched buffer falls back to a fresh
+allocation instead of silently corrupting data, and (4) both the DDP
+and non-DDP (named_parameters) branches behave correctly under reuse.
+Validated end-to-end on a real 40-node, 70B-parameter training run:
+process RSS held flat in a 49-52 GB band across 5 training steps versus
+an unbounded 40 -> 82 -> 100+ GB climb (and OOM) without this fix.
+---
+ .../experimental/separation/engine_workers.py | 17 +++++-
+ verl/utils/megatron_utils.py                  | 55 +++++++++++++++----
+ 2 files changed, 60 insertions(+), 12 deletions(-)
+
+diff --git a/verl/experimental/separation/engine_workers.py b/verl/experimental/separation/engine_workers.py
+index 68f3286c787..b41ea3d1c3b 100644
+--- a/verl/experimental/separation/engine_workers.py
++++ b/verl/experimental/separation/engine_workers.py
+@@ -134,7 +134,22 @@ def save_model_to_cpu(self, n):
+         if not hasattr(self, "cpu_saved_models"):
+             self.cpu_saved_models = {}
+ 
+-        self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
++        if self.config.actor.strategy == "megatron":
++            # Reuse pinned CPU buffers across calls for the same slot `n` instead of allocating
++            # fresh ones every time (see copy_megatron_model_to_cpu's `cache` argument).
++            # `_cpu_pinned_pool` is intentionally a SEPARATE dict from `cpu_saved_models`:
++            # clear_cpu_model() below only ever removes the `cpu_saved_models` alias (the
++            # "currently active" snapshot for slot n), never this pool, so the underlying pinned
++            # tensors for slot n survive to be reused the next time slot n is saved again --
++            # correct as long as a given slot n is never saved-to while a previous snapshot under
++            # that same slot is still being read elsewhere, which is already the existing calling
++            # contract for save_model_to_cpu/restore_model_from_cpu/clear_cpu_model.
++            if not hasattr(self, "_cpu_pinned_pool"):
++                self._cpu_pinned_pool = {}
++            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module, self._cpu_pinned_pool.get(n))
++            self._cpu_pinned_pool[n] = self.cpu_saved_models[n]
++        else:
++            self.cpu_saved_models[n] = self.copy_handler(self.actor.engine.module)
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def restore_model_from_cpu(self, n):
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 2d51906e594..bce99a27e40 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -1906,8 +1906,19 @@ def patch_engine_mtp(module, model_config):
+             patch_mtp_layer_get_embeddings(m)
+ 
+ 
++def _reuse_or_alloc_pinned(cached_tensor, src):
++    """Copy `src` (GPU or CPU) into `cached_tensor` in place if shapes/dtypes match, avoiding a
++    fresh pinned-host allocation; otherwise allocate a new pinned CPU tensor (first call, or a
++    genuine shape/dtype change). Returns the tensor now holding the data.
++    """
++    if cached_tensor is not None and cached_tensor.shape == src.shape and cached_tensor.dtype == src.dtype:
++        cached_tensor.copy_(src)
++        return cached_tensor
++    return src.cpu().clone().pin_memory()
++
++
+ @torch.no_grad()
+-def copy_megatron_model_to_cpu(models):
++def copy_megatron_model_to_cpu(models, cache=None):
+     """
+     Copy Megatron model parameters to CPU memory (non-destructive copy).
+     Unlike offload_megatron_model_to_cpu which moves data, this function creates
+@@ -1915,41 +1926,63 @@ def copy_megatron_model_to_cpu(models):
+ 
+     Args:
+         models: List of model chunks (DDP-wrapped or unwrapped)
++        cache: Optional cpu_state dict from a PREVIOUS call (same models, same structure) whose
++            pinned CPU tensors should be reused in place instead of allocating fresh ones. Pass
++            the same cache object back in on every call for a given snapshot slot to keep host
++            pinned-memory usage bounded to one copy per slot instead of growing on every call --
++            PyTorch's pinned-host allocator does not always reclaim a previous call's freed
++            blocks for reuse, so repeatedly calling this function without a cache can leak
++            several GB of host RAM per call under Decoupled PPO's every-step CPU snapshotting
++            (algorithm.rollout_correction.bypass_mode: False with a short parameter_sync_step).
++            Any buffer missing from `cache` (or with a mismatched shape/dtype -- should not
++            happen mid-training, but handled safely) falls back to a fresh allocation, exactly
++            matching the original unconditional behavior when `cache` is None.
+ 
+     Returns:
+-        dict: CPU state containing copied parameters and buffers
++        dict: CPU state containing copied parameters and buffers. Pass this same dict back in as
++            `cache` on the next call for the same slot to reuse its pinned buffers.
+     """
+     cpu_state = {}
++    cache = cache or {}
+ 
+     for model_idx, model_chunk in enumerate(models):
++        chunk_key = f"model_chunk_{model_idx}"
++        cached_chunk = cache.get(chunk_key) or {}
++
+         if isinstance(model_chunk, DDP):
+             # Handle DDP-wrapped models
+             model_chunk_all_buffers = [model_chunk.buffers, model_chunk.expert_parallel_buffers]
++            cached_buffer_states = cached_chunk.get("buffer_states") or [[], []]
+             buffer_states = []
+ 
+-            for buffers in model_chunk_all_buffers:
++            for group_idx, buffers in enumerate(model_chunk_all_buffers):
++                cached_group = cached_buffer_states[group_idx] if group_idx < len(cached_buffer_states) else []
+                 buffer_list = []
+-                for buffer in buffers:
++                for buf_idx, buffer in enumerate(buffers):
++                    cached_bstate = cached_group[buf_idx] if buf_idx < len(cached_group) else {}
+                     buffer_state = {}
+ 
+-                    # Copy parameter data to CPU
++                    # Copy parameter data to CPU, reusing a previously-pinned destination buffer
++                    # when available (see `_reuse_or_alloc_pinned`).
+                     if buffer.param_data.storage().size() > 0:
+-                        buffer_state["param_data"] = buffer.param_data.data.cpu().clone().pin_memory()
++                        src = buffer.param_data.data
+                     else:
+-                        buffer_state["param_data"] = buffer.param_data.cpu_data.clone().pin_memory()
++                        src = buffer.param_data.cpu_data
++                    buffer_state["param_data"] = _reuse_or_alloc_pinned(cached_bstate.get("param_data"), src)
+ 
+                     buffer_list.append(buffer_state)
+                 buffer_states.append(buffer_list)
+ 
+-            cpu_state[f"model_chunk_{model_idx}"] = {"buffer_states": buffer_states, "is_ddp": True}
++            cpu_state[chunk_key] = {"buffer_states": buffer_states, "is_ddp": True}
+         else:
+             # Handle non-DDP models (ref module)
++            cached_model_state = cached_chunk.get("model_state") or {}
+             model_state = {}
+             for name, param in model_chunk.named_parameters():
+-                param_state = {"data": param.data.cpu().clone().pin_memory()}
+-                model_state[name] = param_state
++                cached_tensor = (cached_model_state.get(name) or {}).get("data")
++                model_state[name] = {"data": _reuse_or_alloc_pinned(cached_tensor, param.data)}
+ 
+-            cpu_state[f"model_chunk_{model_idx}"] = {"model_state": model_state, "is_ddp": False}
++            cpu_state[chunk_key] = {"model_state": model_state, "is_ddp": False}
+ 
+     return cpu_state
+ 

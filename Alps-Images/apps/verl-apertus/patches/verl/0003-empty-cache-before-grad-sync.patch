@@ -1,0 +1,43 @@
+# [CSCS, 2026-09-08] Return PyTorch's cached-but-free CUDA blocks to the driver right before the
+# Megatron DP gradient reduce-scatter (finalize_model_grads), by wrapping the hook verl installs
+# in verl/utils/megatron_utils.py:register_megatron_training_hooks.
+#
+# Found on rl-bench-apertus-v1.5-70B-sglang-megatron-v1-separate-async.sh with DAPO-Math at the
+# 12288-token thinking cap (runs 3316163 and 3326537): step 1 dies with
+#   RuntimeError: NCCL Error 1: unhandled cuda error
+#   finalize_model_grads -> finish_grad_sync -> start_grad_sync -> _coalescing_manager
+# while an identical configuration (run 3317733) completed 2 steps -- a batch-dependent, marginal
+# condition. At the step peak the trainer had ~60 GB allocated but ~86 GB RESERVED by the caching
+# allocator; after the backward pass the activations are freed but the cache keeps holding the
+# high-water mark, and NCCL's own CUDA allocations for the reduce-scatter happen outside that
+# cache -> cudaMalloc fails on a 95 GB GPU even though the live tensors fit. Same mechanism and
+# same remedy as the DeepSeek-V3 recipe's unconditional empty_cache() before optimizer.step().
+# Numerically a no-op; cost is one empty_cache() per optimizer step (tens of ms).
+#
+# Generated from a real git worktree at verl v0.9.0; git apply --check / py_compile /
+# --reverse --check verified. Touches only verl/utils/megatron_utils.py (no overlap with the other
+# patches this recipe applies).
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 0358497c..016e8f2d 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -1689,7 +1689,18 @@ def register_megatron_training_hooks(model: list[torch.nn.Module], optimizer):
+     for one_model in model:
+         config = get_model_config(one_model)
+         config.grad_scale_func = optimizer.scale_loss
+-        config.finalize_model_grads_func = finalize_model_grads
++
++        def _finalize_model_grads_with_empty_cache(*args, **kwargs):
++            # Return PyTorch's cached-but-free blocks to CUDA before the DP gradient
++            # reduce-scatter: after the backward pass the caching allocator still holds
++            # the activation high-water mark, and NCCL's own CUDA allocations for the
++            # collective happen outside that cache. On long-sequence RL steps this
++            # otherwise fails with "NCCL Error 1: unhandled cuda error" even though the
++            # step's live tensors fit. Numerically a no-op.
++            get_torch_device().empty_cache()
++            return finalize_model_grads(*args, **kwargs)
++
++        config.finalize_model_grads_func = _finalize_model_grads_with_empty_cache
+ 
+         overlap_param_gather = getattr(optimizer.config, "overlap_param_gather", False)
+         overlap_grad_reduce = getattr(one_model.ddp_config, "overlap_grad_reduce", False)
