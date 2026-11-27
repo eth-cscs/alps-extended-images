@@ -1,0 +1,113 @@
+From 52d8fb79c0632020fef7afe3b3b0169eedf38ea2 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Thu, 12 Nov 2026 13:43:04 +0100
+Subject: [PATCH] ep: select CXI domains by physical GPU rank
+
+Ray exposes one GPU per worker, so every worker sees its assigned GPU as
+logical device zero.  Selecting cxi0 from that logical index sends all four
+MI300A workers through the same CXI device and can crash UCCL while its
+per-rank endpoints and IPC mappings are initialized.
+
+The topology detector already records each visible device's rank in the
+node-wide physical PCI ordering as nic_local_rank.  Use that rank only for
+CXI domain selection while retaining the logical device index for HIP memory
+registration.
+
+Rebased onto uccl-project/uccl 52d4184c from the vllm app's patch for
+e22a3e8f.  Both select_cxi_info() calls (the first attempt and the
+fi_domain retry path) use the physical rank, and the proxy-thread NUMA
+lookup added by #1139 reads cxi<nic_local_rank> so it matches the
+selected device.
+---
+ ep/include/cxi_transport.hpp |  1 +
+ ep/src/cxi_transport.cpp     | 11 +++++++----
+ ep/src/proxy.cpp             |  8 ++++----
+ 3 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/ep/include/cxi_transport.hpp b/ep/include/cxi_transport.hpp
+index f90578af..a63cfc9b 100644
+--- a/ep/include/cxi_transport.hpp
++++ b/ep/include/cxi_transport.hpp
+@@ -20,6 +20,7 @@ class CxiTransport final : public EpTransport {
+   ~CxiTransport() override;
+ 
+   void init(ProxyCtx& ctx) override;
++  void init(ProxyCtx& ctx, int cxi_local_rank);
+   void register_main_buffer(void* ptr, size_t len, int cuda_device) override;
+   void register_atomic_buffer(void* ptr, size_t len, int cuda_device) override;
+   LocalConnInfo local_info() const override;
+diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
+index 59912f27..bb52b28d 100644
+--- a/ep/src/cxi_transport.cpp
++++ b/ep/src/cxi_transport.cpp
+@@ -24,7 +24,8 @@ void CxiTransport::unavailable() {
+ 
+ #ifndef USE_LIBFABRIC_CXI
+ 
+-void CxiTransport::init(ProxyCtx&) { unavailable(); }
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++void CxiTransport::init(ProxyCtx&, int) { unavailable(); }
+ void CxiTransport::register_main_buffer(void*, size_t, int) { unavailable(); }
+ void CxiTransport::register_atomic_buffer(void*, size_t, int) { unavailable(); }
+ LocalConnInfo CxiTransport::local_info() const { unavailable(); }
+@@ -204,14 +205,16 @@ int cxi_domain_retries() {
+ 
+ }  // namespace
+ 
+-void CxiTransport::init(ProxyCtx& ctx) {
++void CxiTransport::init(ProxyCtx& ctx) { init(ctx, ctx.local_rank); }
++
++void CxiTransport::init(ProxyCtx& ctx, int cxi_local_rank) {
+   ctx_ = &ctx;
+ 
+   std::unique_lock<std::mutex> setup_lock(g_cxi_setup_mu);
+   fi_info* info = get_cxi_info();
+ 
+   try {
+-    fi_info* selected = select_cxi_info(info, ctx.local_rank);
++    fi_info* selected = select_cxi_info(info, cxi_local_rank);
+ 
+     check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr), "fi_fabric");
+     int rc = fi_domain(fabric_, selected, &domain_, nullptr);
+@@ -226,7 +229,7 @@ void CxiTransport::init(ProxyCtx& ctx) {
+       info = nullptr;
+       usleep(50000);
+       info = get_cxi_info();
+-      selected = select_cxi_info(info, ctx.local_rank);
++      selected = select_cxi_info(info, cxi_local_rank);
+       check_fi(fi_fabric(selected->fabric_attr, &fabric_, nullptr),
+                "fi_fabric");
+       rc = fi_domain(fabric_, selected, &domain_, nullptr);
+diff --git a/ep/src/proxy.cpp b/ep/src/proxy.cpp
+index 265ae394..1db07b82 100644
+--- a/ep/src/proxy.cpp
++++ b/ep/src/proxy.cpp
+@@ -34,8 +34,8 @@ static bool is_normal_mode_remote_peer(Proxy::Config const& cfg, int my_rank,
+ 
+ static constexpr uint64_t kCxiInternalWrId = UINT64_MAX;
+ 
+-// NUMA node of the CXI NIC that CxiTransport selects for this local rank
+-// (cxi<local_rank>), or -1 if sysfs does not report it.
++// NUMA node of the CXI NIC that CxiTransport selects for this physical local
++// rank (cxi<nic_local_rank>), or -1 if sysfs does not report it.
+ static int cxi_nic_numa_node(int local_rank) {
+   std::string const path =
+       "/sys/class/cxi/cxi" + std::to_string(local_rank) + "/device/numa_node";
+@@ -285,7 +285,7 @@ void Proxy::init_common() {
+       if (!should_connect_peer(peer)) continue;
+ 
+       auto transport = std::make_unique<CxiTransport>();
+-      transport->init(ctx_);
++      transport->init(ctx_, cfg_.nic_local_rank);
+       transport->register_main_buffer(cfg_.gpu_buffer, cfg_.total_size,
+                                       cfg_.local_rank);
+       transport->register_atomic_buffer(atomic_buffer_ptr_, kAtomicBufferSize,
+@@ -374,7 +374,7 @@ void Proxy::init_common() {
+     dst_pending_.assign(256, 0);  // TransferCmd::dst_rank is a uint8_t
+ #endif
+ 
+-    ctx_.numa_node = cxi_nic_numa_node(cfg_.local_rank);
++    ctx_.numa_node = cxi_nic_numa_node(cfg_.nic_local_rank);
+     if (ctx_.numa_node >= 0) {
+       pin_thread_to_numa_wrapper();
+     } else if (cfg_.pin_thread) {

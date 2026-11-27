@@ -1,0 +1,31 @@
+From 3d9f63fc8d5a2072a4a6d1b388fa958217a732a2 Mon Sep 17 00:00:00 2001
+From: CSCS Alps Images <noreply@cscs.ch>
+Date: Wed, 9 Sep 2026 00:00:00 +0000
+Subject: [PATCH] ep: use the ROCR libfabric HMEM interface on AMD
+
+The CXI transport always marks GPU memory as CUDA memory.  ROCm builds must
+use FI_HMEM_ROCR so the CXI provider registers the allocation through the
+ROCR support enabled in the Alps libfabric build.
+---
+ ep/src/cxi_transport.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ep/src/cxi_transport.cpp b/ep/src/cxi_transport.cpp
+index ae753f5..34f9ec0 100644
+--- a/ep/src/cxi_transport.cpp
++++ b/ep/src/cxi_transport.cpp
+@@ -72,7 +72,12 @@ fid_mr* register_cuda_mr(fid_domain* domain, fid_ep* ep, void* ptr, size_t len,
+   attr.access =
+       FI_SEND | FI_RECV | FI_WRITE | FI_READ | FI_REMOTE_WRITE | FI_REMOTE_READ;
++#ifdef __HIP_PLATFORM_AMD__
++  attr.iface = FI_HMEM_ROCR;
++  attr.device.rocr = cuda_device;
++#else
+   attr.iface = FI_HMEM_CUDA;
+   attr.device.cuda = static_cast<uint64_t>(cuda_device);
++#endif
+ 
+   fid_mr* mr = nullptr;
+   int rc = fi_mr_regattr(domain, &attr, 0, &mr);
+-- 
+2.51.0
