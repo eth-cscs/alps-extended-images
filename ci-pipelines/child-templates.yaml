@@ -219,6 +219,19 @@ include:
     SLURM_JOB_NUM_NODES: 2
     SLURM_NTASKS: 8
 
+# CUDA base libfabric CXI test for the hybrid MR desc patch: correctness of
+# AMO/RMA/FI_INJECT operand copies, and zero MR cache lookups per post with a
+# valid desc. Runs the test source from the repo checkout.
+.child-cuda-base-cxi-hybrid-mr-desc-test-template:
+  stage: test-base
+  extends: [.container-runner-clariden-gh200, .child-slurm-template]
+  timeout: 30m
+  script:
+    - bash ci-pipelines/base-tests/cxi-hybrid-mr-desc/run.sh
+  variables:
+    SLURM_JOB_NUM_NODES: 1
+    SLURM_NTASKS: 1
+
 # CUDA base hardware/software diagnosis via vetnode.
 .child-cuda-vetnode-test-template:
   stage: test-base
